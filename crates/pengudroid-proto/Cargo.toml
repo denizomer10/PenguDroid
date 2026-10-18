@@ -1,0 +1,9 @@
+[package]
+name = "pengudroid-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Wire protocol and ABI constants shared across PenguDroid components."
+
+[dependencies]

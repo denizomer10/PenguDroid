@@ -1,0 +1,10 @@
+[package]
+name = "pengudroid-hostgpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Host GPU access (EGL/GLES/GBM via dlopen) for PenguDroid guests."
+
+[dependencies]
+libc.workspace = true

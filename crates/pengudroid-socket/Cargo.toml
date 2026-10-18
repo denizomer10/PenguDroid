@@ -1,0 +1,11 @@
+[package]
+name = "pengudroid-socket"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Unix-socket transport with SCM_RIGHTS file-descriptor passing for PenguDroid."
+
+[dependencies]
+pengudroid-proto.workspace = true
+libc.workspace = true

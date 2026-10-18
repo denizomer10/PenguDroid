@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+*.sock
+*.pid
+*.log
+fixtures/*/lib/

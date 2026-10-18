@@ -1,0 +1,234 @@
+# PenguDroid
+
+**A no-KVM, no-container, no-VM Android compatibility layer for Linux — in Rust.**
+
+PenguDroid runs Android applications as ordinary Linux processes. There is no
+virtual machine, no LXC/Waydroid-style container, no namespace sandbox, and no
+booted `system.img`. Like Wine/Proton translate Windows to POSIX, PenguDroid
+translates Android's user-space interfaces — binder, Bionic libc, the surface
+stack, audio — directly onto Linux primitives and onto the user's own session
+(Wayland, PipeWire, the host's Vulkan/GL drivers).
+
+A small always-on daemon (`pengudroid-daemon`, analogous to Proton's
+`wineserver`) brokers shared resources and stays resident; apps come and go as
+normal processes that you can see in `ps aux`.
+
+```
+$ pengudroid run app.apk
+package:      com.example.app
+targetSdk:    36
+main activity:com.example.app/.MainActivity
+started guest: pid 26829 (com.example.app)
+the window is live; press Ctrl-C to stop the guest
+
+$ pengudroid ps
+PID      PACKAGE                      SURFACE  COMPONENT
+26829    com.example.app              1        com.example.app/.MainActivity
+
+$ ps -eo pid,comm,args | grep pengudroid
+26822 pengudroid-daem  pengudroid-daemon --daemonize
+26829 pengudroid       pengudroid __guest --package com.example.app ...
+```
+
+---
+
+## Status: what actually works vs. what is stubbed
+
+This is an **MVP skeleton with a genuinely working spine**. The infrastructure
+is real and tested; the Android runtime integration is the next (very large)
+milestone. Nothing below is overstated.
+
+| Area | Status | Notes |
+|---|---|---|
+| Control daemon, lifecycle, `--daemonize`, signals | **Working** | ~few-ms startup, no boot phase |
+| Unix-socket protocol, framing, `SCM_RIGHTS` fd passing | **Working** | tested with real memfds |
+| `ashmem` via `memfd_create` + seals | **Working** | GROW/SHRINK seals verified to block `ftruncate` |
+| Kernel binder probe (`BINDER_VERSION` ioctl) + fallback | **Working** | detects `/dev/binderfs/binder`; falls back to userspace broker on desktop kernels |
+| Android property store (`getprop`/`setprop`) | **Working** | Android 16 defaults; reported to guests |
+| APK + binary `AndroidManifest.xml` parsing | **Working** | ZIP (store/deflate) + AXML parser, unit-tested |
+| `pengudroid deps`: ELF import / Bionic-coverage analysis | **Working** | parses real arm64 / armv7 / x86-64 APK libraries; predicts `dlopen` outcome |
+| Loading **real Android APK libraries** on glibc (`de-bionic` + `libpath` + `nativelib`) | **Working** | real x86-64 APK libraries (`librtb.so`, `libgtb.so`, `libnativeutil.so`) `dlopen` successfully |
+| Loading a native `.so` under the shim (`LD_PRELOAD`) | **Partial** | `dlopen` verified; library teardown (`dlclose`/`atexit`) and stdio via `__sF` are not ABI-compatible yet |
+| **Calling a real Android-style library and getting a correct result** | **Working** | `fixtures/native-demo` returns 500500 after `de-bionic` + load, via the shim |
+| **Loading an application's own native libraries (`nativelib --apk`)** | **Working** | extracts an APK's `lib/<abi>/*.so`, strips them, and loads the set (intra-APK deps resolve) |
+| Wayland graphics broker (compositor, `wl_shm`, `xdg_wm_base`, toplevels) | **Working** | connects to the live session; surfaces + `wl_shm` buffers |
+| Guest process: owns a window, `ps`-visible, animated | **Working** | the `__guest` runtime |
+| `LD_PRELOAD` Bionic→glibc shim (`libashmem`, logging, props, API level) | **Working** | interposes real Bionic symbol names |
+| Service registry + `phone`/`media.camera`/AMS/PMS/SurfaceFlinger stubs | **Stub** | correctly-named interfaces, minimal replies |
+| Audio: PipeWire | **Stub** | `dlopen` availability probe + shared ring buffer; the pump into PipeWire is not written |
+| Telephony / camera | **Stub** | report "radio off" / "zero cameras" |
+| **Running real DEX bytecode (ART)** | **Not started** | the central open problem; see `docs/LIMITATIONS.md` |
+| **Real Bionic/EGL in a guest** | **Not started** | needs the Android userspace `.so`s loaded in-process |
+
+The honest framing of "no `system.img`": the *container/VM* image is gone, but
+Android apps still need ART and Bionic *binaries* from somewhere. PenguDroid's
+design goal is to load those as host libraries under a translation shim rather
+than boot them as a guest OS. See `docs/ARCHITECTURE.md`.
+
+---
+
+## Build
+
+Requires a Rust toolchain (stable, 1.75+). No system `-dev` packages are needed
+for the default build — the Wayland client backend is pure Rust.
+
+```sh
+cargo build --release
+```
+
+Binaries land in `target/release/`:
+
+* `pengudroid-daemon` — the resident broker
+* `pengudroid` — the CLI
+* `libpengudroid_shim.so` — the `LD_PRELOAD` Bionic translation shim
+
+## Usage
+
+```sh
+# Start the daemon (or let `run` start it for you).
+pengudroid daemon
+
+# Inspect an APK without running it.
+pengudroid info app.apk
+
+# Report how well the shim covers a native library's Bionic imports.
+pengudroid deps lib/arm64-v8a/librtb.so
+
+# Try to load a real Android library on glibc (de-bionic + bionic-compat + dlopen).
+pengudroid nativelib lib/x86_64/librtb.so
+
+# Load every native library an APK ships for an ABI.
+pengudroid nativelib --apk app.apk --abi x86_64
+
+# Print the Bionic-soname compat directory (for LD_LIBRARY_PATH) / strip versioning.
+pengudroid libpath
+pengudroid de-bionic in.so out.so
+
+# Launch an app as a native Wayland window; Ctrl-C stops the guest.
+pengudroid run app.apk
+
+# Manage guests and properties.
+pengudroid ps
+pengudroid getprop ro.build.version.sdk      # -> 36
+pengudroid setprop debug.pengudroid 1
+pengudroid status
+pengudroid stop
+```
+
+Health-check the graphics path without opening a window:
+
+```sh
+pengudroid-daemon --wayland-selftest
+# OK: connected to the Wayland compositor and bound required globals
+```
+
+Using the shim with a guest process:
+
+```sh
+LD_PRELOAD=$PWD/target/release/libpengudroid_shim.so your-android-binary
+```
+
+## Loading and running native libraries
+
+Android `.so` files are Bionic-linked, and glibc refuses to load them for two
+independent reasons, both found empirically against real APK libraries:
+
+1. **Symbol versioning.** Bionic versions every libc symbol against a single
+   node per library — `libc.so` → `LIBC`, `libm.so` → `LIBM`, `libdl.so` → `LD`
+   — while glibc exports granular `GLIBC_2.x`. So an object both demands
+   `version 'LIBC' not found` and requires `free@LIBC` / `__cxa_finalize@LIBC`,
+   which glibc's versioned `free` cannot satisfy.
+2. **Soname mismatch.** `DT_NEEDED` names like `libc.so`, `libdl.so` do not
+   exist on a modern glibc system (`libc.so` is a linker script; `libdl.so` was
+   merged into libc).
+
+A few Bionic symbols glibc simply lacks (`__strlen_chk`, `__sF`, ...) are the
+third issue, handled by the shim.
+
+```
+$ pengudroid deps lib/x86_64/librtb.so        # measure Bionic coverage vs the shim
+bionic coverage: 2/2 (100%)
+
+$ pengudroid nativelib fixtures/native-demo/lib/libandroid_demo.so \
+      --call pengudroid_demo_run             # strip, load, and call
+library: .../libandroid_demo.so (ELF64, x86-64)
+OK: dlopen succeeded
+CALL pengudroid_demo_run() = 500500
+```
+
+The mechanism has two parts:
+
+* **`pengudroid de-bionic` / `pengudroid_elf::strip_android_versions`** rewrites
+  every non-zero `.gnu.version` entry to *global*, so symbol references become
+  unversioned and resolve normally against glibc (or the shim).
+* **`pengudroid libpath`** materialises a compat directory in which the Bionic
+  sonames (`libc.so`, `libm.so`, `libdl.so`, `liblog.so`, ...) all resolve to
+  the **shim**, which carries the `LIBC`/`LIBM`/`LD` version nodes via a linker
+  version script (`crates/pengudroid-shim/build.rs`) and provides the Bionic
+  symbols. glibc's own `libc.so.6` is already loaded in the process, so
+  unversioned references like `free` resolve from there.
+
+`nativelib` runs both and then actually attempts the load (re-execing as the
+hidden `__dlopen` command under `LD_PRELOAD` + `LD_LIBRARY_PATH`), optionally
+calling a nullary `int`-returning export with `--call`.
+
+### An application's own libraries (`nativelib --apk`)
+
+`pengudroid nativelib --apk app.apk --abi <abi>` extracts every native library
+an APK ships for that ABI, strips them into one scratch directory, and loads
+them as a set — so dependencies *between* the APK's libraries (for example a
+library that `DT_NEEDED`s the APK's own `libc++_shared.so`) resolve inside that
+directory rather than failing. Cross-architecture entries are reported as
+`[SKIP]` with the reason instead of a confusing load failure:
+
+```
+$ pengudroid nativelib --apk droidfish.apk --abi x86_64
+/tmp/droidfish.apk: 3 native libraries for x86_64
+  [ OK ] libgtb.so
+  [ OK ] libnativeutil.so
+  [ OK ] librtb.so
+/tmp/droidfish.apk: 3 loadable, 0 skipped, 0 failed
+```
+
+**What this does not mean:** teardown (`dlclose`/`atexit`) can crash because C++
+static destructors assume Bionic runtime state, and the `__sF` stdio array is
+not ABI-compatible with glibc's `FILE`. `pengudroid-elf` reads ELF32 and ELF64
+(armv7, aarch64, x86, x86-64) with no external dependencies.
+
+### Reproducible test
+
+`fixtures/native-demo/` builds a small *Android-style versioned* library (a stub
+`libc.so` provides version `LIBC`) with an entry point returning `500500`, and
+`fixtures/native-demo/run-test.sh` loads and calls it through PenguDroid — no
+network or real APK required.
+
+## Repository layout
+
+```
+crates/
+  pengudroid-proto/    wire protocol, ABI constants, no dependencies
+  pengudroid-socket/   Unix-socket transport with SCM_RIGHTS fd passing
+  pengudroid-elf/      ELF dynamic-symbol reader + Android version stripping
+  pengudroid-daemon/   the resident broker (binder/graphics/audio/props)
+  pengudroid-cli/      the `pengudroid` command, APK/AXML parser, guest runtime
+  pengudroid-shim/     LD_PRELOAD Bionic->glibc translation shim
+fixtures/
+  native-demo/         a reproducible Android-style versioned test library
+docs/
+  ARCHITECTURE.md      how each translation layer works
+  LIMITATIONS.md       the hard problems, stated plainly
+```
+
+## Testing
+
+```sh
+cargo test --workspace
+```
+
+Unit tests cover the wire protocol round-trips, `SCM_RIGHTS` fd passing,
+ashmem sealing, binder ioctl-number correctness, the property store, the
+service stubs, ZIP + AXML parsing, and the shim's property/ashmem entry points.
+
+## License
+
+Apache-2.0.

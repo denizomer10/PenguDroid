@@ -1,0 +1,9 @@
+[package]
+name = "pengudroid-elf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Minimal ELF dynamic-symbol reader (imports/exports) for PenguDroid."
+
+[dependencies]

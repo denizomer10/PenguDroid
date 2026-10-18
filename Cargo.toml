@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pengudroid-proto",
+    "crates/pengudroid-socket",
+    "crates/pengudroid-elf",
+    "crates/pengudroid-hostgpu",
+    "crates/pengudroid-daemon",
+    "crates/pengudroid-cli",
+    "crates/pengudroid-shim",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+authors = ["PenguDroid contributors"]
+description = "A no-KVM, no-container Android compatibility layer for Linux."
+
+[workspace.dependencies]
+libc = "0.2"
+miniz_oxide = "0.8"
+
+# Wayland: pure-Rust client backend (no libwayland-client headers needed at
+# build time). We deliberately disable the system "sys" backend so this builds
+# on machines without wayland dev packages.
+wayland-client = { version = "0.31", default-features = false }
+wayland-protocols = { version = "0.31", default-features = false, features = ["client", "unstable"] }
+
+pengudroid-proto = { path = "crates/pengudroid-proto" }
+pengudroid-socket = { path = "crates/pengudroid-socket" }
+pengudroid-elf = { path = "crates/pengudroid-elf" }
+pengudroid-hostgpu = { path = "crates/pengudroid-hostgpu" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

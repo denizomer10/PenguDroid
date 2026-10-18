@@ -1,0 +1,27 @@
+[package]
+name = "pengudroid-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "PenguDroid background daemon (binder/graphics/audio broker)."
+
+[lib]
+name = "pengudroid_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pengudroid-daemon"
+path = "src/main.rs"
+
+[dependencies]
+pengudroid-proto.workspace = true
+pengudroid-socket.workspace = true
+pengudroid-hostgpu.workspace = true
+libc.workspace = true
+wayland-client = { workspace = true, optional = true }
+wayland-protocols = { workspace = true, optional = true }
+
+[features]
+default = ["wayland"]
+wayland = ["dep:wayland-client", "dep:wayland-protocols"]

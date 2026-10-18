@@ -1,0 +1,19 @@
+[package]
+name = "pengudroid-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The `pengudroid` command: run APKs, manage the daemon."
+
+[[bin]]
+name = "pengudroid"
+path = "src/main.rs"
+
+[dependencies]
+pengudroid-proto.workspace = true
+pengudroid-socket.workspace = true
+pengudroid-elf.workspace = true
+pengudroid-hostgpu.workspace = true
+libc.workspace = true
+miniz_oxide.workspace = true

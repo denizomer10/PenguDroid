@@ -1,0 +1,7 @@
+/* Android/Bionic style: one version node, `LIBC`, covering the whole libc. */
+LIBC {
+  global:
+    __android_log_print;
+    ashmem_create_region;
+  local: *;
+};
