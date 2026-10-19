@@ -74,6 +74,24 @@ fn symlink(link: &Path, target: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(target, link)
 }
 
+/// Locate `libpengudroid_gleshim.so` (the Bionic libEGL/GLESv2 shim) next to
+/// this executable.
+fn find_gleshim() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("PENGUDROID_GLESHIM") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let candidate = dir.join("libpengudroid_gleshim.so");
+    if candidate.exists() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
 /// Create (or refresh) the compat directory. Returns its path.
 ///
 /// Every Bionic soname an Android object might `DT_NEEDED` resolves to the
@@ -100,9 +118,25 @@ pub fn ensure_compat_dir() -> Result<PathBuf, String> {
         "libandroid.so",
         "libnativewindow.so",
         "libnativehelper.so",
+        "libOpenSLES.so",
     ];
     for name in BIONIC_SONAMES {
         symlink(&dir.join(name), &shim).map_err(|e| format!("symlink {name}: {e}"))?;
+    }
+
+    // EGL must go through our shim: it owns the virtual surface, the FBO, and
+    // the dma-buf swap. GL itself, however, can bind straight to the host
+    // driver — our shim makes the host context current and binds its FBO, so
+    // direct `gl*` calls land in the right place. That also gives the app the
+    // *full* GLES entry-point surface instead of the handful we export.
+    if let Some(gleshim) = find_gleshim() {
+        let _ = symlink(&dir.join("libEGL.so"), &gleshim);
+    }
+    if let Some(gles) = find_host_lib(&["libGLESv2.so.2"]) {
+        let _ = symlink(&dir.join("libGLESv2.so"), &gles);
+    }
+    if let Some(gles1) = find_host_lib(&["libGLESv1_CM.so.1"]) {
+        let _ = symlink(&dir.join("libGLESv1_CM.so"), &gles1);
     }
 
     if let Some(z) = find_host_lib(&["libz.so.1"]) {
@@ -379,6 +413,16 @@ pub fn dlopen_helper(args: &[String]) -> i32 {
     };
     // SAFETY: valid C strings; dlopen/dlsym/dlerror are standard libc calls.
     unsafe {
+        // Bionic folds several sonames into single libraries; we map `libm.so`,
+        // `libc.so`, etc. to the shim to satisfy their version nodes. Make the
+        // host libraries that really contain those symbols available in the
+        // global scope so unversioned references (e.g. `fma`) resolve.
+        for soname in ["libm.so.6", "libstdc++.so.6", "libz.so.1", "libgcc_s.so.1"] {
+            if let Ok(c) = std::ffi::CString::new(soname) {
+                libc::dlopen(c.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
+            }
+        }
+
         let handle = libc::dlopen(cpath.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
         if handle.is_null() {
             let err = libc::dlerror();

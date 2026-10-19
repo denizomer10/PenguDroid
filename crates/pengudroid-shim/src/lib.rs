@@ -854,6 +854,20 @@ pub unsafe extern "C" fn ANativeWindow_getHeight(_w: *mut c_void) -> i32 {
     0
 }
 
+/// `ANativeWindow_setBuffersGeometry(w, width, height, format)`.
+///
+/// // STUB: the real buffer geometry is owned by the shim's EGL surface; this
+/// accepts the request and reports success.
+#[no_mangle]
+pub unsafe extern "C" fn ANativeWindow_setBuffersGeometry(
+    _w: *mut c_void,
+    _width: i32,
+    _height: i32,
+    _format: i32,
+) -> i32 {
+    0
+}
+
 // ---------------------------------------------------------------------------
 // <string.h> fortify helpers (_FORTIFY_SOURCE)
 // ---------------------------------------------------------------------------
@@ -958,6 +972,197 @@ pub unsafe extern "C" fn __memchr_chk(
         libc::abort();
     }
     libc::memchr(s, c, n)
+}
+
+/// Bionic's bounded `strncpy`. Aborts when the requested length exceeds the
+/// destination capacity.
+#[no_mangle]
+pub unsafe extern "C" fn __strncpy_chk(
+    dst: *mut c_char,
+    src: *const c_char,
+    n: usize,
+    dst_len: usize,
+) -> *mut c_char {
+    if n > dst_len {
+        libc::abort();
+    }
+    libc::strncpy(dst, src, n)
+}
+
+/// Bionic's `strncpy` that knows both buffer sizes.
+#[no_mangle]
+pub unsafe extern "C" fn __strncpy_chk2(
+    dst: *mut c_char,
+    src: *const c_char,
+    n: usize,
+    dst_len: usize,
+    src_len: usize,
+) -> *mut c_char {
+    if n > dst_len || n > src_len {
+        libc::abort();
+    }
+    libc::strncpy(dst, src, n)
+}
+
+/// `stpncpy` is not exposed by the `libc` crate; implement it directly.
+unsafe fn stpncpy_impl(dst: *mut c_char, src: *const c_char, n: usize) -> *mut c_char {
+    let mut i = 0usize;
+    while i < n {
+        let ch = *src.add(i);
+        *dst.add(i) = ch;
+        if ch == 0 {
+            for j in (i + 1)..n {
+                *dst.add(j) = 0;
+            }
+            return dst.add(i);
+        }
+        i += 1;
+    }
+    dst.add(n)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __stpncpy_chk(
+    dst: *mut c_char,
+    src: *const c_char,
+    n: usize,
+    dst_len: usize,
+) -> *mut c_char {
+    if n > dst_len {
+        libc::abort();
+    }
+    stpncpy_impl(dst, src, n)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __stpncpy_chk2(
+    dst: *mut c_char,
+    src: *const c_char,
+    n: usize,
+    dst_len: usize,
+    src_len: usize,
+) -> *mut c_char {
+    if n > dst_len || n > src_len {
+        libc::abort();
+    }
+    stpncpy_impl(dst, src, n)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __strncat_chk(
+    dst: *mut c_char,
+    src: *const c_char,
+    n: usize,
+    dst_len: usize,
+) -> *mut c_char {
+    let cur = libc::strlen(dst);
+    if cur.saturating_add(n) >= dst_len {
+        libc::abort();
+    }
+    libc::strncat(dst, src, n)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __strcat_chk(
+    dst: *mut c_char,
+    src: *const c_char,
+    dst_len: usize,
+) -> *mut c_char {
+    let cur = libc::strlen(dst);
+    let add = libc::strlen(src);
+    if cur.saturating_add(add) >= dst_len {
+        libc::abort();
+    }
+    libc::strcat(dst, src)
+}
+
+/// Reverse `memchr`, bounded.
+#[no_mangle]
+pub unsafe extern "C" fn __memrchr_chk(
+    s: *const c_void,
+    c: c_int,
+    n: usize,
+    slen: usize,
+) -> *mut c_void {
+    if n > slen {
+        libc::abort();
+    }
+    let bytes = s as *const u8;
+    let target = c as u8;
+    let mut i = n;
+    while i > 0 {
+        i -= 1;
+        if *bytes.add(i) == target {
+            return bytes.add(i) as *mut c_void;
+        }
+    }
+    std::ptr::null_mut()
+}
+
+/// Bionic's bounded `FD_SET`/`FD_CLR`/`FD_ISSET` variants.
+#[no_mangle]
+pub unsafe extern "C" fn __FD_SET_chk(
+    fd: c_int,
+    set: *mut libc::fd_set,
+    set_size: usize,
+) -> c_int {
+    if fd < 0 || (fd as usize) >= set_size.saturating_mul(8) {
+        libc::abort();
+    }
+    libc::FD_SET(fd, set);
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __FD_CLR_chk(
+    fd: c_int,
+    set: *mut libc::fd_set,
+    set_size: usize,
+) -> c_int {
+    if fd < 0 || (fd as usize) >= set_size.saturating_mul(8) {
+        libc::abort();
+    }
+    libc::FD_CLR(fd, set);
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __FD_ISSET_chk(
+    fd: c_int,
+    set: *const libc::fd_set,
+    set_size: usize,
+) -> c_int {
+    if fd < 0 || (fd as usize) >= set_size.saturating_mul(8) {
+        libc::abort();
+    }
+    i32::from(libc::FD_ISSET(fd, set))
+}
+
+/// Bionic's `__assert`/`__assert2`: report and abort (glibc's are different).
+unsafe fn bionic_assert(file: *const c_char, line: c_int, func: *const c_char, msg: *const c_char) -> ! {
+    let file = if file.is_null() { String::from("<unknown>") } else { cstr_lossy(file) };
+    let msg = if msg.is_null() { String::new() } else { cstr_lossy(msg) };
+    if func.is_null() {
+        eprintln!("assertion failed: {msg} at {file}:{line}");
+    } else {
+        eprintln!("assertion failed: {msg} at {}(), {file}:{line}", cstr_lossy(func));
+    }
+    libc::abort();
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __assert(file: *const c_char, line: c_int, msg: *const c_char) -> ! {
+    bionic_assert(file, line, std::ptr::null(), msg)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __assert2(
+    file: *const c_char,
+    line: c_int,
+    func: *const c_char,
+    msg: *const c_char,
+) -> ! {
+    bionic_assert(file, line, func, msg)
 }
 
 // ---------------------------------------------------------------------------
@@ -1316,6 +1521,95 @@ extern "C" fn pengudroid_init() {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// OpenSL ES (stubs)
+// ---------------------------------------------------------------------------
+// Real apps `DT_NEEDED` `libOpenSLES.so` even when they only render. Exporting
+// the entry points and interface IDs they reference lets the library load;
+// audio through OpenSL ES is **not** implemented (creating an engine fails).
+//
+// `SL_IID_*` are opaque interface identifiers; callers only pass them back to
+// us, so unique non-null values suffice (they are never dereferenced).
+const SL_RESULT_FEATURE_UNSUPPORTED: u32 = 12;
+
+/// Export a batch of OpenSL ES interface-ID data symbols. Apps compare these
+/// opaque values and pass them back to us; they are never dereferenced, so
+/// unique non-null integers are sufficient.
+macro_rules! sl_iids {
+    ($($name:ident = $value:expr),* $(,)?) => {
+        $(
+            #[no_mangle]
+            pub static $name: usize = $value;
+        )*
+    };
+}
+
+sl_iids! {
+    SL_IID_ENGINE = 0x5044_0001,
+    SL_IID_BUFFERQUEUE = 0x5044_0002,
+    SL_IID_VOLUME = 0x5044_0003,
+    SL_IID_PLAY = 0x5044_0004,
+    SL_IID_RECORD = 0x5044_0005,
+    SL_IID_SEEK = 0x5044_0006,
+    SL_IID_MUTESOLO = 0x5044_0007,
+    SL_IID_PRELOADSTATUS = 0x5044_0008,
+    SL_IID_ANDROIDSIMPLEBUFFERQUEUE = 0x5044_0009,
+    SL_IID_ANDROIDCONFIGURATION = 0x5044_000a,
+    SL_IID_ANDROIDEFFECT = 0x5044_000b,
+    SL_IID_ANDROIDEFFECTSEND = 0x5044_000c,
+    SL_IID_ANDROIDEFFECTCAPABILITIES = 0x5044_000d,
+    SL_IID_EQUALIZER = 0x5044_000e,
+    SL_IID_ENVIRONMENTALREVERB = 0x5044_000f,
+    SL_IID_PRESETREVERB = 0x5044_0010,
+    SL_IID_VIRTUALIZER = 0x5044_0011,
+    SL_IID_BASSBOOST = 0x5044_0012,
+    SL_IID_OUTPUTMIX = 0x5044_0013,
+    SL_IID_AUDIODECODERCAPABILITIES = 0x5044_0014,
+    SL_IID_AUDIOENCODERCAPABILITIES = 0x5044_0015,
+    SL_IID_AUDIOENCODER = 0x5044_0016,
+    SL_IID_AUDIOIODEVICECAPABILITIES = 0x5044_0017,
+    SL_IID_DEVICEVOLUME = 0x5044_0018,
+    SL_IID_DYNAMICINTERFACEMANAGEMENT = 0x5044_0019,
+    SL_IID_EFFECTSEND = 0x5044_001a,
+    SL_IID_LED = 0x5044_001b,
+    SL_IID_METADATAEXTRACTION = 0x5044_001c,
+    SL_IID_METADATATRAVERSAL = 0x5044_001d,
+    SL_IID_NULL = 0x5044_001e,
+    SL_IID_OBJECT = 0x5044_001f,
+    SL_IID_PLAYBACKRATE = 0x5044_0020,
+    SL_IID_RATEPITCH = 0x5044_0021,
+    SL_IID_STREAMINFORMATION = 0x5044_0022,
+    SL_IID_VIBRA = 0x5044_0023,
+    SL_IID_VISUALIZATION = 0x5044_0024,
+    SL_IID_XAUDIO2EFFECTSEND = 0x5044_0025,
+    SL_IID_AUDIOPLAYER = 0x5044_0026,
+    SL_IID_AUDIORECORDER = 0x5044_0027,
+    SL_IID_3DDOPPLER = 0x5044_0028,
+    SL_IID_3DGROUPING = 0x5044_0029,
+    SL_IID_3DHEADPHONEREFLECTIONS = 0x5044_002a,
+    SL_IID_3DLOCATION = 0x5044_002b,
+    SL_IID_3DMACROSCOPIC = 0x5044_002c,
+    SL_IID_3DSOURCE = 0x5044_002d,
+    SL_IID_3DDISTANCEDAMPING = 0x5044_002e,
+    SL_IID_3DDISTANCEATTENUATION = 0x5044_002f,
+}
+
+/// `SLresult slCreateEngine(SLObjectItf*, ...)`. Always fails cleanly.
+#[no_mangle]
+pub unsafe extern "C" fn slCreateEngine(
+    engine: *mut *mut c_void,
+    _num_options: u32,
+    _options: *const c_void,
+    _num_interfaces: u32,
+    _interface_ids: *const *const c_void,
+    _interface_required: *const u8,
+) -> u32 {
+    if !engine.is_null() {
+        *engine = std::ptr::null_mut();
+    }
+    SL_RESULT_FEATURE_UNSUPPORTED
+}
 
 // ---------------------------------------------------------------------------
 // Version-node anchors

@@ -1047,6 +1047,11 @@ pub unsafe extern "C" fn eglGetCurrentDisplay() -> EGLDisplay {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn eglGetCurrentSurface(_readdraw: i32) -> EGLSurface {
+    lock_state().current_surface as EGLSurface
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn eglBindAPI(api: u32) -> u32 {
     match host().ok().and_then(|h| h.bind_api) {
         // SAFETY: forwarded verbatim.
@@ -1128,6 +1133,65 @@ pub unsafe extern "C" fn eglDestroySurface(_dpy: EGLDisplay, surface: EGLSurface
     // `eglCreateWindowSurface` and is dropped exactly once here.
     drop(Box::from_raw(surface as *mut SurfaceRec));
     EGL_TRUE
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglCreatePbufferSurface(
+    _dpy: EGLDisplay,
+    _config: EGLConfig,
+    attribs: *const c_int,
+) -> EGLSurface {
+    // A pbuffer is just another offscreen target for us: the same FBO-backed
+    // surface, with geometry taken from EGL_WIDTH/EGL_HEIGHT if supplied.
+    const EGL_WIDTH: c_int = 0x3057;
+    const EGL_HEIGHT: c_int = 0x3056;
+    let mut w = env_dim("PENGUDROID_SURFACE_W", 720);
+    let mut h = env_dim("PENGUDROID_SURFACE_H", 1280);
+    if !attribs.is_null() {
+        let mut i = 0isize;
+        loop {
+            let key = *attribs.offset(i);
+            if key == 0x3038 {
+                break; // EGL_NONE
+            }
+            let val = *attribs.offset(i + 1);
+            if key == EGL_WIDTH && val > 0 {
+                w = val as u32;
+            } else if key == EGL_HEIGHT && val > 0 {
+                h = val as u32;
+            }
+            i += 2;
+        }
+    }
+    let rec = Box::new(SurfaceRec { w, h, tex: 0, fbo: 0 });
+    let surface = Box::into_raw(rec) as EGLSurface;
+    lock_state().current_surface = surface as usize;
+    surface
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglQuerySurface(
+    _dpy: EGLDisplay,
+    surface: EGLSurface,
+    attribute: c_int,
+    value: *mut c_int,
+) -> u32 {
+    if surface.is_null() || value.is_null() {
+        return EGL_FALSE;
+    }
+    // SAFETY: non-null surfaces are `SurfaceRec` pointers from the create calls.
+    let rec = &*(surface as *const SurfaceRec);
+    match attribute {
+        0x3057 => {
+            *value = rec.w as c_int; // EGL_WIDTH
+            EGL_TRUE
+        }
+        0x3056 => {
+            *value = rec.h as c_int; // EGL_HEIGHT
+            EGL_TRUE
+        }
+        _ => EGL_FALSE,
+    }
 }
 
 #[no_mangle]

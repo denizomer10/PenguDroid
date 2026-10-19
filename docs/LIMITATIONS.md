@@ -98,7 +98,12 @@ Still missing: `gralloc`/`AHardwareBuffer` compatibility, hardware composition,
 Vulkan (the host Vulkan ICDs can be loaded, but no translation layer drives them
 yet), and GLES coverage beyond the exported core functions (apps that call less
 common GL entry points directly, rather than via `eglGetProcAddress`, may fail
-to resolve).
+to resolve). Note that the compat directory maps `libGLESv2.so` to the *host*
+driver, which covers this in practice.
+
+**OpenSL ES is a stub.** `slCreateEngine` and the `SL_IID_*` identifiers are
+exported so audio-using apps load, but no engine is created and no sound is
+produced. The PipeWire pump is likewise still unwritten.
 
 ## 5. SurfaceFlinger is bypassed, not emulated
 

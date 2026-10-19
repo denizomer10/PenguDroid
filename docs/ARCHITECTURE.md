@@ -334,6 +334,19 @@ Still missing on this front: `gralloc`/`AHardwareBuffer` compatibility, hardware
 composition, and Vulkan (the host Vulkan ICDs can be loaded, but no translation
 layer drives them yet).
 
+One deliberate shortcut: the compat directory maps `libEGL.so` to our shim but
+`libGLESv2.so` to the **host driver**. Our shim makes the host context current
+and binds its FBO, so direct `gl*` calls land in the right place — and the app
+gets the *full* GLES entry-point surface rather than the handful the shim
+exports. (Apps that resolve GL through `eglGetProcAddress` get host pointers
+anyway.)
+`libOpenSLES.so` resolves to the Bionic shim, which exports `slCreateEngine` and
+the `SL_IID_*` identifiers so OpenSL ES users load; audio is not produced.
+
+With those mappings and the fortify/NDK stubs, real application libraries load:
+Dolphin's `libmain.so` (15 MB) and PPSSPP's `libppsspp_jni.so` (27 MB) both
+`dlopen` under `pengudroid nativelib --apk`.
+
 ## Why this is faster than a container
 
 Waydroid/Anbox boot an Android userspace inside an LXC container (or a VM):
