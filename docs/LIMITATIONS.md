@@ -103,7 +103,9 @@ driver, which covers this in practice.
 
 **OpenSL ES is a stub.** `slCreateEngine` and the `SL_IID_*` identifiers are
 exported so audio-using apps load, but no engine is created and no sound is
-produced. The PipeWire pump is likewise still unwritten.
+produced. The underlying PipeWire sink *is* implemented (`pengudroid audio-test`
+streams PCM through `pw-cat`); what remains is draining the daemon's ring and
+layering an OpenSL ES engine on top.
 
 ## 5. SurfaceFlinger is bypassed, not emulated
 
@@ -123,9 +125,10 @@ Some framework code depends on those semantics.
 ## 7. Stubs are stubs
 
 Telephony reports "radio off"; the camera reports "zero cameras"; `AudioFlinger`
-returns empty replies; the PipeWire pump is not written; `PackageManager` and
-`ActivityManager` answer minimally. These are honest placeholders, not partial
-implementations.
+returns empty replies; the OpenSL ES engine is not implemented (audio can be
+streamed through `pengudroid audio-test`, but an app's OpenSL/AudioTrack path is
+still a stub); `PackageManager` and `ActivityManager` answer minimally. These are
+honest placeholders, not partial implementations.
 
 ## 8. Security
 
@@ -169,7 +172,9 @@ hanging forever, so a wedged guest cannot freeze its peers.
    app's own EGL/GL calls and swaps them to Wayland (`fixtures/egl-app`).
 5. Attempt ART bring-up against a minimal `libandroid_runtime` with no
    `system_server`.
-6. Wire the PipeWire audio pump.
+6. ~~Wire the PipeWire audio pump.~~ **Partly done**: `AudioSink` streams real PCM
+   through `pw-cat` (silence default, `--tone` audible) in `pengudroid audio-test`.
+   Remaining: drain the daemon's shared ring and implement the OpenSL ES engine.
 7. Replace telephony/camera stubs with real AIDL marshalers.
 8. Add seccomp + a private mount namespace for isolation without a full
    container.

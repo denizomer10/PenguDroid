@@ -11,6 +11,7 @@
 //! ```
 
 mod apk;
+mod audio;
 mod client;
 mod deps;
 mod gpu;
@@ -50,6 +51,7 @@ fn real_main() -> i32 {
         "deps" => deps::run(&args[2..]),
         "gpu-info" => gpu::info(),
         "gpu-test" => gpu::test(),
+        "audio-test" => audio::test(&args[2..]),
         "libpath" => nativelib::libpath(&args[2..]),
         "de-bionic" => nativelib::de_bionic(&args[2..]),
         "nativelib" => nativelib::nativelib(&args[2..]),
@@ -406,7 +408,8 @@ fn print_help() {
          \x20   info <app.apk>                              show manifest details\n\
          \x20   deps <lib.so>                               bionic import coverage\n\
          \x20   gpu-info                                    report host EGL/GLES/GPU capabilities\n\
-         \x20   gpu-test                                    render on the GPU and export a dmabuf\n\
+         \x20   gpu-test                                    render offscreen on the GPU + export a dmabuf\n\
+         \x20   audio-test [--seconds N] [--tone]           play silence (or a tone) through PipeWire\n\
          \x20   nativelib <lib.so> [--call SYM] [--lib-dir D]  de-bionic + dlopen (+ call) a .so\n\
          \x20   nativelib --apk <app.apk> [--abi <abi>]      load an APK's own native libraries\n\
          \x20   libpath                                     print the bionic-compat LD_LIBRARY_PATH dir\n\

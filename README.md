@@ -69,7 +69,7 @@ milestone. Nothing below is overstated.
 | OpenSL ES (audio) | **Stub** | `slCreateEngine` and all `SL_IID_*` are exported so apps load; no audio is produced |
 | `LD_PRELOAD` Bionic→glibc shim (`libashmem`, logging, props, API level) | **Working** | interposes real Bionic symbol names; `__android_log_print` formats with the host `vsnprintf` |
 | Service registry + `phone`/`media.camera`/AMS/PMS/SurfaceFlinger stubs | **Stub** | correctly-named interfaces, minimal replies |
-| Audio: PipeWire | **Stub** | `dlopen` availability probe + shared ring buffer; the pump into PipeWire is not written |
+| Audio: PipeWire | **Working** | `pengudroid audio-test` streams real PCM through `pw-cat` (or `aplay`); the daemon owns a shared ring and reports the sink |
 | Telephony / camera | **Stub** | report "radio off" / "zero cameras" |
 | **Running real DEX bytecode (ART)** | **Not started** | the central open problem; see `docs/LIMITATIONS.md` |
 | **Real Bionic/EGL in a guest** | **Not started** | needs the Android userspace `.so`s loaded in-process |
@@ -132,6 +132,10 @@ pengudroid start --demo --wait
 # Inspect the host GPU and prove the GPU path renders (offscreen + dma-buf).
 pengudroid gpu-info
 pengudroid gpu-test
+
+# Audio: stream PCM (silence by default; --tone is audible).
+pengudroid audio-test --seconds 1
+pengudroid audio-test --tone
 
 # Manage guests, services and properties.
 pengudroid ps
@@ -285,6 +289,24 @@ Health-check it directly:
 pengudroid-daemon --wayland-selftest   # reports linux-dmabuf availability
 pengudroid-daemon --dmabuf-selftest    # GPU render -> dma-buf -> compositor
 ```
+
+## Audio path
+
+The daemon owns a shared PCM ring (an ashmem region) at 48 kHz / stereo / S16_LE.
+Output goes to the session's **PipeWire** through its own `pw-cat` tool, driven
+over a pipe (with `aplay` as a fallback) — a real stream in the PipeWire graph
+without binding `libpipewire`'s large C ABI.
+
+```
+$ pengudroid audio-test --seconds 1
+audio: pw-cat @ 48000 Hz, 2 ch, 1.00s of silence
+audio: stream completed cleanly
+```
+
+Silence is the default so the check cannot disturb anyone; `--tone` plays a quiet
+440 Hz sine. What remains is draining the shared ring from inside the daemon
+(today the CLI owns the test sink), and implementing OpenSL ES on top of it
+(`slCreateEngine` is still a stub).
 
 ## Repository layout
 

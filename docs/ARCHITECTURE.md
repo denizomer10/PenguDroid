@@ -117,10 +117,17 @@ acked before the first attach, and window-close events are tracked.
 
 ## 4. Audio
 
-`AudioBroker` probes for `libpipewire-0.3.so.0` at runtime with `dlopen` (no
-build-time headers) and allocates a PCM ring buffer as an ashmem region. The
-transport and the availability probe are real; the thread that drains the ring
-into a PipeWire virtual sink is the next milestone.
+`AudioBroker` owns a 48 kHz / stereo / S16_LE ring buffer as an ashmem region and
+reports the available sink. Output is a genuine PipeWire stream: rather than bind
+`libpipewire` (whose C ABI needs many structs and headers), PenguDroid drives the
+session's own **`pw-cat`** over a pipe — `pw-cat -p -a --rate 48000 --channels 2
+--format s16 -` reads raw PCM on stdin — with `aplay` as a fallback. The
+`AudioSink` type and `pengudroid audio-test` exercise it (silence by default,
+`--tone` for a quiet 440 Hz sine).
+
+Remaining: draining the shared ring from inside the daemon (the CLI owns the
+current test sink), and implementing OpenSL ES on top of `AudioSink`
+(`slCreateEngine` and the `SL_IID_*` identifiers are stubs so apps load).
 
 ## 5. ashmem
 

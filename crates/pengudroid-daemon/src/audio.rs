@@ -7,9 +7,9 @@
 //! [`AshmemRegion`]) that a future PipeWire writer thread would drain into a
 //! virtual sink.
 //!
-//! **Status: transport is real, the PipeWire pump is a stub.** The ring buffer
-//! and the availability probe work today; actually feeding samples to PipeWire
-//! is the next milestone.
+//! **Status:** the ring and the sink are real. `pengudroid audio-test` drives a
+//! genuine PipeWire stream through `pw-cat` (or `aplay`); draining the shared
+//! ring from inside the daemon is the remaining step.
 
 use std::os::fd::RawFd;
 
@@ -26,6 +26,8 @@ const PIPEWIRE_SONAME: &str = "libpipewire-0.3.so.0";
 pub struct AudioBroker {
     /// Whether libpipewire was found at runtime.
     pub pipewire_available: bool,
+    /// Which command-line sink is available (`pw-cat`, `aplay`), if any.
+    pub pump_backend: Option<&'static str>,
     pub sample_rate: u32,
     pub channels: u16,
     /// Shared ring the guest writes PCM into.
@@ -37,16 +39,20 @@ impl AudioBroker {
     /// audio as unavailable rather than aborting the daemon.
     pub fn start() -> AudioBroker {
         let pipewire_available = probe_library(PIPEWIRE_SONAME);
+        let pump_backend = find_in_path("pw-cat")
+            .map(|_| "pw-cat")
+            .or_else(|| find_in_path("aplay").map(|_| "aplay"));
         let ring = AshmemRegion::create("pengudroid-audio-ring", (RING_FRAMES * BYTES_PER_FRAME) as u64)
             .expect("audio ring allocation");
         crate::info!(
-            "audio broker: pipewire={}, {} Hz, {} ch, ring={} bytes",
-            if pipewire_available { "available" } else { "missing (stub)" },
+            "audio broker: pipewire={}, sink={}, {} Hz, {} ch, ring={} bytes",
+            if pipewire_available { "available" } else { "missing" },
+            pump_backend.unwrap_or("none"),
             48000,
             2,
             ring.size()
         );
-        AudioBroker { pipewire_available, sample_rate: 48000, channels: 2, ring }
+        AudioBroker { pipewire_available, pump_backend, sample_rate: 48000, channels: 2, ring }
     }
 
     pub fn ring_fd(&self) -> RawFd {
@@ -55,12 +61,25 @@ impl AudioBroker {
 
     pub fn describe(&self) -> String {
         format!(
-            "PipeWire {} @ {}Hz/{}ch",
-            if self.pipewire_available { "ready" } else { "unavailable (stub sink)" },
+            "PipeWire {}, sink {} @ {}Hz/{}ch",
+            if self.pipewire_available { "available" } else { "missing" },
+            self.pump_backend.unwrap_or("unavailable"),
             self.sample_rate,
             self.channels
         )
     }
+}
+
+/// Look up an executable on `PATH`.
+pub fn find_in_path(name: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// `dlopen` a shared library without linking it, returning whether it loaded.
@@ -96,5 +115,11 @@ mod tests {
         let b = AudioBroker::start();
         assert!(b.ring_fd() >= 0);
         assert_eq!(b.sample_rate, 48000);
+    }
+
+    #[test]
+    fn find_in_path_finds_sh() {
+        assert!(find_in_path("sh").is_some());
+        assert!(find_in_path("definitely-not-a-program-xyz").is_none());
     }
 }
