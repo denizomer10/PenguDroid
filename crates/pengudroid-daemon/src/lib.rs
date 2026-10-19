@@ -12,6 +12,7 @@
 //! * [`ashmem`]   — `memfd`-backed ashmem regions
 //! * [`audio`]    — PipeWire ring buffer
 //! * [`props`]    — the Android property store
+//! * [`parcel`]   — the Android `Parcel` codec used by the stub services
 //! * [`stubs`]    — telephony/camera/AMS/PMS/SF placeholders
 //! * [`log`]      — tiny leveled logger
 
@@ -20,6 +21,7 @@ pub mod audio;
 pub mod binder;
 pub mod graphics;
 pub mod log;
+pub mod parcel;
 pub mod props;
 pub mod server;
 pub mod services;

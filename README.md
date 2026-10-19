@@ -70,7 +70,8 @@ milestone. Nothing below is overstated.
 | `LD_PRELOAD` Bionic→glibc shim (`libashmem`, logging, props, API level) | **Working** | interposes real Bionic symbol names; `__android_log_print` formats with the host `vsnprintf` |
 | Service registry + `phone`/`media.camera`/AMS/PMS/SurfaceFlinger stubs | **Stub** | correctly-named interfaces, minimal replies |
 | Audio: PipeWire | **Working** | the daemon owns a shared ring and drains it into `pw-cat` (or `aplay`); `audio-test [--via-daemon]` streams PCM |
-| Telephony / camera | **Stub** | report "radio off" / "zero cameras" |
+| Telephony (`ITelephony`) | **Working (no-SIM model)** | real AIDL transaction codes and `Parcel`-marshalled replies for the methods apps reach through `TelephonyManager`; `pengudroid telephony` transacts and decodes them |
+| Camera | **Stub** | reports zero cameras |
 | **Running real DEX bytecode (ART)** | **Partial** | `libart.so` and its whole dependency closure now `dlopen` on glibc, and `JNI_CreateJavaVM` executes into ART's runtime setup; full runtime bring-up is the open problem — see `docs/LIMITATIONS.md` |
 | Android packed relocations (`APS2` / `ANDROID_RELA` / `ANDROID_RELR`) | **Working** | `de-bionic` expands them into standard `RELA`/`RELR` (new `PT_LOAD` + retagged dynamic entries); without this a modern Android `.so` loads with *no* relocations applied |
 | Android linker API (`android_dlopen_ext`, namespaces, `__loader_*`) | **Working** | translated to glibc's flat namespace by the shim; `libdl_android.so` / `ld-android.so` resolve to the shim |

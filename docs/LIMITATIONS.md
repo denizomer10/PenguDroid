@@ -146,11 +146,21 @@ Some framework code depends on those semantics.
 
 ## 7. Stubs are stubs
 
-Telephony reports "radio off"; the camera reports "zero cameras"; `AudioFlinger`
-returns empty replies; the OpenSL ES **buffer-queue player** is implemented
-(`Enqueue` → `pw-cat`), but recorders, prefetch and effects are still
-`SL_RESULT_FEATURE_UNSUPPORTED`; `PackageManager` and `ActivityManager` answer
-minimally. These are honest placeholders, not partial implementations.
+**Telephony is no longer a stub.** `ITelephony` uses its real AIDL transaction
+codes and marshals replies in the real `Parcel` format (`crate::parcel`),
+modelling a no-SIM, radio-off device: `getCallState` → idle, `isRadioOn` →
+false, `hasIccCard` → false, `getDeviceId` → `null`, `getAllCellInfo` → empty.
+`pengudroid telephony` transacts against the `phone` service and decodes each
+reply, so the marshalling is observable. The implemented subset is the methods a
+normal app reaches through `TelephonyManager`; the rest of the ~250-method
+interface returns `-ENOSYS`. The transaction codes are the AIDL declaration
+order for a given AOSP release and can shift when methods are inserted.
+
+The camera reports "zero cameras"; `AudioFlinger` returns empty replies; the
+OpenSL ES **buffer-queue player** is implemented (`Enqueue` → `pw-cat`), but
+recorders, prefetch and effects are still `SL_RESULT_FEATURE_UNSUPPORTED`;
+`PackageManager` and `ActivityManager` answer minimally. These are honest
+placeholders, not partial implementations.
 
 ## 8. Security
 
@@ -201,6 +211,9 @@ hanging forever, so a wedged guest cannot freeze its peers.
    drains it into `pw-cat` (`audio-test --via-daemon`); silence by default,
    `--tone` audible. ~~OpenSL ES buffer-queue player~~ **Done**: `Enqueue` →
    `pw-cat`, verified against the canonical headers (`fixtures/opensl-app`).
-7. Replace telephony/camera stubs with real AIDL marshalers.
+7. ~~Replace telephony/camera stubs with real AIDL marshalers.~~ **Telephony done**:
+   real `ITelephony` transaction codes and `Parcel` replies for the
+   `TelephonyManager` subset, exercised by `pengudroid telephony`. Camera
+   remains a stub.
 8. Add seccomp + a private mount namespace for isolation without a full
    container.

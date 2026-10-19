@@ -78,9 +78,29 @@ Android's IPC is binder. PenguDroid has two backends behind one interface:
   over the control socket.
 
 Guests address platform services by name (`activity`, `package`,
-`SurfaceFlinger`, `media.camera`, `phone`, ...). Each has a stub implementation
-in `pengudroid-daemon::stubs` that returns a well-formed, honest answer (for
-example "zero cameras" or "radio off") so probes do not hang.
+`SurfaceFlinger`, `media.camera`, `phone`, ...). Each has an implementation in
+`pengudroid-daemon::stubs` that returns a well-formed, honest answer so probes do
+not hang.
+
+### 2.1 Parcels and the telephony service
+
+A binder transaction's payload is an Android `Parcel`, and a reply must be
+marshalled in exactly that format or the caller reads garbage. `pengudroid-daemon::parcel`
+implements the subset the platform services need — little-endian `int32`/`int64`,
+`boolean` as a 32-bit `0`/`1`, `String` as a UTF-16LE length-prefixed array with a
+NUL terminator, `byte[]`, a nullable `Parcelable` presence flag, and `List`
+counts.
+
+`ITelephony` is the first service to use it for real. Its transaction codes are
+not free choices: the AIDL compiler numbers methods in declaration order from
+`FIRST_CALL_TRANSACTION` (1), so `stubs::telephony_transact` uses that numbering
+for the methods a normal app reaches through `TelephonyManager` (`getCallState`
+= 34, `hasIccCard` = 68, `getDeviceId` = 146, ...) and marshals each reply. The
+modelled device is a no-SIM, radio-off phone, so every query answers the inert
+value a device without a SIM reports — which is what lets apps that probe
+telephony degrade gracefully instead of throwing. `pengudroid telephony`
+transacts against the service and decodes the replies, so the marshalling is
+observable end to end.
 
 A **guest may also publish its own service**. `RegisterService` binds the name
 to the connection that registered it; a transaction on that handle is forwarded

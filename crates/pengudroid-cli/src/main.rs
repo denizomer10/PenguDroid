@@ -18,6 +18,7 @@ mod gpu;
 mod guest;
 mod nativelib;
 mod runner;
+mod telephony;
 
 use pengudroid_proto::{default_socket_path, Message, Role, PROTO_VERSION};
 
@@ -59,6 +60,7 @@ fn real_main() -> i32 {
         "getprop" => cmd_getprop(&args[2..]),
         "setprop" => cmd_setprop(&args[2..]),
         "services" => cmd_services(),
+        "telephony" => telephony::run(&args[2..]),
         "daemon" => cmd_daemon(&args[2..]),
         "stop" => cmd_stop(),
         "status" => cmd_status(),
@@ -417,6 +419,7 @@ fn print_help() {
          \x20   getprop [NAME]                              read a property (no NAME: list all)\n\
          \x20   setprop <NAME> <VALUE>                      write a system property\n\
          \x20   services                                    list the broker's services\n\
+         \x20   telephony                                   transact with the phone service and decode replies\n\
          \x20   status | stop                               manage the daemon\n\
          \x20   daemon [--foreground]                       start the daemon\n\
          \n\

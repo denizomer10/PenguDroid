@@ -1,14 +1,18 @@
 //! Stub implementations of the Android platform services.
 //!
 //! These exist so that guests which probe for `phone`, `media.camera`, or the
-//! activity manager get a well-formed, honest answer instead of a hang. Every
-//! function here is a **stub**: the transaction codes are illustrative of the
-//! real AIDL interfaces but the replies are minimal (typically "unsupported"
-//! or an empty result). Real implementations would marshal `Parcel` bytes to
+//! activity manager get a well-formed, honest answer instead of a hang.
+//!
+//! **Telephony is the exception.** `ITelephony` uses its real AIDL transaction
+//! codes and marshals replies in the real `Parcel` format (see
+//! [`crate::parcel`]), modelling a no-SIM, radio-off device. The remaining
+//! services are still stubs: their transaction codes are illustrative and the
+//! replies are minimal. Real implementations would marshal `Parcel` bytes to
 //! match each AIDL method exactly.
 //!
-//! Marked clearly so nobody mistakes these for working telephony/camera.
+//! Marked clearly so nobody mistakes these for working camera/AMS/PMS.
 
+use crate::parcel::ParcelWriter;
 use crate::services::{Reply, ServiceKind};
 
 /// The set of platform services PenguDroid advertises, as
@@ -39,22 +43,119 @@ fn i32_reply(v: i32) -> Reply {
 }
 
 // ---------------------------------------------------------------------------
-// Telephony (STUB)
+// Telephony
 // ---------------------------------------------------------------------------
+//
+// `ITelephony` is a real AIDL interface, so its transaction codes are not free
+// choices: the AIDL compiler numbers methods in declaration order starting at
+// `FIRST_CALL_TRANSACTION` (1). The constants below are that numbering for the
+// subset of methods a normal app reaches through `TelephonyManager`, taken from
+// `frameworks/base/telephony/java/com/android/internal/telephony/ITelephony.aidl`.
+//
+// The numbering is stable for a given AOSP release but can shift when methods
+// are inserted, so each constant names its method and the replies are marshalled
+// with the real `Parcel` format (see [`crate::parcel`]).
+//
+// The device modelled is a **no-SIM, radio-off** phone: every query answers the
+// inert value a device without a SIM reports, which is what lets apps that probe
+// telephony degrade gracefully instead of throwing.
 
-/// Illustrative `ITelephony` transaction codes.
-pub const TELEPHONY_GET_CALL_STATE: u32 = 1;
-pub const TELEPHONY_END_CALL: u32 = 2;
+/// `isRadioOn(String callingPackage)`.
 pub const TELEPHONY_IS_RADIO_ON: u32 = 3;
-pub const TELEPHONY_GET_DEVICE_ID: u32 = 4;
+/// `getCallState()`.
+pub const TELEPHONY_GET_CALL_STATE: u32 = 34;
+/// `getDataActivity()`.
+pub const TELEPHONY_GET_DATA_ACTIVITY: u32 = 36;
+/// `getDataState()`.
+pub const TELEPHONY_GET_DATA_STATE: u32 = 38;
+/// `getActivePhoneType()`.
+pub const TELEPHONY_GET_ACTIVE_PHONE_TYPE: u32 = 40;
+/// `getNetworkTypeForSubscriber(int, String, String)`.
+pub const TELEPHONY_GET_NETWORK_TYPE: u32 = 64;
+/// `getDataNetworkType(String, String)`.
+pub const TELEPHONY_GET_DATA_NETWORK_TYPE: u32 = 65;
+/// `getVoiceNetworkTypeForSubscriber(int, String, String)`.
+pub const TELEPHONY_GET_VOICE_NETWORK_TYPE: u32 = 67;
+/// `hasIccCard()`.
+pub const TELEPHONY_HAS_ICC_CARD: u32 = 68;
+/// `hasIccCardUsingSlotIndex(int)`.
+pub const TELEPHONY_HAS_ICC_CARD_SLOT: u32 = 69;
+/// `getAllCellInfo(String, String)`.
+pub const TELEPHONY_GET_ALL_CELL_INFO: u32 = 72;
+/// `getDeviceId(String)`.
+pub const TELEPHONY_GET_DEVICE_ID: u32 = 146;
+/// `getDeviceIdWithFeature(String, String)`.
+pub const TELEPHONY_GET_DEVICE_ID_WITH_FEATURE: u32 = 147;
+/// `getImeiForSlot(int, String, String)`.
+pub const TELEPHONY_GET_IMEI_FOR_SLOT: u32 = 148;
+/// `getPrimaryImei(String, String)`.
+pub const TELEPHONY_GET_PRIMARY_IMEI: u32 = 149;
+/// `getMeidForSlot(int, String, String)`.
+pub const TELEPHONY_GET_MEID_FOR_SLOT: u32 = 151;
+/// `getServiceStateForSlot(int, boolean, boolean, String, String)`.
+pub const TELEPHONY_GET_SERVICE_STATE: u32 = 159;
+/// `getSignalStrength(int)`.
+pub const TELEPHONY_GET_SIGNAL_STRENGTH: u32 = 190;
 
-/// A no-SIM device: radio off, no calls. This is deliberately inert so that
-/// apps relying on telephony degrade gracefully (many check `isRadioOn` first).
+/// `TelephonyManager.CALL_STATE_IDLE`.
+const CALL_STATE_IDLE: i32 = 0;
+/// `TelephonyManager.DATA_ACTIVITY_NONE`.
+const DATA_ACTIVITY_NONE: i32 = 0;
+/// `TelephonyManager.DATA_DISCONNECTED`.
+const DATA_DISCONNECTED: i32 = 0;
+/// `TelephonyManager.PHONE_TYPE_GSM`.
+const PHONE_TYPE_GSM: i32 = 1;
+/// `TelephonyManager.NETWORK_TYPE_UNKNOWN`.
+const NETWORK_TYPE_UNKNOWN: i32 = 0;
+
+fn bool_reply(v: bool) -> Reply {
+    let mut w = ParcelWriter::new();
+    w.write_bool(v);
+    Reply::ok(w.into_bytes())
+}
+
+fn null_string_reply() -> Reply {
+    let mut w = ParcelWriter::new();
+    w.write_string16(None);
+    Reply::ok(w.into_bytes())
+}
+
+fn null_parcelable_reply() -> Reply {
+    let mut w = ParcelWriter::new();
+    w.write_null_parcelable();
+    Reply::ok(w.into_bytes())
+}
+
+fn empty_list_reply() -> Reply {
+    let mut w = ParcelWriter::new();
+    w.write_empty_list();
+    Reply::ok(w.into_bytes())
+}
+
+/// Answer an `ITelephony` transaction for a no-SIM, radio-off device.
+///
+/// The request `data` is not inspected: none of the implemented methods changes
+/// its answer based on its arguments, and the reply is a well-formed `Parcel`
+/// regardless. Methods outside the implemented subset return `-ENOSYS` so the
+/// caller sees an explicit "unsupported" rather than a malformed reply.
 pub fn telephony_transact(code: u32, _data: &[u8]) -> Reply {
     match code {
-        TELEPHONY_IS_RADIO_ON | TELEPHONY_GET_CALL_STATE => i32_reply(0),
-        TELEPHONY_END_CALL => empty_ok(),
-        TELEPHONY_GET_DEVICE_ID => Reply::unsupported(),
+        TELEPHONY_IS_RADIO_ON => bool_reply(false),
+        TELEPHONY_GET_CALL_STATE => i32_reply(CALL_STATE_IDLE),
+        TELEPHONY_GET_DATA_ACTIVITY => i32_reply(DATA_ACTIVITY_NONE),
+        TELEPHONY_GET_DATA_STATE => i32_reply(DATA_DISCONNECTED),
+        TELEPHONY_GET_ACTIVE_PHONE_TYPE => i32_reply(PHONE_TYPE_GSM),
+        TELEPHONY_GET_NETWORK_TYPE
+        | TELEPHONY_GET_DATA_NETWORK_TYPE
+        | TELEPHONY_GET_VOICE_NETWORK_TYPE => i32_reply(NETWORK_TYPE_UNKNOWN),
+        TELEPHONY_HAS_ICC_CARD | TELEPHONY_HAS_ICC_CARD_SLOT => bool_reply(false),
+        TELEPHONY_GET_ALL_CELL_INFO => empty_list_reply(),
+        TELEPHONY_GET_DEVICE_ID
+        | TELEPHONY_GET_DEVICE_ID_WITH_FEATURE
+        | TELEPHONY_GET_IMEI_FOR_SLOT
+        | TELEPHONY_GET_PRIMARY_IMEI
+        | TELEPHONY_GET_MEID_FOR_SLOT => null_string_reply(),
+        TELEPHONY_GET_SERVICE_STATE | TELEPHONY_GET_SIGNAL_STRENGTH => null_parcelable_reply(),
         _ => Reply::unsupported(),
     }
 }
@@ -160,7 +261,27 @@ mod tests {
 
     #[test]
     fn telephony_radio_is_off() {
-        assert_eq!(telephony_transact(TELEPHONY_IS_RADIO_ON, &[]), i32_reply(0));
+        // `isRadioOn` returns a marshalled `boolean` (a 32-bit 0).
+        assert_eq!(telephony_transact(TELEPHONY_IS_RADIO_ON, &[]), bool_reply(false));
+    }
+
+    #[test]
+    fn telephony_reports_a_no_sim_device() {
+        assert_eq!(telephony_transact(TELEPHONY_GET_CALL_STATE, &[]), i32_reply(0));
+        assert_eq!(telephony_transact(TELEPHONY_HAS_ICC_CARD, &[]), bool_reply(false));
+        assert_eq!(telephony_transact(TELEPHONY_GET_ACTIVE_PHONE_TYPE, &[]), i32_reply(1));
+        // A device id is a `null` string (length -1).
+        assert_eq!(
+            telephony_transact(TELEPHONY_GET_DEVICE_ID, &[]).data,
+            (-1i32).to_le_bytes().to_vec()
+        );
+        // Cell info is an empty list.
+        assert_eq!(telephony_transact(TELEPHONY_GET_ALL_CELL_INFO, &[]).data, 0i32.to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn telephony_unknown_code_is_unsupported() {
+        assert_eq!(telephony_transact(9999, &[]), Reply::unsupported());
     }
 
     #[test]
