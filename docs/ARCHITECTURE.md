@@ -241,6 +241,40 @@ runtime state (observed on `librtb.so`, hence `__dlopen` exits via `_exit`
 without running destructors). The `__sF` stdio array satisfies linkage but is
 not ABI-compatible with glibc's `FILE`.
 
+## 9. GPU path: host EGL/GLES and dma-buf presentation
+
+`pengudroid-hostgpu` binds the **host's** graphics stack with `dlopen` — no
+build-time EGL/GLES/GBM headers or link libraries. It resolves EGL and GLES
+entry points (`eglGetProcAddress` first, then `dlsym`) and provides:
+
+* [`info`](crate::GpuInfo) — EGL/GL vendor and version, GL renderer/version,
+  and whether `libgbm`, dma-buf export/import, and the GBM/surfaceless
+  platforms are available.
+* `Offscreen` — an EGL context created on the **surfaceless** platform (Mesa's
+  `EGL_MESA_platform_surfaceless`), with an RGBA8 FBO. `render` clears and
+draws a triangle with a tiny GLES2 program; `read_pixels` reads the FBO back
+  (used for verification); `export_dmabuf` turns the FBO's texture into an
+  `EGLImage` and exports it with `EGL_MESA_image_dma_buf_export`, yielding an fd,
+  stride, fourcc and DRM modifier.
+
+Presentation is the zero-copy counterpart of the `wl_shm` path. The daemon
+binds `zwp_linux_dmabuf_v1` (v3+, for modifiers); a guest renders on the GPU,
+exports a dma-buf, and sends `PresentDmabuf` with the fd over `SCM_RIGHTS`. The
+daemon builds a `zwp_linux_buffer_params_v1`, calls `create_immed`, attaches the
+resulting `wl_buffer` to the **existing** surface, commits, and keeps the fd
+alive. Nothing is copied through the CPU and no shared-memory pool is involved.
+
+The guest runtime prefers this path when `Offscreen::new` succeeds and the
+compositor supports the protocol, falling back to `wl_shm` otherwise. The
+`--dmabuf-selftest` command exercises the whole chain and includes a negative
+check (a plain memfd must be rejected) so a silent pass cannot mask a broken
+acceptance verdict.
+
+What this is not yet: an app's *own* `libEGL`/`libGLESv2` calls are not
+forwarded — there is no Bionic `libEGL` shim yet. The guest (the PenguDroid
+runtime) renders on the app's behalf. Forwarding an app's `eglSwapBuffers` to
+`PresentDmabuf` is the next step.
+
 ## Why this is faster than a container
 
 Waydroid/Anbox boot an Android userspace inside an LXC container (or a VM):

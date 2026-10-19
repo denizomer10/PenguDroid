@@ -16,7 +16,7 @@
 //! nested calls work without two threads deadlocking on each other's socket.
 
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -327,8 +327,28 @@ fn serve(daemon: Arc<Daemon>, conn: Connection) -> io::Result<()> {
             }
             Err(e) => break Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
         };
-        let (msg, _fds) = received;
-        let (reply, out_fds, close) = handle(&daemon, &peer, &_keepalive, msg);
+        let (msg, raw_fds) = received;
+        let (reply, out_fds, close) = match msg {
+            Message::PresentDmabuf { surface_id, width, height, stride, fourcc, modifier, offset } => {
+                // SAFETY: these fds arrived via SCM_RIGHTS and are now ours.
+                let in_fds: Vec<OwnedFd> = raw_fds
+                    .into_iter()
+                    .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+                    .collect();
+                handle_present_dmabuf(
+                    &daemon, surface_id, width, height, stride, fourcc, modifier, offset, in_fds,
+                )
+            }
+            other => {
+                // Any fds attached to other messages are not expected; drop
+                // them (closing them) rather than leaking.
+                let _unexpected: Vec<OwnedFd> = raw_fds
+                    .into_iter()
+                    .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+                    .collect();
+                handle(&daemon, &peer, &_keepalive, other)
+            }
+        };
         if let Some(r) = reply {
             let raw: Vec<RawFd> = out_fds.iter().map(|f| f.as_raw_fd()).collect();
             // `out_fds` must outlive the send call.
@@ -590,6 +610,14 @@ fn handle(
             SHUTDOWN.store(true, Ordering::Relaxed);
             (Some(Message::Goodbye), vec![], true)
         }
+        Message::PresentDmabuf { .. } => (
+            Some(Message::Error {
+                code: -22,
+                message: "PresentDmabuf must carry a dma-buf fd".into(),
+            }),
+            vec![],
+            false,
+        ),
         Message::Goodbye => (None, vec![], true),
         Message::Error { .. }
         | Message::ProcList { .. }
@@ -675,6 +703,42 @@ fn run_apk(daemon: &Arc<Daemon>, path: &str, component: Option<String>, args: &[
 fn decode_status(status: std::process::ExitStatus) -> RunExit {
     use std::os::unix::process::ExitStatusExt;
     RunExit { code: status.code().unwrap_or(0), signal: status.signal().unwrap_or(0) }
+}
+
+/// Handle a `PresentDmabuf`: present a GPU-rendered buffer on an existing
+/// surface, zero-copy.
+#[allow(clippy::too_many_arguments)]
+fn handle_present_dmabuf(
+    daemon: &Arc<Daemon>,
+    surface_id: u32,
+    width: u32,
+    height: u32,
+    stride: u32,
+    fourcc: u32,
+    modifier: u64,
+    offset: u32,
+    in_fds: Vec<OwnedFd>,
+) -> (Option<Message>, Vec<OwnedFd>, bool) {
+    let mut fds = in_fds.into_iter();
+    let Some(fd) = fds.next() else {
+        return (
+            Some(Message::Error { code: -22, message: "PresentDmabuf: no fd attached".into() }),
+            vec![],
+            false,
+        );
+    };
+    let mut guard = daemon.graphics.lock().unwrap();
+    let Some(gfx) = guard.as_mut() else {
+        return (
+            Some(Message::Error { code: -19, message: "graphics unavailable".into() }),
+            vec![],
+            false,
+        );
+    };
+    match gfx.present_dmabuf(surface_id, fd, width, height, stride, fourcc, modifier, offset) {
+        Ok(()) => (Some(Message::Ack), vec![], false),
+        Err(e) => (Some(Message::Error { code: -5, message: e }), vec![], false),
+    }
 }
 
 /// Is `pid` still a live process? Uses `/proc`, so it needs no privileges.

@@ -65,6 +65,10 @@ mod imp {
         /// Kept alive so the memfd is not closed while the compositor may read
         /// it, and so `present` can repaint.
         pub region: AshmemRegion,
+        /// When the surface is fed by an imported dma-buf, its fd is kept alive
+        /// here (the compositor holds its own reference, but the buffer's memory
+        /// must stay valid while attached).
+        pub dmabuf_fd: Option<std::os::fd::OwnedFd>,
         pub width: u32,
         pub height: u32,
         pub configured: bool,
@@ -184,6 +188,7 @@ mod imp {
                     xdg_toplevel: self.toplevels.remove(&p.id).expect("toplevel stored at creation"),
                     buffer,
                     region: p.region,
+                    dmabuf_fd: None,
                     width: p.width,
                     height: p.height,
                     configured: true,
@@ -474,6 +479,59 @@ mod imp {
             }
             Ok(())
         }
+
+        /// Present a GPU-rendered dma-buf on an existing surface (zero-copy).
+        ///
+        /// This is what a guest's `eglSwapBuffers` ultimately becomes: a buffer
+        /// the GPU wrote, imported by the compositor without a CPU copy.
+        #[allow(clippy::too_many_arguments)]
+        pub fn present_dmabuf(
+            &mut self,
+            id: u32,
+            fd: std::os::fd::OwnedFd,
+            width: u32,
+            height: u32,
+            stride: u32,
+            fourcc: u32,
+            modifier: u64,
+            offset: u32,
+        ) -> Result<(), String> {
+            let dmabuf = self
+                .state
+                .dmabuf
+                .clone()
+                .ok_or("compositor lacks zwp_linux_dmabuf_v1")?;
+            let qh = self.queue.handle();
+            let Some(s) = self.state.surfaces.get_mut(&id) else {
+                return Err(format!("no such surface {id}"));
+            };
+            let params = dmabuf.create_params(&qh, ());
+            params.add(
+                fd.as_fd(),
+                0,
+                offset,
+                stride,
+                (modifier >> 32) as u32,
+                (modifier & 0xffff_ffff) as u32,
+            );
+            let buffer = params.create_immed(
+                width as i32,
+                height as i32,
+                fourcc,
+                zwp_linux_buffer_params_v1::Flags::empty(),
+                &qh,
+                (),
+            );
+            params.destroy();
+
+            s.wl_surface.attach(Some(&buffer), 0, 0);
+            s.wl_surface.damage(0, 0, width as i32, height as i32);
+            s.wl_surface.commit();
+            s.buffer = buffer;
+            s.dmabuf_fd = Some(fd);
+            let _ = self.conn.flush();
+            Ok(())
+        }
     }
 
     impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for State {
@@ -649,6 +707,20 @@ mod imp {
             _width: u32,
             _height: u32,
             _fd: std::os::fd::OwnedFd,
+            _stride: u32,
+            _fourcc: u32,
+            _modifier: u64,
+            _offset: u32,
+        ) -> Result<(), String> {
+            Err("graphics built without the `wayland` feature".into())
+        }
+        #[allow(clippy::too_many_arguments)]
+        pub fn present_dmabuf(
+            &mut self,
+            _id: u32,
+            _fd: std::os::fd::OwnedFd,
+            _width: u32,
+            _height: u32,
             _stride: u32,
             _fourcc: u32,
             _modifier: u64,

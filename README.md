@@ -60,6 +60,9 @@ milestone. Nothing below is overstated.
 | Guest launched by the **daemon** (`RunApk`, `pengudroid start --wait`) | **Working** | daemon forks the CLI's `__guest`, reaps it, and reports its exit through `QueryRun`; an exited guest's window is destroyed and it leaves `ps` |
 | Fallback when the sandbox forbids `bind(2)` | **Working** | the daemon retries on an abstract (`@name`) Unix socket and clients connect to it transparently |
 | `pengudroid demo` | **Working** | built-in animated window, no APK and no manifest needed |
+| Host GPU via EGL/GLES/GBM (`gpu-info`, `gpu-test`) | **Working** | dlopen'd host EGL/GLES/GBM; offscreen render + pixel readback verified on Intel UHD 630 |
+| Zero-copy GPU presentation (`zwp_linux_dmabuf_v1`) | **Working** | the guest renders on the GPU, exports a dma-buf, the daemon imports and commits it |
+| Bionic `libEGL`/`libGLESv2` forwarding (an app's own EGL calls) | **Not started** | apps cannot call EGL directly yet; the guest runtime uses the host GPU on their behalf |
 | `LD_PRELOAD` Bionic→glibc shim (`libashmem`, logging, props, API level) | **Working** | interposes real Bionic symbol names; `__android_log_print` formats with the host `vsnprintf` |
 | Service registry + `phone`/`media.camera`/AMS/PMS/SurfaceFlinger stubs | **Stub** | correctly-named interfaces, minimal replies |
 | Audio: PipeWire | **Stub** | `dlopen` availability probe + shared ring buffer; the pump into PipeWire is not written |
@@ -121,6 +124,10 @@ pengudroid run app.apk
 # blocks until it exits and prints the exit status.
 pengudroid start app.apk --wait
 pengudroid start --demo --wait
+
+# Inspect the host GPU and prove the GPU path renders (offscreen + dma-buf).
+pengudroid gpu-info
+pengudroid gpu-test
 
 # Manage guests, services and properties.
 pengudroid ps
@@ -218,6 +225,46 @@ not ABI-compatible with glibc's `FILE`. `pengudroid-elf` reads ELF32 and ELF64
 `libc.so` provides version `LIBC`) with an entry point returning `500500`, and
 `fixtures/native-demo/run-test.sh` loads and calls it through PenguDroid — no
 network or real APK required.
+
+## GPU path (zero-copy)
+
+PenguDroid binds the **host's** EGL/GLES/GBM at runtime (no `-dev` headers —
+everything is `dlopen`'d), so guest graphics drive the real GPU instead of a
+software rasteriser. `pengudroid gpu-info` reports the driver; `pengudroid
+gpu-test` renders offscreen and verifies the pixels, then exports a dma-buf:
+
+```
+$ pengudroid gpu-info
+GL renderer:      Mesa Intel(R) UHD Graphics 630 (CFL GT2)
+GL version:       OpenGL ES 3.2 Mesa 25.0.7
+zero-copy ready:  yes
+
+$ pengudroid gpu-test
+rendered 128x128 on the GPU; corner pixel RGBA = (26,51,230,255)
+pixel verification: OK
+dmabuf: 128x128 stride 512 fourcc 0x34324241 modifier 0x100000000000002 offset 0 fd 7
+zero-copy hand-off: OK
+```
+
+When a compositor advertises `zwp_linux_dmabuf_v1`, `pengudroid run` uses the
+guest's GPU path: the guest renders into an FBO on the host GPU, exports it as a
+dma-buf, and sends it to the daemon (`PresentDmabuf`, fd via `SCM_RIGHTS`),
+which imports it into the existing Wayland surface and commits — no CPU copy and
+no `wl_shm`. If the GPU or the protocol is unavailable it falls back to the
+`wl_shm` client path.
+
+```
+$ pengudroid run app.apk
+guest pid 9734: rendering on the host GPU via dma-buf
+guest: first dma-buf presented (720x1280, fourcc 0x34324241) — zero-copy
+```
+
+Health-check it directly:
+
+```sh
+pengudroid-daemon --wayland-selftest   # reports linux-dmabuf availability
+pengudroid-daemon --dmabuf-selftest    # GPU render -> dma-buf -> compositor
+```
 
 ## Repository layout
 

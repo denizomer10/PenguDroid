@@ -168,28 +168,77 @@ pub fn guest_main(args: &[String]) -> i32 {
         }
     };
 
+    // Prefer the GPU path: render on the host GPU and hand the daemon a dma-buf
+    // (zero-copy) instead of writing pixels through wl_shm.
+    let mut gpu = pengudroid_hostgpu::Offscreen::new(g.width, g.height).ok();
+    if gpu.is_some() {
+        println!(
+            "guest pid {}: rendering on the host GPU via dma-buf",
+            std::process::id()
+        );
+    } else {
+        println!(
+            "guest pid {}: GPU unavailable; using CPU (wl_shm) path",
+            std::process::id()
+        );
+    }
+
     let mut phase: u32 = 0;
+    let mut announced = false;
     let mut present_errors: u32 = 0;
     while !STOP.load(Ordering::Relaxed) {
-        paint(&mut map, g.width, g.height, stride, phase);
-        phase = phase.wrapping_add(4);
-        match client.request(&Message::PresentFrame { surface_id }) {
-            Ok((Message::Ack, _)) => present_errors = 0,
-            Ok((Message::Error { message, .. }, _)) => {
-                eprintln!("guest: present failed: {message}");
-                break;
+        let mut presented = false;
+        if let Some(off) = gpu.as_mut() {
+            let t = (phase % 256) as f32 / 255.0;
+            if off.render(0.1 + 0.2 * t, 0.3, 0.7 - 0.2 * t, 1.0).is_ok() {
+                if let Ok(d) = off.export_dmabuf() {
+                    let msg = Message::PresentDmabuf {
+                        surface_id,
+                        width: d.width,
+                        height: d.height,
+                        stride: d.stride,
+                        fourcc: d.fourcc,
+                        modifier: d.modifier,
+                        offset: d.offset,
+                    };
+                    if matches!(
+                        client.request_with_fds(&msg, &[d.fd.as_raw_fd()]),
+                        Ok(Message::Ack)
+                    ) {
+                        presented = true;
+                        present_errors = 0;
+                        if !announced {
+                            println!(
+                                "guest: first dma-buf presented ({}x{}, fourcc {:#x}) — zero-copy",
+                                d.width, d.height, d.fourcc
+                            );
+                            announced = true;
+                        }
+                    }
+                }
             }
-            Ok(_) => {}
-            Err(e) if present_errors == 0 => {
-                // One retry: the daemon may be briefly busy serving another
-                // connection. A second consecutive failure means it is gone.
-                present_errors += 1;
-                eprintln!("guest: present failed ({e}); retrying once");
-                std::thread::sleep(Duration::from_millis(50));
-                continue;
-            }
-            Err(_) => break, // daemon went away
         }
+        if !presented {
+            paint(&mut map, g.width, g.height, stride, phase);
+            match client.request(&Message::PresentFrame { surface_id }) {
+                Ok((Message::Ack, _)) => present_errors = 0,
+                Ok((Message::Error { message, .. }, _)) => {
+                    eprintln!("guest: present failed: {message}");
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) if present_errors == 0 => {
+                    // One retry: the daemon may be briefly busy serving another
+                    // connection. A second consecutive failure means it is gone.
+                    present_errors += 1;
+                    eprintln!("guest: present failed ({e}); retrying once");
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                Err(_) => break, // daemon went away
+            }
+        }
+        phase = phase.wrapping_add(4);
         std::thread::sleep(Duration::from_millis(120));
     }
 

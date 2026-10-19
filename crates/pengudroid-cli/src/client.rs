@@ -61,6 +61,22 @@ impl Client {
             .collect();
         Ok((reply, fds))
     }
+
+    /// Like [`Client::request`], but attaches file descriptors to the outgoing
+    /// message (used to hand the daemon a GPU-exported dma-buf).
+    pub fn request_with_fds(
+        &self,
+        msg: &Message,
+        fds: &[std::os::fd::RawFd],
+    ) -> Result<Message, String> {
+        self.conn.send_message(msg, fds).map_err(|e| e.to_string())?;
+        let (reply, raw_fds) = self.conn.recv_message().map_err(|e| e.to_string())?;
+        // We expect no fds back here; owning and dropping them closes them.
+        for fd in raw_fds {
+            drop(unsafe { OwnedFd::from_raw_fd(fd) });
+        }
+        Ok(reply)
+    }
 }
 
 /// Ask the daemon to shut down, and wait for the socket to go away so a

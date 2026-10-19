@@ -75,18 +75,25 @@ The shim exports around 45 Bionic entry points plus the version nodes; a large
 C++/NDK app will still hit missing symbols, and `pengudroid deps` measures the
 remaining gap per library.
 
-## 4. Graphics: from `wl_shm` to GPU
+## 4. Graphics: from `wl_shm` to the GPU
 
-The MVP path is `wl_shm` (CPU pixels), which is correct but slow and does not
-give an app a GPU. Real game/app performance needs:
+The MVP initially presented pixels through `wl_shm` (CPU memory). PenguDroid now
+has a working **zero-copy GPU path**: `pengudroid-hostgpu` binds the host's
+EGL/GLES via `dlopen`, renders into an FBO on the real GPU, exports the result
+as a dma-buf, and the daemon imports it with `zwp_linux_dmabuf_v1`. The guest
+runtime uses this automatically (`pengudroid run` reports "rendering on the host
+GPU via dma-buf"), falling back to `wl_shm` when unavailable. `pengudroid
+gpu-test` verifies rendering by reading pixels back, and `pengudroid-daemon
+--dmabuf-selftest` verifies the compositor accepts the buffer.
 
-* `EGL`/`GLES` implemented on top of the **host** EGL/GLES (or Vulkan via
-  `libvulkan`),
-* `gralloc`/`AHardwareBuffer` mapped to `dmabuf`,
-* `wl_shm` replaced with `zwp_linux_dmabuf_v1`.
+Still missing: **an app's own EGL calls are not forwarded.** There is no Bionic
+`libEGL`/`libGLESv2` shim yet, so an ART-hosted app's `eglCreateWindowSurface` /
+`eglSwapBuffers` would not reach this path; the PenguDroid guest runtime renders
+on its behalf. Binding Bionic `libEGL` to `PresentDmabuf` is the next step.
 
-None of that exists yet; only the buffer-ownership groundwork (the daemon owns
-the allocation and the fd) is in place.
+Also absent: `gralloc`/`AHardwareBuffer` compatibility, hardware composition,
+and Vulkan (the host Vulkan ICDs can be loaded, but no translation layer drives
+them yet).
 
 ## 5. SurfaceFlinger is bypassed, not emulated
 
@@ -142,8 +149,11 @@ hanging forever, so a wedged guest cannot freeze its peers.
    **Done** (end-to-end tested against a real daemon).
 3. Close the *running* gap: Bionic-compatible teardown, a real `__sF`, and
    loading an APK's own `libc++_shared.so` via the compat path.
-4. Bring up enough of the Android linker namespace to `dlopen` `libEGL` and bind
-   it to host EGL, then present a GPU frame over `dmabuf`.
+4. ~~Present a GPU frame over `dmabuf`.~~ **Partly done**: `pengudroid-hostgpu`
+   binds the host EGL/GLES/GBM and exports dma-bufs; the daemon imports them via
+   `zwp_linux_dmabuf_v1`, and `pengudroid run` presents zero-copy GPU frames.
+   Remaining: a Bionic `libEGL`/`libGLESv2` shim so an app's own EGL calls reach
+   this path.
 5. Attempt ART bring-up against a minimal `libandroid_runtime` with no
    `system_server`.
 6. Wire the PipeWire audio pump.

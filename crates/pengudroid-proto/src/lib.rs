@@ -65,6 +65,8 @@ pub enum MsgKind {
     CreateSurface = 60,
     SurfaceCreated = 61,
     PresentFrame = 62,
+    /// Present a GPU-rendered dma-buf on an existing surface (fd via SCM_RIGHTS).
+    PresentDmabuf = 63,
 
     GetProp = 70,
     PropValue = 71,
@@ -111,6 +113,7 @@ impl MsgKind {
             60 => CreateSurface,
             61 => SurfaceCreated,
             62 => PresentFrame,
+            63 => PresentDmabuf,
             70 => GetProp,
             71 => PropValue,
             72 => SetProp,
@@ -202,6 +205,16 @@ pub enum Message {
     CreateSurface { width: u32, height: u32, title: String },
     SurfaceCreated { surface_id: u32, shm_name: String, stride: u32, size: u64, format: u32 },
     PresentFrame { surface_id: u32 },
+    /// Present a dma-buf (fd passed out-of-band) on an existing surface.
+    PresentDmabuf {
+        surface_id: u32,
+        width: u32,
+        height: u32,
+        stride: u32,
+        fourcc: u32,
+        modifier: u64,
+        offset: u32,
+    },
 
     GetProp { name: String },
     PropValue { name: String, value: Option<String> },
@@ -263,6 +276,7 @@ impl Message {
             CreateSurface { .. } => MsgKind::CreateSurface,
             SurfaceCreated { .. } => MsgKind::SurfaceCreated,
             PresentFrame { .. } => MsgKind::PresentFrame,
+            PresentDmabuf { .. } => MsgKind::PresentDmabuf,
             GetProp { .. } => MsgKind::GetProp,
             PropValue { .. } => MsgKind::PropValue,
             SetProp { .. } => MsgKind::SetProp,
@@ -372,6 +386,15 @@ impl Message {
                 e.u32(*format);
             }
             PresentFrame { surface_id } => e.u32(*surface_id),
+            PresentDmabuf { surface_id, width, height, stride, fourcc, modifier, offset } => {
+                e.u32(*surface_id);
+                e.u32(*width);
+                e.u32(*height);
+                e.u32(*stride);
+                e.u32(*fourcc);
+                e.u64(*modifier);
+                e.u32(*offset);
+            }
             GetProp { name } => e.str(name),
             SetProp { name, value } => {
                 e.str(name);
@@ -493,6 +516,15 @@ impl Message {
                 format: d.u32()?,
             },
             K::PresentFrame => PresentFrame { surface_id: d.u32()? },
+            K::PresentDmabuf => PresentDmabuf {
+                surface_id: d.u32()?,
+                width: d.u32()?,
+                height: d.u32()?,
+                stride: d.u32()?,
+                fourcc: d.u32()?,
+                modifier: d.u64()?,
+                offset: d.u32()?,
+            },
             K::GetProp => GetProp { name: d.str()? },
             K::SetProp => SetProp { name: d.str()?, value: d.str()? },
             K::PropValue => {

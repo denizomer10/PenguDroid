@@ -1,5 +1,6 @@
-// `rust-lld` and GNU `ld` differ in which diagnostics they treat as lintable;
-// the version-script reassignment below is intentional, so nothing to allow.
+// `rust-lld` warns when a version script reassigns an already-global symbol to a
+// version node; the reassignment is intentional and succeeds, so silence it.
+#![allow(linker_messages)]
 
 //! `pengudroid-shim` — an `LD_PRELOAD` Bionic→glibc translation shim.
 //!
