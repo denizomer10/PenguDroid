@@ -605,6 +605,27 @@ fn handle(
             (reply, vec![], false)
         }
 
+        Message::GetAudioRing => {
+            let (rate, channels, size) = daemon.audio.params();
+            match daemon.audio.dup_ring_fd() {
+                Ok(fd) => (
+                    Some(Message::AudioRing { rate, channels, size }),
+                    vec![fd],
+                    false,
+                ),
+                Err(e) => (
+                    Some(Message::Error { code: -5, message: format!("audio ring fd: {e}") }),
+                    vec![],
+                    false,
+                ),
+            }
+        }
+
+        Message::AudioWrite { offset, len } => match daemon.audio.write_ring(offset, len) {
+            Ok(()) => (Some(Message::Ack), vec![], false),
+            Err(e) => (Some(Message::Error { code: -5, message: e }), vec![], false),
+        },
+
         Message::Shutdown => {
             crate::info!("shutdown requested by client");
             SHUTDOWN.store(true, Ordering::Relaxed);
@@ -631,6 +652,7 @@ fn handle(
         | Message::RunStatus { .. }
         | Message::GuestCall { .. }
         | Message::RunStarted { .. }
+        | Message::AudioRing { .. }
         | Message::Pong
         | Message::Ack => {
             crate::debug!("unexpected inbound message kind {:?}", msg.kind());

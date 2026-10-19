@@ -11,7 +11,10 @@
 //! genuine PipeWire stream through `pw-cat` (or `aplay`); draining the shared
 //! ring from inside the daemon is the remaining step.
 
-use std::os::fd::RawFd;
+use std::io::Write;
+use std::os::fd::{OwnedFd, RawFd};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::Mutex;
 
 use crate::ashmem::AshmemRegion;
 
@@ -32,6 +35,54 @@ pub struct AudioBroker {
     pub channels: u16,
     /// Shared ring the guest writes PCM into.
     ring: AshmemRegion,
+    /// Lazily-started pipe to `pw-cat`/`aplay`.
+    sink: Mutex<Option<AudioSink>>,
+}
+
+/// A running playback stream draining raw PCM into the sound server.
+pub struct AudioSink {
+    child: Child,
+    stdin: Option<ChildStdin>,
+}
+
+impl AudioSink {
+    fn spawn(rate: u32, channels: u16) -> Result<AudioSink, String> {
+        let rate_s = rate.to_string();
+        let channels_s = channels.to_string();
+        let mut cmd = if find_in_path("pw-cat").is_some() {
+            let mut c = Command::new("pw-cat");
+            c.args(["-p", "-a", "--rate", &rate_s, "--channels", &channels_s, "--format", "s16", "-"]);
+            c
+        } else if find_in_path("aplay").is_some() {
+            let mut c = Command::new("aplay");
+            c.args(["-q", "-t", "raw", "-f", "S16_LE", "-r", &rate_s, "-c", &channels_s, "-"]);
+            c
+        } else {
+            return Err("neither `pw-cat` nor `aplay` is on PATH".into());
+        };
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("cannot start the audio sink: {e}"))?;
+        let stdin = child.stdin.take();
+        Ok(AudioSink { child, stdin })
+    }
+
+    fn write(&mut self, pcm: &[u8]) -> std::io::Result<()> {
+        match self.stdin.as_mut() {
+            Some(stdin) => stdin.write_all(pcm),
+            None => Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stream closed")),
+        }
+    }
+}
+
+impl Drop for AudioSink {
+    fn drop(&mut self) {
+        self.stdin.take(); // EOF -> pw-cat drains and exits
+        let _ = self.child.wait();
+    }
 }
 
 impl AudioBroker {
@@ -52,11 +103,51 @@ impl AudioBroker {
             2,
             ring.size()
         );
-        AudioBroker { pipewire_available, pump_backend, sample_rate: 48000, channels: 2, ring }
+        AudioBroker { pipewire_available, pump_backend, sample_rate: 48000, channels: 2, ring, sink: Mutex::new(None) }
     }
 
     pub fn ring_fd(&self) -> RawFd {
         self.ring.as_raw_fd()
+    }
+
+    /// Geometry of the shared ring: `(sample_rate, channels, bytes)`.
+    pub fn params(&self) -> (u32, u16, u32) {
+        (self.sample_rate, self.channels, self.ring.size() as u32)
+    }
+
+    /// Duplicate the ring's fd for sending over the control socket.
+    pub fn dup_ring_fd(&self) -> std::io::Result<OwnedFd> {
+        self.ring.try_clone_fd()
+    }
+
+    /// Forward `ring[offset .. offset+len]` to the sink, spawning it on demand.
+    ///
+    /// This is the daemon-side half of the audio pump: a guest writes PCM into
+    /// the shared ring (it holds the fd) and asks for it to be played.
+    pub fn write_ring(&self, offset: u32, len: u32) -> Result<(), String> {
+        let size = self.ring.size();
+        let end = (offset as u64)
+            .checked_add(len as u64)
+            .ok_or_else(|| "audio range overflow".to_string())?;
+        if end > size {
+            return Err(format!("audio range {offset}+{len} exceeds ring size {size}"));
+        }
+        let backend = self
+            .pump_backend
+            .ok_or_else(|| "no audio sink available (pw-cat/aplay missing)".to_string())?;
+
+        let mut guard = self.sink.lock().map_err(|_| "audio sink lock poisoned".to_string())?;
+        if guard.is_none() {
+            *guard = Some(AudioSink::spawn(self.sample_rate, self.channels)?);
+            crate::info!("audio: sink started ({backend})");
+        }
+        let map = self.ring.map_mut().map_err(|e| format!("audio ring map: {e}"))?;
+        let bytes = &map.as_slice()[offset as usize..end as usize];
+        guard
+            .as_mut()
+            .expect("sink just created")
+            .write(bytes)
+            .map_err(|e| format!("audio write: {e}"))
     }
 
     pub fn describe(&self) -> String {

@@ -84,6 +84,10 @@ pub enum MsgKind {
     QueryRun = 82,
     RunStatus = 83,
 
+    GetAudioRing = 84,
+    AudioRing = 85,
+    AudioWrite = 86,
+
     Ack = 80,
 
     Shutdown = 90,
@@ -126,6 +130,9 @@ impl MsgKind {
             79 => UnregisterProc,
             82 => QueryRun,
             83 => RunStatus,
+            84 => GetAudioRing,
+            85 => AudioRing,
+            86 => AudioWrite,
             80 => Ack,
             90 => Shutdown,
             91 => Goodbye,
@@ -242,6 +249,11 @@ pub enum Message {
 
     /// Query the exit status of a guest launched through `RunApk`.
     QueryRun { pid: i32 },
+    /// Ask for the daemon's shared audio ring; the memfd is attached.
+    GetAudioRing,
+    AudioRing { rate: u32, channels: u16, size: u32 },
+    /// Ask the daemon to forward `ring[offset .. offset+len]` to the audio sink.
+    AudioWrite { offset: u32, len: u32 },
     /// A guest launched through `RunApk` has exited (`running` false) or is
     /// still alive.
     RunStatus { pid: i32, running: bool, exit_code: i32, signal: i32 },
@@ -289,6 +301,9 @@ impl Message {
             UnregisterProc { .. } => MsgKind::UnregisterProc,
             QueryRun { .. } => MsgKind::QueryRun,
             RunStatus { .. } => MsgKind::RunStatus,
+            GetAudioRing => MsgKind::GetAudioRing,
+            AudioRing { .. } => MsgKind::AudioRing,
+            AudioWrite { .. } => MsgKind::AudioWrite,
             Ack => MsgKind::Ack,
             Shutdown => MsgKind::Shutdown,
             Goodbye => MsgKind::Goodbye,
@@ -444,6 +459,16 @@ impl Message {
                 e.i32(*exit_code);
                 e.i32(*signal);
             }
+            GetAudioRing => {}
+            AudioRing { rate, channels, size } => {
+                e.u32(*rate);
+                e.u16(*channels);
+                e.u32(*size);
+            }
+            AudioWrite { offset, len } => {
+                e.u32(*offset);
+                e.u32(*len);
+            }
         }
         e.into_frame()
     }
@@ -568,6 +593,13 @@ impl Message {
                 exit_code: d.i32()?,
                 signal: d.i32()?,
             },
+            K::GetAudioRing => GetAudioRing,
+            K::AudioRing => AudioRing {
+                rate: d.u32()?,
+                channels: d.u16()?,
+                size: d.u32()?,
+            },
+            K::AudioWrite => AudioWrite { offset: d.u32()?, len: d.u32()? },
         })
     }
 }

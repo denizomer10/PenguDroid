@@ -125,9 +125,14 @@ session's own **`pw-cat`** over a pipe — `pw-cat -p -a --rate 48000 --channels
 `AudioSink` type and `pengudroid audio-test` exercise it (silence by default,
 `--tone` for a quiet 440 Hz sine).
 
-Remaining: draining the shared ring from inside the daemon (the CLI owns the
-current test sink), and implementing OpenSL ES on top of `AudioSink`
-(`slCreateEngine` and the `SL_IID_*` identifiers are stubs so apps load).
+The daemon half is implemented: a client asks for the ring (`GetAudioRing`, fd
+attached), writes PCM into it, and sends `AudioWrite { offset, len }`; the daemon
+maps the ring and forwards that slice to the sink, starting `pw-cat` on first
+use. `AudioBroker::write_ring` validates the range against the ring size.
+
+Remaining: implementing OpenSL ES on top of `AudioSink` (`slCreateEngine` and the
+`SL_IID_*` identifiers are stubs so apps load, but an app's own audio path is not
+wired yet).
 
 ## 5. ashmem
 

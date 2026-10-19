@@ -69,7 +69,7 @@ milestone. Nothing below is overstated.
 | OpenSL ES (audio) | **Stub** | `slCreateEngine` and all `SL_IID_*` are exported so apps load; no audio is produced |
 | `LD_PRELOAD` Bionic→glibc shim (`libashmem`, logging, props, API level) | **Working** | interposes real Bionic symbol names; `__android_log_print` formats with the host `vsnprintf` |
 | Service registry + `phone`/`media.camera`/AMS/PMS/SurfaceFlinger stubs | **Stub** | correctly-named interfaces, minimal replies |
-| Audio: PipeWire | **Working** | `pengudroid audio-test` streams real PCM through `pw-cat` (or `aplay`); the daemon owns a shared ring and reports the sink |
+| Audio: PipeWire | **Working** | the daemon owns a shared ring and drains it into `pw-cat` (or `aplay`); `audio-test [--via-daemon]` streams PCM |
 | Telephony / camera | **Stub** | report "radio off" / "zero cameras" |
 | **Running real DEX bytecode (ART)** | **Not started** | the central open problem; see `docs/LIMITATIONS.md` |
 | **Real Bionic/EGL in a guest** | **Not started** | needs the Android userspace `.so`s loaded in-process |
@@ -304,9 +304,16 @@ audio: stream completed cleanly
 ```
 
 Silence is the default so the check cannot disturb anyone; `--tone` plays a quiet
-440 Hz sine. What remains is draining the shared ring from inside the daemon
-(today the CLI owns the test sink), and implementing OpenSL ES on top of it
-(`slCreateEngine` is still a stub).
+440 Hz sine. Add `--via-daemon` to exercise the full architecture — the client
+maps the daemon's ring, fills it, and sends `AudioWrite`:
+
+```
+$ pengudroid audio-test --via-daemon --seconds 1
+audio: sent 192000 bytes through the daemon ring (48000 Hz, 2 ch)
+```
+
+What remains is implementing OpenSL ES on top of the sink (`slCreateEngine` is
+still a stub), so an app's own `AudioTrack`/OpenSL calls are captured and played.
 
 ## Repository layout
 

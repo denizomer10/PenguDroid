@@ -13,7 +13,12 @@
 //! anyone; `--tone` opts into an audible 440 Hz sine.
 
 use std::io::Write;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::process::{Child, ChildStdin, Command, Stdio};
+
+use pengudroid_proto::{Message, Role};
+
+use crate::client::Client;
 
 /// A running playback stream (one subprocess reading raw PCM from our pipe).
 pub struct AudioSink {
@@ -103,10 +108,11 @@ pub fn generate_pcm(seconds: f32, rate: u32, channels: u16, tone_hz: Option<f32>
     out
 }
 
-/// `pengudroid audio-test [--seconds N] [--tone]`
+/// `pengudroid audio-test [--seconds N] [--tone] [--via-daemon]`
 pub fn test(args: &[String]) -> i32 {
     let mut seconds = 0.5f32;
     let mut tone = false;
+    let mut via_daemon = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -118,11 +124,16 @@ pub fn test(args: &[String]) -> i32 {
                 }
             },
             "--tone" => tone = true,
+            "--via-daemon" => via_daemon = true,
             other => {
                 eprintln!("pengudroid: unknown argument {other}");
                 return 2;
             }
         }
+    }
+
+    if via_daemon {
+        return via_daemon_ring(seconds, tone);
     }
 
     const RATE: u32 = 48_000;
@@ -164,6 +175,118 @@ pub fn test(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+/// A shared mapping of the daemon's audio ring.
+struct Map {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl Map {
+    fn new(fd: &OwnedFd, len: usize) -> std::io::Result<Map> {
+        // SAFETY: mmap of a valid memfd, PROT_READ|PROT_WRITE, MAP_SHARED.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Map { ptr: ptr as *mut u8, len })
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: the mapping is valid for `len` bytes.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for Map {
+    fn drop(&mut self) {
+        // SAFETY: ptr/len came from a successful mmap we own.
+        unsafe {
+            libc::munmap(self.ptr as *mut libc::c_void, self.len);
+        }
+    }
+}
+
+/// Ask the daemon for its ring, fill it with PCM and ask the daemon to play it.
+fn via_daemon_ring(seconds: f32, tone: bool) -> i32 {
+    let client = match Client::connect().and_then(|c| {
+        c.handshake(Role::Cli)?;
+        Ok(c)
+    }) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("pengudroid: {e}");
+            return 1;
+        }
+    };
+
+    let (reply, fds) = match client.request(&Message::GetAudioRing) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pengudroid: {e}");
+            return 1;
+        }
+    };
+    let (rate, channels, size) = match reply {
+        Message::AudioRing { rate, channels, size } => (rate, channels, size),
+        Message::Error { message, .. } => {
+            eprintln!("daemon: {message}");
+            return 1;
+        }
+        other => {
+            eprintln!("pengudroid: unexpected reply {other:?}");
+            return 1;
+        }
+    };
+    let Some(fd) = fds.into_iter().next() else {
+        eprintln!("pengudroid: daemon sent no audio-ring fd");
+        return 1;
+    };
+    let mut map = match Map::new(&fd, size as usize) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("pengudroid: cannot map the audio ring: {e}");
+            return 1;
+        }
+    };
+
+    let pcm = generate_pcm(seconds, rate, channels, if tone { Some(440.0) } else { None });
+    let mut sent = 0usize;
+    while sent < pcm.len() {
+        let n = (pcm.len() - sent).min(size as usize);
+        map.as_mut_slice()[..n].copy_from_slice(&pcm[sent..sent + n]);
+        match client.request(&Message::AudioWrite { offset: 0, len: n as u32 }) {
+            Ok((Message::Ack, _)) => {}
+            Ok((Message::Error { message, .. }, _)) => {
+                eprintln!("daemon: {message}");
+                return 1;
+            }
+            Ok((other, _)) => {
+                eprintln!("pengudroid: unexpected reply {other:?}");
+                return 1;
+            }
+            Err(e) => {
+                eprintln!("pengudroid: {e}");
+                return 1;
+            }
+        }
+        sent += n;
+    }
+
+    println!(
+        "audio: sent {sent} bytes through the daemon ring ({rate} Hz, {channels} ch)"
+    );
+    0
 }
 
 #[cfg(test)]
