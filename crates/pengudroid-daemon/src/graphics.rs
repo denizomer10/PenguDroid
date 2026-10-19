@@ -71,6 +71,11 @@ mod imp {
         pub closed: bool,
     }
 
+    /// The broker's surface id, carried as a toplevel's user data so events can
+    /// name their own window.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct SurfaceId(u32);
+
     /// A surface waiting for its first `xdg_surface.configure`.
     struct Pending {
         id: u32,
@@ -78,6 +83,7 @@ mod imp {
         height: u32,
         xdg_surface: xdg_surface::XdgSurface,
         wl_surface: wl_surface::WlSurface,
+        /// Read through the region's fd on `finalize_surface`.
         region: AshmemRegion,
         stride: u32,
     }
@@ -112,6 +118,11 @@ mod imp {
 
         /// Build the `wl_shm` buffer for a pending surface once the compositor
         /// has configured it.
+        ///
+        /// The buffer is a read-only view of the surface's fd, which the guest
+        /// also maps. Holding it in a `foreign` slot keeps it alive even after
+        /// the guest (and this process's own handle) goes away, so the memfd
+        /// itself is not released until the compositor has the newest frame.
         fn finalize_surface(&mut self, xdg: &xdg_surface::XdgSurface, qh: &QueueHandle<State>) {
             let Some(idx) = self.pending.iter().position(|p| p.xdg_surface.id() == xdg.id()) else {
                 return;
@@ -146,6 +157,7 @@ mod imp {
                 }
             };
             let pool = shm.create_pool(dup.as_fd(), p.region.size() as i32, qh, ());
+            // The buffer's user data is unused (we keep our own handle below).
             let buffer = pool.create_buffer(
                 0,
                 p.width as i32,
@@ -156,6 +168,8 @@ mod imp {
                 (),
             );
             pool.destroy();
+
+
 
             p.wl_surface.attach(Some(&buffer), 0, 0);
             p.wl_surface.damage(0, 0, p.width as i32, p.height as i32);
@@ -188,6 +202,20 @@ mod imp {
     }
 
     impl Graphics {
+        /// Tear down a toplevel whose `configure` never arrived, so its proxies
+        /// do not leak and its id is not reused while half-alive.
+        fn abandon_pending(&mut self, id: u32) {
+            if let Some(pos) = self.state.pending.iter().position(|p| p.id == id) {
+                let p = self.state.pending.remove(pos);
+                p.xdg_surface.destroy();
+                p.wl_surface.destroy();
+            }
+            if let Some(t) = self.state.toplevels.remove(&id) {
+                t.destroy();
+            }
+            let _ = self.conn.flush();
+        }
+
         /// Connect to the compositor named by `WAYLAND_DISPLAY`. Returns `None`
         /// if there is no Wayland session (the daemon then runs graphics-less).
         pub fn connect() -> Option<Graphics> {
@@ -255,7 +283,7 @@ mod imp {
             let id = self.state.alloc_id();
             let wl_surface = compositor.create_surface(&qh, ());
             let xdg_surface = wm_base.get_xdg_surface(&wl_surface, &qh, ());
-            let xdg_toplevel = xdg_surface.get_toplevel(&qh, ());
+            let xdg_toplevel = xdg_surface.get_toplevel(&qh, SurfaceId(id));
             xdg_toplevel.set_title(title.to_string());
             wl_surface.commit();
 
@@ -275,6 +303,7 @@ mod imp {
             // Drive the configure → ack → attach → commit cycle synchronously.
             if let Err(e) = self.queue.roundtrip(&mut self.state) {
                 crate::warn!("roundtrip during create failed: {e}");
+                self.abandon_pending(id);
                 return None;
             }
 
@@ -294,6 +323,7 @@ mod imp {
             };
             if !self.state.surfaces.contains_key(&id) {
                 crate::warn!("surface {id} never got configured");
+                self.abandon_pending(id);
                 return None;
             }
             Some(info)
@@ -303,11 +333,33 @@ mod imp {
         /// buffer become visible. Pixel contents are owned by the guest; the
         /// daemon only drives the Wayland commit.
         pub fn present(&mut self, id: u32) -> bool {
+            // Drain pending events first: the compositor may have destroyed the
+            // surface (or asked to close it) since the guest's last frame, and a
+            // request to a dead object is a protocol error.
+            self.poll();
             let Some(s) = self.state.surfaces.get(&id) else { return false };
+            if s.closed || s.width == 0 || s.height == 0 {
+                return false;
+            }
             s.wl_surface.attach(Some(&s.buffer), 0, 0);
+            // A zero-area damage rect is a protocol violation.
             s.wl_surface.damage(0, 0, s.width as i32, s.height as i32);
             s.wl_surface.commit();
+            // Flush errors mean the compositor is gone; report the frame as lost
+            // rather than pretending it was shown.
+            self.conn.flush().is_ok()
+        }
+
+        /// Destroy a surface and its Wayland objects (the compositor closed the
+        /// window, or the guest went away). Idempotent.
+        pub fn destroy_surface(&mut self, id: u32) -> bool {
+            let Some(surface) = self.state.surfaces.remove(&id) else { return false };
+            surface.xdg_toplevel.destroy();
+            surface.xdg_surface.destroy();
+            surface.buffer.destroy();
+            surface.wl_surface.destroy();
             let _ = self.conn.flush();
+            crate::debug!("destroyed surface {id}");
             true
         }
 
@@ -378,7 +430,8 @@ mod imp {
 
             let wl_surface = compositor.create_surface(&qh, ());
             let xdg_surface = wm_base.get_xdg_surface(&wl_surface, &qh, ());
-            let toplevel = xdg_surface.get_toplevel(&qh, ());
+            // Throwaway toplevel for the dmabuf self-test: it owns no surface id.
+            let toplevel = xdg_surface.get_toplevel(&qh, SurfaceId(u32::MAX));
             toplevel.set_title("PenguDroid dmabuf selftest".to_string());
             wl_surface.commit();
 
@@ -525,23 +578,29 @@ mod imp {
         }
     }
 
-    impl Dispatch<xdg_toplevel::XdgToplevel, ()> for State {
+    impl Dispatch<xdg_toplevel::XdgToplevel, SurfaceId> for State {
         fn event(
             state: &mut Self,
-            _: &xdg_toplevel::XdgToplevel,
+            proxy: &xdg_toplevel::XdgToplevel,
             event: xdg_toplevel::Event,
-            _: &(),
+            _: &SurfaceId,
             _: &Connection,
             _: &QueueHandle<Self>,
         ) {
             if let xdg_toplevel::Event::Close = event {
-                // Mark the newest surface (best-effort: MVP tracks one at a time
-                // per close event) as closed.
-                if let Some((&id, _)) = state.surfaces.iter().find(|(_, s)| !s.closed) {
-                    if let Some(s) = state.surfaces.get_mut(&id) {
-                        s.closed = true;
+                // The toplevel is created with the surface id as its user data,
+                // so a close is attributed to *its* window (picking "the first
+                // open surface" would be wrong with several windows).
+                match proxy.data::<SurfaceId>().map(|d| d.0) {
+                    Some(id) => {
+                        if let Some(s) = state.surfaces.get_mut(&id) {
+                            if !s.closed {
+                                s.closed = true;
+                                state.close_requests.push(id);
+                            }
+                        }
                     }
-                    state.close_requests.push(id);
+                    None => crate::warn!("close event from an untracked toplevel"),
                 }
             }
         }

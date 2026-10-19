@@ -69,6 +69,8 @@ pub struct Daemon {
 pub(crate) struct SpawnedRun {
     pub pid: i32,
     pub status: Option<RunExit>,
+    /// A client has already collected `status` through `QueryRun`.
+    pub reported: bool,
 }
 
 /// A decoded child status.
@@ -219,14 +221,22 @@ impl Daemon {
             run.status = Some(exit);
         }
         crate::info!("guest pid {pid} exited ({})", exit.describe());
-        // Drop entries that were reported and whose pid has been recycled.
-        spawned.retain(|r| r.status.is_none() || r.pid == pid || pid_alive(r.pid));
     }
 
-    /// Reap `RunApk` children that are about to disappear. The waiter threads
-    /// do the real `wait`; this only prunes the table.
+    /// Reap `RunApk` children.
+    ///
+    /// The waiter threads do the real `wait`. An exit status that no client has
+    /// collected yet is *kept* even after the child is gone, so `QueryRun` can
+    /// always report a guest that finished quickly; a reported entry is dropped
+    /// (it will never be asked for again). Entries that were never reported and
+    /// whose pid no longer exists are still kept, which bounds the table to the
+    /// number of launches.
     pub fn reap_children(&self) {
-        self.spawned.lock().unwrap().retain(|r| r.status.is_none() || pid_alive(r.pid));
+        let mut spawned = self.spawned.lock().unwrap();
+        spawned.retain(|r| match r.status {
+            None => true,
+            Some(_) => !r.reported,
+        });
     }
 }
 
@@ -333,15 +343,26 @@ fn serve(daemon: Arc<Daemon>, conn: Connection) -> io::Result<()> {
         }
     };
 
-    // The connection is over: forget everything this peer owned.
-    let mut table = daemon.services.lock().unwrap();
-    let removed = table.remove_owned_by(peer.pid);
-    if !removed.is_empty() {
-        crate::info!("guest pid {} disconnected; dropped {} service(s)", peer.pid, removed.len());
-    }
-    drop(table);
-    daemon.procs.lock().unwrap().retain(|p| p.pid != peer.pid);
+    // The connection is over: drop the guest services it published.
+    //
+    // The peer's `Hello` pid is only a hint (short-lived tools and tests often
+    // share a pid with a guest they talk to), so the process table is *not*
+    // touched by pid here; a guest's own disconnect is handled by its
+    // `UnregisterProc` or, failing that, by `ListProcs` liveness pruning.
+    forget_peer(&daemon, &peer);
     result
+}
+
+/// Release everything bound to a connection that is closing.
+fn forget_peer(daemon: &Arc<Daemon>, peer: &Peer) {
+    let removed = daemon.services.lock().unwrap().remove_owned_by(peer.pid);
+    if !removed.is_empty() {
+        crate::info!(
+            "connection pid {} closed; dropped {} service(s)",
+            peer.pid,
+            removed.len()
+        );
+    }
 }
 
 /// Dispatch one message. Returns `(reply, fds_to_send, should_close)`.
@@ -490,10 +511,24 @@ fn handle(
 
         Message::PresentFrame { surface_id } => {
             let mut guard = daemon.graphics.lock().unwrap();
-            if let Some(gfx) = guard.as_mut() {
-                gfx.present(surface_id);
+            let presented = match guard.as_mut() {
+                Some(gfx) => gfx.present(surface_id),
+                None => false,
+            };
+            // A frame for a surface that no longer exists (or whose window was
+            // closed) is reported as an error so the guest stops repainting.
+            if presented {
+                (Some(Message::Ack), vec![], false)
+            } else {
+                (
+                    Some(Message::Error {
+                        code: -19,
+                        message: format!("surface {surface_id} is gone or closed"),
+                    }),
+                    vec![],
+                    false,
+                )
             }
-            (Some(Message::Ack), vec![], false)
         }
 
         Message::RegisterProc { pid, package, component, surface_id } => {
@@ -522,11 +557,18 @@ fn handle(
         }
 
         Message::QueryRun { pid } => {
-            let spawned = daemon.spawned.lock().unwrap();
-            let reply = match spawned.iter().find(|r| r.pid == pid) {
+            let mut spawned = daemon.spawned.lock().unwrap();
+            let reply = match spawned.iter_mut().find(|r| r.pid == pid) {
                 Some(run) => match run.status {
                     Some(exit) => {
-                        Some(Message::RunStatus { pid, running: false, exit_code: exit.code, signal: exit.signal })
+                        // One collector: the reporter needs the status once.
+                        run.reported = true;
+                        Some(Message::RunStatus {
+                            pid,
+                            running: false,
+                            exit_code: exit.code,
+                            signal: exit.signal,
+                        })
                     }
                     None => Some(Message::RunStatus {
                         pid,
@@ -581,15 +623,21 @@ fn run_apk(daemon: &Arc<Daemon>, path: &str, component: Option<String>, args: &[
                 .into(),
         };
     };
-    if !std::path::Path::new(path).exists() {
+    // `pengudroid start --demo` addresses the built-in demo with a marker path.
+    let demo = path == "-";
+    if !demo && !std::path::Path::new(path).exists() {
         return Message::Error { code: -2, message: format!("no such file: {path}") };
     }
     let mut cmd = std::process::Command::new(&cli);
-    cmd.arg("__guest")
-        .arg("--apk")
-        .arg(path)
-        .arg("--socket")
-        .arg(&daemon.socket_path);
+    cmd.arg("__guest").arg("--socket").arg(&daemon.socket_path);
+    if demo {
+        cmd.arg("--package")
+            .arg("com.pengudroid.demo")
+            .arg("--title")
+            .arg("PenguDroid demo");
+    } else {
+        cmd.arg("--apk").arg(path);
+    }
     if let Some(c) = &component {
         cmd.arg("--component").arg(c);
     }
@@ -605,7 +653,7 @@ fn run_apk(daemon: &Arc<Daemon>, path: &str, component: Option<String>, args: &[
     match cmd.spawn() {
         Ok(mut child) => {
             let pid = child.id() as i32;
-            daemon.spawned.lock().unwrap().push(SpawnedRun { pid, status: None });
+            daemon.spawned.lock().unwrap().push(SpawnedRun { pid, status: None, reported: false });
             crate::info!("RunApk: started guest pid {pid} for {path}");
             let d = Arc::clone(daemon);
             std::thread::spawn(move || {

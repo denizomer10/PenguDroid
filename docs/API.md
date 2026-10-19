@@ -11,8 +11,10 @@ açısından tek yerde toplar. Uygulamanın neyi çalıştırdığı/neyi çalı
 | `pengudroid daemon [--foreground]` | daemon'ı başlatır (zaten çalışıyorsa sessizce çıkar) | çalışır |
 | `pengudroid status` | daemon'a ping atar, guest/servis/property sayılarını yazar | çalışır |
 | `pengudroid stop` | daemon'ı kapatır ve soketin yok olmasını bekler | çalışır |
-| `pengudroid run app.apk` | guest'i CLI altında başlatır, Ctrl-C ile birlikte durur | çalışır (Wayland oturumu gerekir) |
+| `pengudroid demo` | dahili demo penceresi (APK gerekmez) | çalışır (Wayland oturumu gerekir) |
+| `pengudroid run app.apk` | guest'i CLI altında başlatır, Ctrl-C ile birlikte durur; olmayan APK hata olur | çalışır (Wayland oturumu gerekir) |
 | `pengudroid start app.apk [--wait]` | guest'i *daemon* altında başlatır; `--wait` çıkış kodunu bekler | çalışır |
+| `pengudroid start --demo [--wait]` | aynısı, dahili demo ile | çalışır |
 | `pengudroid ps` | çalışan guest'leri daemon'ın tablosundan listeler | çalışır |
 | `pengudroid services` | broker'ın servis tablosunu (handle/isim/arayüz) yazar | çalışır |
 | `pengudroid getprop [NAME]` | bir özelliği okur; NAME yoksa hepsini listeler | çalışır |

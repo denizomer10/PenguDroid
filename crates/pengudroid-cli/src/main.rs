@@ -43,6 +43,7 @@ fn real_main() -> i32 {
     };
     match cmd {
         "run" => cmd_run(&args[2..]),
+        "demo" => cmd_demo(&args[2..]),
         "start" => cmd_start(&args[2..]),
         "ps" => cmd_ps(),
         "info" | "inspect" => cmd_info(&args[2..]),
@@ -77,11 +78,14 @@ fn real_main() -> i32 {
 }
 
 fn cmd_start(args: &[String]) -> i32 {
-    let Some(apk) = args.first() else {
-        eprintln!("usage: pengudroid start <app.apk> [--component C] [--wait] [-- ARGS]");
-        return 2;
-    };
+    let demo = args.iter().any(|a| a == "--demo");
     let wait = args.iter().any(|a| a == "--wait");
+    if !demo && args.first().map(|a| a.starts_with('-')).unwrap_or(true) {
+        eprintln!("usage: pengudroid start <app.apk> [--component C] [--wait] [-- ARGS]");
+        eprintln!("       pengudroid start --demo [--wait]");
+        return 2;
+    }
+    let apk = args.first().cloned().unwrap_or_default();
     let mut component: Option<String> = None;
     let mut extra: Vec<String> = Vec::new();
     let mut i = 1;
@@ -97,7 +101,7 @@ fn cmd_start(args: &[String]) -> i32 {
                     }
                 }
             }
-            "--wait" => {}
+            "--wait" | "--demo" => {}
             "--" => {
                 extra.extend_from_slice(&args[i + 1..]);
                 break;
@@ -106,7 +110,12 @@ fn cmd_start(args: &[String]) -> i32 {
         }
         i += 1;
     }
-    match runner::start_detached(apk, component.as_deref(), &extra) {
+    let result = if demo {
+        runner::start_demo_detached(&extra)
+    } else {
+        runner::start_detached(&apk, component.as_deref(), &extra)
+    };
+    match result {
         Ok(pid) => {
             println!("started guest: pid {pid} (detached; `pengudroid ps` lists it)");
             if !wait {
@@ -121,6 +130,20 @@ fn cmd_start(args: &[String]) -> i32 {
             }
         }
         Err(e) => fail(&e),
+    }
+}
+
+fn cmd_demo(args: &[String]) -> i32 {
+    let extra: Vec<String> = match args.iter().position(|a| a == "--") {
+        Some(i) => args[i + 1..].to_vec(),
+        None => Vec::new(),
+    };
+    match runner::run_demo(&extra) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("pengudroid: {e}");
+            1
+        }
     }
 }
 
@@ -376,7 +399,9 @@ fn print_help() {
          \n\
          COMMANDS:\n\
          \x20   run <app.apk> [--component C] [-- ARGS]   launch a guest window\n\
+         \x20   demo                                        launch the built-in demo window\n\
          \x20   start <app.apk> [--wait]                   let the daemon fork the guest\n\
+         \x20   start --demo [--wait]                       same, for the built-in demo\n\
          \x20   ps                                          list running guests\n\
          \x20   info <app.apk>                              show manifest details\n\
          \x20   deps <lib.so>                               bionic import coverage\n\

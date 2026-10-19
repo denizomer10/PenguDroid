@@ -19,6 +19,10 @@ const DEFAULT_H: u32 = 1280;
 /// Set when the CLI receives SIGINT/SIGTERM; used to take the guest down with us.
 static STOP: AtomicBool = AtomicBool::new(false);
 
+/// Package name and title of the built-in demo guest (`pengudroid demo`).
+pub const DEMO_PACKAGE: &str = "com.pengudroid.demo";
+pub const DEMO_TITLE: &str = "PenguDroid demo";
+
 extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
@@ -88,16 +92,12 @@ pub fn find_daemon_binary() -> Result<PathBuf, String> {
     Ok(PathBuf::from("pengudroid-daemon"))
 }
 
-/// Parse the APK (best-effort) and launch a guest.
+/// Parse the APK and launch a guest.
+///
+/// A missing or unreadable APK is an error: pretending to run an app that does
+/// not exist only produces a confusing "window is live" and an immediate exit.
 pub fn run(apk_path: &str, component: Option<&str>, extra: &[String]) -> Result<(), String> {
-    let info = match apk::read_apk(apk_path) {
-        Ok(info) => info,
-        Err(e) => {
-            eprintln!("warning: {e}");
-            eprintln!("warning: continuing with defaults derived from the file name");
-            ApkInfo { package: package_from_filename(apk_path), ..Default::default() }
-        }
-    };
+    let info = apk::read_apk(apk_path)?;
     print_apk_summary(&info);
 
     let socket = default_socket_path();
@@ -135,19 +135,70 @@ pub fn run(apk_path: &str, component: Option<&str>, extra: &[String]) -> Result<
     launch_guest(cmd, &info.package, &resolved_component)
 }
 
+/// Launch the built-in demo guest: a window with a live animation, no APK.
+///
+/// This is the smoke test for the whole graphics path (daemon → Wayland →
+/// shared buffer → guest painting) and the fastest way to see PenguDroid work.
+pub fn run_demo(extra: &[String]) -> Result<(), String> {
+    let socket = default_socket_path();
+    ensure_daemon(&socket)?;
+    let exe = std::env::current_exe().map_err(|e| format!("cannot find own exe: {e}"))?;
+
+    let mut cmd = Command::new(exe);
+    cmd.arg("__guest")
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--package")
+        .arg(DEMO_PACKAGE)
+        .arg("--component")
+        .arg(format!("{DEMO_PACKAGE}/.DemoActivity"))
+        .arg("--title")
+        .arg(DEMO_TITLE)
+        .arg("--width")
+        .arg(DEFAULT_W.to_string())
+        .arg("--height")
+        .arg(DEFAULT_H.to_string())
+        .args(extra);
+
+    launch_guest(cmd, DEMO_PACKAGE, &format!("{DEMO_PACKAGE}/.DemoActivity"))
+}
+
 /// `pengudroid start <app.apk>`: ask the daemon itself to fork the guest, so it
 /// survives the CLI exiting and `pengudroid ps` tracks it.
 pub fn start_detached(apk_path: &str, component: Option<&str>, extra: &[String]) -> Result<i32, String> {
+    run_detached(apk_path, component, extra)
+}
+
+/// `pengudroid start --demo`: the detached variant of [`run_demo`].
+///
+/// The demo has no APK, so it is addressed by a marker path the daemon
+/// recognises; `__guest` then takes the package/component from `--component`.
+pub fn start_demo_detached(extra: &[String]) -> Result<i32, String> {
+    run_detached(DEMO_APK, Some(&format!("{DEMO_PACKAGE}/.DemoActivity")), extra)
+}
+
+/// Marker path used to launch the built-in demo through the daemon.
+pub const DEMO_APK: &str = "-";
+
+fn run_detached(
+    apk_path: &str,
+    component: Option<&str>,
+    extra: &[String],
+) -> Result<i32, String> {
     let socket = default_socket_path();
     ensure_daemon(&socket)?;
     let client = Client::connect_to(&socket)?;
     client.handshake(Role::Cli)?;
     let resolved = component.map(str::to_string);
-    match client.request(&Message::RunApk {
+    let reply = client.request(&Message::RunApk {
         path: apk_path.to_string(),
         component: resolved,
         args: extra.to_vec(),
-    }) {
+    });
+    // Say goodbye before dropping the socket: the daemon then logs a clean
+    // close instead of observing a reset, and it reaps the connection eagerly.
+    let _ = client.send(&Message::Goodbye);
+    match reply {
         Ok((Message::RunStarted { pid, .. }, _)) => Ok(pid),
         Ok((Message::Error { message, .. }, _)) => Err(message),
         Ok((other, _)) => Err(format!("unexpected reply: {other:?}")),
@@ -155,15 +206,32 @@ pub fn start_detached(apk_path: &str, component: Option<&str>, extra: &[String])
     }
 }
 
+/// The daemon polls each connection for server-initiated messages with this
+/// read timeout; keep it in sync with `pengudroid-daemon`'s `INBOX_POLL`.
+const SOCKET_POLL_MS: Duration = Duration::from_millis(5);
+
 /// Wait for a guest started with [`start_detached`] to exit.
 pub fn wait_detached(pid: i32) -> Result<String, String> {
     let socket = default_socket_path();
     let client = Client::connect_to(&socket)?;
     client.handshake(Role::Cli)?;
+    match wait_for_run(&client, pid) {
+        Ok(how) => {
+            let _ = client.send(&Message::Goodbye);
+            Ok(how)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn wait_for_run(client: &Client, pid: i32) -> Result<String, String> {
     loop {
         match client.request(&Message::QueryRun { pid })? {
             (Message::RunStatus { running: true, .. }, _) => {
-                std::thread::sleep(Duration::from_millis(50));
+                // Sleep longer than the daemon's per-read timeout: if we closed
+                // the socket while it sat in a timed-out read, Linux would send
+                // RST and the daemon could lose a queued reply.
+                std::thread::sleep(SOCKET_POLL_MS + Duration::from_millis(20));
             }
             (Message::RunStatus { exit_code, signal, .. }, _) => {
                 return Ok(if signal != 0 {
@@ -208,31 +276,23 @@ fn launch_guest(mut cmd: Command, package: &str, component: &str) -> Result<(), 
         }
         match child.try_wait() {
             Ok(Some(status)) => {
-                // A guest that dies before ever owning a window usually means
-                // the daemon has no graphics path; say so instead of leaving a
-                // bare exit code.
-                if !status.success() {
-                    eprintln!(
-                        "hint: the guest exited before drawing. Check the daemon's graphics "
-                    );
-                    eprintln!(
-                        "      backend with `pengudroid-daemon --wayland-selftest`."
-                    );
+                if status.success() {
+                    println!("guest exited: {status}");
+                    return Ok(());
                 }
-                println!("guest exited: {status}");
-                return Ok(());
+                // A guest that dies before drawing almost always means the
+                // daemon has no graphics path; name the next diagnostic step
+                // instead of leaving a bare exit code.
+                eprintln!(
+                    "hint: check the daemon's graphics backend with \
+                     `pengudroid-daemon --wayland-selftest`"
+                );
+                return Err(format!("guest exited: {status}"));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
             Err(e) => return Err(format!("waiting on guest failed: {e}")),
         }
     }
-}
-
-fn package_from_filename(path: &str) -> String {
-    Path::new(path)
-        .file_stem()
-        .map(|s| s.to_string_lossy().replace(['-', ' '], "_"))
-        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn print_apk_summary(info: &ApkInfo) {

@@ -50,6 +50,9 @@ that is expensive or shared, so guests start with no boot phase:
 
 * **control socket** — a Unix socket (`$XDG_RUNTIME_DIR/pengudroid/daemon.sock`,
   mode `0600`) speaking the length-prefixed protocol in `pengudroid-proto`.
+  Where a sandbox refuses `bind(2)` with `EPERM`, the daemon falls back to an
+  abstract socket derived from the uid and file name; clients connect to either
+  form through `Connection::connect_endpoint`.
 * **fd passing** — ashmem regions are handed to guests as real file descriptors
   over `SCM_RIGHTS` (`pengudroid-socket`), so pixels are never copied through
   the control channel.

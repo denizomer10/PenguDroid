@@ -193,6 +193,10 @@ pub fn guest_main(args: &[String]) -> i32 {
         std::thread::sleep(Duration::from_millis(120));
     }
 
+    // Close our part of the loop first: the daemon then drops this guest's
+    // entry from `ps` and destroys the toplevel, so an exited guest never
+    // leaves an orphaned window or a phantom process behind.
+    let _ = client.request(&Message::UnregisterProc { pid: std::process::id() as i32 });
     let _ = client.send(&Message::Goodbye);
     println!("guest pid {}: exiting", std::process::id());
     0

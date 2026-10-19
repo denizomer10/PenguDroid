@@ -65,6 +65,11 @@ pub type Result<T> = std::result::Result<T, SocketError>;
 /// Wraps an [`OwnedFd`] so the fd is closed on drop. Reading and writing is
 /// **not** internally synchronized: a [`Connection`] is meant to be owned by a
 /// single thread (the daemon spawns one per client).
+/// A connected control-socket endpoint.
+///
+/// Wraps an [`OwnedFd`] so the fd is closed on drop. Reading and writing is
+/// **not** internally synchronized: a [`Connection`] is meant to be owned by a
+/// single thread (the daemon spawns one per client).
 pub struct Connection {
     fd: OwnedFd,
 }
@@ -86,6 +91,18 @@ impl Connection {
     /// Connect to a listening control socket.
     pub fn connect(path: &std::path::Path) -> io::Result<Connection> {
         Ok(Connection::from_stream(UnixStream::connect(path)?))
+    }
+
+    /// Connect to whatever [`Listener::bind_or_abstract`] published.
+    ///
+    /// Accepts either a filesystem path or an `@name` abstract address, so a
+    /// daemon that had to fall back to an abstract socket remains reachable by
+    /// clients that only know the configured path.
+    pub fn connect_endpoint(endpoint: &std::path::Path) -> io::Result<Connection> {
+        match endpoint.to_str().and_then(|s| s.strip_prefix('@')) {
+            Some(name) => Ok(Connection::from_stream(connect_abstract(name)?)),
+            None => Connection::connect(endpoint),
+        }
     }
 
     pub fn as_raw_fd(&self) -> RawFd {
@@ -177,9 +194,19 @@ fn set_socket_timeouts(fd: RawFd, timeout: Option<Duration>) -> io::Result<()> {
 }
 
 /// A listening control socket.
+/// A listening control socket.
+///
+/// Normally this is a filesystem socket at `$XDG_RUNTIME_DIR/pengudroid/daemon.sock`.
+/// Some hardened sandboxes forbid `bind(2)` on Unix sockets entirely, so as a
+/// last resort the daemon can fall back to an **abstract** socket (no
+/// filesystem entry, namespace shared by all processes of the same network
+/// namespace) — see [`Listener::bind_or_abstract`].
 pub struct Listener {
     inner: UnixListener,
     path: std::path::PathBuf,
+    /// Set when the listener is an abstract socket, so `Drop` does not try to
+    /// unlink a path that was never created.
+    abstract_name: Option<String>,
 }
 
 impl Listener {
@@ -203,7 +230,47 @@ impl Listener {
         use std::os::unix::fs::PermissionsExt;
         perms.set_mode(0o600);
         std::fs::set_permissions(path, perms)?;
-        Ok(Listener { inner, path: path.to_path_buf() })
+        Ok(Listener { inner, path: path.to_path_buf(), abstract_name: None })
+    }
+
+    /// Bind `path`, falling back to an abstract socket when the filesystem bind
+    /// is refused with `EPERM` (sandboxes, read-only runtime dirs).
+    ///
+    /// The abstract name is derived from the path's file name plus the uid, so
+    /// two users (or two test runs) never collide. Callers that print the
+    /// socket location should use [`Listener::display_path`].
+    pub fn bind_or_abstract(path: &std::path::Path) -> io::Result<Listener> {
+        match Self::bind(path) {
+            Ok(l) => Ok(l),
+            Err(e) if e.raw_os_error() == Some(libc::EPERM) => {
+                let uid = std::fs::metadata("/proc/self").map(|m| {
+                    use std::os::unix::fs::MetadataExt;
+                    m.uid()
+                })?;
+                let stem = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy())
+                    .unwrap_or_else(|| "daemon.sock".into());
+                // Abstract names are limited to 107 bytes; keep the stem short.
+                let stem: String = stem.chars().take(64).collect();
+                let name = format!("pengudroid-{uid}-{stem}");
+                let inner = bind_abstract(&name)?;
+                Ok(Listener {
+                    inner,
+                    path: path.to_path_buf(),
+                    abstract_name: Some(name),
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Where clients should connect: the filesystem path, or the abstract name.
+    pub fn display_path(&self) -> std::path::PathBuf {
+        match &self.abstract_name {
+            Some(name) => std::path::PathBuf::from(format!("@{name}")),
+            None => self.path.clone(),
+        }
     }
 
     pub fn accept(&self) -> io::Result<Connection> {
@@ -231,10 +298,83 @@ impl Listener {
     }
 }
 
+/// Bind a listening socket to an abstract (`@name`) Unix-socket name.
+fn bind_abstract(name: &str) -> io::Result<UnixListener> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: plain socket(2).
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = name.as_bytes();
+    if bytes.len() + 1 > addr.sun_path.len() {
+        unsafe { libc::close(fd) };
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "abstract name too long"));
+    }
+    // The first byte being NUL is what makes the address abstract.
+    for (i, b) in bytes.iter().enumerate() {
+        addr.sun_path[i + 1] = *b as libc::c_char;
+    }
+    let len = std::mem::size_of::<libc::sa_family_t>() + 1 + bytes.len();
+    // SAFETY: `addr` is initialised for `len` bytes and `fd` is a fresh socket.
+    let rc = unsafe {
+        libc::bind(fd, &addr as *const libc::sockaddr_un as *const libc::sockaddr, len as libc::socklen_t)
+    };
+    if rc != 0 {
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    // SAFETY: `fd` is a bound listening-capable socket we own.
+    if unsafe { libc::listen(fd, 128) } != 0 {
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    // SAFETY: `fd` is a valid ownerless descriptor.
+    Ok(unsafe { UnixListener::from_raw_fd(fd) })
+}
+
 impl Drop for Listener {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if self.abstract_name.is_none() {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
+}
+
+/// Connect to an abstract (`@name`) Unix-socket address.
+fn connect_abstract(name: &str) -> io::Result<UnixStream> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: plain socket(2).
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = name.as_bytes();
+    if bytes.len() + 1 > addr.sun_path.len() {
+        unsafe { libc::close(fd) };
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "abstract name too long"));
+    }
+    for (i, b) in bytes.iter().enumerate() {
+        addr.sun_path[i + 1] = *b as libc::c_char;
+    }
+    let len = std::mem::size_of::<libc::sa_family_t>() + 1 + bytes.len();
+    // SAFETY: `addr` is initialised for `len` bytes and `fd` is a fresh socket.
+    let rc = unsafe {
+        libc::connect(fd, &addr as *const libc::sockaddr_un as *const libc::sockaddr, len as libc::socklen_t)
+    };
+    if rc != 0 {
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    // SAFETY: `fd` is a connected stream socket we own.
+    Ok(unsafe { UnixStream::from_raw_fd(fd) })
 }
 
 /// Read exactly `buf.len()` bytes, collecting any SCM_RIGHTS descriptors.
@@ -276,6 +416,10 @@ fn recv_once(fd: RawFd, buf: &mut [u8], fds: &mut Vec<RawFd>) -> Result<usize> {
                 if e.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
+                // Both a non-blocking socket and a read timeout surface here as
+                // `WouldBlock`. Retrying would spin a waiter thread at 100% CPU
+                // (std sets MSG_DONTWAIT on every `recvmsg`), so the error is
+                // returned and callers that want to wait again do so.
                 return Err(SocketError::Io(e));
             }
 
@@ -456,11 +600,67 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
-        assert!(start.elapsed() < Duration::from_secs(2));
+        // The call must return promptly, not spin on the timeout.
+        assert!(start.elapsed() < Duration::from_secs(2), "took {:?}", start.elapsed());
 
         // A frame that arrives in time is still delivered normally.
         a.send_message(&pengudroid_proto::Message::Ping, &[]).unwrap();
         assert_eq!(b.recv_message().unwrap().0, pengudroid_proto::Message::Ping);
+    }
+
+    #[test]
+    fn nonblocking_socket_reports_would_block_without_blocking() {
+        let (a, b) = socketpair();
+        b.set_nonblocking(true).unwrap();
+        assert!(matches!(b.recv_message(), Err(SocketError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock));
+        a.send_message(&pengudroid_proto::Message::Ping, &[]).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            // A non-blocking socket reports WouldBlock instantly; retry a few
+            // times with a pause instead of spinning on a slow fd.
+            match b.recv_message() {
+                Ok((m, _)) => {
+                    assert_eq!(m, pengudroid_proto::Message::Ping);
+                    break;
+                }
+                Err(SocketError::Io(e))
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("no frame after 2s: {e:?}"),
+            }
+        }
+        b.set_nonblocking(false).unwrap();
+    }
+
+    #[test]
+    fn abstract_listener_round_trip_when_supported() {
+        // Abstract sockets are Linux-specific and may be blocked by sandboxes;
+        // when either side refuses, there is nothing to test here.
+        let name = format!("pengudroid-test-{}-{}", std::process::id(), line!());
+        let listener = match super::bind_abstract(&name) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let client = match super::connect_abstract(&name) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let server = Connection::from_stream(listener.accept().unwrap().0);
+        let client = Connection::from_stream(client);
+        server.send_message(&pengudroid_proto::Message::Pong, &[]).unwrap();
+        assert_eq!(client.recv_message().unwrap().0, pengudroid_proto::Message::Pong);
+    }
+
+    #[test]
+    fn endpoint_connect_understands_abstract_names() {
+        // A filesystem path is handed to `UnixStream::connect`, which fails
+        // cleanly for a missing socket.
+        assert!(Connection::connect(std::path::Path::new("/nonexistent/pd.sock")).is_err());
+        // An abstract name with no listener fails cleanly too.
+        assert!(Connection::connect_endpoint(std::path::Path::new("@pengudroid-missing")).is_err());
     }
 
     #[test]

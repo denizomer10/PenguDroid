@@ -57,7 +57,9 @@ milestone. Nothing below is overstated.
 | **Loading an application's own native libraries (`nativelib --apk`)** | **Working** | extracts an APK's `lib/<abi>/*.so`, strips them, and loads the set (intra-APK deps resolve) |
 | Wayland graphics broker (compositor, `wl_shm`, `xdg_wm_base`, toplevels) | **Working** | connects to the live session; surfaces + `wl_shm` buffers |
 | Guest process: owns a window, `ps`-visible, animated | **Working** | the `__guest` runtime; the compositor closing a window stops the guest |
-| Guest launched by the **daemon** (`RunApk`, `pengudroid start --wait`) | **Working** | daemon forks the CLI's `__guest`, reaps it, and reports its exit through `QueryRun` |
+| Guest launched by the **daemon** (`RunApk`, `pengudroid start --wait`) | **Working** | daemon forks the CLI's `__guest`, reaps it, and reports its exit through `QueryRun`; an exited guest's window is destroyed and it leaves `ps` |
+| Fallback when the sandbox forbids `bind(2)` | **Working** | the daemon retries on an abstract (`@name`) Unix socket and clients connect to it transparently |
+| `pengudroid demo` | **Working** | built-in animated window, no APK and no manifest needed |
 | `LD_PRELOAD` Bionic→glibc shim (`libashmem`, logging, props, API level) | **Working** | interposes real Bionic symbol names; `__android_log_print` formats with the host `vsnprintf` |
 | Service registry + `phone`/`media.camera`/AMS/PMS/SurfaceFlinger stubs | **Stub** | correctly-named interfaces, minimal replies |
 | Audio: PipeWire | **Stub** | `dlopen` availability probe + shared ring buffer; the pump into PipeWire is not written |
@@ -109,12 +111,16 @@ pengudroid nativelib --apk app.apk --abi x86_64
 pengudroid libpath
 pengudroid de-bionic in.so out.so
 
+# See it work with no APK at all: the built-in demo window.
+pengudroid demo
+
 # Launch an app as a native Wayland window; Ctrl-C stops the guest.
 pengudroid run app.apk
 
 # Let the daemon fork the guest instead (survives the CLI exiting); `--wait`
 # blocks until it exits and prints the exit status.
 pengudroid start app.apk --wait
+pengudroid start --demo --wait
 
 # Manage guests, services and properties.
 pengudroid ps

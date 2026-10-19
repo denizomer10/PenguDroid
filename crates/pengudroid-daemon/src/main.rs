@@ -106,7 +106,7 @@ fn main() {
     install_signal_handlers();
 
     // Refuse to clobber a live daemon's socket.
-    if let Ok(conn) = Connection::connect(&args.socket) {
+    if let Ok(conn) = Connection::connect_endpoint(&args.socket) {
         if probe(&conn) {
             eprintln!("pengudroid-daemon: already running on {}", args.socket.display());
             std::process::exit(0);
@@ -128,8 +128,16 @@ fn main() {
 
     let t0 = Instant::now();
     let daemon = Arc::new(Daemon::new(args.socket.clone(), props_path, args.enable_wayland));
-    let listener = match Listener::bind(&args.socket) {
-        Ok(l) => l,
+    let listener = match Listener::bind_or_abstract(&args.socket) {
+        Ok(l) => {
+            if l.display_path() != args.socket {
+                pengudroid_daemon::warn!(
+                    "filesystem socket unavailable; listening on the abstract address {}",
+                    l.display_path().display()
+                );
+            }
+            l
+        }
         Err(e) => {
             eprintln!("error: cannot bind {}: {e}", args.socket.display());
             std::process::exit(1);

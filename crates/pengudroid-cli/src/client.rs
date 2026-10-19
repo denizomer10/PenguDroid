@@ -16,7 +16,9 @@ impl Client {
     }
 
     pub fn connect_to(path: &std::path::Path) -> Result<Client, String> {
-        let conn = Connection::connect(path)
+        // `connect_endpoint` also understands the `@name` form a daemon falls
+        // back to when the sandbox refuses filesystem `bind(2)`.
+        let conn = Connection::connect_endpoint(path)
             .map_err(|e| format!("cannot connect to {}: {e}", path.display()))?;
         Ok(Client { conn })
     }
@@ -75,7 +77,7 @@ pub fn stop() -> Result<bool, String> {
     let socket = default_socket_path();
     let start = std::time::Instant::now();
     while start.elapsed() < std::time::Duration::from_secs(3) {
-        if Connection::connect(&socket).is_err() {
+        if Connection::connect_endpoint(&socket).is_err() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
