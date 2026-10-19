@@ -75,7 +75,8 @@ milestone. Nothing below is overstated.
 | **Running real DEX bytecode (ART)** | **Partial** | `libart.so` and its whole dependency closure now `dlopen` on glibc, and `JNI_CreateJavaVM` executes into ART's runtime setup; full runtime bring-up is the open problem — see `docs/LIMITATIONS.md` |
 | Android packed relocations (`APS2` / `ANDROID_RELA` / `ANDROID_RELR`) | **Working** | `de-bionic` expands them into standard `RELA`/`RELR` (new `PT_LOAD` + retagged dynamic entries); without this a modern Android `.so` loads with *no* relocations applied |
 | Android linker API (`android_dlopen_ext`, namespaces, `__loader_*`) | **Working** | translated to glibc's flat namespace by the shim; `libdl_android.so` / `ld-android.so` resolve to the shim |
-| **Loading `libart.so` (the Android runtime)** | **Working** | the ART APEX closure (`libart`, `libartbase`, `libdexfile`, `libc++`, `libnativebridge`, `libunwindstack`, ...) `dlopen`s; `JNI_CreateJavaVM` runs and reaches ART's palette/runtime init |
+| **Loading `libart.so` (the Android runtime)** | **Working** | the ART APEX closure (`libart`, `libartbase`, `libdexfile`, `libc++`, `libnativebridge`, `libunwindstack`, ...) `dlopen`s |
+| **Running `JNI_CreateJavaVM`** | **Partial** | ART executes its whole startup path — palette init, page-size check, `ANDROID_ROOT`/`ANDROID_ART_ROOT`, boot classpath, boot-image load — and now fails *gracefully* with a diagnostic instead of crashing; the remaining gap is the APEX/boot-image environment, not ABI translation |
 | **Real Bionic/EGL in a guest** | **Not started** | needs the Android userspace `.so`s loaded in-process |
 
 The honest framing of "no `system.img`": the *container/VM* image is gone, but

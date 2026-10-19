@@ -34,28 +34,31 @@ Wine reimplements the entire platform rather than hosting Microsoft's
 expands Android's packed relocations (`APS2`) into standard `RELA`/`RELR` and
 retags the dynamic entries, the shim supplies the linker API
 (`android_dlopen_ext`, `android_create_namespace`, the `__loader_*` entry
-points), the CFI/fdsan/fortify/`_ctype_` surface, and the Bionic log and
-property calls, and the whole set — `libart.so` (9 MB), `libartbase`,
-`libdexfile`, `libc++`, `libnativebridge`, `libnativeloader`, `libunwindstack`,
-`libsigchain`, `libartpalette` + `libartpalette-system`, and the system-library
-chain they pull in — `dlopen`s. `JNI_CreateJavaVM` then **executes**: it enters
-ART's real code, initialises the palette, and proceeds into runtime setup before
-faulting.
+points), the CFI/fdsan/fortify/`_ctype_` surface, the liblog logger API, the
+Bionic `sysconf` numbering, and the Bionic log and property calls, and the whole
+set — `libart.so` (9 MB), `libartbase`, `libdexfile`, `libc++`,
+`libnativebridge`, `libnativeloader`, `libunwindstack`, `libsigchain`,
+`libartpalette` + `libartpalette-system`, and the system-library chain they pull
+in — `dlopen`s.
 
-**What remains.** Getting `JNI_CreateJavaVM` to return a live `JavaVM` is the
-open problem. ART is deeply coupled to Bionic in ways a syscall shim does not
-cover:
+`JNI_CreateJavaVM` then **executes ART's whole startup path**: palette
+initialisation, the page-size check, the `ANDROID_ROOT`/`ANDROID_ART_ROOT`
+lookups, the boot classpath, and the boot-image load. It now fails *gracefully*
+— returning `JNI_ERR` with a diagnostic such as `Boot classpath is empty` —
+rather than crashing.
 
-* the runtime's thread/GC machinery expects Bionic-specific suspend and TLS
-  mechanisms;
-* `sigchain` installs signal handlers through Bionic's `sigaction` contract;
-* the boot classpath (`core-libart.jar`, `core-oj.jar`) and the JIT must be
-  brought up, and the runtime expects a `/proc`, property and ashmem environment
-  shaped like Android's.
+**What remains.** Getting `JNI_CreateJavaVM` to return a live `JavaVM` needs an
+Android-shaped environment, not more ABI translation:
 
-The current fault is inside ART's runtime initialisation (after palette setup),
-with no symbol gap left to close — it is a semantic mismatch, not a missing
-import. Making this work is a research project measured in years, not a patch.
+* the **APEX manifests** (`/apex/com.android.art/apex_manifest.pb`, ...) so the
+  boot image's `ValidateApexVersions` check passes — without them ART reports an
+  APEX version mismatch and falls back to imageless running;
+* the **boot image** (`boot.art`/`boot.oat`/`boot.vdex` per boot-classpath jar)
+  and the profile files it references by absolute path;
+* the runtime's thread/GC machinery, which expects Bionic-specific suspend and
+  TLS mechanisms.
+
+Making this work is a research project measured in years, not a patch.
 `pengudroid run` therefore still brings up a real process and a real window so
 the surrounding plumbing (binder, ashmem, graphics, audio, properties, fd
 passing) can be built and tested against a running system first.

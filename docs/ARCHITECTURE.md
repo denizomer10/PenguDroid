@@ -431,13 +431,32 @@ directory points `libdl_android.so` and `ld-android.so` at the shim. The shim
   instead of mapping it again.
 * **The Bionic runtime surface.** CFI (`__cfi_slowpath`), fdsan, the full
   `_FORTIFY_SOURCE` set, `_ctype_`, `getprogname`, `__gnu_strerror_r`, the
-  `*64` signal calls, `__system_properties_init`, and the `liblog` event API.
+  `*64` signal calls, `__system_properties_init`, the `liblog` event API, and the
+  `liblog` logger API (`__android_log_set_logger` and friends).
+
+Two traps are worth recording because they cost real debugging time:
+
+* **Weak-undefined symbols resolve to `null` silently.** libbase references
+  `__android_log_set_logger` as a *weak* undefined symbol; with no definition it
+  resolves to address zero, and the first call jumps to `null` — a crash with no
+  diagnostic. Auditing the closure for weak-undefined symbols that neither the
+  shim nor glibc provides is what surfaced it (and the rest of the liblog logger
+  API).
+* **Bionic and glibc number `sysconf` differently.** ART checks
+  `sysconf(_SC_PAGESIZE)`, which is Bionic 39 but glibc 30; glibc reads 39 as
+  `_SC_BC_STRING_MAX` and answers 99, so the check fails. The shim translates the
+  names Android uses and passes the rest through — which keeps a *glibc* caller
+  correct, because glibc's `_SC_PAGESIZE` (30) and `_SC_NPROCESSORS_ONLN` (84)
+  are not Bionic names the table translates. The translation must reach the real
+  `sysconf` through `dlsym(RTLD_NEXT)`: naming it directly resolves to the shim's
+  own definition and recurses forever.
 
 With those in place `libart.so` (9 MB) and its closure load, and
-`JNI_CreateJavaVM` **executes**: it enters ART's real code, initialises
-`libartpalette`, and proceeds into runtime setup before faulting. The remaining
-fault is a semantic mismatch inside ART's runtime initialisation, not a missing
-symbol — see `docs/LIMITATIONS.md` §2.
+`JNI_CreateJavaVM` **executes ART's whole startup path** — palette init, the
+page-size check, the `ANDROID_ROOT`/`ANDROID_ART_ROOT` lookups, the boot
+classpath and the boot-image load — failing *gracefully* with a diagnostic
+(`Boot classpath is empty`) rather than crashing. The remaining gap is the
+APEX/boot-image environment, not ABI translation — see `docs/LIMITATIONS.md` §2.
 
 ## Why this is faster than a container
 

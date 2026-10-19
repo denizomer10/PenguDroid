@@ -43,7 +43,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 
 use libc::{c_char, c_int, c_void};
@@ -2074,6 +2074,289 @@ pub unsafe extern "C" fn android_log_write_string8_len(
 pub unsafe extern "C" fn android_log_destroy(_msg: *mut *mut c_void) {}
 
 // ---------------------------------------------------------------------------
+// sysconf
+// ---------------------------------------------------------------------------
+//
+// Bionic and glibc number the `sysconf` names differently. A Bionic object
+// asking for `_SC_PAGESIZE` passes 39 (Bionic's value); glibc reads 39 as
+// `_SC_BC_STRING_MAX` and answers 99, so a page-size check fails. The shim
+// translates the names Android code actually uses and passes everything else
+// through.
+//
+// Passing the rest through is what keeps a *glibc* caller correct: glibc's
+// `_SC_PAGESIZE` is 30 and `_SC_NPROCESSORS_ONLN` is 84, and neither 30 nor 84
+// is a Bionic name this table translates, so those calls reach glibc unchanged.
+
+/// Bionic `_SC_*` name → glibc `_SC_*` name, for the names Android code uses.
+///
+/// A table rather than a `match`: the compiler turned the `match` into a
+/// jump-table dispatch that re-entered itself for the arms mapping to 30
+/// (`_SC_PAGESIZE`), spinning forever. A linear scan over a small table cannot.
+const SYSCONF_NAMES: &[(c_int, c_int)] = &[
+    (0x00, 0),   // _SC_ARG_MAX
+    (0x05, 1),   // _SC_CHILD_MAX
+    (0x06, 2),   // _SC_CLK_TCK
+    (0x0a, 3),   // _SC_NGROUPS_MAX
+    (0x0b, 4),   // _SC_OPEN_MAX
+    (0x1b, 5),   // _SC_STREAM_MAX
+    (0x1c, 6),   // _SC_TZNAME_MAX
+    (0x17, 7),   // _SC_JOB_CONTROL
+    (0x18, 8),   // _SC_SAVED_IDS
+    (0x19, 29),  // _SC_VERSION
+    (0x27, 30),  // _SC_PAGESIZE
+    (0x28, 30),  // _SC_PAGE_SIZE
+    (0x1a, 43),  // _SC_RE_DUP_MAX
+    (0x25, 54),  // _SC_ATEXIT_MAX
+    (0x26, 55),  // _SC_IOV_MAX
+    (0x60, 83),  // _SC_NPROCESSORS_CONF
+    (0x61, 84),  // _SC_NPROCESSORS_ONLN
+    (0x62, 85),  // _SC_PHYS_PAGES
+    (0x63, 86),  // _SC_AVPHYS_PAGES
+    (0x64, 149), // _SC_MONOTONIC_CLOCK
+    (0x8f, 185), // _SC_LEVEL1_ICACHE_SIZE
+    (0x90, 186), // _SC_LEVEL1_ICACHE_ASSOC
+    (0x91, 187), // _SC_LEVEL1_ICACHE_LINESIZE
+    (0x92, 188), // _SC_LEVEL1_DCACHE_SIZE
+    (0x93, 189), // _SC_LEVEL1_DCACHE_ASSOC
+    (0x94, 190), // _SC_LEVEL1_DCACHE_LINESIZE
+    (0x95, 191), // _SC_LEVEL2_CACHE_SIZE
+    (0x96, 192), // _SC_LEVEL2_CACHE_ASSOC
+    (0x97, 193), // _SC_LEVEL2_CACHE_LINESIZE
+    (0x98, 194), // _SC_LEVEL3_CACHE_SIZE
+    (0x99, 195), // _SC_LEVEL3_CACHE_ASSOC
+    (0x9a, 196), // _SC_LEVEL3_CACHE_LINESIZE
+    (0x9b, 197), // _SC_LEVEL4_CACHE_SIZE
+    (0x9c, 198), // _SC_LEVEL4_CACHE_ASSOC
+    (0x9d, 199), // _SC_LEVEL4_CACHE_LINESIZE
+];
+
+/// Translate a Bionic `_SC_*` name to glibc's numbering.
+fn translate_sysconf_name(name: c_int) -> c_int {
+    for &(bionic, glibc) in SYSCONF_NAMES {
+        if name == bionic {
+            return glibc;
+        }
+    }
+    name
+}
+
+/// `sysconf(name)` — Bionic's numbering translated to glibc's.
+///
+/// The real `sysconf` is reached through `dlsym(RTLD_NEXT)`: naming it directly
+/// would resolve to *this* function (the shim exports `sysconf`), turning the
+/// call into unbounded recursion.
+#[no_mangle]
+pub unsafe extern "C" fn sysconf(name: c_int) -> libc::c_long {
+    match dlsym_next::<Sysconf>(b"sysconf\0") {
+        Some(real) => real(translate_sysconf_name(name)),
+        None => -1,
+    }
+}
+
+type Sysconf = unsafe extern "C" fn(c_int) -> libc::c_long;
+
+// ---------------------------------------------------------------------------
+// liblog logger API
+// ---------------------------------------------------------------------------
+//
+// Bionic's liblog lets a process install its own logger, minimum priority and
+// default tag. libbase and ART reference these as **weak** undefined symbols, so
+// when the shim does not provide them they resolve to `null` and the first call
+// jumps to address zero — a crash with no diagnostic. Providing them is what
+// keeps that from happening; the installed logger is remembered but not invoked,
+// since the shim already writes to stderr.
+
+/// The logger installed by `__android_log_set_logger`.
+static LOGGER: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+/// The minimum priority installed by `__android_log_set_minimum_priority`.
+static MIN_PRIORITY: AtomicU32 = AtomicU32::new(ANDROID_LOG_DEFAULT as u32);
+/// The default tag installed by `__android_log_set_default_tag`.
+static DEFAULT_TAG: LazyLock<Mutex<Option<CString>>> = LazyLock::new(|| Mutex::new(None));
+/// The aborter installed by `__android_log_set_aborter`.
+static ABORTER: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+/// `__android_log_set_logger(logger)` — remember the process's logger.
+#[no_mangle]
+pub unsafe extern "C" fn __android_log_set_logger(logger: *mut c_void) {
+    LOGGER.store(logger, Ordering::Relaxed);
+}
+
+/// `__android_log_set_minimum_priority(priority)` — remember the threshold.
+#[no_mangle]
+pub unsafe extern "C" fn __android_log_set_minimum_priority(priority: c_int) {
+    MIN_PRIORITY.store(priority as u32, Ordering::Relaxed);
+}
+
+/// `__android_log_get_minimum_priority()` — the remembered threshold.
+#[no_mangle]
+pub unsafe extern "C" fn __android_log_get_minimum_priority() -> c_int {
+    MIN_PRIORITY.load(Ordering::Relaxed) as c_int
+}
+
+/// `__android_log_set_default_tag(tag)` — remember the default tag.
+#[no_mangle]
+pub unsafe extern "C" fn __android_log_set_default_tag(tag: *const c_char) {
+    let tag = if tag.is_null() {
+        None
+    } else {
+        CStr::from_ptr(tag).to_owned().into()
+    };
+    *DEFAULT_TAG.lock().unwrap() = tag;
+}
+
+/// `__android_log_logd_logger(log_id, priority, tag, file, line, message)` —
+/// the default logger liblog installs. It writes to the shim's single sink.
+#[no_mangle]
+pub unsafe extern "C" fn __android_log_logd_logger(
+    _log_id: c_int,
+    priority: c_int,
+    tag: *const c_char,
+    _file: *const c_char,
+    _line: u32,
+    message: *const c_char,
+) {
+    let _ = log_to_stderr(priority, &cstr_lossy(tag), &cstr_lossy(message));
+}
+
+/// `struct __android_log_message` — the record `__android_log_write_log_message`
+/// consumes.
+#[repr(C)]
+pub struct AndroidLogMessage {
+    pub struct_size: usize,
+    pub buffer_id: i32,
+    pub priority: i32,
+    pub tag: *const c_char,
+    pub file: *const c_char,
+    pub line: u32,
+    pub message: *const c_char,
+}
+
+/// `__android_log_write_log_message(log_message)` — emit a log record.
+#[no_mangle]
+pub unsafe extern "C" fn __android_log_write_log_message(log_message: *mut AndroidLogMessage) {
+    if log_message.is_null() {
+        return;
+    }
+    let m = &*log_message;
+    let _ = log_to_stderr(m.priority, &cstr_lossy(m.tag), &cstr_lossy(m.message));
+}
+
+/// `__android_log_set_aborter(aborter)` — remember the abort handler.
+#[no_mangle]
+pub unsafe extern "C" fn __android_log_set_aborter(aborter: *mut c_void) {
+    ABORTER.store(aborter, Ordering::Relaxed);
+}
+
+/// `__android_log_call_aborter(message)` — invoke the abort handler, or abort.
+#[no_mangle]
+pub unsafe extern "C" fn __android_log_call_aborter(message: *const c_char) {
+    let aborter = ABORTER.load(Ordering::Relaxed);
+    if !aborter.is_null() {
+        let f: extern "C" fn(*const c_char) = std::mem::transmute(aborter);
+        f(message);
+    }
+    libc::abort();
+}
+
+/// `async_safe_write_log(priority, tag, message)` — the async-signal-safe
+/// logger. It writes straight to the descriptor, as its contract requires.
+#[no_mangle]
+pub unsafe extern "C" fn async_safe_write_log(
+    priority: c_int,
+    tag: *const c_char,
+    message: *const c_char,
+) {
+    let _ = log_to_stderr(priority, &cstr_lossy(tag), &cstr_lossy(message));
+}
+
+// ---------------------------------------------------------------------------
+// fdsan error level
+// ---------------------------------------------------------------------------
+
+/// `android_fdsan_get_error_level()` — the shim never enforces, so `none`.
+#[no_mangle]
+pub unsafe extern "C" fn android_fdsan_get_error_level() -> c_int {
+    0
+}
+
+/// `android_fdsan_set_error_level(level)` — accepted and ignored.
+#[no_mangle]
+pub unsafe extern "C" fn android_fdsan_set_error_level(_level: c_int) -> c_int {
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Linker thread-local destructors and CFI
+// ---------------------------------------------------------------------------
+
+/// `__loader_add_thread_local_dtor(dso)` — glibc owns TLS destructors, so this
+/// is a no-op.
+#[no_mangle]
+pub unsafe extern "C" fn __loader_add_thread_local_dtor(_dso: *mut c_void) {}
+
+/// `__loader_remove_thread_local_dtor(dso)` — see
+/// [`__loader_add_thread_local_dtor`].
+#[no_mangle]
+pub unsafe extern "C" fn __loader_remove_thread_local_dtor(_dso: *mut c_void) {}
+
+/// `__loader_cfi_fail(...)` — the host is not built with Android's CFI scheme,
+/// so a cross-DSO check cannot fail.
+#[no_mangle]
+pub unsafe extern "C" fn __loader_cfi_fail(
+    _call_site_type_id: u64,
+    _ptr: *mut c_void,
+    _diag: *mut c_void,
+) {
+}
+
+// ---------------------------------------------------------------------------
+// Bionic TLS introspection
+// ---------------------------------------------------------------------------
+
+/// `__libc_get_static_tls_bounds(start, end)` — Bionic's static-TLS window.
+///
+/// glibc has no equivalent region, so an empty window is reported; callers use
+/// this only to decide whether a pointer lies in static TLS.
+#[no_mangle]
+pub unsafe extern "C" fn __libc_get_static_tls_bounds(start: *mut *mut c_void, end: *mut *mut c_void) {
+    if !start.is_null() {
+        *start = std::ptr::null_mut();
+    }
+    if !end.is_null() {
+        *end = std::ptr::null_mut();
+    }
+}
+
+/// `__libc_iterate_dynamic_tls(tid, cb, arg)` — Bionic's dynamic-TLS walk.
+///
+/// There is no dynamic-TLS registry to walk, so the callback is never invoked.
+#[no_mangle]
+pub unsafe extern "C" fn __libc_iterate_dynamic_tls(
+    _tid: c_int,
+    _cb: *mut c_void,
+    _arg: *mut c_void,
+) {
+}
+
+/// `__cxa_demangle(mangled, out, len, status)` — the C++ demangler.
+///
+/// glibc does not provide one and the shim has no demangler, so this reports
+/// "invalid name" (`status = -2`) and returns `NULL`, which is the documented
+/// failure result callers already handle.
+#[no_mangle]
+pub unsafe extern "C" fn __cxa_demangle(
+    _mangled: *const c_char,
+    _out: *mut c_char,
+    _len: *mut usize,
+    status: *mut c_int,
+) -> *mut c_char {
+    if !status.is_null() {
+        *status = -2;
+    }
+    std::ptr::null_mut()
+}
+
+// ---------------------------------------------------------------------------
 // 64-bit signal API (`*64` variants)
 // ---------------------------------------------------------------------------
 //
@@ -3593,6 +3876,26 @@ mod tests {
         assert_eq!(at(b'\t'), CTYPE_C | CTYPE_S | CTYPE_B);
         assert_eq!(at(b'!'), CTYPE_P);
         assert_eq!(at(0x7f), CTYPE_C);
+    }
+
+    #[test]
+    fn sysconf_translates_bionic_names() {
+        // Bionic's `_SC_PAGESIZE` (0x27) and `_SC_PAGE_SIZE` (0x28) must reach
+        // glibc's `_SC_PAGESIZE` (30).
+        assert_eq!(translate_sysconf_name(0x27), 30);
+        assert_eq!(translate_sysconf_name(0x28), 30);
+        // glibc's own `_SC_PAGESIZE` (30) is not a Bionic name this table
+        // translates, so a glibc caller's value passes through unchanged.
+        assert_eq!(translate_sysconf_name(30), 30);
+        // Unknown names pass through.
+        assert_eq!(translate_sysconf_name(12345), 12345);
+    }
+
+    #[test]
+    fn sysconf_answers_the_page_size() {
+        // The translation must reach the real `sysconf`, not recurse into the
+        // shim's own definition.
+        assert_eq!(unsafe { sysconf(0x27) }, 4096);
     }
 
     #[test]
