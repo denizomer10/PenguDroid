@@ -41,18 +41,22 @@ pub fn is_bionic(sym: &str) -> bool {
 }
 
 /// Locate the built shim: explicit override, then next to this executable.
+///
+/// The returned path is **absolute**: it is used both as an `LD_PRELOAD` value
+/// and as the target of the compat-directory symlinks, and a relative target
+/// would resolve against the symlink's own directory rather than the caller's.
 pub(crate) fn find_shim() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("PENGUDROID_SHIM") {
         let p = PathBuf::from(p);
         if p.exists() {
-            return Some(p);
+            return Some(std::fs::canonicalize(&p).unwrap_or(p));
         }
     }
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
     let candidate = dir.join("libpengudroid_shim.so");
     if candidate.exists() {
-        Some(candidate)
+        Some(std::fs::canonicalize(&candidate).unwrap_or(candidate))
     } else {
         None
     }

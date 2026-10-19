@@ -469,10 +469,14 @@ pub unsafe extern "C" fn android_get_device_api_level() -> c_int {
     pengudroid_proto::abi::ANDROID_API_LEVEL
 }
 
-/// `android_get_application_target_sdk_version()` — same level as the device.
+/// `android_get_application_target_sdk_version()` — the target SDK a guest
+/// declared, or the device level if it never declared one.
 #[no_mangle]
 pub unsafe extern "C" fn android_get_application_target_sdk_version() -> c_int {
-    pengudroid_proto::abi::ANDROID_API_LEVEL
+    match TARGET_SDK.load(Ordering::Relaxed) {
+        0 => pengudroid_proto::abi::ANDROID_API_LEVEL,
+        v => v as c_int,
+    }
 }
 
 /// `android_set_abort_message(msg)` — record a fatal message for debuggerd.
@@ -482,6 +486,348 @@ pub unsafe extern "C" fn android_get_application_target_sdk_version() -> c_int {
 pub unsafe extern "C" fn android_set_abort_message(msg: *const c_char) {
     let msg = cstr_lossy(msg);
     let _ = log_to_stderr(ANDROID_LOG_FATAL, "abort", &format!("abort message: {msg}"));
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic linker namespaces (<android/dlext.h>)
+// ---------------------------------------------------------------------------
+//
+// Android's linker gives every app an isolated *namespace*: a private library
+// search path plus the set of libraries it is allowed to see. PenguDroid has no
+// linker namespaces — every guest shares the host's flat, global symbol scope —
+// so these entry points are translated to their glibc equivalents.
+// `android_dlopen_ext` forwards to `dlopen`; the namespace-management calls
+// succeed as no-ops so a caller that sets up an isolated namespace still
+// proceeds. This is the same trade Wine makes: a single process-wide namespace
+// instead of the platform's isolation model.
+//
+// Both the public `android_*` spellings (reached by `libart.so` directly) and
+// the internal `__loader_*` spellings (reached by `libdl_android.so`) are
+// exported: the compat directory points `libdl_android.so` and `ld-android.so`
+// at this shim, so whichever name a guest uses resolves here.
+
+/// `android_dlextinfo.flags` bits we act on.
+const ANDROID_DLEXT_USE_LIBRARY_FD: u64 = 0x10;
+const ANDROID_DLEXT_USE_LIBRARY_FD_OFFSET: u64 = 0x20;
+
+/// `struct android_dlextinfo` — the extended-`dlopen` argument block.
+#[repr(C)]
+pub struct AndroidDlextinfo {
+    pub flags: u64,
+    pub reserved_addr: *mut c_void,
+    pub reserved_size: usize,
+    pub relro_fd: c_int,
+    pub library_fd: c_int,
+    pub library_fd_offset: i64,
+    pub library_namespace: *mut c_void,
+}
+
+/// Opaque stand-in for `struct android_namespace_t`.
+///
+/// PenguDroid has a single global namespace, so a namespace handle carries no
+/// state; a fixed non-null address lets callers treat creation as successful.
+static DUMMY_NAMESPACE: u8 = 0;
+
+/// Application target SDK version, set by
+/// `android_set_application_target_sdk_version`.
+static TARGET_SDK: AtomicU32 = AtomicU32::new(0);
+
+/// `android_dlopen_ext(filename, flags, extinfo)` — `dlopen` with Android's
+/// extended options.
+///
+/// `ANDROID_DLEXT_USE_LIBRARY_FD` is honoured by reopening the file through
+/// `/proc/self/fd/<fd>`; every other option (reserved address, relro, namespace)
+/// is ignored, which is safe because glibc picks its own load address and
+/// PenguDroid has no relro-sharing or namespace isolation.
+#[no_mangle]
+pub unsafe extern "C" fn android_dlopen_ext(
+    filename: *const c_char,
+    flags: c_int,
+    extinfo: *const AndroidDlextinfo,
+) -> *mut c_void {
+    let mut path = cstr_lossy(filename);
+    if !extinfo.is_null() {
+        let info = &*extinfo;
+        if info.flags & ANDROID_DLEXT_USE_LIBRARY_FD != 0 {
+            // A non-zero `library_fd_offset` (an APK's embedded `.so`) cannot be
+            // expressed as a path; fall back to the plain filename in that case.
+            let offset = if info.flags & ANDROID_DLEXT_USE_LIBRARY_FD_OFFSET != 0 {
+                info.library_fd_offset
+            } else {
+                0
+            };
+            if offset == 0 && info.library_fd >= 0 {
+                path = format!("/proc/self/fd/{}", info.library_fd);
+            }
+        }
+    }
+    let Ok(cpath) = CString::new(path) else {
+        return std::ptr::null_mut();
+    };
+    libc::dlopen(cpath.as_ptr(), flags)
+}
+
+/// `android_create_namespace(...)` — always succeeds with a stateless handle.
+#[no_mangle]
+pub unsafe extern "C" fn android_create_namespace(
+    _name: *const c_char,
+    _ld_library_path: *const c_char,
+    _default_library_path: *const c_char,
+    _type: u64,
+    _permitted_when_isolated_path: *const c_char,
+    _parent: *mut c_void,
+) -> *mut c_void {
+    &DUMMY_NAMESPACE as *const u8 as *mut c_void
+}
+
+/// `android_get_exported_namespace(name)` — no namespaces exist, so `NULL`.
+#[no_mangle]
+pub unsafe extern "C" fn android_get_exported_namespace(_name: *const c_char) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `android_link_namespaces(from, to, sonames)` — a no-op success, since the
+/// single global namespace already exposes every library.
+#[no_mangle]
+pub unsafe extern "C" fn android_link_namespaces(
+    _from: *mut c_void,
+    _to: *mut c_void,
+    _shared_libs_sonames: *const c_char,
+) -> bool {
+    true
+}
+
+/// `android_link_namespaces_all_libs(from, to)` — see
+/// [`android_link_namespaces`].
+#[no_mangle]
+pub unsafe extern "C" fn android_link_namespaces_all_libs(
+    _from: *mut c_void,
+    _to: *mut c_void,
+) -> bool {
+    true
+}
+
+/// `android_init_anonymous_namespace(sonames, search_path)` — no-op success.
+#[no_mangle]
+pub unsafe extern "C" fn android_init_anonymous_namespace(
+    _shared_libs_sonames: *const c_char,
+    _library_search_path: *const c_char,
+) -> bool {
+    true
+}
+
+/// `android_dlwarning(obj, f, arg)` — the linker's "this library is not
+/// accessible" callback. Nothing is ever inaccessible here, so do nothing.
+#[no_mangle]
+pub unsafe extern "C" fn android_dlwarning(
+    _obj: *mut c_void,
+    _f: *mut c_void,
+    _arg: *mut c_void,
+) {
+}
+
+/// `android_set_application_target_sdk_version(target)` — remember the target
+/// and report success.
+#[no_mangle]
+pub unsafe extern "C" fn android_set_application_target_sdk_version(target: u32) -> bool {
+    TARGET_SDK.store(target, Ordering::Relaxed);
+    true
+}
+
+/// `android_get_LD_LIBRARY_PATH(buffer, size)` — copy the process's
+/// `LD_LIBRARY_PATH` into `buffer` and return it.
+#[no_mangle]
+pub unsafe extern "C" fn android_get_LD_LIBRARY_PATH(
+    buffer: *mut c_char,
+    buffer_size: usize,
+) -> *mut c_char {
+    if buffer.is_null() || buffer_size == 0 {
+        return buffer;
+    }
+    let path = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+    let bytes = path.as_bytes();
+    let n = bytes.len().min(buffer_size - 1);
+    std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, buffer, n);
+    *buffer.add(n) = 0;
+    buffer
+}
+
+/// `android_update_LD_LIBRARY_PATH(path)` — update the process's
+/// `LD_LIBRARY_PATH`.
+#[no_mangle]
+pub unsafe extern "C" fn android_update_LD_LIBRARY_PATH(ld_library_path: *const c_char) {
+    let path = cstr_lossy(ld_library_path);
+    let Ok(cpath) = CString::new(path) else {
+        return;
+    };
+    let name = c"LD_LIBRARY_PATH";
+    libc::setenv(name.as_ptr(), cpath.as_ptr(), 1);
+}
+
+// `__loader_*` — the internal spellings the Android linker exports and
+// `libdl_android.so` calls. Each forwards to the public entry point above.
+
+/// `__loader_android_dlopen_ext` — see [`android_dlopen_ext`].
+#[no_mangle]
+pub unsafe extern "C" fn __loader_android_dlopen_ext(
+    filename: *const c_char,
+    flags: c_int,
+    extinfo: *const AndroidDlextinfo,
+) -> *mut c_void {
+    android_dlopen_ext(filename, flags, extinfo)
+}
+
+/// `__loader_android_create_namespace` — see [`android_create_namespace`].
+#[no_mangle]
+pub unsafe extern "C" fn __loader_android_create_namespace(
+    name: *const c_char,
+    ld_library_path: *const c_char,
+    default_library_path: *const c_char,
+    r#type: u64,
+    permitted_when_isolated_path: *const c_char,
+    parent: *mut c_void,
+) -> *mut c_void {
+    android_create_namespace(
+        name,
+        ld_library_path,
+        default_library_path,
+        r#type,
+        permitted_when_isolated_path,
+        parent,
+    )
+}
+
+/// `__loader_android_get_exported_namespace` — see
+/// [`android_get_exported_namespace`].
+#[no_mangle]
+pub unsafe extern "C" fn __loader_android_get_exported_namespace(name: *const c_char) -> *mut c_void {
+    android_get_exported_namespace(name)
+}
+
+/// `__loader_android_link_namespaces` — see [`android_link_namespaces`].
+#[no_mangle]
+pub unsafe extern "C" fn __loader_android_link_namespaces(
+    from: *mut c_void,
+    to: *mut c_void,
+    shared_libs_sonames: *const c_char,
+) -> bool {
+    android_link_namespaces(from, to, shared_libs_sonames)
+}
+
+/// `__loader_android_link_namespaces_all_libs` — see
+/// [`android_link_namespaces_all_libs`].
+#[no_mangle]
+pub unsafe extern "C" fn __loader_android_link_namespaces_all_libs(
+    from: *mut c_void,
+    to: *mut c_void,
+) -> bool {
+    android_link_namespaces_all_libs(from, to)
+}
+
+/// `__loader_android_init_anonymous_namespace` — see
+/// [`android_init_anonymous_namespace`].
+#[no_mangle]
+pub unsafe extern "C" fn __loader_android_init_anonymous_namespace(
+    shared_libs_sonames: *const c_char,
+    library_search_path: *const c_char,
+) -> bool {
+    android_init_anonymous_namespace(shared_libs_sonames, library_search_path)
+}
+
+/// `__loader_android_dlwarning` — see [`android_dlwarning`].
+#[no_mangle]
+pub unsafe extern "C" fn __loader_android_dlwarning(
+    obj: *mut c_void,
+    f: *mut c_void,
+    arg: *mut c_void,
+) {
+    android_dlwarning(obj, f, arg)
+}
+
+/// `__loader_android_set_application_target_sdk_version` — see
+/// [`android_set_application_target_sdk_version`].
+#[no_mangle]
+pub unsafe extern "C" fn __loader_android_set_application_target_sdk_version(target: u32) -> bool {
+    android_set_application_target_sdk_version(target)
+}
+
+/// `__loader_android_get_application_target_sdk_version` — see
+/// [`android_get_application_target_sdk_version`].
+#[no_mangle]
+pub unsafe extern "C" fn __loader_android_get_application_target_sdk_version() -> c_int {
+    android_get_application_target_sdk_version()
+}
+
+/// `__loader_android_get_LD_LIBRARY_PATH` — see [`android_get_LD_LIBRARY_PATH`].
+#[no_mangle]
+pub unsafe extern "C" fn __loader_android_get_LD_LIBRARY_PATH(
+    buffer: *mut c_char,
+    buffer_size: usize,
+) -> *mut c_char {
+    android_get_LD_LIBRARY_PATH(buffer, buffer_size)
+}
+
+/// `__loader_android_update_LD_LIBRARY_PATH` — see
+/// [`android_update_LD_LIBRARY_PATH`].
+#[no_mangle]
+pub unsafe extern "C" fn __loader_android_update_LD_LIBRARY_PATH(ld_library_path: *const c_char) {
+    android_update_LD_LIBRARY_PATH(ld_library_path)
+}
+
+// The core `__loader_dl*` entry points the Android linker exports. Guests that
+// reach for the linker directly (rather than through `libdl.so`) land here; each
+// forwards to the matching glibc call.
+
+/// `__loader_dlopen(filename, flags)` — see `dlopen(3)`.
+#[no_mangle]
+pub unsafe extern "C" fn __loader_dlopen(filename: *const c_char, flags: c_int) -> *mut c_void {
+    libc::dlopen(filename, flags)
+}
+
+/// `__loader_dlsym(handle, symbol)` — see `dlsym(3)`.
+#[no_mangle]
+pub unsafe extern "C" fn __loader_dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void {
+    libc::dlsym(handle, symbol)
+}
+
+/// `__loader_dlvsym(handle, symbol, version)` — versioned `dlsym`. glibc's
+/// versioning is unrelated to Android's, so the version is ignored.
+#[no_mangle]
+pub unsafe extern "C" fn __loader_dlvsym(
+    handle: *mut c_void,
+    symbol: *const c_char,
+    _version: *const c_char,
+) -> *mut c_void {
+    libc::dlsym(handle, symbol)
+}
+
+/// `__loader_dlerror()` — see `dlerror(3)`.
+#[no_mangle]
+pub unsafe extern "C" fn __loader_dlerror() -> *mut c_char {
+    libc::dlerror()
+}
+
+/// `__loader_dlclose(handle)` — see `dlclose(3)`.
+#[no_mangle]
+pub unsafe extern "C" fn __loader_dlclose(handle: *mut c_void) -> c_int {
+    libc::dlclose(handle)
+}
+
+/// `__loader_dladdr(addr, info)` — see `dladdr(3)`.
+#[no_mangle]
+pub unsafe extern "C" fn __loader_dladdr(addr: *const c_void, info: *mut libc::Dl_info) -> c_int {
+    libc::dladdr(addr, info)
+}
+
+/// `__loader_dl_iterate_phdr(callback, data)` — see `dl_iterate_phdr(3)`.
+#[no_mangle]
+pub unsafe extern "C" fn __loader_dl_iterate_phdr(
+    callback: Option<
+        unsafe extern "C" fn(info: *mut libc::dl_phdr_info, size: usize, data: *mut c_void) -> c_int,
+    >,
+    data: *mut c_void,
+) -> c_int {
+    libc::dl_iterate_phdr(callback, data)
 }
 
 // ---------------------------------------------------------------------------
@@ -684,6 +1030,24 @@ pub unsafe extern "C" fn property_set(name: *const c_char, value: *const c_char)
 #[no_mangle]
 pub unsafe extern "C" fn __system_property_serial(_pi: *const c_void) -> u32 {
     prop_serial()
+}
+
+/// `__system_property_area_serial()` — a pointer to the property area's serial.
+///
+/// Bionic hands callers a `uint32_t*` they can poll for changes; the shim's
+/// single serial (see [`SERIAL`]) is returned directly.
+#[no_mangle]
+pub unsafe extern "C" fn __system_property_area_serial() -> *mut u32 {
+    SERIAL.as_ptr()
+}
+
+/// `__system_properties_init()` — Bionic's one-time property-area setup.
+///
+/// The shim's store is a plain in-process map that needs no initialisation, so
+/// this reports success.
+#[no_mangle]
+pub unsafe extern "C" fn __system_properties_init() -> c_int {
+    0
 }
 
 /// `__system_property_wait(pi, old_serial, new_serial, timeout)`.
@@ -1021,6 +1385,36 @@ unsafe fn stpncpy_impl(dst: *mut c_char, src: *const c_char, n: usize) -> *mut c
     dst.add(n)
 }
 
+/// `strlcpy` is not exposed by the `libc` crate; implement it directly.
+///
+/// Copies at most `siz - 1` bytes and always NUL-terminates (when `siz > 0`),
+/// returning the length of `src` so truncation is detectable.
+unsafe fn strlcpy_impl(dst: *mut c_char, src: *const c_char, siz: usize) -> usize {
+    let src_len = libc::strlen(src);
+    if siz != 0 {
+        let n = src_len.min(siz - 1);
+        std::ptr::copy_nonoverlapping(src, dst, n);
+        *dst.add(n) = 0;
+    }
+    src_len
+}
+
+/// `strlcat` is not exposed by the `libc` crate; implement it directly.
+///
+/// Appends `src` to the NUL-terminated `dst`, writing at most `siz` bytes total,
+/// and returns the length it tried to create (`strlen(dst) + strlen(src)`).
+unsafe fn strlcat_impl(dst: *mut c_char, src: *const c_char, siz: usize) -> usize {
+    let dst_len = libc::strlen(dst);
+    let src_len = libc::strlen(src);
+    if dst_len >= siz {
+        return siz + src_len;
+    }
+    let n = src_len.min(siz - dst_len - 1);
+    std::ptr::copy_nonoverlapping(src, dst.add(dst_len), n);
+    *dst.add(dst_len + n) = 0;
+    dst_len + src_len
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn __stpncpy_chk(
     dst: *mut c_char,
@@ -1136,6 +1530,650 @@ pub unsafe extern "C" fn __FD_ISSET_chk(
         libc::abort();
     }
     i32::from(libc::FD_ISSET(fd, set))
+}
+
+// ---------------------------------------------------------------------------
+// <stdio.h> / <string.h> / <unistd.h> fortify wrappers
+// ---------------------------------------------------------------------------
+//
+// The remaining `_FORTIFY_SOURCE` entry points a Bionic-built object may
+// reference. Each forwards to the host C library; the size argument is checked
+// only where a mismatch is unambiguously a caller bug, and otherwise ignored so
+// a guest's own overflow cannot abort the whole host process.
+
+/// `__fwrite_chk(buf, size, count, stream, buf_size)`.
+#[no_mangle]
+pub unsafe extern "C" fn __fwrite_chk(
+    buf: *const c_void,
+    size: usize,
+    count: usize,
+    stream: *mut libc::FILE,
+    _buf_size: usize,
+) -> usize {
+    libc::fwrite(buf, size, count, stream)
+}
+
+/// `__fread_chk(buf, buf_size, size, count, stream)`.
+#[no_mangle]
+pub unsafe extern "C" fn __fread_chk(
+    buf: *mut c_void,
+    _buf_size: usize,
+    size: usize,
+    count: usize,
+    stream: *mut libc::FILE,
+) -> usize {
+    libc::fread(buf, size, count, stream)
+}
+
+/// `__fgets_chk(buf, size, buf_size, stream)`.
+#[no_mangle]
+pub unsafe extern "C" fn __fgets_chk(
+    buf: *mut c_char,
+    size: c_int,
+    _buf_size: usize,
+    stream: *mut libc::FILE,
+) -> *mut c_char {
+    libc::fgets(buf, size, stream)
+}
+
+/// `__memcpy_chk(dst, src, len, dst_size)`.
+#[no_mangle]
+pub unsafe extern "C" fn __memcpy_chk(
+    dst: *mut c_void,
+    src: *const c_void,
+    len: usize,
+    dst_size: usize,
+) -> *mut c_void {
+    if len > dst_size {
+        libc::abort();
+    }
+    libc::memcpy(dst, src, len)
+}
+
+/// `__memmove_chk(dst, src, len, dst_size)`.
+#[no_mangle]
+pub unsafe extern "C" fn __memmove_chk(
+    dst: *mut c_void,
+    src: *const c_void,
+    len: usize,
+    dst_size: usize,
+) -> *mut c_void {
+    if len > dst_size {
+        libc::abort();
+    }
+    libc::memmove(dst, src, len)
+}
+
+/// `__memset_chk(dst, c, len, dst_size)`.
+#[no_mangle]
+pub unsafe extern "C" fn __memset_chk(
+    dst: *mut c_void,
+    c: c_int,
+    len: usize,
+    dst_size: usize,
+) -> *mut c_void {
+    if len > dst_size {
+        libc::abort();
+    }
+    libc::memset(dst, c, len)
+}
+
+/// `__strcpy_chk(dst, src, dst_size)`.
+#[no_mangle]
+pub unsafe extern "C" fn __strcpy_chk(
+    dst: *mut c_char,
+    src: *const c_char,
+    dst_size: usize,
+) -> *mut c_char {
+    if libc::strlen(src) >= dst_size {
+        libc::abort();
+    }
+    libc::strcpy(dst, src)
+}
+
+/// `__strlcpy_chk(dst, src, siz, dst_size)` — Bionic's bounded copy.
+#[no_mangle]
+pub unsafe extern "C" fn __strlcpy_chk(
+    dst: *mut c_char,
+    src: *const c_char,
+    siz: usize,
+    _dst_size: usize,
+) -> usize {
+    strlcpy_impl(dst, src, siz)
+}
+
+/// `__strlcat_chk(dst, src, siz, dst_size)` — Bionic's bounded append.
+#[no_mangle]
+pub unsafe extern "C" fn __strlcat_chk(
+    dst: *mut c_char,
+    src: *const c_char,
+    siz: usize,
+    _dst_size: usize,
+) -> usize {
+    strlcat_impl(dst, src, siz)
+}
+
+/// `__strnlen_chk(s, n, slen)`.
+#[no_mangle]
+pub unsafe extern "C" fn __strnlen_chk(s: *const c_char, n: usize, slen: usize) -> usize {
+    if n > slen {
+        libc::abort();
+    }
+    libc::strnlen(s, n)
+}
+
+/// `__read_chk(fd, buf, count, buf_size)`.
+#[no_mangle]
+pub unsafe extern "C" fn __read_chk(
+    fd: c_int,
+    buf: *mut c_void,
+    count: usize,
+    _buf_size: usize,
+) -> isize {
+    libc::read(fd, buf, count)
+}
+
+/// `__write_chk(fd, buf, count, buf_size)`.
+#[no_mangle]
+pub unsafe extern "C" fn __write_chk(
+    fd: c_int,
+    buf: *const c_void,
+    count: usize,
+    _buf_size: usize,
+) -> isize {
+    libc::write(fd, buf, count)
+}
+
+/// `__pread_chk(fd, buf, count, offset, buf_size)`.
+#[no_mangle]
+pub unsafe extern "C" fn __pread_chk(
+    fd: c_int,
+    buf: *mut c_void,
+    count: usize,
+    offset: libc::off_t,
+    _buf_size: usize,
+) -> isize {
+    libc::pread(fd, buf, count, offset)
+}
+
+/// `__pwrite_chk(fd, buf, count, offset, buf_size)`.
+#[no_mangle]
+pub unsafe extern "C" fn __pwrite_chk(
+    fd: c_int,
+    buf: *const c_void,
+    count: usize,
+    offset: libc::off_t,
+    _buf_size: usize,
+) -> isize {
+    libc::pwrite(fd, buf, count, offset)
+}
+
+/// `__readlink_chk(path, buf, size, buf_size)`.
+#[no_mangle]
+pub unsafe extern "C" fn __readlink_chk(
+    path: *const c_char,
+    buf: *mut c_char,
+    size: usize,
+    _buf_size: usize,
+) -> isize {
+    libc::readlink(path, buf, size)
+}
+
+/// `__umask_chk(mode)`.
+#[no_mangle]
+pub unsafe extern "C" fn __umask_chk(mode: libc::mode_t) -> libc::mode_t {
+    libc::umask(mode)
+}
+
+/// `__pread64_chk(fd, buf, count, offset, buf_size)`.
+#[no_mangle]
+pub unsafe extern "C" fn __pread64_chk(
+    fd: c_int,
+    buf: *mut c_void,
+    count: usize,
+    offset: libc::off64_t,
+    _buf_size: usize,
+) -> isize {
+    libc::pread64(fd, buf, count, offset)
+}
+
+/// `__pwrite64_chk(fd, buf, count, offset, buf_size)`.
+#[no_mangle]
+pub unsafe extern "C" fn __pwrite64_chk(
+    fd: c_int,
+    buf: *const c_void,
+    count: usize,
+    offset: libc::off64_t,
+    _buf_size: usize,
+) -> isize {
+    libc::pwrite64(fd, buf, count, offset)
+}
+
+/// `__recvfrom_chk(fd, buf, len, buf_size, flags, addr, addrlen)`.
+#[no_mangle]
+pub unsafe extern "C" fn __recvfrom_chk(
+    fd: c_int,
+    buf: *mut c_void,
+    len: usize,
+    _buf_size: usize,
+    flags: c_int,
+    addr: *mut libc::sockaddr,
+    addrlen: *mut libc::socklen_t,
+) -> isize {
+    libc::recvfrom(fd, buf, len, flags, addr, addrlen)
+}
+
+/// `__sendto_chk(fd, buf, len, buf_size, flags, addr, addrlen)`.
+#[no_mangle]
+pub unsafe extern "C" fn __sendto_chk(
+    fd: c_int,
+    buf: *const c_void,
+    len: usize,
+    _buf_size: usize,
+    flags: c_int,
+    addr: *const libc::sockaddr,
+    addrlen: libc::socklen_t,
+) -> isize {
+    libc::sendto(fd, buf, len, flags, addr, addrlen)
+}
+
+/// `__open_chk(path, flags, mode)`.
+#[no_mangle]
+pub unsafe extern "C" fn __open_chk(path: *const c_char, flags: c_int, mode: c_int) -> c_int {
+    libc::open(path, flags, mode)
+}
+
+/// `__openat_chk(dirfd, path, flags, mode)`.
+#[no_mangle]
+pub unsafe extern "C" fn __openat_chk(
+    dirfd: c_int,
+    path: *const c_char,
+    flags: c_int,
+    mode: c_int,
+) -> c_int {
+    libc::openat(dirfd, path, flags, mode)
+}
+
+/// `__getcwd_chk(buf, len, buf_size)`.
+#[no_mangle]
+pub unsafe extern "C" fn __getcwd_chk(
+    buf: *mut c_char,
+    len: usize,
+    _buf_size: usize,
+) -> *mut c_char {
+    libc::getcwd(buf, len)
+}
+
+/// `__realpath_chk(path, resolved, resolved_size)`.
+#[no_mangle]
+pub unsafe extern "C" fn __realpath_chk(
+    path: *const c_char,
+    resolved: *mut c_char,
+    _resolved_size: usize,
+) -> *mut c_char {
+    libc::realpath(path, resolved)
+}
+
+/// `__poll_chk(fds, nfds, timeout, fds_size)`.
+#[no_mangle]
+pub unsafe extern "C" fn __poll_chk(
+    fds: *mut libc::pollfd,
+    nfds: libc::nfds_t,
+    timeout: c_int,
+    _fds_size: usize,
+) -> c_int {
+    libc::poll(fds, nfds, timeout)
+}
+
+/// `__ppoll_chk(fds, nfds, timeout, sigmask, fds_size)`.
+#[no_mangle]
+pub unsafe extern "C" fn __ppoll_chk(
+    fds: *mut libc::pollfd,
+    nfds: libc::nfds_t,
+    timeout: *const libc::timespec,
+    sigmask: *const libc::sigset_t,
+    _fds_size: usize,
+) -> c_int {
+    libc::ppoll(fds, nfds, timeout, sigmask)
+}
+
+// ---------------------------------------------------------------------------
+// libc++ helpers
+// ---------------------------------------------------------------------------
+
+/// `__gnu_strerror_r(errnum, buf, buflen)` — Bionic's GNU-flavoured
+/// `strerror_r`, which returns a `char*` rather than an error code.
+///
+/// glibc only exposes the XSI variant (returning `int`), so this adapts it: on
+/// success the caller's buffer is returned, and on failure (an unknown `errnum`
+/// or a buffer too small) the static string from `strerror` is returned, which
+/// is exactly what the GNU contract permits.
+#[no_mangle]
+pub unsafe extern "C" fn __gnu_strerror_r(
+    errnum: c_int,
+    buf: *mut c_char,
+    buflen: usize,
+) -> *mut c_char {
+    if libc::strerror_r(errnum, buf, buflen) == 0 {
+        return buf;
+    }
+    libc::strerror(errnum)
+}
+
+/// `getprogname()` — the BSD/Android accessor for the program's short name.
+///
+/// glibc keeps this in `program_invocation_short_name`, which is exactly the
+/// basename of `argv[0]` that the BSD contract asks for.
+#[no_mangle]
+pub unsafe extern "C" fn getprogname() -> *const c_char {
+    extern "C" {
+        static program_invocation_short_name: *mut c_char;
+    }
+    program_invocation_short_name
+}
+
+/// `setprogname(name)` — BSD/Android setter. glibc derives the short name from
+/// `argv[0]` and does not allow overriding it, so this is a no-op.
+#[no_mangle]
+pub unsafe extern "C" fn setprogname(_name: *const c_char) {}
+
+// ---------------------------------------------------------------------------
+// ctype table
+// ---------------------------------------------------------------------------
+//
+// Bionic exports its character-classification table as the data symbol
+// `_ctype_` (OpenBSD's layout: one leading EOF slot, then a byte per input
+// byte). glibc has no such symbol — it uses `__ctype_b_loc()` — so a Bionic
+// object that reads `_ctype_[c]` directly fails to load. The table is rebuilt
+// here with Bionic's flag bits.
+
+/// Bionic's `_ctype_` flag bits.
+const CTYPE_U: u8 = 0x01; // upper
+const CTYPE_L: u8 = 0x02; // lower
+const CTYPE_N: u8 = 0x04; // digit
+const CTYPE_S: u8 = 0x08; // space
+const CTYPE_P: u8 = 0x10; // punctuation
+const CTYPE_C: u8 = 0x20; // control
+const CTYPE_X: u8 = 0x40; // hex digit
+const CTYPE_B: u8 = 0x80; // blank
+
+const fn build_ctype() -> [u8; 257] {
+    let mut t = [0u8; 257];
+    let mut i = 0usize;
+    while i < 256 {
+        let c = i as u8;
+        let mut f = 0u8;
+        if c >= b'A' && c <= b'Z' {
+            f |= CTYPE_U;
+        }
+        if c >= b'a' && c <= b'z' {
+            f |= CTYPE_L;
+        }
+        if c >= b'0' && c <= b'9' {
+            f |= CTYPE_N;
+        }
+        if c == b' ' || (c >= 0x09 && c <= 0x0d) {
+            f |= CTYPE_S;
+        }
+        if (c >= 0x21 && c <= 0x2f)
+            || (c >= 0x3a && c <= 0x40)
+            || (c >= 0x5b && c <= 0x60)
+            || (c >= 0x7b && c <= 0x7e)
+        {
+            f |= CTYPE_P;
+        }
+        if c < 0x20 || c == 0x7f {
+            f |= CTYPE_C;
+        }
+        if (c >= b'0' && c <= b'9') || (c >= b'A' && c <= b'F') || (c >= b'a' && c <= b'f') {
+            f |= CTYPE_X;
+        }
+        if c == b' ' || c == b'\t' {
+            f |= CTYPE_B;
+        }
+        t[i + 1] = f;
+        i += 1;
+    }
+    t
+}
+
+/// Bionic's `_ctype_` table, `const char _ctype_[1 + 256]`.
+#[no_mangle]
+pub static _ctype_: [u8; 257] = build_ctype();
+
+// ---------------------------------------------------------------------------
+// CFI runtime
+// ---------------------------------------------------------------------------
+//
+// Android's Control Flow Integrity instrumentation calls `__cfi_slowpath` when
+// a cross-DSO indirect call cannot be verified at link time. The host process is
+// not built with the same CFI scheme, so there is nothing to verify against;
+// the calls are accepted as no-ops.
+
+/// `__cfi_slowpath(call_site_type_id, ptr)`.
+#[no_mangle]
+pub unsafe extern "C" fn __cfi_slowpath(_call_site_type_id: u64, _ptr: *mut c_void) {}
+
+/// `__cfi_slowpath_diag(call_site_type_id, ptr, diag)`.
+#[no_mangle]
+pub unsafe extern "C" fn __cfi_slowpath_diag(
+    _call_site_type_id: u64,
+    _ptr: *mut c_void,
+    _diag: *mut c_void,
+) {
+}
+
+// ---------------------------------------------------------------------------
+// fdsan (<android/fdsan.h>)
+// ---------------------------------------------------------------------------
+//
+// Bionic's file-descriptor sanitizer tags each fd with an owner so that a
+// double-close or a close-by-the-wrong-owner is caught. PenguDroid has no
+// fdsan runtime, so tags are computed and exchanged as pure bookkeeping and
+// never enforced: the tag arithmetic is kept exact so a guest that round-trips
+// a tag observes the value it created.
+
+/// `android_fdsan_create_owner_tag(type, tag)` — pack an owner type and tag.
+#[no_mangle]
+pub unsafe extern "C" fn android_fdsan_create_owner_tag(owner_type: u64, tag: u64) -> u64 {
+    (owner_type << 56) | (tag & 0x00ff_ffff_ffff_ffff)
+}
+
+/// `android_fdsan_exchange_owner_tag(fd, expected_tag, new_tag)` — no-op.
+#[no_mangle]
+pub unsafe extern "C" fn android_fdsan_exchange_owner_tag(
+    _fd: c_int,
+    _expected_tag: u64,
+    _new_tag: u64,
+) {
+}
+
+/// `android_fdsan_close_with_tag(fd, tag)` — close the fd, ignoring the tag.
+#[no_mangle]
+pub unsafe extern "C" fn android_fdsan_close_with_tag(fd: c_int, _tag: u64) -> c_int {
+    libc::close(fd)
+}
+
+// ---------------------------------------------------------------------------
+// liblog event API (<android/log.h>)
+// ---------------------------------------------------------------------------
+//
+// The `log_msg`-based API (`android_log_write_list` and friends) builds a binary
+// log record in a caller-owned buffer. PenguDroid has no binary log transport,
+// so the record builders succeed without writing and the list writer emits a
+// short textual note instead.
+
+/// `__android_log_error_write(tag, sub_tag, uid, msg, msg_len)`.
+#[no_mangle]
+pub unsafe extern "C" fn __android_log_error_write(
+    tag: c_int,
+    sub_tag: *const c_char,
+    _uid: i32,
+    msg: *const c_char,
+    _msg_len: u32,
+) -> c_int {
+    let sub = cstr_lossy(sub_tag);
+    let text = cstr_lossy(msg);
+    log_to_stderr(tag, &sub, &text) as c_int
+}
+
+/// `android_log_write_list(msg, id)` — accept and drop the record.
+#[no_mangle]
+pub unsafe extern "C" fn android_log_write_list(_msg: *mut c_void, _id: c_int) -> c_int {
+    0
+}
+
+/// Opaque stand-in for `struct android_log_context`.
+static DUMMY_LOG_CONTEXT: u8 = 0;
+
+/// `create_android_logger(tag)` — begin building a binary log record.
+///
+/// The record is never emitted, but a non-null context is returned so callers
+/// that chain `android_log_write_*` calls proceed normally.
+#[no_mangle]
+pub unsafe extern "C" fn create_android_logger(_tag: u32) -> *mut c_void {
+    &DUMMY_LOG_CONTEXT as *const u8 as *mut c_void
+}
+
+/// `create_android_log_parser(msg, len)` — begin parsing a binary log record.
+///
+/// Parsing is unsupported, so `NULL` is returned, which the API defines as
+/// failure.
+#[no_mangle]
+pub unsafe extern "C" fn create_android_log_parser(_msg: *const c_char, _len: usize) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `android_log_write_int32(msg, value)` — accept and drop the field.
+#[no_mangle]
+pub unsafe extern "C" fn android_log_write_int32(_msg: *mut c_void, _value: i32) -> c_int {
+    0
+}
+
+/// `android_log_write_string8(msg, value)` — accept and drop the field.
+#[no_mangle]
+pub unsafe extern "C" fn android_log_write_string8(
+    _msg: *mut c_void,
+    _value: *const c_char,
+) -> c_int {
+    0
+}
+
+/// `android_log_write_string8_len(msg, value, max_len)` — accept and drop.
+#[no_mangle]
+pub unsafe extern "C" fn android_log_write_string8_len(
+    _msg: *mut c_void,
+    _value: *const c_char,
+    _max_len: usize,
+) -> c_int {
+    0
+}
+
+/// `android_log_destroy(msg)` — release the caller's record buffer.
+#[no_mangle]
+pub unsafe extern "C" fn android_log_destroy(_msg: *mut *mut c_void) {}
+
+// ---------------------------------------------------------------------------
+// 64-bit signal API (`*64` variants)
+// ---------------------------------------------------------------------------
+//
+// Bionic exposes `sigset64_t`-based entry points (`sigfillset64`, `sigaction64`,
+// ...) alongside the legacy 32-bit ones. On glibc/x86-64 `sigset_t` is already
+// the full 1024-bit type and `struct sigaction` has the same layout as Bionic's
+// `struct sigaction64`, so each forwards directly.
+
+/// `sigemptyset64(set)`.
+#[no_mangle]
+pub unsafe extern "C" fn sigemptyset64(set: *mut libc::sigset_t) -> c_int {
+    libc::sigemptyset(set)
+}
+
+/// `sigfillset64(set)`.
+#[no_mangle]
+pub unsafe extern "C" fn sigfillset64(set: *mut libc::sigset_t) -> c_int {
+    libc::sigfillset(set)
+}
+
+/// `sigaddset64(set, signum)`.
+#[no_mangle]
+pub unsafe extern "C" fn sigaddset64(set: *mut libc::sigset_t, signum: c_int) -> c_int {
+    libc::sigaddset(set, signum)
+}
+
+/// `sigdelset64(set, signum)`.
+#[no_mangle]
+pub unsafe extern "C" fn sigdelset64(set: *mut libc::sigset_t, signum: c_int) -> c_int {
+    libc::sigdelset(set, signum)
+}
+
+/// `sigismember64(set, signum)`.
+#[no_mangle]
+pub unsafe extern "C" fn sigismember64(set: *const libc::sigset_t, signum: c_int) -> c_int {
+    libc::sigismember(set, signum)
+}
+
+/// `sigprocmask64(how, set, oldset)`.
+#[no_mangle]
+pub unsafe extern "C" fn sigprocmask64(
+    how: c_int,
+    set: *const libc::sigset_t,
+    oldset: *mut libc::sigset_t,
+) -> c_int {
+    libc::sigprocmask(how, set, oldset)
+}
+
+/// `pthread_sigmask64(how, set, oldset)`.
+#[no_mangle]
+pub unsafe extern "C" fn pthread_sigmask64(
+    how: c_int,
+    set: *const libc::sigset_t,
+    oldset: *mut libc::sigset_t,
+) -> c_int {
+    libc::pthread_sigmask(how, set, oldset)
+}
+
+/// `sigpending64(set)`.
+#[no_mangle]
+pub unsafe extern "C" fn sigpending64(set: *mut libc::sigset_t) -> c_int {
+    libc::sigpending(set)
+}
+
+/// `sigsuspend64(set)`.
+#[no_mangle]
+pub unsafe extern "C" fn sigsuspend64(set: *const libc::sigset_t) -> c_int {
+    libc::sigsuspend(set)
+}
+
+/// `sigwait64(set, sig)`.
+#[no_mangle]
+pub unsafe extern "C" fn sigwait64(set: *const libc::sigset_t, sig: *mut c_int) -> c_int {
+    libc::sigwait(set, sig)
+}
+
+/// `sigaction64(signum, act, oldact)` — layout-compatible with glibc's
+/// `struct sigaction` on x86-64.
+#[no_mangle]
+pub unsafe extern "C" fn sigaction64(
+    signum: c_int,
+    act: *const libc::sigaction,
+    oldact: *mut libc::sigaction,
+) -> c_int {
+    libc::sigaction(signum, act, oldact)
+}
+
+// ---------------------------------------------------------------------------
+// pthread helpers
+// ---------------------------------------------------------------------------
+
+/// `pthread_gettid_np(thread)` — Bionic's accessor for a thread's kernel TID.
+///
+/// glibc's `pthread_t` is a TCB address rather than a TID, so the TID is read
+/// from the kernel. Only the calling thread is resolved exactly; for any other
+/// thread the caller's own TID is returned, which is correct for the common case
+/// (a thread asking for its own id) and harmless otherwise.
+#[no_mangle]
+pub unsafe extern "C" fn pthread_gettid_np(_thread: libc::pthread_t) -> libc::pid_t {
+    libc::gettid()
 }
 
 /// Bionic's `__assert`/`__assert2`: report and abort (glibc's are different).
@@ -2539,6 +3577,22 @@ mod tests {
         );
         // Unknown priorities degrade to "UNKNOWN" rather than panicking.
         assert_eq!(format_log_line(42, "T", "x"), "[pengudroid:log] UNKNOWN T: x");
+    }
+
+    #[test]
+    fn ctype_table_matches_bionic_flags() {
+        // Slot 0 is the EOF entry and is always zero.
+        assert_eq!(_ctype_[0], 0);
+        // `_ctype_[c]` is the class of byte `c`; index by `c + 1`.
+        let at = |c: u8| _ctype_[c as usize + 1];
+        assert_eq!(at(b'A'), CTYPE_U | CTYPE_X);
+        assert_eq!(at(b'f'), CTYPE_L | CTYPE_X);
+        assert_eq!(at(b'0'), CTYPE_N | CTYPE_X);
+        assert_eq!(at(b'g'), CTYPE_L);
+        assert_eq!(at(b' '), CTYPE_S | CTYPE_B);
+        assert_eq!(at(b'\t'), CTYPE_C | CTYPE_S | CTYPE_B);
+        assert_eq!(at(b'!'), CTYPE_P);
+        assert_eq!(at(0x7f), CTYPE_C);
     }
 
     #[test]

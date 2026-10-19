@@ -30,20 +30,35 @@ Wine works because the Win32 ABI is stable, documented, and — crucially —
 Wine reimplements the entire platform rather than hosting Microsoft's
 `ntdll`. PenguDroid's plan is the harder, opposite bet: host *Google's* ART.
 
-ART is deeply coupled to Bionic in ways a syscall shim does not cover:
+**What now works.** The ART APEX closure loads on glibc. `pengudroid de-bionic`
+expands Android's packed relocations (`APS2`) into standard `RELA`/`RELR` and
+retags the dynamic entries, the shim supplies the linker API
+(`android_dlopen_ext`, `android_create_namespace`, the `__loader_*` entry
+points), the CFI/fdsan/fortify/`_ctype_` surface, and the Bionic log and
+property calls, and the whole set — `libart.so` (9 MB), `libartbase`,
+`libdexfile`, `libc++`, `libnativebridge`, `libnativeloader`, `libunwindstack`,
+`libsigchain`, `libartpalette` + `libartpalette-system`, and the system-library
+chain they pull in — `dlopen`s. `JNI_CreateJavaVM` then **executes**: it enters
+ART's real code, initialises the palette, and proceeds into runtime setup before
+faulting.
 
-* linker **namespace** semantics (`libnativeloader`, `android_dlopen_ext`) that
-  glibc's `dlopen` does not implement;
-* `__system_property_*`, `pthread` internals, and TLS layout assumptions baked
-  into compiled `.so`s;
-* a GC that expects to find and suspend threads through Bionic-specific
-  mechanisms.
+**What remains.** Getting `JNI_CreateJavaVM` to return a live `JavaVM` is the
+open problem. ART is deeply coupled to Bionic in ways a syscall shim does not
+cover:
 
-Making this work is a research project measured in years, not a patch. The MVP
-deliberately does **not** claim to run DEX bytecode; `pengudroid run` brings up a
-real process and a real window so the surrounding plumbing (binder, ashmem,
-graphics, audio, properties, fd passing) can be built and tested against a
-running system first.
+* the runtime's thread/GC machinery expects Bionic-specific suspend and TLS
+  mechanisms;
+* `sigchain` installs signal handlers through Bionic's `sigaction` contract;
+* the boot classpath (`core-libart.jar`, `core-oj.jar`) and the JIT must be
+  brought up, and the runtime expects a `/proc`, property and ashmem environment
+  shaped like Android's.
+
+The current fault is inside ART's runtime initialisation (after palette setup),
+with no symbol gap left to close — it is a semantic mismatch, not a missing
+import. Making this work is a research project measured in years, not a patch.
+`pengudroid run` therefore still brings up a real process and a real window so
+the surrounding plumbing (binder, ashmem, graphics, audio, properties, fd
+passing) can be built and tested against a running system first.
 
 ## 3. Native `.so` compatibility
 
@@ -69,8 +84,15 @@ What remains is the gap between *running a function* and *running an app*:
   set so that dependency resolves; `fixtures/cpp-cascade` verifies a consumer
   calling through the bundled runtime. (The F-Droid apps checked statically link
   libc++, so a real `libc++_shared.so` APK was not available to test against.)
-* **The Android linker namespace.** `android_dlopen_ext` is not implemented; it
-  carries namespace semantics glibc lacks.
+* **The Android linker namespace.** Implemented as a translation: the shim
+exports `android_dlopen_ext`, `android_create_namespace`,
+`android_link_namespaces`, the `__loader_*` entry points and the rest of the
+linker API, mapping Android's per-app namespaces onto glibc's single flat
+namespace. `libdl_android.so` and `ld-android.so` resolve to the shim.
+* **Packed relocations.** Implemented: `de-bionic` expands `APS2` into standard
+  `RELA`/`RELR`. Without this a modern Android `.so` (anything built in the last
+  several years) loads with *no* relocations applied and crashes in its first
+  constructor.
 * **Graphics.** `libEGL`/`libGLESv2` must be bound to host EGL before apps draw.
 
 The shim exports around 45 Bionic entry points plus the version nodes; a large
@@ -170,8 +192,11 @@ hanging forever, so a wedged guest cannot freeze its peers.
    `zwp_linux_dmabuf_v1` import in the daemon, zero-copy frames from
    `pengudroid run`, and `pengudroid-gleshim` — a Bionic `libEGL` that renders an
    app's own EGL/GL calls and swaps them to Wayland (`fixtures/egl-app`).
-5. Attempt ART bring-up against a minimal `libandroid_runtime` with no
-   `system_server`.
+5. ~~Load the ART runtime and execute `JNI_CreateJavaVM`.~~ **Partial**: the whole
+   ART closure `dlopen`s and `JNI_CreateJavaVM` executes into ART's runtime setup
+   (packed relocations, the linker API, CFI/fdsan/fortify/`_ctype_` and the
+   system-library chain are all handled). Returning a live `JavaVM` remains open
+   — see §2.
 6. ~~Wire the PipeWire audio pump.~~ **Done**: the daemon owns a shared ring and
    drains it into `pw-cat` (`audio-test --via-daemon`); silence by default,
    `--tone` audible. ~~OpenSL ES buffer-queue player~~ **Done**: `Enqueue` →

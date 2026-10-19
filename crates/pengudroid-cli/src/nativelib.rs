@@ -119,6 +119,11 @@ pub fn ensure_compat_dir() -> Result<PathBuf, String> {
         "libnativewindow.so",
         "libnativehelper.so",
         "libOpenSLES.so",
+        // Android's linker API (`android_dlopen_ext`, `android_create_namespace`,
+        // the `__loader_*` entry points) is translated to glibc by the shim, so
+        // the linker and its `libdl_android` wrapper resolve here too.
+        "libdl_android.so",
+        "ld-android.so",
     ];
     for name in BIONIC_SONAMES {
         symlink(&dir.join(name), &shim).map_err(|e| format!("symlink {name}: {e}"))?;

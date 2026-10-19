@@ -23,6 +23,9 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+#[path = "src/vlog.rs"]
+mod vlog;
+
 fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     compile_variadic_shims(&out_dir);
@@ -41,8 +44,6 @@ fn compile_variadic_shims(out_dir: &PathBuf) {
     let o_path = dir.join("vlog.o");
     let a_path = dir.join("libpengudroid_vlog.a");
 
-    #[path = "src/vlog.rs"]
-    mod vlog;
     std::fs::write(&c_path, vlog::source()).expect("write generated C");
 
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
@@ -65,13 +66,13 @@ fn compile_variadic_shims(out_dir: &PathBuf) {
     if matches!(archived, Ok(s) if s.success()) {
         println!("cargo:rustc-link-search=native={}", dir.display());
         println!("cargo:rustc-link-lib=static=pengudroid_vlog");
-        // The archive member only defines `__android_log_print` and
-        // `__android_log_assert`; nothing in the Rust half references them, so
-        // without these the linker drops the object and the cdylib silently
-        // fails to export the two most important Bionic entry points. Force
-        // them in.
-        println!("cargo:rustc-cdylib-link-arg=-Wl,--undefined=__android_log_print");
-        println!("cargo:rustc-cdylib-link-arg=-Wl,--undefined=__android_log_assert");
+        // The archive members define only the C entry points; nothing in the
+        // Rust half references them, so without these the linker drops the
+        // objects and the cdylib silently fails to export them. Force each one
+        // in; `write_version_script` then re-declares them global.
+        for sym in vlog::C_SYMBOLS {
+            println!("cargo:rustc-cdylib-link-arg=-Wl,--undefined={sym}");
+        }
         println!("cargo:rustc-cfg=has_variadic_log");
     } else {
         println!(
@@ -83,12 +84,22 @@ fn compile_variadic_shims(out_dir: &PathBuf) {
 
 /// Assign the three anchor symbols to `LIBC`/`LIBM`/`LD`; everything else stays
 /// global, so the shim can serve as the provider of the Bionic sonames.
+///
+/// The C-implemented entry points are listed in the `LIBC` node as well: rustc
+/// emits its own export list for a cdylib, and a symbol that appears in *no*
+/// version node is hidden by it. Naming them here is what makes them visible.
 fn write_version_script(out_dir: &PathBuf) {
     let map = out_dir.join("pengudroid-versions.map");
-    let script = "\
-LIBC { global: __pengudroid_ver_libc; __android_log_print; __android_log_assert; };\
-LIBM { global: __pengudroid_ver_libm; };\
-LD   { global: __pengudroid_ver_ld; };\n";
+    let mut libc_globals = String::from("__pengudroid_ver_libc");
+    for sym in vlog::C_SYMBOLS {
+        libc_globals.push_str("; ");
+        libc_globals.push_str(sym);
+    }
+    let script = format!(
+        "LIBC {{ global: {libc_globals}; }};\
+         LIBM {{ global: __pengudroid_ver_libm; }};\
+         LD   {{ global: __pengudroid_ver_ld; }};\n"
+    );
     std::fs::write(&map, script).expect("write version script");
 
     // Applies to the cdylib target only, so the rlib/tests are unaffected.
@@ -105,8 +116,12 @@ LD   { global: __pengudroid_ver_ld; };\n";
             "cargo:rustc-cdylib-link-arg=-Wl,--version-script={},--undefined-version",
             map.display()
         );
-        println!("cargo:rustc-cdylib-link-arg=-Wl,--export-dynamic-symbol=__android_log_print");
-        println!("cargo:rustc-cdylib-link-arg=-Wl,--export-dynamic-symbol=__android_log_assert");
+        // A SONAME makes every compat-directory symlink (`libc.so`, `libdl.so`,
+        // `ld-android.so`, ...) resolve to the *already-loaded* shim by name
+        // instead of being mapped a second time under the alias. Without it the
+        // loader maps the shim again for each alias, and an alias such as
+        // `ld-android.so` then runs the real Android linker's constructor.
+        println!("cargo:rustc-cdylib-link-arg=-Wl,-soname,libpengudroid_shim.so");
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let _ = map;

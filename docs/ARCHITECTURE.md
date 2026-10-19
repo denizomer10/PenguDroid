@@ -297,9 +297,29 @@ on the bundled runtime and returns `42` through it.
 A build detail worth recording: the variadic log entry points are written in C
 (stable Rust cannot define `...`), and Rust's cdylib export list hides
 C-defined symbols while a static-archive member is dropped if unreferenced. The
-build therefore links them with `--undefined` + `--export-dynamic-symbol` and
-assigns them to the `LIBC` version node; without that, `__android_log_print` was
-silently absent from the `.so`.
+build therefore links them with `--undefined` and lists them in the `LIBC` node
+of the version script (a symbol in *no* version node is hidden by rustc's export
+list); without that, `__android_log_print` was silently absent from the `.so`.
+
+### 8.6 Android's packed relocations (`APS2`)
+
+A modern Android `.so` does not carry a plain `.rela.dyn`. It carries an
+`APS2`-compressed stream tagged `DT_ANDROID_RELA` (and relative relocations
+tagged `DT_ANDROID_RELR`), neither of which glibc recognises. The failure mode
+is nasty: the library *loads* — every symbol resolves — but **no relocations are
+applied**, so the first constructor dereferences a null GOT slot and the process
+segfaults with no diagnostic.
+
+`pengudroid_elf::unpack_android_relocations` (called from `de-bionic`) decodes
+the `APS2` group stream into ordinary `RELA` entries. The unpacked table is
+larger than the packed one, so it cannot be written in place: the function
+appends it at the end of the file under a **new `PT_LOAD`**, moves the
+program-header table there (with one extra entry), and retags
+`DT_ANDROID_RELA`/`DT_ANDROID_RELASZ`/`DT_ANDROID_RELR`/... as the standard tags.
+A new segment is used rather than extending the last one because that segment
+usually carries `.bss`, and growing its file size would overwrite the
+zero-filled tail. This is what makes `libc++.so` — and therefore ART — load at
+all.
 
 ## 9. GPU path: host EGL/GLES and dma-buf presentation
 
@@ -372,6 +392,32 @@ exporting `slCreateEngine` and the `SL_IID_*` identifiers.
 With those mappings and the fortify/NDK stubs, real application libraries load:
 Dolphin's `libmain.so` (15 MB) and PPSSPP's `libppsspp_jni.so` (27 MB) both
 `dlopen` under `pengudroid nativelib --apk`.
+
+## 10. The ART attempt
+
+The end goal is to host Google's ART rather than reimplement it. The ART APEX
+(`/system/apex/com.android.art/lib64`) is extracted with `debugfs` and its whole
+dependency closure is `de-bionic`'d, then loaded. Three things had to be solved
+before `libart.so` would even `dlopen`:
+
+* **Packed relocations** (§8.6) — without them every constructor faults.
+* **The linker API.** `libart.so` `DT_NEEDED`s `libdl_android.so`, which needs
+  `ld-android.so`. The shim exports the whole linker surface
+  (`android_dlopen_ext`, `android_create_namespace`, `android_link_namespaces`,
+  `android_get_exported_namespace`, the `__loader_*` entry points) and maps
+  Android's per-app namespaces onto glibc's single flat namespace; the compat
+directory points `libdl_android.so` and `ld-android.so` at the shim. The shim
+  also gained a `SONAME`, so those aliases resolve to the already-loaded shim
+  instead of mapping it again.
+* **The Bionic runtime surface.** CFI (`__cfi_slowpath`), fdsan, the full
+  `_FORTIFY_SOURCE` set, `_ctype_`, `getprogname`, `__gnu_strerror_r`, the
+  `*64` signal calls, `__system_properties_init`, and the `liblog` event API.
+
+With those in place `libart.so` (9 MB) and its closure load, and
+`JNI_CreateJavaVM` **executes**: it enters ART's real code, initialises
+`libartpalette`, and proceeds into runtime setup before faulting. The remaining
+fault is a semantic mismatch inside ART's runtime initialisation, not a missing
+symbol — see `docs/LIMITATIONS.md` §2.
 
 ## Why this is faster than a container
 
