@@ -305,10 +305,34 @@ compositor supports the protocol, falling back to `wl_shm` otherwise. The
 check (a plain memfd must be rejected) so a silent pass cannot mask a broken
 acceptance verdict.
 
-What this is not yet: an app's *own* `libEGL`/`libGLESv2` calls are not
-forwarded — there is no Bionic `libEGL` shim yet. The guest (the PenguDroid
-runtime) renders on the app's behalf. Forwarding an app's `eglSwapBuffers` to
-`PresentDmabuf` is the next step.
+### 9.1 An app's own EGL calls (`pengudroid-gleshim`)
+
+`crates/pengudroid-gleshim` is a Bionic-compatible **`libEGL`** (plus a small
+`libGLESv2` surface). It resolves the **host's** EGL/GLES with `dlopen` and
+implements EGL on a surfaceless host context:
+
+* `eglGetDisplay` uses `EGL_MESA_platform_surfaceless`; `eglInitialize`,
+  `eglChooseConfig`, `eglCreateContext`, `eglBindAPI` and the query/attribute
+  calls forward to the host.
+* `eglCreateWindowSurface` ignores the opaque `ANativeWindow` and allocates a
+  virtual surface (`PENGUDROID_SURFACE_W`/`_H`, default 720×1280).
+* `eglMakeCurrent` makes the host context current and binds an RGBA8 FBO for that
+  surface, so the app's GL draws land there.
+* `eglSwapBuffers` exports the FBO texture as a dma-buf
+  (`EGL_MESA_image_dma_buf_export`, passing the **current context** to
+  `eglCreateImageKHR` — `EGL_NO_CONTEXT` segfaults on iris) and sends
+  `PresentDmabuf` to the daemon. The shim creates a surface on demand (or uses
+  `PENGUDROID_SURFACE_ID`) and expects an `Ack`; if the daemon is absent it
+  returns `EGL_FALSE` instead of hanging.
+
+`EGL_GL_TEXTURE_2D_KHR` → dma-buf → `zwp_linux_dmabuf_v1` is the app-facing form
+of the zero-copy path. `fixtures/egl-app` is a native program that loads the
+shim, creates a context and window surface, clears 5 frames and swaps: it reports
+`5 frames swapped (GPU -> dma-buf -> Wayland)`.
+
+Still missing on this front: `gralloc`/`AHardwareBuffer` compatibility, hardware
+composition, and Vulkan (the host Vulkan ICDs can be loaded, but no translation
+layer drives them yet).
 
 ## Why this is faster than a container
 

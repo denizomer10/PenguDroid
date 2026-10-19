@@ -5,6 +5,7 @@ members = [
     "crates/pengudroid-socket",
     "crates/pengudroid-elf",
     "crates/pengudroid-hostgpu",
+    "crates/pengudroid-gleshim",
     "crates/pengudroid-daemon",
     "crates/pengudroid-cli",
     "crates/pengudroid-shim",
@@ -32,6 +33,7 @@ pengudroid-proto = { path = "crates/pengudroid-proto" }
 pengudroid-socket = { path = "crates/pengudroid-socket" }
 pengudroid-elf = { path = "crates/pengudroid-elf" }
 pengudroid-hostgpu = { path = "crates/pengudroid-hostgpu" }
+pengudroid-gleshim = { path = "crates/pengudroid-gleshim" }
 
 [profile.release]
 opt-level = "z"

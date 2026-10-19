@@ -88,14 +88,17 @@ GPU via dma-buf"), falling back to `wl_shm` when unavailable. `pengudroid
 gpu-test` verifies rendering by reading pixels back, and `pengudroid-daemon
 --dmabuf-selftest` verifies the compositor accepts the buffer.
 
-Still missing: **an app's own EGL calls are not forwarded.** There is no Bionic
-`libEGL`/`libGLESv2` shim yet, so an ART-hosted app's `eglCreateWindowSurface` /
-`eglSwapBuffers` would not reach this path; the PenguDroid guest runtime renders
-on its behalf. Binding Bionic `libEGL` to `PresentDmabuf` is the next step.
+An app's own EGL calls now do reach the GPU: `crates/pengudroid-gleshim` is a
+Bionic-compatible `libEGL` (plus a small `libGLESv2`) that binds the host's
+EGL/GLES, renders the app's drawing into an FBO, and exports each
+`eglSwapBuffers` as a dma-buf presented by the daemon. `fixtures/egl-app` swaps
+five frames through it.
 
-Also absent: `gralloc`/`AHardwareBuffer` compatibility, hardware composition,
-and Vulkan (the host Vulkan ICDs can be loaded, but no translation layer drives
-them yet).
+Still missing: `gralloc`/`AHardwareBuffer` compatibility, hardware composition,
+Vulkan (the host Vulkan ICDs can be loaded, but no translation layer drives them
+yet), and GLES coverage beyond the exported core functions (apps that call less
+common GL entry points directly, rather than via `eglGetProcAddress`, may fail
+to resolve).
 
 ## 5. SurfaceFlinger is bypassed, not emulated
 
@@ -154,11 +157,11 @@ hanging forever, so a wedged guest cannot freeze its peers.
    suppressed (a faulting teardown goes 139 → 0), the three standard streams map
    through `__sF` (`fprintf` varargs remain literal), and `nativelib --apk`
    stages an APK's library set (`fixtures/cpp-cascade`).
-4. ~~Present a GPU frame over `dmabuf`.~~ **Partly done**: `pengudroid-hostgpu`
-   binds the host EGL/GLES/GBM and exports dma-bufs; the daemon imports them via
-   `zwp_linux_dmabuf_v1`, and `pengudroid run` presents zero-copy GPU frames.
-   Remaining: a Bionic `libEGL`/`libGLESv2` shim so an app's own EGL calls reach
-   this path.
+4. ~~Present a GPU frame over `dmabuf`, including an app's own EGL calls.~~
+   **Done**: `pengudroid-hostgpu` (host EGL/GLES/GBM + dma-buf export),
+   `zwp_linux_dmabuf_v1` import in the daemon, zero-copy frames from
+   `pengudroid run`, and `pengudroid-gleshim` — a Bionic `libEGL` that renders an
+   app's own EGL/GL calls and swaps them to Wayland (`fixtures/egl-app`).
 5. Attempt ART bring-up against a minimal `libandroid_runtime` with no
    `system_server`.
 6. Wire the PipeWire audio pump.

@@ -1,0 +1,16 @@
+[package]
+name = "pengudroid-gleshim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bionic-compatible libEGL/libGLESv2 on the host GPU for PenguDroid."
+
+[lib]
+name = "pengudroid_gleshim"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+libc.workspace = true
+pengudroid-proto.workspace = true
+pengudroid-socket.workspace = true

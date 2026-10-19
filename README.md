@@ -64,7 +64,7 @@ milestone. Nothing below is overstated.
 | `pengudroid demo` | **Working** | built-in animated window, no APK and no manifest needed |
 | Host GPU via EGL/GLES/GBM (`gpu-info`, `gpu-test`) | **Working** | dlopen'd host EGL/GLES/GBM; offscreen render + pixel readback verified on Intel UHD 630 |
 | Zero-copy GPU presentation (`zwp_linux_dmabuf_v1`) | **Working** | the guest renders on the GPU, exports a dma-buf, the daemon imports and commits it |
-| Bionic `libEGL`/`libGLESv2` forwarding (an app's own EGL calls) | **Not started** | apps cannot call EGL directly yet; the guest runtime uses the host GPU on their behalf |
+| Bionic `libEGL`/`libGLESv2` shim (`pengudroid-gleshim`) | **Working** | exports the EGL API (and core GLES2); an app's EGL/GL calls render on the host GPU and swap into Wayland as dma-bufs — `fixtures/egl-app` swaps 5 frames |
 | `LD_PRELOAD` Bionic→glibc shim (`libashmem`, logging, props, API level) | **Working** | interposes real Bionic symbol names; `__android_log_print` formats with the host `vsnprintf` |
 | Service registry + `phone`/`media.camera`/AMS/PMS/SurfaceFlinger stubs | **Stub** | correctly-named interfaces, minimal replies |
 | Audio: PipeWire | **Stub** | `dlopen` availability probe + shared ring buffer; the pump into PipeWire is not written |

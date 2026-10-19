@@ -1,0 +1,1392 @@
+//! Bionic-compatible `libEGL` / `libGLESv2` running on the *host* GPU.
+//!
+//! Android apps (and their bundled native libraries) call the Bionic EGL/GLES
+//! entry points directly. This crate implements the small subset they need by
+//! `dlopen`ing the host's `libEGL.so.1` / `libGLESv2.so.2` at runtime — there
+//! are no `-dev` headers involved — and by rendering into an offscreen FBO.
+//!
+//! Every [`eglSwapBuffers`] exports the FBO's texture as a dma-buf with
+//! `EGL_MESA_image_dma_buf_export` and hands the fd to the PenguDroid daemon as
+//! a [`Message::PresentDmabuf`] over `SCM_RIGHTS`. The daemon imports the
+//! buffer into its Wayland surface, so the frame reaches the screen with no CPU
+//! copy and no `wl_shm`.
+//!
+//! # Surfaces
+//!
+//! A Bionic app passes an `ANativeWindow*` to `eglCreateWindowSurface`, but
+//! PenguDroid has no real native window: the geometry is supplied out of band
+//! via `PENGUDROID_SURFACE_W` / `PENGUDROID_SURFACE_H`. The returned
+//! `EGLSurface` is an opaque pointer to a [`SurfaceRec`] owned by this crate;
+//! it is *not* a host EGL surface because a surfaceless display has none.
+//!
+//! # Global state and locking
+//!
+//! The host entry-point table is immutable after the first load ([`OnceLock`]).
+//! Everything mutable (cached display, current surface, daemon connection and
+//! surface id) lives under one [`Mutex`]. That mutex is never held across
+//! arbitrary host calls; in `eglSwapBuffers` it is held for one daemon
+//! request/response only (the socket has a short read timeout), so a missing or
+//! wedged daemon can never hang the guest.
+
+#![allow(non_snake_case)]
+#![allow(clippy::missing_safety_doc)]
+
+use std::ffi::{c_char, c_int, c_void, CString};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
+
+use pengudroid_proto::{default_socket_path, Message, Role, PROTO_VERSION};
+use pengudroid_socket::Connection;
+
+// ---------------------------------------------------------------------------
+// EGL/GLES types and constants
+// ---------------------------------------------------------------------------
+
+pub type EGLDisplay = *mut c_void;
+pub type EGLContext = *mut c_void;
+pub type EGLConfig = *mut c_void;
+pub type EGLSurface = *mut c_void;
+type EGLImageKHR = *mut c_void;
+type EGLClientBuffer = *mut c_void;
+
+const EGL_TRUE: u32 = 1;
+const EGL_FALSE: u32 = 0;
+const EGL_NOT_INITIALIZED: i32 = 0x3001;
+
+const EGL_PLATFORM_SURFACELESS_MESA: u32 = 0x31DD;
+const EGL_GL_TEXTURE_2D_KHR: u32 = 0x30B1;
+
+const GL_TEXTURE_2D: u32 = 0x0DE1;
+const GL_RGBA: i32 = 0x1908;
+const GL_RGBA8: i32 = 0x8058;
+const GL_UNSIGNED_BYTE: u32 = 0x1401;
+const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
+const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
+const GL_LINEAR: i32 = 0x2601;
+const GL_FRAMEBUFFER: u32 = 0x8D40;
+const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
+
+// ---------------------------------------------------------------------------
+// Host entry-point signatures
+// ---------------------------------------------------------------------------
+
+type EglGetProcAddress = unsafe extern "C" fn(*const c_char) -> *mut c_void;
+type EglGetDisplay = unsafe extern "C" fn(*mut c_void) -> EGLDisplay;
+type EglGetPlatformDisplayEXT =
+    unsafe extern "C" fn(u32, *mut c_void, *const c_int) -> EGLDisplay;
+type EglInitialize = unsafe extern "C" fn(EGLDisplay, *mut c_int, *mut c_int) -> u32;
+type EglTerminate = unsafe extern "C" fn(EGLDisplay) -> u32;
+type EglQueryString = unsafe extern "C" fn(EGLDisplay, c_int) -> *const c_char;
+type EglGetError = unsafe extern "C" fn() -> c_int;
+type EglChooseConfig =
+    unsafe extern "C" fn(EGLDisplay, *const c_int, *mut EGLConfig, c_int, *mut c_int) -> u32;
+type EglGetConfigAttrib = unsafe extern "C" fn(EGLDisplay, EGLConfig, c_int, *mut c_int) -> u32;
+type EglCreateContext =
+    unsafe extern "C" fn(EGLDisplay, EGLConfig, EGLContext, *const c_int) -> EGLContext;
+type EglDestroyContext = unsafe extern "C" fn(EGLDisplay, EGLContext) -> u32;
+type EglMakeCurrent =
+    unsafe extern "C" fn(EGLDisplay, EGLSurface, EGLSurface, EGLContext) -> u32;
+type EglGetCurrentContext = unsafe extern "C" fn() -> EGLContext;
+type EglGetCurrentDisplay = unsafe extern "C" fn() -> EGLDisplay;
+type EglBindAPI = unsafe extern "C" fn(u32) -> u32;
+type EglSwapInterval = unsafe extern "C" fn(EGLDisplay, c_int) -> u32;
+type EglCreateImageKHR =
+    unsafe extern "C" fn(EGLDisplay, EGLContext, u32, EGLClientBuffer, *const c_int) -> EGLImageKHR;
+type EglDestroyImageKHR = unsafe extern "C" fn(EGLDisplay, EGLImageKHR) -> u32;
+type EglExportDMABUFImageQueryMESA =
+    unsafe extern "C" fn(EGLDisplay, EGLImageKHR, *mut c_int, *mut c_int, *mut u64) -> u32;
+type EglExportDMABUFImageMESA =
+    unsafe extern "C" fn(EGLDisplay, EGLImageKHR, *mut c_int, *mut c_int, *mut c_int) -> u32;
+
+type GlGenTextures = unsafe extern "C" fn(c_int, *mut u32);
+type GlBindTexture = unsafe extern "C" fn(u32, u32);
+type GlTexImage2D = unsafe extern "C" fn(
+    u32,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    u32,
+    u32,
+    *const c_void,
+);
+type GlTexParameteri = unsafe extern "C" fn(u32, u32, c_int);
+type GlGenFramebuffers = unsafe extern "C" fn(c_int, *mut u32);
+type GlBindFramebuffer = unsafe extern "C" fn(u32, u32);
+type GlFramebufferTexture2D = unsafe extern "C" fn(u32, u32, u32, u32, c_int);
+type GlViewport = unsafe extern "C" fn(c_int, c_int, c_int, c_int);
+type GlGetError = unsafe extern "C" fn() -> u32;
+type GlGetString = unsafe extern "C" fn(u32) -> *const u8;
+type GlClear = unsafe extern "C" fn(u32);
+type GlClearColor = unsafe extern "C" fn(f32, f32, f32, f32);
+type GlFinish = unsafe extern "C" fn();
+type GlFlush = unsafe extern "C" fn();
+
+// ---------------------------------------------------------------------------
+// Host table
+// ---------------------------------------------------------------------------
+
+struct Host {
+    /// `libGLESv2` handle, kept for the `eglGetProcAddress` dlsym fallback.
+    gles_handle: usize,
+
+    get_proc_address: Option<EglGetProcAddress>,
+    get_display: EglGetDisplay,
+    get_platform_display_ext: Option<EglGetPlatformDisplayEXT>,
+    initialize: EglInitialize,
+    terminate: EglTerminate,
+    query_string: EglQueryString,
+    get_error: EglGetError,
+    choose_config: EglChooseConfig,
+    get_config_attrib: EglGetConfigAttrib,
+    create_context: EglCreateContext,
+    destroy_context: EglDestroyContext,
+    make_current: EglMakeCurrent,
+    get_current_context: Option<EglGetCurrentContext>,
+    get_current_display: Option<EglGetCurrentDisplay>,
+    bind_api: Option<EglBindAPI>,
+    swap_interval: Option<EglSwapInterval>,
+    create_image_khr: Option<EglCreateImageKHR>,
+    destroy_image_khr: Option<EglDestroyImageKHR>,
+    export_dmabuf_query: Option<EglExportDMABUFImageQueryMESA>,
+    export_dmabuf_export: Option<EglExportDMABUFImageMESA>,
+
+    gl_gen_textures: Option<GlGenTextures>,
+    gl_bind_texture: Option<GlBindTexture>,
+    gl_tex_image_2d: Option<GlTexImage2D>,
+    gl_tex_parameter_i: Option<GlTexParameteri>,
+    gl_gen_framebuffers: Option<GlGenFramebuffers>,
+    gl_bind_framebuffer: Option<GlBindFramebuffer>,
+    gl_framebuffer_texture_2d: Option<GlFramebufferTexture2D>,
+    gl_viewport: Option<GlViewport>,
+    gl_get_error: Option<GlGetError>,
+    gl_get_string: Option<GlGetString>,
+    gl_clear: Option<GlClear>,
+    gl_clear_color: Option<GlClearColor>,
+    gl_finish: Option<GlFinish>,
+    gl_flush: Option<GlFlush>,
+}
+
+impl Host {
+    fn load() -> Result<Host, String> {
+        let egl_handle = open_first(&["libEGL.so.1", "libEGL.so", "libEGL_mesa.so.0"])
+            .ok_or_else(|| "could not dlopen libEGL.so.1".to_string())?;
+        let gles_handle = open_first(&["libGLESv2.so.2", "libGLESv2.so"])
+            .ok_or_else(|| "could not dlopen libGLESv2.so.2".to_string())?;
+
+        // Core entry points are looked up in libEGL itself; the extension
+        // entry points may only be published through `eglGetProcAddress`.
+        let core = |name: &str| sym_ptr(egl_handle, name);
+
+        let get_proc_address: Option<EglGetProcAddress> =
+            core("eglGetProcAddress").and_then(cast_fn);
+
+        let proc_or_sym = |name: &str| -> Option<*mut c_void> {
+            if let Some(get_proc_address) = get_proc_address {
+                if let Ok(c_name) = CString::new(name) {
+                    // SAFETY: `get_proc_address` is the host EGL entry point and
+                    // `c_name` is a valid NUL-terminated string.
+                    let ptr = unsafe { get_proc_address(c_name.as_ptr()) };
+                    if !ptr.is_null() {
+                        return Some(ptr);
+                    }
+                }
+            }
+            sym_ptr(egl_handle, name)
+        };
+
+        let gl_proc = |name: &str| -> Option<*mut c_void> {
+            if let Some(get_proc_address) = get_proc_address {
+                if let Ok(c_name) = CString::new(name) {
+                    // SAFETY: as above.
+                    let ptr = unsafe { get_proc_address(c_name.as_ptr()) };
+                    if !ptr.is_null() {
+                        return Some(ptr);
+                    }
+                }
+            }
+            sym_ptr(gles_handle, name).or_else(|| sym_ptr(egl_handle, name))
+        };
+
+        Ok(Host {
+            gles_handle: gles_handle as usize,
+            get_proc_address,
+            get_display: need(core("eglGetDisplay"), "eglGetDisplay")?,
+            get_platform_display_ext: proc_or_sym("eglGetPlatformDisplayEXT")
+                .and_then(cast_fn),
+            initialize: need(core("eglInitialize"), "eglInitialize")?,
+            terminate: need(core("eglTerminate"), "eglTerminate")?,
+            query_string: need(core("eglQueryString"), "eglQueryString")?,
+            get_error: need(core("eglGetError"), "eglGetError")?,
+            choose_config: need(core("eglChooseConfig"), "eglChooseConfig")?,
+            get_config_attrib: need(core("eglGetConfigAttrib"), "eglGetConfigAttrib")?,
+            create_context: need(core("eglCreateContext"), "eglCreateContext")?,
+            destroy_context: need(core("eglDestroyContext"), "eglDestroyContext")?,
+            make_current: need(core("eglMakeCurrent"), "eglMakeCurrent")?,
+            get_current_context: core("eglGetCurrentContext").and_then(cast_fn),
+            get_current_display: core("eglGetCurrentDisplay").and_then(cast_fn),
+            bind_api: core("eglBindAPI").and_then(cast_fn),
+            swap_interval: core("eglSwapInterval").and_then(cast_fn),
+            create_image_khr: proc_or_sym("eglCreateImageKHR").and_then(cast_fn),
+            destroy_image_khr: proc_or_sym("eglDestroyImageKHR").and_then(cast_fn),
+            export_dmabuf_query: proc_or_sym("eglExportDMABUFImageQueryMESA")
+                .and_then(cast_fn),
+            export_dmabuf_export: proc_or_sym("eglExportDMABUFImageMESA")
+                .and_then(cast_fn),
+
+            gl_gen_textures: gl_proc("glGenTextures").and_then(cast_fn),
+            gl_bind_texture: gl_proc("glBindTexture").and_then(cast_fn),
+            gl_tex_image_2d: gl_proc("glTexImage2D").and_then(cast_fn),
+            gl_tex_parameter_i: gl_proc("glTexParameteri").and_then(cast_fn),
+            gl_gen_framebuffers: gl_proc("glGenFramebuffers").and_then(cast_fn),
+            gl_bind_framebuffer: gl_proc("glBindFramebuffer").and_then(cast_fn),
+            gl_framebuffer_texture_2d: gl_proc("glFramebufferTexture2D")
+                .and_then(cast_fn),
+            gl_viewport: gl_proc("glViewport").and_then(cast_fn),
+            gl_get_error: gl_proc("glGetError").and_then(cast_fn),
+            gl_get_string: gl_proc("glGetString").and_then(cast_fn),
+            gl_clear: gl_proc("glClear").and_then(cast_fn),
+            gl_clear_color: gl_proc("glClearColor").and_then(cast_fn),
+            gl_finish: gl_proc("glFinish").and_then(cast_fn),
+            gl_flush: gl_proc("glFlush").and_then(cast_fn),
+        })
+    }
+}
+
+static HOST: OnceLock<Result<Host, String>> = OnceLock::new();
+
+fn host() -> Result<&'static Host, String> {
+    HOST.get_or_init(Host::load).as_ref().map_err(Clone::clone)
+}
+
+fn open_first(names: &[&str]) -> Option<*mut c_void> {
+    for name in names {
+        if let Ok(c_name) = CString::new(*name) {
+            // SAFETY: `c_name` is a valid NUL-terminated soname.
+            let handle =
+                unsafe { libc::dlopen(c_name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+            if !handle.is_null() {
+                return Some(handle);
+            }
+        }
+    }
+    None
+}
+
+fn sym_ptr(handle: *mut c_void, name: &str) -> Option<*mut c_void> {
+    let c_name = CString::new(name).ok()?;
+    // SAFETY: `handle` came from `dlopen` and `c_name` is a valid C string.
+    let ptr = unsafe { libc::dlsym(handle, c_name.as_ptr()) };
+    if ptr.is_null() {
+        None
+    } else {
+        Some(ptr)
+    }
+}
+
+fn need<T: Copy>(ptr: Option<*mut c_void>, name: &str) -> Result<T, String> {
+    ptr.and_then(cast_fn)
+        .ok_or_else(|| format!("host symbol `{name}` is missing"))
+}
+
+/// Reinterpret a `dlsym`/`eglGetProcAddress` result as a function pointer.
+///
+/// The caller only instantiates `T` with an `unsafe extern "C" fn` type that
+/// matches the symbol the pointer was looked up under. POSIX guarantees the
+/// representation of `void *` matches a function pointer on Linux.
+fn cast_fn<T: Copy>(ptr: *mut c_void) -> Option<T> {
+    if ptr.is_null() {
+        return None;
+    }
+    debug_assert_eq!(
+        std::mem::size_of::<T>(),
+        std::mem::size_of::<*mut c_void>()
+    );
+    // SAFETY: see the function comment.
+    Some(unsafe { std::mem::transmute_copy(&ptr) })
+}
+
+// ---------------------------------------------------------------------------
+// Mutable global state
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct State {
+    /// Host `EGLDisplay`, stored as `usize` so `State` stays `Send`.
+    display: usize,
+    /// Host `EGLContext` that the app most recently made current.
+    context: usize,
+    /// Our `EGLSurface` (`*mut SurfaceRec`) currently made current.
+    current_surface: usize,
+
+    conn: Option<Connection>,
+    surface_id: Option<u32>,
+    /// Whether we already tried (and possibly failed) to reach the daemon.
+    connect_attempted: bool,
+}
+
+fn state() -> &'static Mutex<State> {
+    static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(State::default()))
+}
+
+fn lock_state() -> MutexGuard<'static, State> {
+    // A panic in another FFI call poisons the mutex; recover so a guest never
+    // sees a hard failure because of it.
+    state().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+static LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Emit the first diagnostic only. Bytecode loaders call EGL from many threads
+/// and a missing daemon would otherwise flood the guest's stderr.
+fn log_once(args: std::fmt::Arguments<'_>) {
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        eprintln!("[pengudroid-gleshim] {args}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Surfaces and FBOs
+// ---------------------------------------------------------------------------
+
+/// The object behind every `EGLSurface` this crate hands out.
+struct SurfaceRec {
+    w: u32,
+    h: u32,
+    tex: u32,
+    fbo: u32,
+}
+
+fn env_dim(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(default)
+}
+
+/// Lazily create the colour texture + FBO for `surface`. The host context must
+/// be current on this thread.
+unsafe fn ensure_fbo(surface: EGLSurface, host: &Host) -> Result<(), String> {
+    let rec = &mut *(surface as *mut SurfaceRec);
+    if rec.tex != 0 && rec.fbo != 0 {
+        return Ok(());
+    }
+
+    let gen_textures = host
+        .gl_gen_textures
+        .ok_or_else(|| "host glGenTextures is unavailable".to_string())?;
+    let bind_texture = host
+        .gl_bind_texture
+        .ok_or_else(|| "host glBindTexture is unavailable".to_string())?;
+    let tex_image_2d = host
+        .gl_tex_image_2d
+        .ok_or_else(|| "host glTexImage2D is unavailable".to_string())?;
+    let tex_parameter_i = host
+        .gl_tex_parameter_i
+        .ok_or_else(|| "host glTexParameteri is unavailable".to_string())?;
+    let gen_framebuffers = host
+        .gl_gen_framebuffers
+        .ok_or_else(|| "host glGenFramebuffers is unavailable".to_string())?;
+    let bind_framebuffer = host
+        .gl_bind_framebuffer
+        .ok_or_else(|| "host glBindFramebuffer is unavailable".to_string())?;
+    let framebuffer_texture_2d = host
+        .gl_framebuffer_texture_2d
+        .ok_or_else(|| "host glFramebufferTexture2D is unavailable".to_string())?;
+
+    let mut tex = 0u32;
+    gen_textures(1, &mut tex);
+    if tex == 0 {
+        return Err("glGenTextures returned 0".into());
+    }
+    bind_texture(GL_TEXTURE_2D, tex);
+    tex_image_2d(
+        GL_TEXTURE_2D,
+        0,
+        GL_RGBA8,
+        rec.w as c_int,
+        rec.h as c_int,
+        0,
+        GL_RGBA as u32,
+        GL_UNSIGNED_BYTE,
+        std::ptr::null(),
+    );
+    tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    let mut fbo = 0u32;
+    gen_framebuffers(1, &mut fbo);
+    if fbo == 0 {
+        return Err("glGenFramebuffers returned 0".into());
+    }
+    bind_framebuffer(GL_FRAMEBUFFER, fbo);
+    framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+
+    rec.tex = tex;
+    rec.fbo = fbo;
+    Ok(())
+}
+
+/// Bind the surface's FBO and set the viewport, creating it first if needed.
+unsafe fn bind_surface_fbo(surface: EGLSurface, host: &Host) -> Result<(), String> {
+    ensure_fbo(surface, host)?;
+    let rec = &*(surface as *const SurfaceRec);
+    if let Some(bind_framebuffer) = host.gl_bind_framebuffer {
+        bind_framebuffer(GL_FRAMEBUFFER, rec.fbo);
+    }
+    if let Some(viewport) = host.gl_viewport {
+        viewport(0, 0, rec.w as c_int, rec.h as c_int);
+    }
+    Ok(())
+}
+
+/// Make sure a host context is current on this thread before any GL/export.
+unsafe fn ensure_host_context(host: &Host) -> Result<(), String> {
+    if let Some(get_current_context) = host.get_current_context {
+        if !get_current_context().is_null() {
+            return Ok(());
+        }
+        let (display, context) = {
+            let st = lock_state();
+            (st.display, st.context)
+        };
+        if display != 0 && context != 0 {
+            let ok = (host.make_current)(
+                display as EGLDisplay,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                context as EGLContext,
+            );
+            if ok == EGL_TRUE {
+                return Ok(());
+            }
+        }
+        Err("no current EGL context".into())
+    } else {
+        // We cannot query the driver; assume the app made the context current.
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dma-buf export
+// ---------------------------------------------------------------------------
+
+/// Plane 0 of an exported EGLImage. The caller owns `fd`.
+#[derive(Debug, Clone, Copy)]
+pub struct DmabufExport {
+    pub fd: RawFd,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub fourcc: u32,
+    pub modifier: u64,
+    pub offset: u32,
+}
+
+/// Export the texture of `surface` as a dma-buf.
+///
+/// The host context must be current. The internal EGL context value is passed
+/// to `eglCreateImageKHR` — Mesa's Iris driver dereferences it and segfaults if
+/// `EGL_NO_CONTEXT` is used.
+pub fn export_surface_dmabuf(surface: EGLSurface) -> Result<DmabufExport, String> {
+    if surface.is_null() {
+        return Err("export: null EGLSurface".into());
+    }
+    let host = host()?;
+
+    let create_image = host
+        .create_image_khr
+        .ok_or_else(|| "EGL_KHR_image_base (eglCreateImageKHR) is unavailable".to_string())?;
+    let destroy_image = host
+        .destroy_image_khr
+        .ok_or_else(|| "eglDestroyImageKHR is unavailable".to_string())?;
+    let query_image = host
+        .export_dmabuf_query
+        .ok_or_else(|| "EGL_MESA_image_dma_buf_export is unavailable".to_string())?;
+    let export_image = host
+        .export_dmabuf_export
+        .ok_or_else(|| "EGL_MESA_image_dma_buf_export is unavailable".to_string())?;
+
+    unsafe {
+        // Direct callers of this helper may not have made the context current
+        // even though they set one up earlier.
+        ensure_host_context(host)?;
+        ensure_fbo(surface, host)?;
+    }
+    let rec = unsafe { &*(surface as *const SurfaceRec) };
+    if rec.tex == 0 {
+        return Err("export: surface has no texture".into());
+    }
+
+    // The display and current context. Never pass `EGL_NO_CONTEXT`.
+    let (cached_display, cached_context) = {
+        let st = lock_state();
+        (st.display, st.context)
+    };
+    let current_context = host
+        .get_current_context
+        .map(|f| unsafe { f() })
+        .unwrap_or(std::ptr::null_mut());
+    let context = if current_context.is_null() {
+        if cached_context == 0 {
+            return Err("export: no current EGLContext".into());
+        }
+        cached_context as EGLContext
+    } else {
+        current_context
+    };
+    let display = host
+        .get_current_display
+        .map(|f| unsafe { f() })
+        .filter(|d| !d.is_null())
+        .unwrap_or(cached_display as EGLDisplay);
+    if display.is_null() {
+        return Err("export: display is not initialized".into());
+    }
+
+    // SAFETY: the texture belongs to the current context and `image` is
+    // destroyed below on every path.
+    let image = unsafe {
+        create_image(
+            display,
+            context,
+            EGL_GL_TEXTURE_2D_KHR,
+            rec.tex as usize as EGLClientBuffer,
+            std::ptr::null(),
+        )
+    };
+    if image.is_null() {
+        return Err(format!("eglCreateImageKHR failed: {}", host_error(host)));
+    }
+
+    let result = export_plane0(
+        host,
+        display,
+        image,
+        query_image,
+        export_image,
+        rec.w,
+        rec.h,
+    );
+    // SAFETY: `image` was created above and is not used afterwards.
+    unsafe { destroy_image(display, image) };
+    result
+}
+
+fn export_plane0(
+    host: &Host,
+    display: EGLDisplay,
+    image: EGLImageKHR,
+    query_image: EglExportDMABUFImageQueryMESA,
+    export_image: EglExportDMABUFImageMESA,
+    width: u32,
+    height: u32,
+) -> Result<DmabufExport, String> {
+    let mut fourcc: c_int = 0;
+    let mut num_planes: c_int = 0;
+    let mut modifiers = [0u64; 4];
+
+    // SAFETY: `image` is live, the out-pointers are valid, and `modifiers` has
+    // room for the number of planes the extension reports.
+    let ok = unsafe { query_image(display, image, &mut fourcc, &mut num_planes, modifiers.as_mut_ptr()) };
+    if ok != EGL_TRUE {
+        return Err(format!(
+            "eglExportDMABUFImageQueryMESA failed: {}",
+            host_error(host)
+        ));
+    }
+    if num_planes < 1 {
+        return Err("dmabuf export reported no planes".into());
+    }
+    let planes = (num_planes as usize).min(modifiers.len());
+
+    let mut fds = [-1i32; 4];
+    let mut strides = [0i32; 4];
+    let mut offsets = [0i32; 4];
+    // SAFETY: three arrays of at least `num_planes` `int`s, as required.
+    let ok = unsafe {
+        export_image(
+            display,
+            image,
+            fds.as_mut_ptr(),
+            strides.as_mut_ptr(),
+            offsets.as_mut_ptr(),
+        )
+    };
+    if ok != EGL_TRUE {
+        close_exported_fds(&fds[..planes]);
+        return Err(format!(
+            "eglExportDMABUFImageMESA failed: {}",
+            host_error(host)
+        ));
+    }
+    if fds[0] < 0 {
+        close_exported_fds(&fds[..planes]);
+        return Err("dmabuf export returned an invalid fd".into());
+    }
+
+    // Only plane 0 is presented; close any additional planes (avoiding dupes).
+    for i in 1..planes {
+        if fds[i] >= 0 && !fds[..i].contains(&fds[i]) {
+            // SAFETY: this fd was just created by the export extension.
+            unsafe { libc::close(fds[i]) };
+        }
+    }
+
+    Ok(DmabufExport {
+        fd: fds[0],
+        width,
+        height,
+        stride: strides[0] as u32,
+        fourcc: fourcc as u32,
+        modifier: modifiers[0],
+        offset: offsets[0] as u32,
+    })
+}
+
+fn close_exported_fds(fds: &[RawFd]) {
+    for &fd in fds {
+        if fd >= 0 {
+            // SAFETY: these fds are owned by us and not closed elsewhere.
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+fn host_error(host: &Host) -> String {
+    // SAFETY: plain entry point with no arguments.
+    let code = unsafe { (host.get_error)() };
+    format!("EGL error 0x{code:04X}")
+}
+
+// ---------------------------------------------------------------------------
+// Daemon presentation
+// ---------------------------------------------------------------------------
+
+fn close_fds(fds: &[RawFd]) {
+    for &fd in fds {
+        if fd >= 0 {
+            // SAFETY: the socket layer transferred ownership of these fds.
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+/// Connect + handshake + resolve/create the surface id, lazily and once.
+fn ensure_surface_id(st: &mut State, w: u32, h: u32) -> Result<u32, String> {
+    if let Some(id) = st.surface_id {
+        return Ok(id);
+    }
+
+    if st.conn.is_none() {
+        if st.connect_attempted {
+            return Err("daemon is unavailable".into());
+        }
+        st.connect_attempted = true;
+
+        let conn = Connection::connect(&default_socket_path())
+            .map_err(|e| format!("cannot connect to the daemon: {e}"))?;
+        // Never block a guest indefinitely behind a wedged daemon.
+        let _ = conn.set_read_timeout(Some(Duration::from_millis(500)));
+
+        let hello = Message::Hello {
+            version: PROTO_VERSION,
+            role: Role::Guest,
+            pid: std::process::id() as i32,
+        };
+        conn.send_message(&hello, &[])
+            .map_err(|e| format!("Hello failed: {e}"))?;
+        let (reply, fds) = conn
+            .recv_message()
+            .map_err(|e| format!("Welcome failed: {e}"))?;
+        close_fds(&fds);
+        match reply {
+            Message::Welcome { .. } => {}
+            other => return Err(format!("unexpected handshake reply: {other:?}")),
+        }
+        st.conn = Some(conn);
+    }
+
+    if let Ok(value) = std::env::var("PENGUDROID_SURFACE_ID") {
+        if let Ok(id) = value.trim().parse::<u32>() {
+            st.surface_id = Some(id);
+            return Ok(id);
+        }
+    }
+
+    let request = Message::CreateSurface {
+        width: w,
+        height: h,
+        title: "PenguDroid EGL".into(),
+    };
+    let send_result = match st.conn.as_ref() {
+        Some(conn) => conn.send_message(&request, &[]),
+        None => return Err("daemon is unavailable".into()),
+    };
+    if let Err(e) = send_result {
+        st.conn = None;
+        return Err(format!("CreateSurface failed: {e}"));
+    }
+
+    let recv_result = match st.conn.as_ref() {
+        Some(conn) => conn.recv_message(),
+        None => return Err("daemon is unavailable".into()),
+    };
+    let (reply, fds) = match recv_result {
+        Ok(v) => v,
+        Err(e) => {
+            st.conn = None;
+            return Err(format!("SurfaceCreated failed: {e}"));
+        }
+    };
+    close_fds(&fds);
+    match reply {
+        Message::SurfaceCreated { surface_id, .. } => {
+            st.surface_id = Some(surface_id);
+            Ok(surface_id)
+        }
+        Message::Error { code, message } => Err(format!(
+            "CreateSurface rejected ({code}): {message}"
+        )),
+        other => Err(format!("unexpected CreateSurface reply: {other:?}")),
+    }
+}
+
+/// Send one `PresentDmabuf` and wait for exactly one reply.
+///
+/// The connection is taken out of the global state for the duration, so even a
+/// blocked `recv` does not leave the mutex in a state that other EGL calls
+/// would deadlock on; the mutex is held only for this single request/response.
+fn present_dmabuf(
+    width: u32,
+    height: u32,
+    stride: u32,
+    fourcc: u32,
+    modifier: u64,
+    offset: u32,
+    fd: RawFd,
+) -> Result<(), String> {
+    let mut st = lock_state();
+    let surface_id = ensure_surface_id(&mut st, width, height)?;
+
+    let conn = st
+        .conn
+        .take()
+        .ok_or_else(|| "daemon is unavailable".to_string())?;
+
+    let mut io_failure = false;
+    let result = (|| -> Result<(), String> {
+        let msg = Message::PresentDmabuf {
+            surface_id,
+            width,
+            height,
+            stride,
+            fourcc,
+            modifier,
+            offset,
+        };
+        conn.send_message(&msg, &[fd]).map_err(|e| {
+            io_failure = true;
+            format!("PresentDmabuf send failed: {e}")
+        })?;
+        let (reply, fds) = conn.recv_message().map_err(|e| {
+            io_failure = true;
+            format!("PresentDmabuf reply failed: {e}")
+        })?;
+        close_fds(&fds);
+        match reply {
+            Message::Ack => Ok(()),
+            Message::Error { code, message } => {
+                Err(format!("present rejected ({code}): {message}"))
+            }
+            other => Err(format!("unexpected present reply: {other:?}")),
+        }
+    })();
+
+    if io_failure {
+        // Dead socket: allow a later swap to reconnect.
+        st.conn = None;
+        st.connect_attempted = false;
+    } else {
+        st.conn = Some(conn);
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Exported EGL API
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn eglGetDisplay(native_display: *mut c_void) -> EGLDisplay {
+    let host = match host() {
+        Ok(host) => host,
+        Err(e) => {
+            log_once(format_args!("{e}"));
+            return std::ptr::null_mut();
+        }
+    };
+
+    let mut display = std::ptr::null_mut();
+    if native_display.is_null() {
+        if let Some(get_platform_display) = host.get_platform_display_ext {
+            // SAFETY: the surfaceless platform ignores both arguments.
+            display = get_platform_display(
+                EGL_PLATFORM_SURFACELESS_MESA,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+        }
+    }
+    if display.is_null() {
+        // SAFETY: `EGL_DEFAULT_DISPLAY` is the null native display.
+        display = (host.get_display)(native_display);
+    }
+
+    if !display.is_null() {
+        let mut st = lock_state();
+        st.display = display as usize;
+    }
+    display
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglInitialize(
+    dpy: EGLDisplay,
+    major: *mut c_int,
+    minor: *mut c_int,
+) -> u32 {
+    let host = match host() {
+        Ok(host) => host,
+        Err(e) => {
+            log_once(format_args!("{e}"));
+            return EGL_FALSE;
+        }
+    };
+    let dpy = if dpy.is_null() {
+        lock_state().display as EGLDisplay
+    } else {
+        dpy
+    };
+    if dpy.is_null() {
+        return EGL_FALSE;
+    }
+    // SAFETY: `dpy` is a display handle from the host and the out-pointers are
+    // the caller's (valid or null, which EGL accepts).
+    let ok = (host.initialize)(dpy, major, minor);
+    if ok == EGL_TRUE {
+        lock_state().display = dpy as usize;
+    }
+    ok
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglTerminate(dpy: EGLDisplay) -> u32 {
+    match host() {
+        // SAFETY: `dpy` is the caller's display handle.
+        Ok(host) => (host.terminate)(dpy),
+        Err(_) => EGL_FALSE,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglGetError() -> c_int {
+    match host() {
+        // SAFETY: plain entry point.
+        Ok(host) => (host.get_error)(),
+        Err(_) => EGL_NOT_INITIALIZED,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglQueryString(dpy: EGLDisplay, name: c_int) -> *const c_char {
+    match host() {
+        // SAFETY: forwarded verbatim.
+        Ok(host) => (host.query_string)(dpy, name),
+        Err(_) => std::ptr::null(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglChooseConfig(
+    dpy: EGLDisplay,
+    attribs: *const c_int,
+    configs: *mut EGLConfig,
+    config_size: c_int,
+    num_config: *mut c_int,
+) -> u32 {
+    match host() {
+        // SAFETY: forwarded verbatim.
+        Ok(host) => (host.choose_config)(dpy, attribs, configs, config_size, num_config),
+        Err(_) => EGL_FALSE,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglGetConfigAttrib(
+    dpy: EGLDisplay,
+    config: EGLConfig,
+    attribute: c_int,
+    value: *mut c_int,
+) -> u32 {
+    match host() {
+        // SAFETY: forwarded verbatim.
+        Ok(host) => (host.get_config_attrib)(dpy, config, attribute, value),
+        Err(_) => EGL_FALSE,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglCreateContext(
+    dpy: EGLDisplay,
+    config: EGLConfig,
+    share_context: EGLContext,
+    attribs: *const c_int,
+) -> EGLContext {
+    match host() {
+        // SAFETY: forwarded verbatim.
+        Ok(host) => (host.create_context)(dpy, config, share_context, attribs),
+        Err(e) => {
+            log_once(format_args!("{e}"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglDestroyContext(dpy: EGLDisplay, ctx: EGLContext) -> u32 {
+    let ok = match host() {
+        // SAFETY: forwarded verbatim.
+        Ok(host) => (host.destroy_context)(dpy, ctx),
+        Err(_) => EGL_FALSE,
+    };
+    if ok == EGL_TRUE {
+        let mut st = lock_state();
+        if st.context == ctx as usize {
+            st.context = 0;
+        }
+    }
+    ok
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglMakeCurrent(
+    dpy: EGLDisplay,
+    draw: EGLSurface,
+    read: EGLSurface,
+    ctx: EGLContext,
+) -> u32 {
+    let host = match host() {
+        Ok(host) => host,
+        Err(e) => {
+            log_once(format_args!("{e}"));
+            return EGL_FALSE;
+        }
+    };
+
+    // A surfaceless host display has no window surfaces; the app renders into
+    // our FBO instead, so only the context is made current.
+    let ok = (host.make_current)(
+        dpy,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        ctx,
+    );
+    if ok != EGL_TRUE {
+        let mut st = lock_state();
+        st.current_surface = 0;
+        return EGL_FALSE;
+    }
+
+    {
+        let mut st = lock_state();
+        st.display = dpy as usize;
+        st.context = ctx as usize;
+        st.current_surface = draw as usize;
+    }
+
+    // `read` is ignored: the FBO is both the draw and read target.
+    let _ = read;
+
+    if !draw.is_null() {
+        // Binding has to happen after the context is current. `draw` is one of
+        // our `SurfaceRec`s; `ensure_fbo`/`bind_surface_fbo` need no lock.
+        if let Err(e) = bind_surface_fbo(draw, host) {
+            log_once(format_args!("eglMakeCurrent: {e}"));
+            return EGL_FALSE;
+        }
+    }
+    EGL_TRUE
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglGetCurrentContext() -> EGLContext {
+    if let Some(get_current_context) = host().ok().and_then(|h| h.get_current_context) {
+        // SAFETY: plain entry point.
+        return get_current_context();
+    }
+    lock_state().context as EGLContext
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglGetCurrentDisplay() -> EGLDisplay {
+    if let Some(get_current_display) = host().ok().and_then(|h| h.get_current_display) {
+        // SAFETY: plain entry point.
+        let display = get_current_display();
+        if !display.is_null() {
+            return display;
+        }
+    }
+    lock_state().display as EGLDisplay
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglBindAPI(api: u32) -> u32 {
+    match host().ok().and_then(|h| h.bind_api) {
+        // SAFETY: forwarded verbatim.
+        Some(bind_api) => bind_api(api),
+        None => EGL_FALSE,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglSwapInterval(dpy: EGLDisplay, interval: c_int) -> u32 {
+    match host().ok().and_then(|h| h.swap_interval) {
+        // SAFETY: forwarded verbatim.
+        Some(swap_interval) => swap_interval(dpy, interval),
+        None => EGL_FALSE,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglGetProcAddress(name: *const c_char) -> *mut c_void {
+    if name.is_null() {
+        return std::ptr::null_mut();
+    }
+    let host = match host() {
+        Ok(host) => host,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    if let Some(get_proc_address) = host.get_proc_address {
+        // SAFETY: `name` is the caller's NUL-terminated symbol name.
+        let ptr = get_proc_address(name);
+        if !ptr.is_null() {
+            return ptr;
+        }
+    }
+    if host.gles_handle != 0 {
+        // SAFETY: the handle came from dlopen and `name` is a valid C string.
+        let ptr = libc::dlsym(host.gles_handle as *mut c_void, name);
+        if !ptr.is_null() {
+            return ptr;
+        }
+    }
+    std::ptr::null_mut()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglCreateWindowSurface(
+    _dpy: EGLDisplay,
+    _config: EGLConfig,
+    native_window: *mut c_void,
+    _attribs: *const c_int,
+) -> EGLSurface {
+    // Bionic hands us an `ANativeWindow*`, which we deliberately ignore: there
+    // is no host window, only the FBO that `eglSwapBuffers` exports.
+    let _ = native_window;
+    let w = env_dim("PENGUDROID_SURFACE_W", 720);
+    let h = env_dim("PENGUDROID_SURFACE_H", 1280);
+    let rec = Box::new(SurfaceRec {
+        w,
+        h,
+        tex: 0,
+        fbo: 0,
+    });
+    let surface = Box::into_raw(rec) as EGLSurface;
+    lock_state().current_surface = surface as usize;
+    surface
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglDestroySurface(_dpy: EGLDisplay, surface: EGLSurface) -> u32 {
+    if surface.is_null() {
+        return EGL_FALSE;
+    }
+    {
+        let mut st = lock_state();
+        if st.current_surface == surface as usize {
+            st.current_surface = 0;
+        }
+    }
+    // SAFETY: `surface` was produced by `Box::into_raw` in
+    // `eglCreateWindowSurface` and is dropped exactly once here.
+    drop(Box::from_raw(surface as *mut SurfaceRec));
+    EGL_TRUE
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -> u32 {
+    if surface.is_null() {
+        return EGL_FALSE;
+    }
+    let host = match host() {
+        Ok(host) => host,
+        Err(e) => {
+            log_once(format_args!("{e}"));
+            return EGL_FALSE;
+        }
+    };
+
+    if let Err(e) = ensure_host_context(host) {
+        log_once(format_args!("eglSwapBuffers: {e}"));
+        return EGL_FALSE;
+    }
+    if let Err(e) = ensure_fbo(surface, host) {
+        log_once(format_args!("eglSwapBuffers: {e}"));
+        return EGL_FALSE;
+    }
+    if let Some(finish) = host.gl_finish {
+        finish();
+    }
+
+    let exported = match export_surface_dmabuf(surface) {
+        Ok(exported) => exported,
+        Err(e) => {
+            log_once(format_args!("eglSwapBuffers: {e}"));
+            return EGL_FALSE;
+        }
+    };
+    let rec = &*(surface as *const SurfaceRec);
+
+    // Take ownership so the fd is closed no matter how presentation ends; the
+    // daemon receives its own descriptor via SCM_RIGHTS.
+    // SAFETY: `exported.fd` is a freshly exported descriptor we own.
+    let fd = OwnedFd::from_raw_fd(exported.fd);
+
+    match present_dmabuf(
+        rec.w,
+        rec.h,
+        exported.stride,
+        exported.fourcc,
+        exported.modifier,
+        exported.offset,
+        fd.as_raw_fd(),
+    ) {
+        Ok(()) => EGL_TRUE,
+        Err(e) => {
+            log_once(format_args!("eglSwapBuffers: {e}"));
+            EGL_FALSE
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn eglReleaseThread() -> u32 {
+    EGL_TRUE
+}
+
+// ---------------------------------------------------------------------------
+// Exported GLESv2 API (a small forwarding surface)
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn glClear(mask: u32) {
+    if let Some(f) = host().ok().and_then(|h| h.gl_clear) {
+        // SAFETY: forwarded verbatim.
+        f(mask);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glClearColor(red: f32, green: f32, blue: f32, alpha: f32) {
+    if let Some(f) = host().ok().and_then(|h| h.gl_clear_color) {
+        // SAFETY: forwarded verbatim.
+        f(red, green, blue, alpha);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glViewport(x: c_int, y: c_int, width: c_int, height: c_int) {
+    if let Some(f) = host().ok().and_then(|h| h.gl_viewport) {
+        // SAFETY: forwarded verbatim.
+        f(x, y, width, height);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glFinish() {
+    if let Some(f) = host().ok().and_then(|h| h.gl_finish) {
+        // SAFETY: forwarded verbatim.
+        f();
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glFlush() {
+    if let Some(f) = host().ok().and_then(|h| h.gl_flush) {
+        // SAFETY: forwarded verbatim.
+        f();
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glGetError() -> u32 {
+    match host().ok().and_then(|h| h.gl_get_error) {
+        // SAFETY: forwarded verbatim.
+        Some(f) => f(),
+        None => 0,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn glGetString(name: u32) -> *const u8 {
+    match host().ok().and_then(|h| h.gl_get_string) {
+        // SAFETY: forwarded verbatim.
+        Some(f) => f(name),
+        None => std::ptr::null(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Resolve a GL entry point through the shim's own `eglGetProcAddress`.
+    unsafe fn gl_proc<T: Copy>(name: &str) -> Option<T> {
+        let c_name = CString::new(name).ok()?;
+        let ptr = eglGetProcAddress(c_name.as_ptr());
+        if ptr.is_null() {
+            return None;
+        }
+        Some(std::mem::transmute_copy(&ptr))
+    }
+
+    #[test]
+    fn host_egl_loads() {
+        match host() {
+            Ok(host) => {
+                assert!(
+                    host.get_proc_address.is_some(),
+                    "host eglGetProcAddress did not resolve"
+                );
+                assert!(
+                    host.create_image_khr.is_some(),
+                    "host eglCreateImageKHR did not resolve"
+                );
+                assert!(
+                    host.export_dmabuf_query.is_some(),
+                    "host eglExportDMABUFImageQueryMESA did not resolve"
+                );
+                assert!(host.gl_clear.is_some(), "host glClear did not resolve");
+                assert!(host.gl_finish.is_some(), "host glFinish did not resolve");
+            }
+            Err(e) => eprintln!("skip host_egl_loads: {e}"),
+        }
+    }
+
+    #[test]
+    fn create_context_and_swap_geometry() {
+        if let Err(e) = host() {
+            eprintln!("skip create_context_and_swap_geometry: {e}");
+            return;
+        }
+
+        // This test must exercise the no-daemon path.
+        std::env::remove_var("PENGUDROID_SURFACE_ID");
+        std::env::set_var("PENGUDROID_SURFACE_W", "64");
+        std::env::set_var("PENGUDROID_SURFACE_H", "48");
+
+        unsafe {
+            let dpy = eglGetDisplay(std::ptr::null_mut());
+            if dpy.is_null() {
+                eprintln!("skip create_context_and_swap_geometry: no EGL display");
+                return;
+            }
+            let mut major: c_int = 0;
+            let mut minor: c_int = 0;
+            if eglInitialize(dpy, &mut major, &mut minor) != EGL_TRUE {
+                eprintln!("skip create_context_and_swap_geometry: eglInitialize failed");
+                return;
+            }
+            assert_eq!(eglBindAPI(0x30A0), EGL_TRUE, "eglBindAPI(ES) failed");
+
+            let config_attribs: [c_int; 13] = [
+                0x3033, 0x0001, // EGL_SURFACE_TYPE, EGL_PBUFFER_BIT
+                0x3040, 0x0004, // EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT
+                0x3024, 8, // EGL_RED_SIZE
+                0x3023, 8, // EGL_GREEN_SIZE
+                0x3022, 8, // EGL_BLUE_SIZE
+                0x3021, 8, // EGL_ALPHA_SIZE
+                0x3038, // EGL_NONE
+            ];
+            let mut config: EGLConfig = std::ptr::null_mut();
+            let mut num_configs: c_int = 0;
+            assert_eq!(
+                eglChooseConfig(
+                    dpy,
+                    config_attribs.as_ptr(),
+                    &mut config,
+                    1,
+                    &mut num_configs,
+                ),
+                EGL_TRUE,
+                "eglChooseConfig failed"
+            );
+            assert!(num_configs >= 1 && !config.is_null(), "no config returned");
+
+            let context_attribs: [c_int; 3] = [0x3098, 2, 0x3038]; // client version 2
+            let ctx = eglCreateContext(
+                dpy,
+                config,
+                std::ptr::null_mut(),
+                context_attribs.as_ptr(),
+            );
+            assert!(!ctx.is_null(), "eglCreateContext failed");
+
+            let surface =
+                eglCreateWindowSurface(dpy, config, std::ptr::null_mut(), std::ptr::null());
+            assert!(!surface.is_null(), "eglCreateWindowSurface failed");
+
+            assert_eq!(
+                eglMakeCurrent(dpy, surface, surface, ctx),
+                EGL_TRUE,
+                "eglMakeCurrent failed"
+            );
+
+            let clear_color: Option<unsafe extern "C" fn(f32, f32, f32, f32)> =
+                gl_proc("glClearColor");
+            let clear: Option<unsafe extern "C" fn(u32)> = gl_proc("glClear");
+            let clear_color = clear_color.expect("glClearColor must resolve");
+            let clear = clear.expect("glClear must resolve");
+            clear_color(1.0, 0.0, 0.0, 1.0);
+            clear(0x4000); // GL_COLOR_BUFFER_BIT
+
+            let exported =
+                export_surface_dmabuf(surface).expect("dmabuf export must succeed");
+            assert!(exported.fd >= 0, "export returned an invalid fd");
+            let rec = &*(surface as *const SurfaceRec);
+            assert_eq!(exported.width, 64, "export width must match the surface");
+            assert_eq!(exported.height, 48, "export height must match the surface");
+            assert_eq!(rec.w, 64);
+            assert_eq!(rec.h, 48);
+            assert_eq!(exported.stride % 4, 0, "stride is not pixel aligned");
+            assert!(exported.fourcc != 0, "export returned no fourcc");
+
+            // We own the fd from the export.
+            libc::close(exported.fd);
+
+            assert_eq!(eglDestroySurface(dpy, surface), EGL_TRUE);
+            assert_eq!(eglDestroyContext(dpy, ctx), EGL_TRUE);
+        }
+    }
+}

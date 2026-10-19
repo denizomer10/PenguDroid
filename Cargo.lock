@@ -102,6 +102,15 @@ name = "pengudroid-elf"
 version = "0.1.0"
 
 [[package]]
+name = "pengudroid-gleshim"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "pengudroid-proto",
+ "pengudroid-socket",
+]
+
+[[package]]
 name = "pengudroid-hostgpu"
 version = "0.1.0"
 dependencies = [
