@@ -241,6 +241,41 @@ runtime state (observed on `librtb.so`, hence `__dlopen` exits via `_exit`
 without running destructors). The `__sF` stdio array satisfies linkage but is
 not ABI-compatible with glibc's `FILE`.
 
+### 8.5 Running, not just loading
+
+Three things separate *loading* a Bionic library from *running* it.
+
+**Teardown.** C++ libraries register static destructors via `__cxa_atexit`; those
+destructors assume Bionic runtime state and fault on glibc (this is what
+segfaulted `librtb.so` on `dlclose`). The shim interposes `__cxa_atexit`,
+`atexit`, `__cxa_thread_atexit_impl` and `__cxa_finalize`. When
+`PENGUDROID_SUPPRESS_DESTRUCTORS` is set, registration is skipped and finalisation
+is a no-op; otherwise the calls are forwarded to glibc via `dlsym(RTLD_NEXT)`.
+`pengudroid nativelib --dlclose` sets it for guests and exercises the teardown
+path, so the difference is observable (faulting destructor: 139 → 0).
+
+**`__sF`.** Bionic exposes `FILE __sF[3]` with `stdout`/`stderr` as
+`&__sF[1..2]`. glibc has no such symbol and a different `FILE` layout, so the
+shim interposes the common stdio calls and rewrites an `__sF`-resident `FILE*`
+to glibc's real stream before forwarding (the index comes from
+`offset / 152`, Bionic's LP64 `sizeof(FILE)`). `fprintf` cannot build a
+`va_list` in stable Rust, so it writes its format string literally; `vfprintf`
+receives a real `va_list` and is fully forwarded. `fclose` on a standard stream
+is a no-op so guest code cannot close the host's streams.
+
+**Library sets.** An app that ships `libc++_shared.so` needs it loaded *with* its
+dependents. `nativelib --apk` extracts and strips the whole `lib/<abi>` set into
+one directory, so `DT_NEEDED` entries resolve inside it rather than against the
+host. `fixtures/cpp-cascade` exercises exactly this: a consumer library depends
+on the bundled runtime and returns `42` through it.
+
+A build detail worth recording: the variadic log entry points are written in C
+(stable Rust cannot define `...`), and Rust's cdylib export list hides
+C-defined symbols while a static-archive member is dropped if unreferenced. The
+build therefore links them with `--undefined` + `--export-dynamic-symbol` and
+assigns them to the `LIBC` version node; without that, `__android_log_print` was
+silently absent from the `.so`.
+
 ## 9. GPU path: host EGL/GLES and dma-buf presentation
 
 `pengudroid-hostgpu` binds the **host's** graphics stack with `dlopen` — no

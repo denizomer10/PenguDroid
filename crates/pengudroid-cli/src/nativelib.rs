@@ -196,6 +196,10 @@ struct NativeArgs {
     abi: Option<String>,
     call: Option<String>,
     lib_dir: Option<PathBuf>,
+    /// Exercise `dlclose` (teardown) instead of exiting via `_exit`.
+    dlclose: bool,
+    /// Ask the shim to suppress Bionic C++ destructors (default on).
+    suppress_destructors: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<NativeArgs, String> {
@@ -204,6 +208,8 @@ fn parse_args(args: &[String]) -> Result<NativeArgs, String> {
     let mut abi = None;
     let mut call = None;
     let mut lib_dir = None;
+    let mut dlclose = false;
+    let mut suppress_destructors = true;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -211,6 +217,8 @@ fn parse_args(args: &[String]) -> Result<NativeArgs, String> {
             "--lib-dir" => lib_dir = Some(PathBuf::from(it.next().ok_or("--lib-dir needs a DIR")?)),
             "--apk" => apk = Some(it.next().ok_or("--apk needs a PATH")?.clone()),
             "--abi" => abi = Some(it.next().ok_or("--abi needs a NAME")?.clone()),
+            "--dlclose" => dlclose = true,
+            "--no-suppress-destructors" => suppress_destructors = false,
             other if other.starts_with('-') => {
                 return Err(format!("unknown option: {other}"));
             }
@@ -224,7 +232,7 @@ fn parse_args(args: &[String]) -> Result<NativeArgs, String> {
                 .into(),
         );
     }
-    Ok(NativeArgs { lib, apk, abi, call, lib_dir })
+    Ok(NativeArgs { lib, apk, abi, call, lib_dir, dlclose, suppress_destructors })
 }
 
 /// The Android ABI directory that matches this host's architecture.
@@ -337,7 +345,12 @@ pub fn nativelib(args: &[String]) -> i32 {
         }
         ld_path.push_str(&dir.display().to_string());
     }
-    cmd.env("LD_PRELOAD", &shim).env("LD_LIBRARY_PATH", ld_path);
+    cmd.env("LD_PRELOAD", &shim)
+        .env("LD_LIBRARY_PATH", ld_path)
+        .env("PENGUDROID_SUPPRESS_DESTRUCTORS", if na.suppress_destructors { "1" } else { "0" });
+    if na.dlclose {
+        cmd.env("PENGUDROID_DLCLOSE", "1");
+    }
     let status = cmd.status();
     match status {
         Ok(s) if s.success() => 0,
@@ -404,10 +417,18 @@ pub fn dlopen_helper(args: &[String]) -> i32 {
         }
 
         let _ = std::io::Write::flush(&mut std::io::stdout());
-        // Deliberately skip dlclose/atexit: the library's teardown runs C++
-        // static destructors and atexit handlers that assume Bionic runtime
-        // state and can segfault (observed on librtb.so). `_exit` avoids a
-        // teardown crash masking a successful load/call.
+        if std::env::var("PENGUDROID_DLCLOSE").as_deref() == Ok("1") {
+            // Teardown path. With PENGUDROID_SUPPRESS_DESTRUCTORS=1 the shim
+            // keeps Bionic C++ static destructors from running (they assume
+            // Bionic runtime state and can segfault).
+            libc::dlclose(handle);
+            println!("dlclose: returned without crashing");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            // Also run process-exit handlers, so a destructor registered with
+            // `dso_handle = 0` (process-global) is actually invoked — this is
+            // precisely what suppression must prevent.
+            libc::exit(0);
+        }
         libc::_exit(0);
     }
 }
@@ -516,6 +537,7 @@ fn run_apk(na: &NativeArgs) -> i32 {
             .arg(target)
             .env("LD_PRELOAD", &shim)
             .env("LD_LIBRARY_PATH", &ld_path)
+            .env("PENGUDROID_SUPPRESS_DESTRUCTORS", "1")
             .output();
         match output {
             Ok(o) => {
@@ -570,6 +592,20 @@ mod tests {
         assert_eq!(a.abi, None);
         assert_eq!(a.call, None);
         assert_eq!(a.lib_dir, None);
+        assert!(!a.dlclose);
+        assert!(a.suppress_destructors);
+    }
+
+    #[test]
+    fn parses_dlclose_and_no_suppress() {
+        let a = parse_args(&[
+            "libfoo.so".to_string(),
+            "--dlclose".to_string(),
+            "--no-suppress-destructors".to_string(),
+        ])
+        .unwrap();
+        assert!(a.dlclose);
+        assert!(!a.suppress_destructors);
     }
 
     #[test]

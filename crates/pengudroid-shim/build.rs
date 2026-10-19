@@ -65,6 +65,13 @@ fn compile_variadic_shims(out_dir: &PathBuf) {
     if matches!(archived, Ok(s) if s.success()) {
         println!("cargo:rustc-link-search=native={}", dir.display());
         println!("cargo:rustc-link-lib=static=pengudroid_vlog");
+        // The archive member only defines `__android_log_print` and
+        // `__android_log_assert`; nothing in the Rust half references them, so
+        // without these the linker drops the object and the cdylib silently
+        // fails to export the two most important Bionic entry points. Force
+        // them in.
+        println!("cargo:rustc-cdylib-link-arg=-Wl,--undefined=__android_log_print");
+        println!("cargo:rustc-cdylib-link-arg=-Wl,--undefined=__android_log_assert");
         println!("cargo:rustc-cfg=has_variadic_log");
     } else {
         println!(
@@ -79,10 +86,9 @@ fn compile_variadic_shims(out_dir: &PathBuf) {
 fn write_version_script(out_dir: &PathBuf) {
     let map = out_dir.join("pengudroid-versions.map");
     let script = "\
-LIBC { global: __pengudroid_ver_libc; };
-LIBM { global: __pengudroid_ver_libm; };
-LD   { global: __pengudroid_ver_ld; };
-";
+LIBC { global: __pengudroid_ver_libc; __android_log_print; __android_log_assert; };\
+LIBM { global: __pengudroid_ver_libm; };\
+LD   { global: __pengudroid_ver_ld; };\n";
     std::fs::write(&map, script).expect("write version script");
 
     // Applies to the cdylib target only, so the rlib/tests are unaffected.
@@ -91,10 +97,17 @@ LD   { global: __pengudroid_ver_ld; };
     // script (rustc's export list) from being an error; without it GNU ld
     // complains the symbol already belongs to another version node.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    println!(
-        "cargo:rustc-cdylib-link-arg=-Wl,--version-script={},--undefined-version",
-        map.display()
-    );
+    {
+        // Rust's cdylib export list hides symbols it does not know about, which
+        // includes the C-implemented variadic log entry points. Re-declare them
+        // global here and force the export.
+        println!(
+            "cargo:rustc-cdylib-link-arg=-Wl,--version-script={},--undefined-version",
+            map.display()
+        );
+        println!("cargo:rustc-cdylib-link-arg=-Wl,--export-dynamic-symbol=__android_log_print");
+        println!("cargo:rustc-cdylib-link-arg=-Wl,--export-dynamic-symbol=__android_log_assert");
+    }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let _ = map;
 }

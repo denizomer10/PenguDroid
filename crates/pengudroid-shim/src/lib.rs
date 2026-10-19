@@ -44,7 +44,7 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 use libc::{c_char, c_int, c_void};
 
@@ -968,12 +968,333 @@ pub unsafe extern "C" fn __memchr_chk(
 /// being `&__sF[0..2]`). glibc has no such symbol, so Bionic-built libraries
 /// that reference it fail to load.
 ///
-// CAVEAT: this 1024-byte blob only satisfies the **link/load** requirement. It
-// is deliberately *not* ABI-compatible with glibc's `FILE`, so a program that
-// actually performs stdio *through* `__sF` is not supported yet — the bytes
-// are zero and no `FILE` is constructed or registered.
+// CAVEAT: this 1024-byte blob is deliberately *not* ABI-compatible with
+// glibc's `FILE`. The stdio entry points below ([`fprintf`], [`vfprintf`],
+// [`fputs`], [`fwrite`], [`fputc`], [`fflush`], [`fclose`]) recognise pointers
+// into it and redirect them to glibc's real standard streams; other stdio
+// functions that receive `&__sF[..]` directly are still unsupported.
 #[no_mangle]
 pub static mut __sF: [u64; 128] = [0u64; 128];
+
+/// Size in bytes of a Bionic `FILE` on LP64 (the only ABI we support here).
+pub const BIONIC_FILE_SIZE: usize = 152;
+
+/// Map an address into the Bionic `__sF` array to a standard-stream index
+/// (`0` = stdin, `1` = stdout, `2` = stderr). Returns `None` for any address
+/// outside the array.
+pub fn bionic_stream_index(stream: usize) -> Option<usize> {
+    let base = (&raw const __sF) as usize;
+    if stream < base || stream >= base + 1024 {
+        return None;
+    }
+    Some(match (stream - base) / BIONIC_FILE_SIZE {
+        0 => 0,
+        1 => 1,
+        _ => 2,
+    })
+}
+
+/// `RTLD_NEXT` — search for symbols after this object. Not exported by the
+/// `libc` crate for the glibc target, so spell it out.
+const RTLD_NEXT: *mut c_void = -1isize as *mut c_void;
+
+/// `RTLD_DEFAULT` — the default global search scope.
+const RTLD_DEFAULT: *mut c_void = std::ptr::null_mut();
+
+/// Resolve `name` (NUL-terminated) in the object following this one.
+///
+/// Returns `None` when the host libc does not export the symbol, letting each
+/// wrapper fall back gracefully instead of crashing.
+unsafe fn dlsym_next<T: Copy>(name: &[u8]) -> Option<T> {
+    debug_assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<*mut c_void>());
+    let p = libc::dlsym(RTLD_NEXT, name.as_ptr() as *const c_char);
+    if p.is_null() {
+        None
+    } else {
+        Some(std::mem::transmute_copy(&p))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Destructor suppression
+// ---------------------------------------------------------------------------
+
+/// Interpret a `PENGUDROID_SUPPRESS_DESTRUCTORS` value: `1`, `true` and `yes`
+/// (ASCII case-insensitive, surrounding whitespace ignored) mean "suppress".
+pub fn env_flag(v: Option<&str>) -> bool {
+    match v {
+        Some(v) => {
+            let v = v.trim();
+            v.eq_ignore_ascii_case("1")
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("yes")
+        }
+        None => false,
+    }
+}
+
+/// Whether guest static destructors are suppressed for this process.
+///
+/// Bionic C++ libraries register destructors that assume Bionic runtime state;
+/// running them on glibc after `dlclose`/`atexit` can segfault. The value is
+/// read once and cached.
+pub fn destructors_suppressed() -> bool {
+    static SUPPRESSED: OnceLock<bool> = OnceLock::new();
+    *SUPPRESSED.get_or_init(|| {
+        let raw = std::env::var("PENGUDROID_SUPPRESS_DESTRUCTORS").ok();
+        env_flag(raw.as_deref())
+    })
+}
+
+type CxaAtexit = unsafe extern "C" fn(
+    Option<unsafe extern "C" fn(*mut c_void)>,
+    *mut c_void,
+    *mut c_void,
+) -> c_int;
+type Atexit = unsafe extern "C" fn(Option<extern "C" fn()>) -> c_int;
+type CxaFinalize = unsafe extern "C" fn(*mut c_void);
+
+/// `__cxa_atexit(func, arg, dso_handle)` — register a destructor, unless
+/// suppression is enabled (in which case the registration is dropped).
+#[no_mangle]
+pub unsafe extern "C" fn __cxa_atexit(
+    func: Option<unsafe extern "C" fn(*mut c_void)>,
+    arg: *mut c_void,
+    dso_handle: *mut c_void,
+) -> c_int {
+    if destructors_suppressed() {
+        return 0;
+    }
+    match dlsym_next::<CxaAtexit>(b"__cxa_atexit\0") {
+        Some(real) => real(func, arg, dso_handle),
+        None => 0,
+    }
+}
+
+/// `atexit(func)` — register a destructor, unless suppression is enabled.
+#[no_mangle]
+pub unsafe extern "C" fn atexit(func: Option<extern "C" fn()>) -> c_int {
+    if destructors_suppressed() {
+        return 0;
+    }
+    match dlsym_next::<Atexit>(b"atexit\0") {
+        Some(real) => real(func),
+        None => 0,
+    }
+}
+
+/// `__cxa_finalize(dso_handle)` — run pending destructors, unless suppression
+/// is enabled (in which case it is a no-op).
+#[no_mangle]
+pub unsafe extern "C" fn __cxa_finalize(dso_handle: *mut c_void) {
+    if destructors_suppressed() {
+        return;
+    }
+    if let Some(real) = dlsym_next::<CxaFinalize>(b"__cxa_finalize\0") {
+        real(dso_handle);
+    }
+}
+
+/// `__cxa_thread_atexit_impl(func, arg, dso_handle)` — thread-exit destructor
+/// registration, suppressed like [`__cxa_atexit`].
+#[no_mangle]
+pub unsafe extern "C" fn __cxa_thread_atexit_impl(
+    func: Option<unsafe extern "C" fn(*mut c_void)>,
+    arg: *mut c_void,
+    dso_handle: *mut c_void,
+) -> c_int {
+    if destructors_suppressed() {
+        return 0;
+    }
+    match dlsym_next::<CxaAtexit>(b"__cxa_thread_atexit_impl\0") {
+        Some(real) => real(func, arg, dso_handle),
+        None => 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bionic stdio on __sF
+// ---------------------------------------------------------------------------
+
+/// Resolve glibc's `stdin`/`stdout`/`stderr` `FILE *` values once.
+///
+/// `dlsym` returns the address of the `FILE *` *variable*, so dereference it.
+/// The addresses are stored as `usize` to keep the cache `Sync`.
+fn glibc_stream_pointers() -> &'static [usize; 3] {
+    static STREAMS: OnceLock<[usize; 3]> = OnceLock::new();
+    STREAMS.get_or_init(|| {
+        let mut out = [0usize; 3];
+        let names: [&[u8]; 3] = [b"stdin\0", b"stdout\0", b"stderr\0"];
+        for (i, name) in names.iter().enumerate() {
+            unsafe {
+                let p = libc::dlsym(RTLD_DEFAULT, name.as_ptr() as *const c_char);
+                if !p.is_null() {
+                    out[i] = *(p as *mut *mut c_void) as usize;
+                }
+            }
+        }
+        out
+    })
+}
+
+/// Translate a Bionic `FILE *` that points into `__sF` to glibc's matching
+/// standard stream. Any other pointer is passed through unchanged.
+unsafe fn translate_stream(stream: *mut c_void) -> *mut c_void {
+    if stream.is_null() {
+        return stream;
+    }
+    if let Some(idx) = bionic_stream_index(stream as usize) {
+        let mapped = glibc_stream_pointers()[idx];
+        if mapped != 0 {
+            return mapped as *mut c_void;
+        }
+    }
+    stream
+}
+
+/// Whether `stream` is (already translated to) one of glibc's standard streams.
+fn is_standard_stream(stream: *mut c_void) -> bool {
+    glibc_stream_pointers().contains(&(stream as usize))
+}
+
+/// File descriptor backing one of glibc's standard streams, used only by the
+/// `dlsym` failure fallbacks below.
+fn stream_fd(stream: *mut c_void) -> c_int {
+    let p = glibc_stream_pointers();
+    if (stream as usize) == p[2] {
+        2
+    } else {
+        1
+    }
+}
+
+type Vfprintf = unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_void) -> c_int;
+type Fputs = unsafe extern "C" fn(*const c_char, *mut c_void) -> c_int;
+type Fwrite = unsafe extern "C" fn(*const c_void, usize, usize, *mut c_void) -> usize;
+type Fputc = unsafe extern "C" fn(c_int, *mut c_void) -> c_int;
+type Fflush = unsafe extern "C" fn(*mut c_void) -> c_int;
+type Fclose = unsafe extern "C" fn(*mut c_void) -> c_int;
+
+/// `fprintf(stream, fmt, ...)`.
+///
+/// LIMITATION: stable Rust cannot build a `va_list`, so this variadic entry
+/// point cannot forward its arguments. It writes `fmt` literally (no `%`
+/// expansion) to the translated stream. The fully-correct path is
+/// [`vfprintf`], which receives a ready `va_list` and is forwarded intact;
+/// libc++ and friends generally call that internally.
+#[no_mangle]
+pub unsafe extern "C" fn fprintf(stream: *mut c_void, fmt: *const c_char, _: ...) -> c_int {
+    if fmt.is_null() {
+        return -1;
+    }
+    fputs(fmt, translate_stream(stream))
+}
+
+/// `vfprintf(stream, fmt, ap)` — fully forwarded with the translated stream.
+#[no_mangle]
+pub unsafe extern "C" fn vfprintf(
+    stream: *mut c_void,
+    fmt: *const c_char,
+    ap: *mut c_void,
+) -> c_int {
+    let stream = translate_stream(stream);
+    match dlsym_next::<Vfprintf>(b"vfprintf\0") {
+        Some(real) => real(stream, fmt, ap),
+        None => -1,
+    }
+}
+
+/// `fputs(s, stream)` with `__sF` stream translation.
+#[no_mangle]
+pub unsafe extern "C" fn fputs(s: *const c_char, stream: *mut c_void) -> c_int {
+    let stream = translate_stream(stream);
+    match dlsym_next::<Fputs>(b"fputs\0") {
+        Some(real) => real(s, stream),
+        None => {
+            // No host symbol to forward to (e.g. in a bare test binary): write
+            // straight to the descriptor instead of failing.
+            if s.is_null() {
+                return -1;
+            }
+            let len = libc::strlen(s);
+            if libc::write(stream_fd(stream), s as *const c_void, len) < 0 {
+                libc::EOF
+            } else {
+                0
+            }
+        }
+    }
+}
+
+/// `fwrite(ptr, size, nmemb, stream)` with `__sF` stream translation.
+#[no_mangle]
+pub unsafe extern "C" fn fwrite(
+    ptr: *const c_void,
+    size: usize,
+    nmemb: usize,
+    stream: *mut c_void,
+) -> usize {
+    let stream = translate_stream(stream);
+    match dlsym_next::<Fwrite>(b"fwrite\0") {
+        Some(real) => real(ptr, size, nmemb, stream),
+        None => {
+            let total = match size.checked_mul(nmemb) {
+                Some(n) => n,
+                None => return 0,
+            };
+            if total == 0 || libc::write(stream_fd(stream), ptr, total) as usize != total {
+                0
+            } else {
+                nmemb
+            }
+        }
+    }
+}
+
+/// `fputc(c, stream)` with `__sF` stream translation.
+#[no_mangle]
+pub unsafe extern "C" fn fputc(c: c_int, stream: *mut c_void) -> c_int {
+    let stream = translate_stream(stream);
+    match dlsym_next::<Fputc>(b"fputc\0") {
+        Some(real) => real(c, stream),
+        None => {
+            let byte = c as u8;
+            if libc::write(stream_fd(stream), &byte as *const u8 as *const c_void, 1) < 0 {
+                libc::EOF
+            } else {
+                c
+            }
+        }
+    }
+}
+
+/// `fflush(stream)` with `__sF` stream translation. A null `stream` means
+/// "flush every stream" and is preserved.
+#[no_mangle]
+pub unsafe extern "C" fn fflush(stream: *mut c_void) -> c_int {
+    let stream = translate_stream(stream);
+    match dlsym_next::<Fflush>(b"fflush\0") {
+        Some(real) => real(stream),
+        None => 0,
+    }
+}
+
+/// `fclose(stream)` with `__sF` stream translation.
+///
+/// Guest code sometimes closes `stderr`/`stdout`; doing that to the host's real
+/// stream would break the whole process, so closing a standard stream is
+/// reported as success without forwarding.
+#[no_mangle]
+pub unsafe extern "C" fn fclose(stream: *mut c_void) -> c_int {
+    let stream = translate_stream(stream);
+    if is_standard_stream(stream) {
+        return 0;
+    }
+    match dlsym_next::<Fclose>(b"fclose\0") {
+        Some(real) => real(stream),
+        None => 0,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Load-time constructor
@@ -1320,5 +1641,58 @@ mod tests {
         // `static mut` (which the `static_mut_refs` lint rejects).
         let p: *const [u64; 128] = &raw const __sF;
         assert_eq!(std::mem::size_of_val(unsafe { &*p }), 1024);
+    }
+
+    #[test]
+    fn env_flag_parses_truthy_and_falsy() {
+        for v in [Some("1"), Some("true"), Some("YES")] {
+            assert!(env_flag(v), "{v:?} must be truthy");
+        }
+        for v in [None, Some("0"), Some("no"), Some("maybe")] {
+            assert!(!env_flag(v), "{v:?} must be falsy");
+        }
+    }
+
+    #[test]
+    fn bionic_stream_index_maps_standard_streams() {
+        let base = (&raw const __sF) as usize;
+        assert_eq!(bionic_stream_index(base), Some(0));
+        assert_eq!(bionic_stream_index(base + BIONIC_FILE_SIZE), Some(1));
+        assert_eq!(bionic_stream_index(base + 2 * BIONIC_FILE_SIZE), Some(2));
+        assert_eq!(bionic_stream_index(base + 3 * BIONIC_FILE_SIZE), Some(2));
+        assert_eq!(bionic_stream_index(base - 1), None);
+        assert_eq!(bionic_stream_index(base + 1024), None);
+    }
+
+    #[test]
+    fn cxa_atexit_is_noop_when_suppressed() {
+        const KEY: &str = "PENGUDROID_SUPPRESS_DESTRUCTORS";
+
+        /// Restores the variable on drop, even on panic.
+        struct EnvGuard(Option<std::ffi::OsString>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var(KEY, v),
+                    None => std::env::remove_var(KEY),
+                }
+            }
+        }
+
+        let _guard = EnvGuard(std::env::var_os(KEY));
+        std::env::set_var(KEY, "1");
+
+        unsafe extern "C" fn cb(_: *mut c_void) {}
+        let rc = unsafe { __cxa_atexit(Some(cb), std::ptr::null_mut(), std::ptr::null_mut()) };
+        assert_eq!(rc, 0, "suppressed __cxa_atexit must report success");
+    }
+
+    #[test]
+    fn fputs_accepts_bionic_stdout_pointer() {
+        let base = (&raw const __sF) as usize;
+        let stdout = (base + BIONIC_FILE_SIZE) as *mut c_void;
+        let s = CString::new("x").unwrap();
+        let rc = unsafe { fputs(s.as_ptr(), stdout) };
+        assert!(rc >= 0, "fputs via __sF stdout failed: {rc}");
     }
 }

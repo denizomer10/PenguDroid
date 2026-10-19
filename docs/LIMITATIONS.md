@@ -57,16 +57,18 @@ correct result through the shim.
 
 What remains is the gap between *running a function* and *running an app*:
 
-* **Teardown.** `dlclose`/`atexit` run C++ static destructors that assume Bionic
-  runtime state and can segfault (seen on `librtb.so`), so PenguDroid loads and
-  uses libraries without unloading them.
-* **`__sF`.** Bionic's stdio array satisfies linkage but is not ABI-compatible
-  with glibc's `FILE`, so stdio routed through it is unsupported.
+* **Teardown.** Mitigated: the shim suppresses Bionic C++ static destructors
+  (`PENGUDROID_SUPPRESS_DESTRUCTORS`), which is what crashed `dlclose`; verified
+  that a faulting destructor goes 139 → 0. Suppression leaks rather than frees,
+  which is acceptable for a process that is about to exit.
+* **`__sF`.** Partially supported: the three standard streams are mapped to
+  glibc, assuming Bionic's LP64 `sizeof(FILE)` = 152. Other `FILE` objects and
+  vararg formatting in `fprintf` are not supported (`vfprintf` is).
 * **libc++.** Symbols like `_ZNSt3__1...` come from the APK's own bundled
-  `libc++_shared.so`. `pengudroid nativelib --apk` now strips the APK's whole
-  `lib/<abi>` set into one directory so that dependency resolves, but a large
-  C++ app may still hit missing Bionic symbols that `pengudroid deps` will
-  report.
+  `libc++_shared.so`. `nativelib --apk` now stages the APK's whole `lib/<abi>`
+  set so that dependency resolves; `fixtures/cpp-cascade` verifies a consumer
+  calling through the bundled runtime. (The F-Droid apps checked statically link
+  libc++, so a real `libc++_shared.so` APK was not available to test against.)
 * **The Android linker namespace.** `android_dlopen_ext` is not implemented; it
   carries namespace semantics glibc lacks.
 * **Graphics.** `libEGL`/`libGLESv2` must be bound to host EGL before apps draw.
@@ -147,8 +149,11 @@ hanging forever, so a wedged guest cannot freeze its peers.
    guest-service calls, detach launches (`RunApk`) and report their exit status,
    stop guests when their window closes, and format variadic Bionic log calls.~~
    **Done** (end-to-end tested against a real daemon).
-3. Close the *running* gap: Bionic-compatible teardown, a real `__sF`, and
-   loading an APK's own `libc++_shared.so` via the compat path.
+3. ~~Close the *running* gap: Bionic-compatible teardown, a real `__sF`, and
+   loading an APK's own `libc++_shared.so`.~~ **Done**: destructors are
+   suppressed (a faulting teardown goes 139 → 0), the three standard streams map
+   through `__sF` (`fprintf` varargs remain literal), and `nativelib --apk`
+   stages an APK's library set (`fixtures/cpp-cascade`).
 4. ~~Present a GPU frame over `dmabuf`.~~ **Partly done**: `pengudroid-hostgpu`
    binds the host EGL/GLES/GBM and exports dma-bufs; the daemon imports them via
    `zwp_linux_dmabuf_v1`, and `pengudroid run` presents zero-copy GPU frames.

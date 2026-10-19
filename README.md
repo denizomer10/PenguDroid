@@ -52,9 +52,11 @@ milestone. Nothing below is overstated.
 | APK + binary `AndroidManifest.xml` parsing | **Working** | ZIP (store/deflate) + AXML parser, unit-tested |
 | `pengudroid deps`: ELF import / Bionic-coverage analysis | **Working** | parses real arm64 / armv7 / x86-64 APK libraries; predicts `dlopen` outcome |
 | Loading **real Android APK libraries** on glibc (`de-bionic` + `libpath` + `nativelib`) | **Working** | real x86-64 APK libraries (`librtb.so`, `libgtb.so`, `libnativeutil.so`) `dlopen` successfully |
-| Loading a native `.so` under the shim (`LD_PRELOAD`) | **Partial** | `dlopen` verified; library teardown (`dlclose`/`atexit`) and stdio via `__sF` are not ABI-compatible yet |
+| Loading a native `.so` under the shim (`LD_PRELOAD`) | **Working** | `dlopen` and `dlclose` verified |
+| Bionic teardown (C++ static destructors) | **Working** | suppressed on request (`PENGUDROID_SUPPRESS_DESTRUCTORS`); `--dlclose` on a faulting destructor goes 139 → 0 |
+| `__sF` standard streams | **Partial** | `stdin`/`stdout`/`stderr` via `__sF` map to glibc streams; other `FILE` uses are unsupported |
 | **Calling a real Android-style library and getting a correct result** | **Working** | `fixtures/native-demo` returns 500500 after `de-bionic` + load, via the shim |
-| **Loading an application's own native libraries (`nativelib --apk`)** | **Working** | extracts an APK's `lib/<abi>/*.so`, strips them, and loads the set (intra-APK deps resolve) |
+| **Loading an application's own native libraries (`nativelib --apk`)** | **Working** | extracts an APK's `lib/<abi>/*.so`, strips them, and loads the set; `fixtures/cpp-cascade` proves a consumer resolves the bundled `libc++_shared.so` (= 42) |
 | Wayland graphics broker (compositor, `wl_shm`, `xdg_wm_base`, toplevels) | **Working** | connects to the live session; surfaces + `wl_shm` buffers |
 | Guest process: owns a window, `ps`-visible, animated | **Working** | the `__guest` runtime; the compositor closing a window stops the guest |
 | Guest launched by the **daemon** (`RunApk`, `pengudroid start --wait`) | **Working** | daemon forks the CLI's `__guest`, reaps it, and reports its exit through `QueryRun`; an exited guest's window is destroyed and it leaves `ps` |
@@ -214,10 +216,26 @@ $ pengudroid nativelib --apk droidfish.apk --abi x86_64
 /tmp/droidfish.apk: 3 loadable, 0 skipped, 0 failed
 ```
 
-**What this does not mean:** teardown (`dlclose`/`atexit`) can crash because C++
-static destructors assume Bionic runtime state, and the `__sF` stdio array is
-not ABI-compatible with glibc's `FILE`. `pengudroid-elf` reads ELF32 and ELF64
-(armv7, aarch64, x86, x86-64) with no external dependencies.
+**Teardown.** Bionic C++ libraries register static destructors that assume Bionic
+runtime state; running them on glibc is what segfaulted `librtb.so` during
+`dlclose`. The shim interposes `__cxa_atexit`/`atexit`/`__cxa_finalize` and,
+when `PENGUDROID_SUPPRESS_DESTRUCTORS=1` (which `nativelib` sets for guests),
+skips registration. Verified: `nativelib --dlclose` on a faulting destructor goes
+from SIGSEGV (139) to a clean exit when suppression is enabled.
+
+**`__sF`.** Bionic's `FILE __sF[3]` is mapped onto glibc's
+`stdin`/`stdout`/`stderr` by interposing `fprintf`/`vfprintf`/`fputs`/`fwrite`/
+`fputc`/`fflush`/`fclose` (the mapping assumes Bionic's LP64 `sizeof(FILE)` =
+152). Only the three standard streams are supported, and `fprintf` does not
+format varargs (use `vfprintf`, which does).
+
+**An application's own libraries.** `nativelib --apk` stages an APK's whole
+`lib/<abi>` set in one directory, so intra-APK dependencies resolve.
+`fixtures/cpp-cascade` proves it: a consumer that `DT_NEEDED`s the bundled
+`libc++_shared.so` loads, and `consumer_run()` returns `42`.
+
+**`pengudroid-elf`** reads ELF32 and ELF64 (armv7, aarch64, x86, x86-64) with no
+external dependencies.
 
 ### Reproducible test
 
