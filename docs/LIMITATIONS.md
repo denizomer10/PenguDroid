@@ -101,11 +101,11 @@ common GL entry points directly, rather than via `eglGetProcAddress`, may fail
 to resolve). Note that the compat directory maps `libGLESv2.so` to the *host*
 driver, which covers this in practice.
 
-**OpenSL ES is a stub.** `slCreateEngine` and the `SL_IID_*` identifiers are
-exported so audio-using apps load, but no engine is created and no sound is
-produced. The underlying PipeWire sink *and* the daemon-side ring pump are
-implemented (`audio-test --via-daemon` streams client PCM through the daemon to
-`pw-cat`); what remains is layering an OpenSL ES engine on top.
+**OpenSL ES is implemented for the common case.** `slCreateEngine`, the object
+model, engine/output-mix/player interfaces and the Android simple buffer queue
+are real: `Enqueue` forwards each buffer to a per-player `pw-cat`. The fixture
+uses the canonical headers so the vtable ABI is genuinely verified. Recorders,
+prefetch, effects and the other interfaces return `SL_RESULT_FEATURE_UNSUPPORTED`.
 
 ## 5. SurfaceFlinger is bypassed, not emulated
 
@@ -125,10 +125,10 @@ Some framework code depends on those semantics.
 ## 7. Stubs are stubs
 
 Telephony reports "radio off"; the camera reports "zero cameras"; `AudioFlinger`
-returns empty replies; the OpenSL ES engine is not implemented (audio can be
-streamed through `pengudroid audio-test`, but an app's OpenSL/AudioTrack path is
-still a stub); `PackageManager` and `ActivityManager` answer minimally. These are
-honest placeholders, not partial implementations.
+returns empty replies; the OpenSL ES **buffer-queue player** is implemented
+(`Enqueue` → `pw-cat`), but recorders, prefetch and effects are still
+`SL_RESULT_FEATURE_UNSUPPORTED`; `PackageManager` and `ActivityManager` answer
+minimally. These are honest placeholders, not partial implementations.
 
 ## 8. Security
 
@@ -174,7 +174,8 @@ hanging forever, so a wedged guest cannot freeze its peers.
    `system_server`.
 6. ~~Wire the PipeWire audio pump.~~ **Done**: the daemon owns a shared ring and
    drains it into `pw-cat` (`audio-test --via-daemon`); silence by default,
-   `--tone` audible. Remaining: the OpenSL ES engine on top.
+   `--tone` audible. ~~OpenSL ES buffer-queue player~~ **Done**: `Enqueue` →
+   `pw-cat`, verified against the canonical headers (`fixtures/opensl-app`).
 7. Replace telephony/camera stubs with real AIDL marshalers.
 8. Add seccomp + a private mount namespace for isolation without a full
    container.

@@ -125,14 +125,27 @@ session's own **`pw-cat`** over a pipe — `pw-cat -p -a --rate 48000 --channels
 `AudioSink` type and `pengudroid audio-test` exercise it (silence by default,
 `--tone` for a quiet 440 Hz sine).
 
+On top of that, the Bionic shim implements the **OpenSL ES** buffer-queue player:
+`slCreateEngine`, `SLObjectItf_`, `SLEngineItf` (output mix + audio player),
+`SLPlayItf`, and `SLAndroidSimpleBufferQueueItf`. `Enqueue` forwards the buffer
+to a lazily-started per-player `pw-cat`. `fixtures/opensl-app` compiles against
+the canonical OpenSL ES headers, so the hand-written vtables are checked against
+the real ABI. Recorders, prefetch, effects and the remaining interfaces return
+`SL_RESULT_FEATURE_UNSUPPORTED`.
+
 The daemon half is implemented: a client asks for the ring (`GetAudioRing`, fd
 attached), writes PCM into it, and sends `AudioWrite { offset, len }`; the daemon
 maps the ring and forwards that slice to the sink, starting `pw-cat` on first
 use. `AudioBroker::write_ring` validates the range against the ring size.
 
-Remaining: implementing OpenSL ES on top of `AudioSink` (`slCreateEngine` and the
-`SL_IID_*` identifiers are stubs so apps load, but an app's own audio path is not
-wired yet).
+The OpenSL ES layer is implemented on top: `slCreateEngine`, the object model
+(`SLObjectItf_`), the engine/output-mix/player interfaces, and the Android simple
+buffer queue (`Enqueue` forwards each buffer to the player's `pw-cat`).
+`fixtures/opensl-app` compiles against the canonical headers, so the vtables are
+verified against the real ABI.
+
+Remaining: recorders, prefetch status, effects, and the rest of the OpenSL ES
+interface surface (currently `SL_RESULT_FEATURE_UNSUPPORTED`).
 
 ## 5. ashmem
 
@@ -352,8 +365,9 @@ and binds its FBO, so direct `gl*` calls land in the right place — and the app
 gets the *full* GLES entry-point surface rather than the handful the shim
 exports. (Apps that resolve GL through `eglGetProcAddress` get host pointers
 anyway.)
-`libOpenSLES.so` resolves to the Bionic shim, which exports `slCreateEngine` and
-the `SL_IID_*` identifiers so OpenSL ES users load; audio is not produced.
+`libOpenSLES.so` resolves to the Bionic shim, which implements the buffer-queue
+player (engine, output mix, audio player, `Enqueue` → `pw-cat`) in addition to
+exporting `slCreateEngine` and the `SL_IID_*` identifiers.
 
 With those mappings and the fortify/NDK stubs, real application libraries load:
 Dolphin's `libmain.so` (15 MB) and PPSSPP's `libppsspp_jni.so` (27 MB) both

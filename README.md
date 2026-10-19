@@ -66,7 +66,7 @@ milestone. Nothing below is overstated.
 | Zero-copy GPU presentation (`zwp_linux_dmabuf_v1`) | **Working** | the guest renders on the GPU, exports a dma-buf, the daemon imports and commits it |
 | Bionic `libEGL`/`libGLESv2` shim (`pengudroid-gleshim`) | **Working** | exports the EGL API; an app's EGL/GL calls render on the host GPU and swap into Wayland as dma-bufs — `fixtures/egl-app` swaps 5 frames |
 | Real apps' native libraries load | **Working** | after soname mapping + Bionic stubs: Dolphin `libmain.so` (15 MB) and PPSSPP `libppsspp_jni.so` (27 MB) both `dlopen` |
-| OpenSL ES (audio) | **Stub** | `slCreateEngine` and all `SL_IID_*` are exported so apps load; no audio is produced |
+| OpenSL ES (audio) | **Working** | engine/output-mix/buffer-queue player implemented; `Enqueue` forwards PCM to `pw-cat`; `fixtures/opensl-app` verifies PLAYING + callbacks against the canonical headers |
 | `LD_PRELOAD` Bionic→glibc shim (`libashmem`, logging, props, API level) | **Working** | interposes real Bionic symbol names; `__android_log_print` formats with the host `vsnprintf` |
 | Service registry + `phone`/`media.camera`/AMS/PMS/SurfaceFlinger stubs | **Stub** | correctly-named interfaces, minimal replies |
 | Audio: PipeWire | **Working** | the daemon owns a shared ring and drains it into `pw-cat` (or `aplay`); `audio-test [--via-daemon]` streams PCM |
@@ -312,8 +312,9 @@ $ pengudroid audio-test --via-daemon --seconds 1
 audio: sent 192000 bytes through the daemon ring (48000 Hz, 2 ch)
 ```
 
-What remains is implementing OpenSL ES on top of the sink (`slCreateEngine` is
-still a stub), so an app's own `AudioTrack`/OpenSL calls are captured and played.
+What remains is the broader OpenSL ES surface: the buffer-queue player works, but
+recorders, prefetch, effects and the other interfaces are still
+`SL_RESULT_FEATURE_UNSUPPORTED`.
 
 ## Repository layout
 

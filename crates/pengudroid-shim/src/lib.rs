@@ -1523,15 +1523,906 @@ extern "C" fn pengudroid_init() {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// OpenSL ES (stubs)
+// OpenSL ES (buffer-queue playback)
 // ---------------------------------------------------------------------------
-// Real apps `DT_NEEDED` `libOpenSLES.so` even when they only render. Exporting
-// the entry points and interface IDs they reference lets the library load;
-// audio through OpenSL ES is **not** implemented (creating an engine fails).
+// Real apps `DT_NEEDED` `libOpenSLES.so` even when they only render, so the
+// entry points and interface IDs must exist. This implements the small slice of
+// OpenSL ES 1.0.1 that a normal Android "buffer queue player" uses:
+//
+//   slCreateEngine -> Realize -> GetInterface(SL_IID_ENGINE)
+//     -> CreateOutputMix / CreateAudioPlayer
+//     -> Realize -> GetInterface(SL_IID_PLAY)
+//     -> GetInterface(SL_IID_ANDROIDSIMPLEBUFFERQUEUE)
+//     -> SetPlayState(PLAYING) -> Enqueue(PCM)
+//
+// Enqueued PCM is written to a lazily spawned `pw-cat` (or `aplay`) sink, which
+// plays it through PipeWire/ALSA. The object/interface layering follows the
+// canonical Khronos headers exactly: an `SLObjectItf`/`SLEngineItf`/`SLPlayItf`
+// /`SLAndroidSimpleBufferQueueItf` is a pointer to a pointer to a vtable, so the
+// first field of every structure below is that vtable pointer. Field order is
+// load-bearing: the guest indexes the vtable by byte offset.
 //
 // `SL_IID_*` are opaque interface identifiers; callers only pass them back to
 // us, so unique non-null values suffice (they are never dereferenced).
+use std::io::Write as _;
+use std::process::{Child, ChildStdin, Command, Stdio};
+
+const SL_RESULT_SUCCESS: u32 = 0;
+const SL_RESULT_PARAMETER_INVALID: u32 = 2;
 const SL_RESULT_FEATURE_UNSUPPORTED: u32 = 12;
+
+const SL_OBJECT_STATE_UNREALIZED: u32 = 1;
+const SL_OBJECT_STATE_REALIZED: u32 = 2;
+
+const SL_PLAYSTATE_STOPPED: u32 = 1;
+#[allow(dead_code)] // Used by the unit test; kept for symmetry/documentation.
+const SL_PLAYSTATE_PLAYING: u32 = 3;
+
+const SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE: u32 = 0x8000_07BD;
+const SL_DATAFORMAT_PCM: u32 = 2;
+
+const DEFAULT_RATE: u32 = 48_000;
+const DEFAULT_CHANNELS: u32 = 2;
+
+/// OpenSL's `SLDataSource` / `SLDataSink` layouts (both are `{locator, format}`).
+#[repr(C)]
+struct SLDataSource {
+    p_locator: *mut c_void,
+    p_format: *mut c_void,
+}
+
+#[repr(C)]
+struct SLDataSink {
+    p_locator: *mut c_void,
+    p_format: *mut c_void,
+}
+
+#[repr(C)]
+struct SLDataFormatPcm {
+    format_type: u32,
+    num_channels: u32,
+    samples_per_sec: u32,
+    bits_per_sample: u32,
+    container_size: u32,
+    channel_mask: u32,
+    endianness: u32,
+}
+
+#[repr(C)]
+struct SLDataLocatorAndroidSimpleBufferQueue {
+    locator_type: u32,
+    num_buffers: u32,
+}
+
+#[repr(C)]
+struct SLAndroidSimpleBufferQueueState {
+    count: u32,
+    index: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Vtables
+// ---------------------------------------------------------------------------
+
+type SlObjectCallback = Option<
+    unsafe extern "C" fn(*mut c_void, *const c_void, u32, u32, u32, *mut c_void),
+>;
+type SlPlayCallback = Option<unsafe extern "C" fn(*mut c_void, *mut c_void, u32)>;
+type SlBqCallback = Option<unsafe extern "C" fn(*mut c_void, *mut c_void)>;
+
+#[repr(C)]
+#[allow(non_snake_case)]
+struct SLObjectItf_ {
+    Realize: Option<unsafe extern "C" fn(*mut c_void, u32) -> u32>,
+    Resume: Option<unsafe extern "C" fn(*mut c_void, u32) -> u32>,
+    GetState: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> u32>,
+    GetInterface: Option<unsafe extern "C" fn(*mut c_void, *const c_void, *mut *mut c_void) -> u32>,
+    RegisterCallback: Option<unsafe extern "C" fn(*mut c_void, SlObjectCallback, *mut c_void) -> u32>,
+    AbortAsyncOperation: Option<unsafe extern "C" fn(*mut c_void)>,
+    Destroy: Option<unsafe extern "C" fn(*mut c_void)>,
+    SetPriority: Option<unsafe extern "C" fn(*mut c_void, i32, u32) -> u32>,
+    GetPriority: Option<unsafe extern "C" fn(*mut c_void, *mut i32, *mut u32) -> u32>,
+    SetLossOfControlInterfaces:
+        Option<unsafe extern "C" fn(*mut c_void, i16, *mut *const c_void, u32) -> u32>,
+}
+
+#[repr(C)]
+#[allow(non_snake_case)]
+struct SLEngineItf_ {
+    CreateLEDDevice: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut *mut c_void,
+            u32,
+            u32,
+            *const *const c_void,
+            *const u32,
+        ) -> u32,
+    >,
+    CreateVibraDevice: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut *mut c_void,
+            u32,
+            u32,
+            *const *const c_void,
+            *const u32,
+        ) -> u32,
+    >,
+    CreateAudioPlayer: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut *mut c_void,
+            *mut SLDataSource,
+            *mut SLDataSink,
+            u32,
+            *const *const c_void,
+            *const u32,
+        ) -> u32,
+    >,
+    CreateAudioRecorder: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut *mut c_void,
+            *mut SLDataSource,
+            *mut SLDataSink,
+            u32,
+            *const *const c_void,
+            *const u32,
+        ) -> u32,
+    >,
+    CreateMidiPlayer: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut *mut c_void,
+            *mut SLDataSource,
+            *mut SLDataSource,
+            *mut SLDataSink,
+            *mut SLDataSink,
+            *mut SLDataSink,
+            u32,
+            *const *const c_void,
+            *const u32,
+        ) -> u32,
+    >,
+    CreateListener: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut *mut c_void,
+            u32,
+            *const *const c_void,
+            *const u32,
+        ) -> u32,
+    >,
+    Create3DGroup: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut *mut c_void,
+            u32,
+            *const *const c_void,
+            *const u32,
+        ) -> u32,
+    >,
+    CreateOutputMix: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut *mut c_void,
+            u32,
+            *const *const c_void,
+            *const u32,
+        ) -> u32,
+    >,
+    CreateMetadataExtractor: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut *mut c_void,
+            *mut SLDataSource,
+            u32,
+            *const *const c_void,
+            *const u32,
+        ) -> u32,
+    >,
+    CreateExtensionObject: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut *mut c_void,
+            *mut c_void,
+            u32,
+            u32,
+            *const *const c_void,
+            *const u32,
+        ) -> u32,
+    >,
+    QueryNumSupportedInterfaces:
+        Option<unsafe extern "C" fn(*mut c_void, u32, *mut u32) -> u32>,
+    QuerySupportedInterfaces:
+        Option<unsafe extern "C" fn(*mut c_void, u32, u32, *mut *const c_void) -> u32>,
+    QueryNumSupportedExtensions: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> u32>,
+    QuerySupportedExtension:
+        Option<unsafe extern "C" fn(*mut c_void, u32, *mut c_char, *mut i16) -> u32>,
+    IsExtensionSupported:
+        Option<unsafe extern "C" fn(*mut c_void, *const c_char, *mut u32) -> u32>,
+}
+
+#[repr(C)]
+#[allow(non_snake_case)]
+struct SLPlayItf_ {
+    SetPlayState: Option<unsafe extern "C" fn(*mut c_void, u32) -> u32>,
+    GetPlayState: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> u32>,
+    GetDuration: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> u32>,
+    GetPosition: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> u32>,
+    RegisterCallback: Option<unsafe extern "C" fn(*mut c_void, SlPlayCallback, *mut c_void) -> u32>,
+    SetCallbackEventsMask: Option<unsafe extern "C" fn(*mut c_void, u32) -> u32>,
+    GetCallbackEventsMask: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> u32>,
+    SetMarkerPosition: Option<unsafe extern "C" fn(*mut c_void, u32) -> u32>,
+    ClearMarkerPosition: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
+    GetMarkerPosition: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> u32>,
+    SetPositionUpdatePeriod: Option<unsafe extern "C" fn(*mut c_void, u32) -> u32>,
+    GetPositionUpdatePeriod: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> u32>,
+}
+
+#[repr(C)]
+#[allow(non_snake_case)]
+struct SLAndroidSimpleBufferQueueItf_ {
+    Enqueue: Option<unsafe extern "C" fn(*mut c_void, *const c_void, u32) -> u32>,
+    Clear: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
+    GetState: Option<unsafe extern "C" fn(*mut c_void, *mut SLAndroidSimpleBufferQueueState) -> u32>,
+    RegisterCallback: Option<unsafe extern "C" fn(*mut c_void, SlBqCallback, *mut c_void) -> u32>,
+}
+
+// ---------------------------------------------------------------------------
+// Objects and interfaces
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+enum ObjKind {
+    Engine = 0,
+    OutputMix = 1,
+    AudioPlayer = 2,
+}
+
+/// Both `ChildStdin` and `Child` are dropped by `Sink`'s `Drop`.
+struct Sink {
+    child: Child,
+    stdin: Option<ChildStdin>,
+}
+
+impl Drop for Sink {
+    fn drop(&mut self) {
+        // Closing stdin signals EOF; kill+wait guarantees we reap even if the
+        // player ignores EOF (e.g. pw-cat waiting on a stalled server).
+        drop(self.stdin.take());
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// An `SLObjectItf` value. The first field *must* stay first: the guest treats
+/// the object pointer as a pointer to a vtable pointer.
+#[repr(C)]
+struct Obj {
+    vtable: *const SLObjectItf_,
+    kind: ObjKind,
+    state: u32,
+    rate: u32,
+    channels: u32,
+    play_state: u32,
+    bq_count: u32,
+    bq_index: u32,
+    bq_callback: SlBqCallback,
+    bq_context: *mut c_void,
+    sink: Option<Sink>,
+    /// Interface blocks handed out by `GetInterface`, freed by `Destroy`.
+    interfaces: Vec<*mut c_void>,
+}
+
+impl Obj {
+    fn new(kind: ObjKind, rate: u32, channels: u32) -> Self {
+        Obj {
+            vtable: &OBJECT_VTABLE,
+            kind,
+            state: SL_OBJECT_STATE_UNREALIZED,
+            rate,
+            channels,
+            play_state: SL_PLAYSTATE_STOPPED,
+            bq_count: 0,
+            bq_index: 0,
+            bq_callback: None,
+            bq_context: std::ptr::null_mut(),
+            sink: None,
+            interfaces: Vec::new(),
+        }
+    }
+}
+
+/// An `SLEngineItf` / `SLPlayItf` / `SLAndroidSimpleBufferQueueItf` value. Like
+/// `Obj`, the vtable pointer is the first field.
+#[repr(C)]
+struct Itf {
+    vtable: *const c_void,
+    owner: *mut Obj,
+}
+
+unsafe fn itf_owner(self_: *mut c_void) -> *mut Obj {
+    if self_.is_null() {
+        return std::ptr::null_mut();
+    }
+    (*(self_ as *const Itf)).owner
+}
+
+unsafe fn alloc_itf(owner: *mut Obj, vtable: *const c_void) -> *mut c_void {
+    let p = Box::into_raw(Box::new(Itf { vtable, owner })) as *mut c_void;
+    if !owner.is_null() {
+        (*owner).interfaces.push(p);
+    }
+    p
+}
+
+fn iid_matches(iid: *const c_void, value: usize) -> bool {
+    !iid.is_null() && iid as usize == value
+}
+
+// ---------------------------------------------------------------------------
+// Object interface implementation
+// ---------------------------------------------------------------------------
+
+// Object-vtable methods receive the `SLObjectItf` itself, which is our `Obj`
+// pointer (its first field is the vtable pointer). Interface-vtable methods
+// receive an `Itf` instead and use `itf_owner` above.
+unsafe fn obj_of(self_: *mut c_void) -> *mut Obj {
+    self_ as *mut Obj
+}
+
+unsafe extern "C" fn obj_realize(self_: *mut c_void, _async: u32) -> u32 {
+    let owner = obj_of(self_);
+    if owner.is_null() {
+        return SL_RESULT_PARAMETER_INVALID;
+    }
+    (*owner).state = SL_OBJECT_STATE_REALIZED;
+    SL_RESULT_SUCCESS
+}
+
+unsafe extern "C" fn obj_resume(self_: *mut c_void, _async: u32) -> u32 {
+    if obj_of(self_).is_null() {
+        SL_RESULT_PARAMETER_INVALID
+    } else {
+        SL_RESULT_SUCCESS
+    }
+}
+
+unsafe extern "C" fn obj_get_state(self_: *mut c_void, p_state: *mut u32) -> u32 {
+    let owner = obj_of(self_);
+    if owner.is_null() || p_state.is_null() {
+        return SL_RESULT_PARAMETER_INVALID;
+    }
+    *p_state = (*owner).state;
+    SL_RESULT_SUCCESS
+}
+
+unsafe extern "C" fn obj_get_interface(
+    self_: *mut c_void,
+    iid: *const c_void,
+    p_interface: *mut *mut c_void,
+) -> u32 {
+    let owner = obj_of(self_);
+    if owner.is_null() || p_interface.is_null() {
+        return SL_RESULT_PARAMETER_INVALID;
+    }
+    *p_interface = std::ptr::null_mut();
+
+    // The object interface is the object itself.
+    if iid_matches(iid, SL_IID_OBJECT) {
+        *p_interface = self_;
+        return SL_RESULT_SUCCESS;
+    }
+
+    let itf = match (*owner).kind {
+        ObjKind::Engine if iid_matches(iid, SL_IID_ENGINE) => alloc_itf(
+            owner,
+            &ENGINE_VTABLE as *const SLEngineItf_ as *const c_void,
+        ),
+        ObjKind::AudioPlayer if iid_matches(iid, SL_IID_PLAY) => {
+            alloc_itf(owner, &PLAY_VTABLE as *const SLPlayItf_ as *const c_void)
+        }
+        ObjKind::AudioPlayer if iid_matches(iid, SL_IID_ANDROIDSIMPLEBUFFERQUEUE) => alloc_itf(
+            owner,
+            &BQ_VTABLE as *const SLAndroidSimpleBufferQueueItf_ as *const c_void,
+        ),
+        _ => return SL_RESULT_FEATURE_UNSUPPORTED,
+    };
+
+    *p_interface = itf;
+    SL_RESULT_SUCCESS
+}
+
+unsafe extern "C" fn obj_register_callback(
+    _self: *mut c_void,
+    _callback: SlObjectCallback,
+    _context: *mut c_void,
+) -> u32 {
+    SL_RESULT_SUCCESS
+}
+
+unsafe extern "C" fn obj_abort_async(_self: *mut c_void) {}
+
+unsafe extern "C" fn obj_destroy(self_: *mut c_void) {
+    if self_.is_null() {
+        return;
+    }
+    let obj = Box::from_raw(self_ as *mut Obj);
+    for itf in &obj.interfaces {
+        if !itf.is_null() {
+            drop(Box::from_raw(*itf as *mut Itf));
+        }
+    }
+    // The sink's Drop closes stdin and reaps the child.
+    drop(obj);
+}
+
+unsafe extern "C" fn obj_set_priority(
+    _self: *mut c_void,
+    _priority: i32,
+    _preemptable: u32,
+) -> u32 {
+    SL_RESULT_SUCCESS
+}
+
+unsafe extern "C" fn obj_get_priority(
+    _self: *mut c_void,
+    p_priority: *mut i32,
+    p_preemptable: *mut u32,
+) -> u32 {
+    if !p_priority.is_null() {
+        *p_priority = 0;
+    }
+    if !p_preemptable.is_null() {
+        *p_preemptable = 0;
+    }
+    SL_RESULT_SUCCESS
+}
+
+unsafe extern "C" fn obj_set_loss_of_control_interfaces(
+    _self: *mut c_void,
+    _num_interfaces: i16,
+    _p_interface_ids: *mut *const c_void,
+    _enabled: u32,
+) -> u32 {
+    SL_RESULT_SUCCESS
+}
+
+static OBJECT_VTABLE: SLObjectItf_ = SLObjectItf_ {
+    Realize: Some(obj_realize),
+    Resume: Some(obj_resume),
+    GetState: Some(obj_get_state),
+    GetInterface: Some(obj_get_interface),
+    RegisterCallback: Some(obj_register_callback),
+    AbortAsyncOperation: Some(obj_abort_async),
+    Destroy: Some(obj_destroy),
+    SetPriority: Some(obj_set_priority),
+    GetPriority: Some(obj_get_priority),
+    SetLossOfControlInterfaces: Some(obj_set_loss_of_control_interfaces),
+};
+
+// ---------------------------------------------------------------------------
+// Engine interface implementation
+// ---------------------------------------------------------------------------
+
+unsafe fn make_object(kind: ObjKind, rate: u32, channels: u32) -> *mut c_void {
+    Box::into_raw(Box::new(Obj::new(kind, rate, channels))) as *mut c_void
+}
+
+unsafe extern "C" fn engine_create_audio_player(
+    _self: *mut c_void,
+    p_player: *mut *mut c_void,
+    p_audio_src: *mut SLDataSource,
+    _p_audio_snk: *mut SLDataSink,
+    _num_interfaces: u32,
+    _p_interface_ids: *const *const c_void,
+    _p_interface_required: *const u32,
+) -> u32 {
+    if p_player.is_null() {
+        return SL_RESULT_PARAMETER_INVALID;
+    }
+    *p_player = std::ptr::null_mut();
+
+    // Defaults used when the source is not an Android simple buffer queue.
+    let mut rate = DEFAULT_RATE;
+    let mut channels = DEFAULT_CHANNELS;
+
+    if !p_audio_src.is_null() {
+        let src = &*p_audio_src;
+        if !src.p_locator.is_null() && !src.p_format.is_null() {
+            let locator = &*(src.p_locator as *const SLDataLocatorAndroidSimpleBufferQueue);
+            let format = &*(src.p_format as *const SLDataFormatPcm);
+            if locator.locator_type == SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE
+                && format.format_type == SL_DATAFORMAT_PCM
+            {
+                if (1..=32).contains(&format.num_channels) {
+                    channels = format.num_channels;
+                }
+                // samplesPerSec is milliHertz: 48_000_000 -> 48_000 Hz.
+                if format.samples_per_sec >= 1_000 {
+                    let hz = format.samples_per_sec / 1_000;
+                    if (4_000..=384_000).contains(&hz) {
+                        rate = hz;
+                    }
+                }
+            }
+        }
+    }
+
+    *p_player = make_object(ObjKind::AudioPlayer, rate, channels);
+    SL_RESULT_SUCCESS
+}
+
+unsafe extern "C" fn engine_create_output_mix(
+    _self: *mut c_void,
+    p_mix: *mut *mut c_void,
+    _num_interfaces: u32,
+    _p_interface_ids: *const *const c_void,
+    _p_interface_required: *const u32,
+) -> u32 {
+    if p_mix.is_null() {
+        return SL_RESULT_PARAMETER_INVALID;
+    }
+    *p_mix = make_object(ObjKind::OutputMix, DEFAULT_RATE, DEFAULT_CHANNELS);
+    SL_RESULT_SUCCESS
+}
+
+macro_rules! engine_unsupported {
+    ($($name:ident($($arg:ident: $ty:ty),*)),* $(,)?) => {
+        $(
+            unsafe extern "C" fn $name($(_: $ty),*) -> u32 {
+                SL_RESULT_FEATURE_UNSUPPORTED
+            }
+        )*
+    };
+}
+
+engine_unsupported! {
+    engine_create_led_device(
+        self_: *mut c_void,
+        p_device: *mut *mut c_void,
+        device_id: u32,
+        num_interfaces: u32,
+        p_interface_ids: *const *const c_void,
+        p_interface_required: *const u32
+    ),
+    engine_create_vibra_device(
+        self_: *mut c_void,
+        p_device: *mut *mut c_void,
+        device_id: u32,
+        num_interfaces: u32,
+        p_interface_ids: *const *const c_void,
+        p_interface_required: *const u32
+    ),
+    engine_create_audio_recorder(
+        self_: *mut c_void,
+        p_recorder: *mut *mut c_void,
+        p_audio_src: *mut SLDataSource,
+        p_audio_snk: *mut SLDataSink,
+        num_interfaces: u32,
+        p_interface_ids: *const *const c_void,
+        p_interface_required: *const u32
+    ),
+    engine_create_midi_player(
+        self_: *mut c_void,
+        p_player: *mut *mut c_void,
+        p_midi_src: *mut SLDataSource,
+        p_bank_src: *mut SLDataSource,
+        p_audio_output: *mut SLDataSink,
+        p_vibra: *mut SLDataSink,
+        p_led_array: *mut SLDataSink,
+        num_interfaces: u32,
+        p_interface_ids: *const *const c_void,
+        p_interface_required: *const u32
+    ),
+    engine_create_listener(
+        self_: *mut c_void,
+        p_listener: *mut *mut c_void,
+        num_interfaces: u32,
+        p_interface_ids: *const *const c_void,
+        p_interface_required: *const u32
+    ),
+    engine_create_3d_group(
+        self_: *mut c_void,
+        p_group: *mut *mut c_void,
+        num_interfaces: u32,
+        p_interface_ids: *const *const c_void,
+        p_interface_required: *const u32
+    ),
+    engine_create_metadata_extractor(
+        self_: *mut c_void,
+        p_metadata_extractor: *mut *mut c_void,
+        p_data_source: *mut SLDataSource,
+        num_interfaces: u32,
+        p_interface_ids: *const *const c_void,
+        p_interface_required: *const u32
+    ),
+    engine_create_extension_object(
+        self_: *mut c_void,
+        p_object: *mut *mut c_void,
+        p_parameters: *mut c_void,
+        object_id: u32,
+        num_interfaces: u32,
+        p_interface_ids: *const *const c_void,
+        p_interface_required: *const u32
+    ),
+    engine_query_num_supported_interfaces(
+        self_: *mut c_void,
+        object_id: u32,
+        p_num: *mut u32
+    ),
+    engine_query_supported_interfaces(
+        self_: *mut c_void,
+        object_id: u32,
+        index: u32,
+        p_interface_id: *mut *const c_void
+    ),
+    engine_query_num_supported_extensions(self_: *mut c_void, p_num_extensions: *mut u32),
+    engine_query_supported_extension(
+        self_: *mut c_void,
+        index: u32,
+        p_extension_name: *mut c_char,
+        p_name_length: *mut i16
+    ),
+    engine_is_extension_supported(
+        self_: *mut c_void,
+        p_extension_name: *const c_char,
+        p_supported: *mut u32
+    )
+}
+
+static ENGINE_VTABLE: SLEngineItf_ = SLEngineItf_ {
+    CreateLEDDevice: Some(engine_create_led_device),
+    CreateVibraDevice: Some(engine_create_vibra_device),
+    CreateAudioPlayer: Some(engine_create_audio_player),
+    CreateAudioRecorder: Some(engine_create_audio_recorder),
+    CreateMidiPlayer: Some(engine_create_midi_player),
+    CreateListener: Some(engine_create_listener),
+    Create3DGroup: Some(engine_create_3d_group),
+    CreateOutputMix: Some(engine_create_output_mix),
+    CreateMetadataExtractor: Some(engine_create_metadata_extractor),
+    CreateExtensionObject: Some(engine_create_extension_object),
+    QueryNumSupportedInterfaces: Some(engine_query_num_supported_interfaces),
+    QuerySupportedInterfaces: Some(engine_query_supported_interfaces),
+    QueryNumSupportedExtensions: Some(engine_query_num_supported_extensions),
+    QuerySupportedExtension: Some(engine_query_supported_extension),
+    IsExtensionSupported: Some(engine_is_extension_supported),
+};
+
+// ---------------------------------------------------------------------------
+// Play interface implementation
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" fn play_set_play_state(self_: *mut c_void, state: u32) -> u32 {
+    let owner = itf_owner(self_);
+    if owner.is_null() {
+        return SL_RESULT_PARAMETER_INVALID;
+    }
+    (*owner).play_state = state;
+    SL_RESULT_SUCCESS
+}
+
+unsafe extern "C" fn play_get_play_state(self_: *mut c_void, p_state: *mut u32) -> u32 {
+    let owner = itf_owner(self_);
+    if owner.is_null() || p_state.is_null() {
+        return SL_RESULT_PARAMETER_INVALID;
+    }
+    *p_state = (*owner).play_state;
+    SL_RESULT_SUCCESS
+}
+
+unsafe extern "C" fn play_get_duration(_self: *mut c_void, p_msec: *mut u32) -> u32 {
+    if p_msec.is_null() {
+        return SL_RESULT_PARAMETER_INVALID;
+    }
+    // Unknown/live stream: OpenSL uses 0xFFFFFFFF as "unknown" here.
+    *p_msec = 0xFFFF_FFFF;
+    SL_RESULT_SUCCESS
+}
+
+unsafe extern "C" fn play_get_position(_self: *mut c_void, p_msec: *mut u32) -> u32 {
+    if p_msec.is_null() {
+        return SL_RESULT_PARAMETER_INVALID;
+    }
+    *p_msec = 0;
+    SL_RESULT_SUCCESS
+}
+
+unsafe extern "C" fn play_register_callback(
+    _self: *mut c_void,
+    _callback: SlPlayCallback,
+    _context: *mut c_void,
+) -> u32 {
+    SL_RESULT_SUCCESS
+}
+
+unsafe extern "C" fn play_set_callback_events_mask(_self: *mut c_void, _flags: u32) -> u32 {
+    SL_RESULT_SUCCESS
+}
+
+unsafe extern "C" fn play_get_callback_events_mask(
+    _self: *mut c_void,
+    p_flags: *mut u32,
+) -> u32 {
+    if !p_flags.is_null() {
+        *p_flags = 0;
+    }
+    SL_RESULT_SUCCESS
+}
+
+unsafe extern "C" fn play_set_marker_position(_self: *mut c_void, _msec: u32) -> u32 {
+    SL_RESULT_SUCCESS
+}
+
+unsafe extern "C" fn play_clear_marker_position(_self: *mut c_void) -> u32 {
+    SL_RESULT_SUCCESS
+}
+
+unsafe extern "C" fn play_get_marker_position(_self: *mut c_void, p_msec: *mut u32) -> u32 {
+    if !p_msec.is_null() {
+        *p_msec = 0;
+    }
+    SL_RESULT_SUCCESS
+}
+
+unsafe extern "C" fn play_set_position_update_period(_self: *mut c_void, _msec: u32) -> u32 {
+    SL_RESULT_SUCCESS
+}
+
+unsafe extern "C" fn play_get_position_update_period(
+    _self: *mut c_void,
+    p_msec: *mut u32,
+) -> u32 {
+    if !p_msec.is_null() {
+        *p_msec = 0;
+    }
+    SL_RESULT_SUCCESS
+}
+
+static PLAY_VTABLE: SLPlayItf_ = SLPlayItf_ {
+    SetPlayState: Some(play_set_play_state),
+    GetPlayState: Some(play_get_play_state),
+    GetDuration: Some(play_get_duration),
+    GetPosition: Some(play_get_position),
+    RegisterCallback: Some(play_register_callback),
+    SetCallbackEventsMask: Some(play_set_callback_events_mask),
+    GetCallbackEventsMask: Some(play_get_callback_events_mask),
+    SetMarkerPosition: Some(play_set_marker_position),
+    ClearMarkerPosition: Some(play_clear_marker_position),
+    GetMarkerPosition: Some(play_get_marker_position),
+    SetPositionUpdatePeriod: Some(play_set_position_update_period),
+    GetPositionUpdatePeriod: Some(play_get_position_update_period),
+};
+
+// ---------------------------------------------------------------------------
+// Android simple buffer queue implementation
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Set while a buffer-queue callback is running on this thread. An app that
+    /// calls `Enqueue` from its callback would otherwise recurse without bound.
+    static IN_BQ_CALLBACK: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+/// Spawn `pw-cat` (preferred) or `aplay` reading S16 PCM from stdin.
+fn spawn_sink(rate: u32, channels: u32) -> Option<Sink> {
+    let rate = rate.to_string();
+    let channels = channels.to_string();
+
+    let pw_cat = Command::new("pw-cat")
+        .args(["-p", "-a", "--rate", &rate, "--channels", &channels, "--format", "s16", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let child = match pw_cat {
+        Ok(child) => Some(child),
+        Err(_) => Command::new("aplay")
+            .args(["-q", "-t", "raw", "-f", "S16_LE", "-r", &rate, "-c", &channels, "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok(),
+    }?;
+
+    let mut child = child;
+    let stdin = child.stdin.take();
+    Some(Sink { child, stdin })
+}
+
+unsafe extern "C" fn bq_enqueue(
+    self_: *mut c_void,
+    p_buffer: *const c_void,
+    size: u32,
+) -> u32 {
+    let owner = itf_owner(self_);
+    if owner.is_null() || p_buffer.is_null() || size == 0 {
+        return SL_RESULT_PARAMETER_INVALID;
+    }
+
+    let obj = &mut *owner;
+
+    if obj.sink.is_none() {
+        match spawn_sink(obj.rate, obj.channels) {
+            Some(sink) => obj.sink = Some(sink),
+            // No host audio tool: keep the OpenSL object model usable.
+            None => return SL_RESULT_FEATURE_UNSUPPORTED,
+        }
+    }
+
+    let bytes = std::slice::from_raw_parts(p_buffer as *const u8, size as usize);
+    if let Some(sink) = obj.sink.as_mut() {
+        if let Some(stdin) = sink.stdin.as_mut() {
+            // A broken pipe (player exited) is not fatal to the app.
+            let _ = stdin.write_all(bytes);
+            let _ = stdin.flush();
+        }
+    }
+
+    obj.bq_count = obj.bq_count.saturating_add(1);
+    obj.bq_index = obj.bq_index.wrapping_add(1);
+
+    // Copy out before the callback: it may destroy the player.
+    let callback = obj.bq_callback;
+    let context = obj.bq_context;
+    let already_in_callback = IN_BQ_CALLBACK.with(|flag| flag.get());
+    if let Some(callback) = callback {
+        if !already_in_callback {
+            IN_BQ_CALLBACK.with(|flag| flag.set(true));
+            callback(self_, context);
+            IN_BQ_CALLBACK.with(|flag| flag.set(false));
+        }
+    }
+
+    SL_RESULT_SUCCESS
+}
+
+unsafe extern "C" fn bq_clear(self_: *mut c_void) -> u32 {
+    let owner = itf_owner(self_);
+    if owner.is_null() {
+        return SL_RESULT_PARAMETER_INVALID;
+    }
+    (*owner).bq_count = 0;
+    SL_RESULT_SUCCESS
+}
+
+unsafe extern "C" fn bq_get_state(
+    self_: *mut c_void,
+    p_state: *mut SLAndroidSimpleBufferQueueState,
+) -> u32 {
+    let owner = itf_owner(self_);
+    if owner.is_null() || p_state.is_null() {
+        return SL_RESULT_PARAMETER_INVALID;
+    }
+    (*p_state).count = (*owner).bq_count;
+    (*p_state).index = (*owner).bq_index;
+    SL_RESULT_SUCCESS
+}
+
+unsafe extern "C" fn bq_register_callback(
+    self_: *mut c_void,
+    callback: SlBqCallback,
+    context: *mut c_void,
+) -> u32 {
+    let owner = itf_owner(self_);
+    if owner.is_null() {
+        return SL_RESULT_PARAMETER_INVALID;
+    }
+    (*owner).bq_callback = callback;
+    (*owner).bq_context = context;
+    SL_RESULT_SUCCESS
+}
+
+static BQ_VTABLE: SLAndroidSimpleBufferQueueItf_ = SLAndroidSimpleBufferQueueItf_ {
+    Enqueue: Some(bq_enqueue),
+    Clear: Some(bq_clear),
+    GetState: Some(bq_get_state),
+    RegisterCallback: Some(bq_register_callback),
+};
 
 /// Export a batch of OpenSL ES interface-ID data symbols. Apps compare these
 /// opaque values and pass them back to us; they are never dereferenced, so
@@ -1595,7 +2486,7 @@ sl_iids! {
     SL_IID_3DDISTANCEATTENUATION = 0x5044_002f,
 }
 
-/// `SLresult slCreateEngine(SLObjectItf*, ...)`. Always fails cleanly.
+/// `SLresult slCreateEngine(SLObjectItf*, ...)` — create a usable engine.
 #[no_mangle]
 pub unsafe extern "C" fn slCreateEngine(
     engine: *mut *mut c_void,
@@ -1605,10 +2496,15 @@ pub unsafe extern "C" fn slCreateEngine(
     _interface_ids: *const *const c_void,
     _interface_required: *const u8,
 ) -> u32 {
-    if !engine.is_null() {
-        *engine = std::ptr::null_mut();
+    if engine.is_null() {
+        return SL_RESULT_PARAMETER_INVALID;
     }
-    SL_RESULT_FEATURE_UNSUPPORTED
+    *engine = Box::into_raw(Box::new(Obj::new(
+        ObjKind::Engine,
+        DEFAULT_RATE,
+        DEFAULT_CHANNELS,
+    ))) as *mut c_void;
+    SL_RESULT_SUCCESS
 }
 
 // ---------------------------------------------------------------------------
@@ -1988,5 +2884,155 @@ mod tests {
         let s = CString::new("x").unwrap();
         let rc = unsafe { fputs(s.as_ptr(), stdout) };
         assert!(rc >= 0, "fputs via __sF stdout failed: {rc}");
+    }
+
+    /// Drive the same call chain the C fixture uses, through the vtable
+    /// pointers, without enqueuing (which would spawn an audio process).
+    #[test]
+    fn opensl_object_model() {
+        unsafe {
+            let mut engine: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                slCreateEngine(
+                    &mut engine,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                SL_RESULT_SUCCESS
+            );
+            assert!(!engine.is_null());
+
+            // An SLObjectItf is a pointer to a vtable pointer.
+            let object_vt = &*(*(engine as *const *const SLObjectItf_));
+            assert_eq!((object_vt.Realize.unwrap())(engine, 0), SL_RESULT_SUCCESS);
+
+            let mut state = 0u32;
+            assert_eq!(
+                (object_vt.GetState.unwrap())(engine, &mut state),
+                SL_RESULT_SUCCESS
+            );
+            assert_eq!(state, SL_OBJECT_STATE_REALIZED);
+
+            let mut engine_itf: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                (object_vt.GetInterface.unwrap())(
+                    engine,
+                    SL_IID_ENGINE as *const c_void,
+                    &mut engine_itf,
+                ),
+                SL_RESULT_SUCCESS
+            );
+            assert!(!engine_itf.is_null());
+            let engine_vt = &*(*(engine_itf as *const *const SLEngineItf_));
+
+            let mut mix: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                (engine_vt.CreateOutputMix.unwrap())(
+                    engine_itf,
+                    &mut mix,
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                SL_RESULT_SUCCESS
+            );
+            assert!(!mix.is_null());
+
+            // 48 kHz stereo, Android simple buffer queue source.
+            let mut locator = SLDataLocatorAndroidSimpleBufferQueue {
+                locator_type: SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE,
+                num_buffers: 2,
+            };
+            let mut format = SLDataFormatPcm {
+                format_type: SL_DATAFORMAT_PCM,
+                num_channels: 2,
+                samples_per_sec: 48_000_000,
+                bits_per_sample: 16,
+                container_size: 16,
+                channel_mask: 3,
+                endianness: 2,
+            };
+            let mut source = SLDataSource {
+                p_locator: &mut locator as *mut _ as *mut c_void,
+                p_format: &mut format as *mut _ as *mut c_void,
+            };
+            let mut sink = SLDataSink {
+                p_locator: std::ptr::null_mut(),
+                p_format: std::ptr::null_mut(),
+            };
+
+            let mut player: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                (engine_vt.CreateAudioPlayer.unwrap())(
+                    engine_itf,
+                    &mut player,
+                    &mut source,
+                    &mut sink,
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                SL_RESULT_SUCCESS
+            );
+            assert!(!player.is_null());
+
+            let player_vt = &*(*(player as *const *const SLObjectItf_));
+            assert_eq!((player_vt.Realize.unwrap())(player, 0), SL_RESULT_SUCCESS);
+
+            let mut play_itf: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                (player_vt.GetInterface.unwrap())(
+                    player,
+                    SL_IID_PLAY as *const c_void,
+                    &mut play_itf,
+                ),
+                SL_RESULT_SUCCESS
+            );
+            let play_vt = &*(*(play_itf as *const *const SLPlayItf_));
+            assert_eq!(
+                (play_vt.SetPlayState.unwrap())(play_itf, SL_PLAYSTATE_PLAYING),
+                SL_RESULT_SUCCESS
+            );
+            let mut play_state = 0u32;
+            assert_eq!(
+                (play_vt.GetPlayState.unwrap())(play_itf, &mut play_state),
+                SL_RESULT_SUCCESS
+            );
+            assert_eq!(play_state, SL_PLAYSTATE_PLAYING);
+
+            let mut bq_itf: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                (player_vt.GetInterface.unwrap())(
+                    player,
+                    SL_IID_ANDROIDSIMPLEBUFFERQUEUE as *const c_void,
+                    &mut bq_itf,
+                ),
+                SL_RESULT_SUCCESS
+            );
+            let bq_vt = &*(*(bq_itf as *const *const SLAndroidSimpleBufferQueueItf_));
+            // Invalid arguments must be rejected before any sink is spawned.
+            assert_eq!(
+                (bq_vt.Enqueue.unwrap())(bq_itf, std::ptr::null(), 0),
+                SL_RESULT_PARAMETER_INVALID
+            );
+
+            // Unknown interfaces are refused rather than returning garbage.
+            let mut unsupported: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                (player_vt.GetInterface.unwrap())(
+                    player,
+                    SL_IID_RECORD as *const c_void,
+                    &mut unsupported,
+                ),
+                SL_RESULT_FEATURE_UNSUPPORTED
+            );
+
+            (player_vt.Destroy.unwrap())(player);
+            (object_vt.Destroy.unwrap())(mix);
+            (object_vt.Destroy.unwrap())(engine);
+        }
     }
 }

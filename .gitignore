@@ -6,3 +6,4 @@
 fixtures/*/lib/
 fixtures/*/*.apk
 fixtures/egl-app/egl-app
+fixtures/opensl-app/opensl-app
