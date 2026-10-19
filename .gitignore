@@ -5,3 +5,4 @@
 *.log
 fixtures/*/lib/
 fixtures/*/*.apk
+fixtures/egl-app/egl-app
