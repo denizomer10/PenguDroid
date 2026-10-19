@@ -22,6 +22,7 @@ use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::ptr;
+use std::time::Duration;
 
 use pengudroid_proto::MAX_FRAME_LEN;
 
@@ -91,6 +92,27 @@ impl Connection {
         self.fd.as_raw_fd()
     }
 
+    /// Bound blocking reads (and writes, on most platforms) to `timeout`.
+    ///
+    /// A timed-out read fails with [`io::ErrorKind::WouldBlock`], which callers
+    /// use to multiplex between the socket and their own work.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        set_socket_timeouts(self.fd.as_raw_fd(), timeout)
+    }
+
+    /// Set the socket non-blocking.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        let flags = unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let flags = if nonblocking { flags | libc::O_NONBLOCK } else { flags & !libc::O_NONBLOCK };
+        if unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_SETFL, flags) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// Read one framed message. Returns the body and any attached fds.
     pub fn recv_frame(&self) -> Result<(Vec<u8>, Vec<RawFd>)> {
         let mut fds = Vec::new();
@@ -127,6 +149,31 @@ impl Connection {
             .map_err(|e| SocketError::Io(io::Error::new(io::ErrorKind::InvalidData, e)))?;
         Ok((msg, fds))
     }
+}
+
+/// Apply `SO_RCVTIMEO`/`SO_SNDTIMEO` to a socket (a no-op timeout means
+/// "block indefinitely").
+fn set_socket_timeouts(fd: RawFd, timeout: Option<Duration>) -> io::Result<()> {
+    let tv = timeout.map(|d| libc::timeval {
+        tv_sec: d.as_secs() as libc::time_t,
+        tv_usec: d.subsec_micros() as libc::suseconds_t,
+    });
+    let ptr = match &tv {
+        Some(t) => t as *const libc::timeval,
+        None => std::ptr::null(),
+    };
+    let len = mem::size_of::<libc::timeval>() as libc::socklen_t;
+    // Timeouts are plain socket state; setting them cannot invalidate the fd.
+    for opt in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+        // SAFETY: `fd` is a live socket and `ptr`/`len` describe a `timeval`.
+        let rc = unsafe {
+            libc::setsockopt(fd, libc::SOL_SOCKET, opt, ptr as *const libc::c_void, len)
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 /// A listening control socket.
@@ -166,6 +213,17 @@ impl Listener {
 
     pub fn set_nonblocking(&self, nb: bool) -> io::Result<()> {
         self.inner.set_nonblocking(nb)
+    }
+
+    /// Make connections returned by [`Listener::accept`] use `timeout` for
+    /// reads and writes from now on.
+    ///
+    /// Accepted sockets inherit this from the listener on Linux, so a daemon
+    /// can keep a non-blocking listener and still give each client a bounded
+    /// blocking channel.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        use std::os::fd::AsFd;
+        set_socket_timeouts(self.inner.as_fd().as_raw_fd(), timeout)
     }
 
     pub fn path(&self) -> &std::path::Path {
@@ -383,6 +441,26 @@ mod tests {
         assert_eq!(n, 4);
         let err = b.recv_frame().unwrap_err();
         assert!(matches!(err, SocketError::BadLength(0)), "got {err:?}");
+    }
+
+    #[test]
+    fn read_timeout_reports_would_block() {
+        let (a, b) = socketpair();
+        // The far end must time out; `a` keeps blocking writes.
+        b.set_read_timeout(Some(Duration::from_millis(30))).unwrap();
+        let start = std::time::Instant::now();
+        let err = b.recv_message().unwrap_err();
+        match err {
+            SocketError::Io(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "got {e:?}")
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(start.elapsed() < Duration::from_secs(2));
+
+        // A frame that arrives in time is still delivered normally.
+        a.send_message(&pengudroid_proto::Message::Ping, &[]).unwrap();
+        assert_eq!(b.recv_message().unwrap().0, pengudroid_proto::Message::Ping);
     }
 
     #[test]

@@ -61,12 +61,24 @@ impl Client {
     }
 }
 
-/// Ask the daemon to shut down. Returns `Ok(true)` if it acknowledged.
+/// Ask the daemon to shut down, and wait for the socket to go away so a
+/// `stop; start` sequence in a script cannot race the old process.
+///
+/// Returns `Ok(true)` if it acknowledged.
 pub fn stop() -> Result<bool, String> {
     let c = Client::connect()?;
     c.handshake(Role::Cli)?;
-    match c.request(&Message::Shutdown)? {
-        (Message::Goodbye, _) => Ok(true),
-        _ => Ok(false),
+    let acknowledged = matches!(c.request(&Message::Shutdown)?, (Message::Goodbye, _));
+    if !acknowledged {
+        return Ok(false);
     }
+    let socket = default_socket_path();
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(3) {
+        if Connection::connect(&socket).is_err() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Ok(true)
 }

@@ -10,7 +10,7 @@ use pengudroid_proto::default_socket_path;
 
 use crate::apk::{self, ApkInfo};
 use crate::client::Client;
-use pengudroid_proto::Role;
+use pengudroid_proto::{Message, Role};
 
 /// Default window size for a phone-shaped app.
 const DEFAULT_W: u32 = 720;
@@ -29,21 +29,40 @@ pub fn ensure_daemon(socket: &Path) -> Result<(), String> {
         return Ok(());
     }
     let bin = find_daemon_binary()?;
-    Command::new(&bin)
-        .arg("--socket")
-        .arg(socket)
-        .arg("--daemonize")
+    // The daemon logs to stderr. Keeping it attached to ours means a failure to
+    // bind (sandboxed or read-only runtime dir) is explained where the user is
+    // looking; `--daemonize` redirects its own stdio to /dev/null afterwards.
+    let bin_arg = bin.display().to_string();
+    let socket_arg = socket.display().to_string();
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg("exec \"$0\" --socket \"$1\" --daemonize")
+        .arg(&bin_arg)
+        .arg(&socket_arg)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
         .spawn()
-        .map_err(|e| format!("cannot start {}: {e}", bin.display()))?;
+        .map_err(|e| format!("cannot start {bin_arg}: {e}"))?;
 
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(3) {
+    while start.elapsed() < Duration::from_secs(5) {
         if is_daemon_up(socket) {
+            // `--daemonize` double-forks; reap the intermediate child so this
+            // process does not leave a zombie behind.
+            let _ = child.try_wait();
             return Ok(());
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            if !status.success() {
+                return Err(format!("{} exited during startup ({status})", bin.display()));
+            }
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    Err(format!("daemon did not start within 3s (tried {})", bin.display()))
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(format!("daemon did not start within 5s (tried {})", bin.display()))
 }
 
 fn is_daemon_up(socket: &Path) -> bool {
@@ -113,15 +132,63 @@ pub fn run(apk_path: &str, component: Option<&str>, extra: &[String]) -> Result<
         .arg(DEFAULT_H.to_string())
         .args(extra);
 
+    launch_guest(cmd, &info.package, &resolved_component)
+}
+
+/// `pengudroid start <app.apk>`: ask the daemon itself to fork the guest, so it
+/// survives the CLI exiting and `pengudroid ps` tracks it.
+pub fn start_detached(apk_path: &str, component: Option<&str>, extra: &[String]) -> Result<i32, String> {
+    let socket = default_socket_path();
+    ensure_daemon(&socket)?;
+    let client = Client::connect_to(&socket)?;
+    client.handshake(Role::Cli)?;
+    let resolved = component.map(str::to_string);
+    match client.request(&Message::RunApk {
+        path: apk_path.to_string(),
+        component: resolved,
+        args: extra.to_vec(),
+    }) {
+        Ok((Message::RunStarted { pid, .. }, _)) => Ok(pid),
+        Ok((Message::Error { message, .. }, _)) => Err(message),
+        Ok((other, _)) => Err(format!("unexpected reply: {other:?}")),
+        Err(e) => Err(e),
+    }
+}
+
+/// Wait for a guest started with [`start_detached`] to exit.
+pub fn wait_detached(pid: i32) -> Result<String, String> {
+    let socket = default_socket_path();
+    let client = Client::connect_to(&socket)?;
+    client.handshake(Role::Cli)?;
+    loop {
+        match client.request(&Message::QueryRun { pid })? {
+            (Message::RunStatus { running: true, .. }, _) => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            (Message::RunStatus { exit_code, signal, .. }, _) => {
+                return Ok(if signal != 0 {
+                    format!("signal {signal}")
+                } else {
+                    format!("exit code {exit_code}")
+                });
+            }
+            (Message::Error { message, .. }, _) => return Err(message),
+            (other, _) => return Err(format!("unexpected reply: {other:?}")),
+        }
+    }
+}
+
+/// Launch a fully prepared `__guest` command and supervise it.
+fn launch_guest(mut cmd: Command, package: &str, component: &str) -> Result<(), String> {
     let mut child = cmd.spawn().map_err(|e| format!("failed to start guest: {e}"))?;
     println!(
         "started guest: pid {} ({}{})",
         child.id(),
-        info.package,
-        if resolved_component.is_empty() {
+        package,
+        if component.is_empty() {
             String::new()
         } else {
-            format!(" :: {resolved_component}")
+            format!(" :: {component}")
         }
     );
     println!("the window is live; press Ctrl-C to stop the guest");
@@ -141,6 +208,17 @@ pub fn run(apk_path: &str, component: Option<&str>, extra: &[String]) -> Result<
         }
         match child.try_wait() {
             Ok(Some(status)) => {
+                // A guest that dies before ever owning a window usually means
+                // the daemon has no graphics path; say so instead of leaving a
+                // bare exit code.
+                if !status.success() {
+                    eprintln!(
+                        "hint: the guest exited before drawing. Check the daemon's graphics "
+                    );
+                    eprintln!(
+                        "      backend with `pengudroid-daemon --wayland-selftest`."
+                    );
+                }
                 println!("guest exited: {status}");
                 return Ok(());
             }

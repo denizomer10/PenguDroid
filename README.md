@@ -1,5 +1,7 @@
 # PenguDroid
 
+<img src="logo.png" alt="PenguDroid logo" width="180">
+
 **A no-KVM, no-container, no-VM Android compatibility layer for Linux — in Rust.**
 
 PenguDroid runs Android applications as ordinary Linux processes. There is no
@@ -44,7 +46,9 @@ milestone. Nothing below is overstated.
 | Unix-socket protocol, framing, `SCM_RIGHTS` fd passing | **Working** | tested with real memfds |
 | `ashmem` via `memfd_create` + seals | **Working** | GROW/SHRINK seals verified to block `ftruncate` |
 | Kernel binder probe (`BINDER_VERSION` ioctl) + fallback | **Working** | detects `/dev/binderfs/binder`; falls back to userspace broker on desktop kernels |
-| Android property store (`getprop`/`setprop`) | **Working** | Android 16 defaults; reported to guests |
+| Userspace binder broker: named services, transactions | **Working** | `pengudroid services` lists the table; platform stubs answer transactions |
+| Guest↔guest service calls (forwarded over the control socket) | **Working** | a guest registers a service, another connection transacts on its handle; covered by an integration test with a real daemon |
+| Android property store (`getprop`/`setprop`, enumeration) | **Working** | Android 16 defaults; `getprop` with no name lists everything |
 | APK + binary `AndroidManifest.xml` parsing | **Working** | ZIP (store/deflate) + AXML parser, unit-tested |
 | `pengudroid deps`: ELF import / Bionic-coverage analysis | **Working** | parses real arm64 / armv7 / x86-64 APK libraries; predicts `dlopen` outcome |
 | Loading **real Android APK libraries** on glibc (`de-bionic` + `libpath` + `nativelib`) | **Working** | real x86-64 APK libraries (`librtb.so`, `libgtb.so`, `libnativeutil.so`) `dlopen` successfully |
@@ -52,8 +56,9 @@ milestone. Nothing below is overstated.
 | **Calling a real Android-style library and getting a correct result** | **Working** | `fixtures/native-demo` returns 500500 after `de-bionic` + load, via the shim |
 | **Loading an application's own native libraries (`nativelib --apk`)** | **Working** | extracts an APK's `lib/<abi>/*.so`, strips them, and loads the set (intra-APK deps resolve) |
 | Wayland graphics broker (compositor, `wl_shm`, `xdg_wm_base`, toplevels) | **Working** | connects to the live session; surfaces + `wl_shm` buffers |
-| Guest process: owns a window, `ps`-visible, animated | **Working** | the `__guest` runtime |
-| `LD_PRELOAD` Bionic→glibc shim (`libashmem`, logging, props, API level) | **Working** | interposes real Bionic symbol names |
+| Guest process: owns a window, `ps`-visible, animated | **Working** | the `__guest` runtime; the compositor closing a window stops the guest |
+| Guest launched by the **daemon** (`RunApk`, `pengudroid start --wait`) | **Working** | daemon forks the CLI's `__guest`, reaps it, and reports its exit through `QueryRun` |
+| `LD_PRELOAD` Bionic→glibc shim (`libashmem`, logging, props, API level) | **Working** | interposes real Bionic symbol names; `__android_log_print` formats with the host `vsnprintf` |
 | Service registry + `phone`/`media.camera`/AMS/PMS/SurfaceFlinger stubs | **Stub** | correctly-named interfaces, minimal replies |
 | Audio: PipeWire | **Stub** | `dlopen` availability probe + shared ring buffer; the pump into PipeWire is not written |
 | Telephony / camera | **Stub** | report "radio off" / "zero cameras" |
@@ -85,7 +90,7 @@ Binaries land in `target/release/`:
 ## Usage
 
 ```sh
-# Start the daemon (or let `run` start it for you).
+# Start the daemon (or let `run`/`start` start it for you).
 pengudroid daemon
 
 # Inspect an APK without running it.
@@ -107,8 +112,14 @@ pengudroid de-bionic in.so out.so
 # Launch an app as a native Wayland window; Ctrl-C stops the guest.
 pengudroid run app.apk
 
-# Manage guests and properties.
+# Let the daemon fork the guest instead (survives the CLI exiting); `--wait`
+# blocks until it exits and prints the exit status.
+pengudroid start app.apk --wait
+
+# Manage guests, services and properties.
 pengudroid ps
+pengudroid services
+pengudroid getprop                           # every property
 pengudroid getprop ro.build.version.sdk      # -> 36
 pengudroid setprop debug.pengudroid 1
 pengudroid status
@@ -216,6 +227,7 @@ fixtures/
   native-demo/         a reproducible Android-style versioned test library
 docs/
   ARCHITECTURE.md      how each translation layer works
+  API.md               CLI surface and the control protocol, in one place
   LIMITATIONS.md       the hard problems, stated plainly
 ```
 
@@ -225,9 +237,16 @@ docs/
 cargo test --workspace
 ```
 
-Unit tests cover the wire protocol round-trips, `SCM_RIGHTS` fd passing,
-ashmem sealing, binder ioctl-number correctness, the property store, the
-service stubs, ZIP + AXML parsing, and the shim's property/ashmem entry points.
+Unit tests cover the wire protocol round-trips, `SCM_RIGHTS` fd passing, socket
+timeouts, ashmem sealing, binder ioctl-number correctness, the property store,
+service stubs and guest-service ownership, daemon dispatch (including guest
+calls, `RunApk` validation and process bookkeeping), ZIP + AXML parsing, and the
+shim's property/ashmem/log-formatting entry points.
+
+The shim's variadic `__android_log_print` / `__android_log_assert` are compiled
+from a small C file generated by `crates/pengudroid-shim/build.rs` (Rust cannot
+define C-variadic functions on stable). Without a C compiler the crate still
+builds, minus those two entry points, and says so with a cargo warning.
 
 ## License
 

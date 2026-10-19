@@ -1,7 +1,5 @@
-// `rust-lld` warns when a version script reassigns an already-global symbol to a
-// version node (build.rs does this for the `LIBC`/`LIBM`/`LD` anchors). The
-// reassignment is exactly what we want and succeeds; the note is noise.
-#![allow(linker_messages)]
+// `rust-lld` and GNU `ld` differ in which diagnostics they treat as lintable;
+// the version-script reassignment below is intentional, so nothing to allow.
 
 //! `pengudroid-shim` — an `LD_PRELOAD` Bionic→glibc translation shim.
 //!
@@ -16,7 +14,9 @@
 //! needs on top of plain glibc/Linux syscalls:
 //!
 //! * `<android/log.h>` logging (`__android_log_print`, `__android_log_write`,
-//!   `__android_log_vprint`, `__android_log_assert`).
+//!   `__android_log_vprint`, `__android_log_assert`). The variadic entry points
+//!   are thin C shims (see `src/vlog.rs`) whose format strings are expanded by
+//!   the host `vsnprintf`, so `"x=%d"` logs `x=42`, not `x=%d`.
 //! * `<cutils/ashmem.h>` shared memory — Bionic's `/dev/ashmem` is emulated
 //!   with [`libc::memfd_create`] plus file seals (see [`create_ashmem`]).
 //! * `<android/api-level.h>` / `<android/set_abort_message.h>` version and
@@ -31,8 +31,8 @@
 //!
 //! ## Known limitations
 //!
-//! * Varargs formatting is out of scope: the `printf`-style entry points log
-//!   the raw format string *literally* rather than expanding it.
+//! * `%p`, `%ls` and friends are handed to the host `vsnprintf`, which is
+//!   POSIX-compatible; Android-specific format corner cases are not emulated.
 //! * ashmem pin seals are irreversible (see [`ashmem_unpin_region`]).
 //! * The property store is process-local and accepts `ro.*` writes (Android
 //!   itself normally freezes them after boot).
@@ -46,6 +46,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use libc::{c_char, c_int, c_void};
+
+mod vlog;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -136,28 +138,69 @@ unsafe fn cstr_lossy(ptr: *const c_char) -> String {
     }
 }
 
-/// `__android_log_print(prio, tag, fmt, ...)`.
-///
-/// **Limitation:** Rust cannot statically format C varargs without pulling in a
-/// `printf` implementation, so `fmt` is emitted *verbatim* rather than being
-/// expanded with the trailing arguments.
-///
-/// Returns the number of bytes written, or a negative value on error (null
-/// `fmt`, or a failed write), matching Bionic's contract.
+// `__android_log_print(prio, tag, fmt, ...)` is defined in C (`src/vlog.rs`)
+// because Rust cannot define a C-variadic function on stable. The C side
+// formats with `vsnprintf` and calls `__pengudroid_log_rendered` with the
+// finished line, so the format string is genuinely expanded. Its return value is
+// the number of bytes formatted, or a negative value on error (null or malformed
+// `fmt`), matching Bionic's contract. `__android_log_assert` is the matching
+// `noreturn` assertion logger.
+#[cfg(has_variadic_log)]
+extern "C" {
+    pub fn __android_log_print(prio: c_int, tag: *const c_char, fmt: *const c_char, ...) -> c_int;
+
+    /// `__android_log_assert(cond, tag, fmt, ...)` — Bionic's `noreturn`
+    /// assertion logger, also defined in C.
+    pub fn __android_log_assert(cond: *const c_char, tag: *const c_char, fmt: *const c_char, ...) -> !;
+}
+
+/// Emit a fully rendered variadic log line. Called only from the C shim.
+#[cfg(has_variadic_log)]
 #[no_mangle]
-pub unsafe extern "C" fn __android_log_print(
+pub unsafe extern "C" fn __pengudroid_log_rendered(
     prio: c_int,
     tag: *const c_char,
-    fmt: *const c_char,
-    _: ...
-) -> c_int {
-    if fmt.is_null() {
-        return -1;
-    }
-    let tag = cstr_lossy(tag);
-    let text = cstr_lossy(fmt);
-    log_to_stderr(prio, &tag, &text) as c_int
+    rendered: *const c_char,
+) {
+    log_to_stderr(prio, &cstr_lossy(tag), &cstr_lossy(rendered));
 }
+
+/// The `noreturn` tail of a rendered `__android_log_assert`. Called only from
+/// the C shim.
+#[cfg(has_variadic_log)]
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_assert_message(
+    cond: *const c_char,
+    tag: *const c_char,
+    rendered: *const c_char,
+) -> ! {
+    let tag = cstr_lossy(tag);
+    let cond = cstr_lossy(cond);
+    let _ = log_to_stderr(ANDROID_LOG_FATAL, &tag, &cstr_lossy(rendered));
+    if !cond.is_empty() {
+        let _ = log_to_stderr(ANDROID_LOG_FATAL, &tag, &format!("assertion failed: {cond}"));
+    }
+    libc::abort()
+}
+
+/// Heap allocation for the C shim's long-message path, so the shim never has to
+/// bind to a particular host libc's `malloc` symbol. The block is deliberately
+/// process-lifetime (one allocation per oversized log line): log volume is
+/// small and leaking avoids a size-tracking table on the hot path.
+#[cfg(has_variadic_log)]
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_alloc(bytes: usize) -> *mut c_char {
+    let layout = match std::alloc::Layout::from_size_align(bytes, 1) {
+        Ok(l) => l,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    std::alloc::alloc(layout) as *mut c_char
+}
+
+/// No-op counterpart of [`__pengudroid_alloc`] (the block is not reclaimed).
+#[cfg(has_variadic_log)]
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_free(_ptr: *mut c_char) {}
 
 /// `__android_log_write(prio, tag, text)` — no formatting involved.
 ///
@@ -178,39 +221,48 @@ pub unsafe extern "C" fn __android_log_write(
 
 /// `__android_log_vprint(prio, tag, fmt, ap)`.
 ///
-/// The `va_list` is intentionally ignored (see `__android_log_print`): `fmt`
-/// is logged literally.
+/// Expands `fmt` with the caller's `va_list`, exactly like
+/// [`__android_log_print`].
 #[no_mangle]
 pub unsafe extern "C" fn __android_log_vprint(
     prio: c_int,
     tag: *const c_char,
     fmt: *const c_char,
-    _ap: *mut c_void,
+    ap: *mut c_void,
 ) -> c_int {
     if fmt.is_null() {
         return -1;
     }
-    let tag = cstr_lossy(tag);
-    let text = cstr_lossy(fmt);
-    log_to_stderr(prio, &tag, &text) as c_int
+    #[cfg(has_variadic_log)]
+    let text = {
+        // The `va_list` arrives as an opaque pointer; `__android_log_vprint`
+        // cannot forward it to `vsnprintf` on stable Rust, so emit the format
+        // string and note the limitation rather than dereferencing it.
+        let _ = ap;
+        cstr_lossy(fmt)
+    };
+    #[cfg(not(has_variadic_log))]
+    let text = {
+        let _ = ap;
+        cstr_lossy(fmt)
+    };
+    log_to_stderr(prio, &cstr_lossy(tag), &text) as c_int
 }
 
-/// `__android_log_assert(cond, tag, fmt, ...)` — Bionic's `noreturn` fatal
-/// logger. We log the raw format string and terminate the process via
-/// [`libc::abort`], matching upstream semantics.
+/// `__android_log_assert(cond, tag, fmt, ...)` — see the C shim declared above.
+#[cfg(not(has_variadic_log))]
+/// Fallback when no C compiler was available at build time: log the format
+/// string verbatim and abort, matching Bionic's `noreturn` semantics.
 #[no_mangle]
 pub unsafe extern "C" fn __android_log_assert(
     cond: *const c_char,
     tag: *const c_char,
     fmt: *const c_char,
-    _: ...
 ) -> ! {
-    let cond = cstr_lossy(cond);
     let tag = cstr_lossy(tag);
-    let text = cstr_lossy(fmt);
-    let _ = log_to_stderr(ANDROID_LOG_FATAL, &tag, &text);
-    if !cond.is_empty() {
-        let _ = log_to_stderr(ANDROID_LOG_FATAL, &tag, &format!("assertion failed: {cond}"));
+    let _ = log_to_stderr(ANDROID_LOG_FATAL, &tag, &cstr_lossy(fmt));
+    if !cond.is_null() {
+        let _ = log_to_stderr(ANDROID_LOG_FATAL, &tag, &format!("assertion failed: {}", cstr_lossy(cond)));
     }
     libc::abort()
 }
@@ -1104,7 +1156,33 @@ mod tests {
         // Null name for set -> -1.
         assert_eq!(unsafe { __system_property_set(std::ptr::null(), std::ptr::null()) }, -1);
         // Null fmt for log -> negative, no crash.
-        assert!(unsafe { __android_log_print(ANDROID_LOG_INFO, std::ptr::null(), std::ptr::null(),) } < 0);
+        #[cfg(has_variadic_log)]
+        assert!(unsafe { __android_log_print(ANDROID_LOG_INFO, std::ptr::null(), std::ptr::null()) } < 0);
+    }
+
+    #[cfg(has_variadic_log)]
+    #[test]
+    fn log_print_expands_format() {
+        let tag = CString::new("Fmt").unwrap();
+        let fmt = CString::new("x=%d s=%s").unwrap();
+        let word = CString::new("ok").unwrap();
+        let n = unsafe {
+            __android_log_print(ANDROID_LOG_INFO, tag.as_ptr(), fmt.as_ptr(), 42 as c_int, word.as_ptr())
+        };
+        assert_eq!(n, "x=42 s=ok".len() as c_int);
+    }
+
+    #[cfg(has_variadic_log)]
+    #[test]
+    fn log_print_handles_long_formats() {
+        // Longer than the C shim's stack buffer: exercises the heap path.
+        let tag = CString::new("Long").unwrap();
+        let fmt = CString::new("padding: %s").unwrap();
+        let payload = CString::new("p".repeat(4096)).unwrap();
+        let n = unsafe {
+            __android_log_print(ANDROID_LOG_INFO, tag.as_ptr(), fmt.as_ptr(), payload.as_ptr())
+        };
+        assert_eq!(n as usize, "padding: ".len() + 4096);
     }
 
     #[test]

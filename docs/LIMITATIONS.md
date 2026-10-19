@@ -120,9 +120,14 @@ reintroducing a container. Do not run untrusted APKs under PenguDroid.
 
 ## 9. Protocol is versioned but young
 
-The control protocol is v1 and hand-rolled. It is tested for round-trips and
+The control protocol is v2 and hand-rolled. It is tested for round-trips and
 truncation handling, but has no negotiation for capability differences and no
 framing for large zero-copy transfers beyond fd passing.
+
+Guest-service calls are forwarded per connection with reply ordering implicit
+(the oldest outstanding call is answered first). A call waits up to
+`GUEST_CALL_TIMEOUT` (5 s); after that the caller gets `-ETIMEDOUT` rather than
+hanging forever, so a wedged guest cannot freeze its peers.
 
 ## Roadmap (rough order)
 
@@ -131,13 +136,17 @@ framing for large zero-copy transfers beyond fd passing.
    x86-64 APK libraries (`librtb.so`, `libgtb.so`, `libnativeutil.so`) `dlopen`,
    and `fixtures/native-demo` is loaded **and called** with a correct result
    (see `docs/ARCHITECTURE.md` §8).
-2. Close the *running* gap: Bionic-compatible teardown, a real `__sF`, and
+2. ~~Close the *control-plane* gaps: enumerate properties and services, forward
+   guest-service calls, detach launches (`RunApk`) and report their exit status,
+   stop guests when their window closes, and format variadic Bionic log calls.~~
+   **Done** (end-to-end tested against a real daemon).
+3. Close the *running* gap: Bionic-compatible teardown, a real `__sF`, and
    loading an APK's own `libc++_shared.so` via the compat path.
-3. Bring up enough of the Android linker namespace to `dlopen` `libEGL` and bind
+4. Bring up enough of the Android linker namespace to `dlopen` `libEGL` and bind
    it to host EGL, then present a GPU frame over `dmabuf`.
-4. Attempt ART bring-up against a minimal `libandroid_runtime` with no
+5. Attempt ART bring-up against a minimal `libandroid_runtime` with no
    `system_server`.
-5. Wire the PipeWire audio pump.
-6. Replace telephony/camera stubs with real AIDL marshalers.
-7. Add seccomp + a private mount namespace for isolation without a full
+6. Wire the PipeWire audio pump.
+7. Replace telephony/camera stubs with real AIDL marshalers.
+8. Add seccomp + a private mount namespace for isolation without a full
    container.

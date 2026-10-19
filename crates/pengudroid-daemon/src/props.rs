@@ -67,6 +67,12 @@ impl Props {
         self.serial
     }
 
+    /// Every property, ordered by name. Used by `pengudroid getprop` with no
+    /// argument and by the shim's cache warm-up.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.map.iter()
+    }
+
     pub fn len(&self) -> usize {
         self.map.len()
     }

@@ -24,7 +24,10 @@
 use std::fmt;
 
 /// Protocol version negotiated during the `Hello`/`Welcome` handshake.
-pub const PROTO_VERSION: u16 = 1;
+///
+/// v2 added property/service enumeration, guest-to-guest calls, process
+/// unregistration and detached launches (`QueryRun`).
+pub const PROTO_VERSION: u16 = 2;
 
 /// Marker used by the daemon's pid/heartbeat file.
 pub const PROTO_MAGIC: u32 = 0x5044_5247; // "PDRG"
@@ -66,6 +69,18 @@ pub enum MsgKind {
     GetProp = 70,
     PropValue = 71,
     SetProp = 72,
+    ListProps = 73,
+    PropList = 74,
+
+    ListServices = 75,
+    ServiceList = 76,
+
+    GuestCall = 77,
+    GuestCallReply = 78,
+    UnregisterProc = 79,
+
+    QueryRun = 82,
+    RunStatus = 83,
 
     Ack = 80,
 
@@ -99,6 +114,15 @@ impl MsgKind {
             70 => GetProp,
             71 => PropValue,
             72 => SetProp,
+            73 => ListProps,
+            74 => PropList,
+            75 => ListServices,
+            76 => ServiceList,
+            77 => GuestCall,
+            78 => GuestCallReply,
+            79 => UnregisterProc,
+            82 => QueryRun,
+            83 => RunStatus,
             80 => Ack,
             90 => Shutdown,
             91 => Goodbye,
@@ -183,6 +207,32 @@ pub enum Message {
     PropValue { name: String, value: Option<String> },
     SetProp { name: String, value: String },
 
+    /// Every property the daemon holds (answers with one `PropValue` each, in
+    /// `PropList` batches).
+    ListProps,
+    /// One batch of `ListProps` results; `more` is true when another batch follows.
+    PropList { pairs: Vec<(String, String)>, more: bool },
+
+    /// Every service the broker advertises: `(name, interface, handle)`.
+    ListServices,
+    ServiceList { services: Vec<(String, String, u32)> },
+
+    /// Invoke a method on a guest-registered service. The owner receives this
+    /// through its own connection; the daemon forwards the reply back to the
+    /// caller.
+    GuestCall { handle: u32, code: u32, data: Vec<u8>, token: u32 },
+    /// A reply to the oldest outstanding `GuestCall` on this connection.
+    GuestCallReply { status: i32, data: Vec<u8> },
+
+    /// Tell the daemon this process's guest connection is gone.
+    UnregisterProc { pid: i32 },
+
+    /// Query the exit status of a guest launched through `RunApk`.
+    QueryRun { pid: i32 },
+    /// A guest launched through `RunApk` has exited (`running` false) or is
+    /// still alive.
+    RunStatus { pid: i32, running: bool, exit_code: i32, signal: i32 },
+
     /// Generic acknowledgement for fire-and-forget requests.
     Ack,
 
@@ -216,6 +266,15 @@ impl Message {
             GetProp { .. } => MsgKind::GetProp,
             PropValue { .. } => MsgKind::PropValue,
             SetProp { .. } => MsgKind::SetProp,
+            ListProps => MsgKind::ListProps,
+            PropList { .. } => MsgKind::PropList,
+            ListServices => MsgKind::ListServices,
+            ServiceList { .. } => MsgKind::ServiceList,
+            GuestCall { .. } => MsgKind::GuestCall,
+            GuestCallReply { .. } => MsgKind::GuestCallReply,
+            UnregisterProc { .. } => MsgKind::UnregisterProc,
+            QueryRun { .. } => MsgKind::QueryRun,
+            RunStatus { .. } => MsgKind::RunStatus,
             Ack => MsgKind::Ack,
             Shutdown => MsgKind::Shutdown,
             Goodbye => MsgKind::Goodbye,
@@ -241,6 +300,7 @@ impl Message {
                 e.str(message);
             }
             Ping | Pong | ListProcs | Shutdown | Goodbye | Ack => {}
+            ListProps | ListServices => {}
             RunApk { path, component, args } => {
                 e.str(path);
                 match component {
@@ -327,6 +387,40 @@ impl Message {
                     None => e.u8(0),
                 }
             }
+            UnregisterProc { pid } => e.i32(*pid),
+            PropList { pairs, more } => {
+                e.u32(pairs.len() as u32);
+                for (k, v) in pairs {
+                    e.str(k);
+                    e.str(v);
+                }
+                e.u8(if *more { 1 } else { 0 });
+            }
+            ServiceList { services } => {
+                e.u32(services.len() as u32);
+                for (name, iface, handle) in services {
+                    e.str(name);
+                    e.str(iface);
+                    e.u32(*handle);
+                }
+            }
+            GuestCall { handle, code, data, token } => {
+                e.u32(*handle);
+                e.u32(*code);
+                e.bytes(data);
+                e.u32(*token);
+            }
+            GuestCallReply { status, data } => {
+                e.i32(*status);
+                e.bytes(data);
+            }
+            QueryRun { pid } => e.i32(*pid),
+            RunStatus { pid, running, exit_code, signal } => {
+                e.i32(*pid);
+                e.u8(if *running { 1 } else { 0 });
+                e.i32(*exit_code);
+                e.i32(*signal);
+            }
         }
         e.into_frame()
     }
@@ -409,6 +503,39 @@ impl Message {
             K::Shutdown => Shutdown,
             K::Goodbye => Goodbye,
             K::Ack => Ack,
+            K::ListProps => ListProps,
+            K::ListServices => ListServices,
+            K::UnregisterProc => UnregisterProc { pid: d.i32()? },
+            K::PropList => {
+                let n = d.u32()? as usize;
+                let mut pairs = Vec::with_capacity(n.min(4096));
+                for _ in 0..n {
+                    pairs.push((d.str()?, d.str()?));
+                }
+                PropList { pairs, more: d.u8()? != 0 }
+            }
+            K::ServiceList => {
+                let n = d.u32()? as usize;
+                let mut services = Vec::with_capacity(n.min(4096));
+                for _ in 0..n {
+                    services.push((d.str()?, d.str()?, d.u32()?));
+                }
+                ServiceList { services }
+            }
+            K::GuestCall => GuestCall {
+                handle: d.u32()?,
+                code: d.u32()?,
+                data: d.bytes()?,
+                token: d.u32()?,
+            },
+            K::GuestCallReply => GuestCallReply { status: d.i32()?, data: d.bytes()? },
+            K::QueryRun => QueryRun { pid: d.i32()? },
+            K::RunStatus => RunStatus {
+                pid: d.i32()?,
+                running: d.u8()? != 0,
+                exit_code: d.i32()?,
+                signal: d.i32()?,
+            },
         })
     }
 }
@@ -637,6 +764,29 @@ mod tests {
             flags: 3,
             data: vec![1, 2, 3, 4],
         });
+    }
+
+    #[test]
+    fn roundtrip_status_messages() {
+        roundtrip(Message::ListProps);
+        roundtrip(Message::ListServices);
+        roundtrip(Message::PropList {
+            pairs: vec![("ro.build.version.sdk".into(), "36".into())],
+            more: true,
+        });
+        roundtrip(Message::ServiceList {
+            services: vec![("activity".into(), "android.app.IActivityManager".into(), 1)],
+        });
+        roundtrip(Message::UnregisterProc { pid: 99 });
+        roundtrip(Message::QueryRun { pid: 12 });
+        roundtrip(Message::RunStatus { pid: 12, running: false, exit_code: 0, signal: 9 });
+        roundtrip(Message::GuestCall {
+            handle: 3,
+            code: 7,
+            data: vec![9, 8],
+            token: 11,
+        });
+        roundtrip(Message::GuestCallReply { status: -38, data: vec![] });
     }
 
     #[test]

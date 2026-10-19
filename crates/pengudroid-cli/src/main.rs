@@ -43,6 +43,7 @@ fn real_main() -> i32 {
     };
     match cmd {
         "run" => cmd_run(&args[2..]),
+        "start" => cmd_start(&args[2..]),
         "ps" => cmd_ps(),
         "info" | "inspect" => cmd_info(&args[2..]),
         "deps" => deps::run(&args[2..]),
@@ -54,6 +55,7 @@ fn real_main() -> i32 {
         "__dlopen" => nativelib::dlopen_helper(&args[2..]),
         "getprop" => cmd_getprop(&args[2..]),
         "setprop" => cmd_setprop(&args[2..]),
+        "services" => cmd_services(),
         "daemon" => cmd_daemon(&args[2..]),
         "stop" => cmd_stop(),
         "status" => cmd_status(),
@@ -71,6 +73,54 @@ fn real_main() -> i32 {
             print_help();
             2
         }
+    }
+}
+
+fn cmd_start(args: &[String]) -> i32 {
+    let Some(apk) = args.first() else {
+        eprintln!("usage: pengudroid start <app.apk> [--component C] [--wait] [-- ARGS]");
+        return 2;
+    };
+    let wait = args.iter().any(|a| a == "--wait");
+    let mut component: Option<String> = None;
+    let mut extra: Vec<String> = Vec::new();
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--component" => {
+                i += 1;
+                match args.get(i) {
+                    Some(c) => component = Some(c.clone()),
+                    None => {
+                        eprintln!("--component needs a value");
+                        return 2;
+                    }
+                }
+            }
+            "--wait" => {}
+            "--" => {
+                extra.extend_from_slice(&args[i + 1..]);
+                break;
+            }
+            other => extra.push(other.to_string()),
+        }
+        i += 1;
+    }
+    match runner::start_detached(apk, component.as_deref(), &extra) {
+        Ok(pid) => {
+            println!("started guest: pid {pid} (detached; `pengudroid ps` lists it)");
+            if !wait {
+                return 0;
+            }
+            match runner::wait_detached(pid) {
+                Ok(how) => {
+                    println!("guest exited: {how}");
+                    0
+                }
+                Err(e) => fail(&e),
+            }
+        }
+        Err(e) => fail(&e),
     }
 }
 
@@ -155,31 +205,52 @@ fn cmd_getprop(args: &[String]) -> i32 {
         Ok(c) => c,
         Err(e) => return fail(&e),
     };
-    let names: Vec<String> = if args.is_empty() {
-        // No enumeration message in the protocol; query a useful default set.
-        [
-            "ro.build.version.sdk",
-            "ro.build.version.release",
-            "ro.product.model",
-            "ro.debuggable",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
-    } else {
-        vec![args[0].clone()]
-    };
-    for name in names {
-        match client.request(&Message::GetProp { name: name.clone() }) {
-            Ok((Message::PropValue { value, .. }, _)) => match value {
-                Some(v) => println!("[{name}]: [{v}]"),
-                None => println!("[{name}]: [<unset>]"),
-            },
-            Ok((other, _)) => return fail(&format!("unexpected reply: {other:?}")),
-            Err(e) => return fail(&e),
-        }
+
+    // `getprop` with no argument lists every property, like Android's tool.
+    if args.is_empty() {
+        return match client.request(&Message::ListProps) {
+            Ok((Message::PropList { pairs, .. }, _)) => {
+                for (name, value) in pairs {
+                    println!("[{name}]: [{value}]");
+                }
+                0
+            }
+            Ok((Message::Error { message, .. }, _)) => fail(&message),
+            Ok((other, _)) => fail(&format!("unexpected reply: {other:?}")),
+            Err(e) => fail(&e),
+        };
+    }
+
+    let name = args[0].clone();
+    match client.request(&Message::GetProp { name: name.clone() }) {
+        Ok((Message::PropValue { value, .. }, _)) => match value {
+            Some(v) => println!("[{name}]: [{v}]"),
+            None => println!("[{name}]: [<unset>]"),
+        },
+        Ok((other, _)) => return fail(&format!("unexpected reply: {other:?}")),
+        Err(e) => return fail(&e),
     }
     0
+}
+
+/// `pengudroid services`: every service the broker can route transactions to.
+fn cmd_services() -> i32 {
+    let client = match connect() {
+        Ok(c) => c,
+        Err(e) => return fail(&e),
+    };
+    match client.request(&Message::ListServices) {
+        Ok((Message::ServiceList { services }, _)) => {
+            println!("{:<8} {:<28} {}", "HANDLE", "NAME", "INTERFACE");
+            for (name, iface, handle) in services {
+                println!("{handle:<8} {name:<28} {iface}");
+            }
+            0
+        }
+        Ok((Message::Error { message, .. }, _)) => fail(&message),
+        Ok((other, _)) => fail(&format!("unexpected reply: {other:?}")),
+        Err(e) => fail(&e),
+    }
 }
 
 fn cmd_setprop(args: &[String]) -> i32 {
@@ -239,23 +310,50 @@ fn cmd_stop() -> i32 {
 
 fn cmd_status() -> i32 {
     let socket = default_socket_path();
-    match Client::connect_to(&socket).and_then(|c| {
+    let client = match Client::connect_to(&socket).and_then(|c| {
         c.handshake(Role::Cli)?;
         Ok(c)
     }) {
-        Ok(c) => match c.request(&Message::Ping) {
-            Ok((Message::Pong, _)) => {
-                println!("daemon: running (socket {})", socket.display());
-                println!("protocol: v{PROTO_VERSION}");
-                0
-            }
-            _ => fail("daemon is up but unresponsive"),
-        },
+        Ok(c) => c,
         Err(_) => {
+            // A live daemon always answers the handshake; explain the two cases
+            // differently so a stale socket file does not look like a bug.
+            let stale = socket.exists();
             println!("daemon: not running (socket {})", socket.display());
-            1
+            if stale {
+                println!("        a stale socket file is present; `pengudroid daemon` replaces it");
+            }
+            return 1;
         }
+    };
+
+    match client.request(&Message::Ping) {
+        Ok((Message::Pong, _)) => {}
+        _ => return fail("daemon is up but unresponsive"),
     }
+
+    let guests = match client.request(&Message::ListProcs) {
+        Ok((Message::ProcList { procs }, _)) => procs,
+        _ => Vec::new(),
+    };
+    let services = match client.request(&Message::ListServices) {
+        Ok((Message::ServiceList { services }, _)) => services.len(),
+        _ => 0,
+    };
+    let props = match client.request(&Message::ListProps) {
+        Ok((Message::PropList { pairs, .. }, _)) => pairs.len(),
+        _ => 0,
+    };
+
+    println!("daemon: running (socket {})", socket.display());
+    println!("protocol: v{PROTO_VERSION}");
+    println!("guests:   {}", guests.len());
+    println!("services: {services} ({props} properties)");
+    for p in guests {
+        println!("          pid {} {} {}", p.pid, p.package, p.component);
+    }
+
+    0
 }
 
 fn connect() -> Result<Client, String> {
@@ -278,17 +376,19 @@ fn print_help() {
          \n\
          COMMANDS:\n\
          \x20   run <app.apk> [--component C] [-- ARGS]   launch a guest window\n\
+         \x20   start <app.apk> [--wait]                   let the daemon fork the guest\n\
          \x20   ps                                          list running guests\n\
          \x20   info <app.apk>                              show manifest details\n\
          \x20   deps <lib.so>                               bionic import coverage\n\
          \x20   gpu-info                                    report host EGL/GLES/GPU capabilities\n\
-         \x20   gpu-test                                    render offscreen on the GPU + export a dmabuf\n\
-         \x20   nativelib <lib.so> [--call SYM] [--lib-dir D]  de-bionic + dlopen (+ call) a native .so\n\
+         \x20   gpu-test                                    render on the GPU and export a dmabuf\n\
+         \x20   nativelib <lib.so> [--call SYM] [--lib-dir D]  de-bionic + dlopen (+ call) a .so\n\
          \x20   nativelib --apk <app.apk> [--abi <abi>]      load an APK's own native libraries\n\
          \x20   libpath                                     print the bionic-compat LD_LIBRARY_PATH dir\n\
          \x20   de-bionic <in.so> <out.so>                  strip Android symbol versioning\n\
-         \x20   getprop [NAME]                              read a system property\n\
+         \x20   getprop [NAME]                              read a property (no NAME: list all)\n\
          \x20   setprop <NAME> <VALUE>                      write a system property\n\
+         \x20   services                                    list the broker's services\n\
          \x20   status | stop                               manage the daemon\n\
          \x20   daemon [--foreground]                       start the daemon\n\
          \n\

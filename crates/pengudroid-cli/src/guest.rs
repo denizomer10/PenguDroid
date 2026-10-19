@@ -28,6 +28,9 @@ struct GuestArgs {
     title: String,
     width: u32,
     height: u32,
+    /// APK to run (the daemon's `RunApk` passes `--apk`; the CLI passes the
+    /// parsed fields directly).
+    apk: Option<String>,
 }
 
 fn parse_args(args: &[String]) -> Result<GuestArgs, String> {
@@ -39,6 +42,7 @@ fn parse_args(args: &[String]) -> Result<GuestArgs, String> {
         title: "PenguDroid app".into(),
         width: 720,
         height: 1280,
+        apk: None,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -48,6 +52,7 @@ fn parse_args(args: &[String]) -> Result<GuestArgs, String> {
             "--package" => g.package = val().ok_or("--package needs a value")?,
             "--component" => g.component = val().ok_or("--component needs a value")?,
             "--title" => g.title = val().ok_or("--title needs a value")?,
+            "--apk" => g.apk = Some(val().ok_or("--apk needs a value")?),
             "--width" => {
                 g.width = val().ok_or("--width needs a value")?.parse().map_err(|_| "bad width")?
             }
@@ -73,6 +78,25 @@ pub fn guest_main(args: &[String]) -> i32 {
             return 2;
         }
     };
+    // Started by the daemon's `RunApk`: derive identity from the APK itself so
+    // the daemon only has to pass a path.
+    let mut g = g;
+    if let Some(apk) = g.apk.clone() {
+        match crate::apk::read_apk(&apk) {
+            Ok(info) => {
+                if g.package == "unknown" {
+                    g.package = info.package.clone();
+                }
+                if g.component.is_empty() {
+                    g.component = info.main_activity_name().map(str::to_string).unwrap_or_default();
+                }
+                if g.title == "PenguDroid app" {
+                    g.title = info.label.clone().unwrap_or_else(|| info.package.clone());
+                }
+            }
+            Err(e) => eprintln!("guest: warning: {e}"),
+        }
+    }
     // SAFETY: correct handler signature.
     unsafe {
         libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
@@ -145,16 +169,25 @@ pub fn guest_main(args: &[String]) -> i32 {
     };
 
     let mut phase: u32 = 0;
+    let mut present_errors: u32 = 0;
     while !STOP.load(Ordering::Relaxed) {
         paint(&mut map, g.width, g.height, stride, phase);
         phase = phase.wrapping_add(4);
         match client.request(&Message::PresentFrame { surface_id }) {
-            Ok((Message::Ack, _)) => {}
+            Ok((Message::Ack, _)) => present_errors = 0,
             Ok((Message::Error { message, .. }, _)) => {
                 eprintln!("guest: present failed: {message}");
                 break;
             }
             Ok(_) => {}
+            Err(e) if present_errors == 0 => {
+                // One retry: the daemon may be briefly busy serving another
+                // connection. A second consecutive failure means it is gone.
+                present_errors += 1;
+                eprintln!("guest: present failed ({e}); retrying once");
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
             Err(_) => break, // daemon went away
         }
         std::thread::sleep(Duration::from_millis(120));
