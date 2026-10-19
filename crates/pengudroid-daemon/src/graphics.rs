@@ -100,8 +100,12 @@ mod imp {
         /// `zwp_linux_dmabuf_v1`, when the compositor advertises it (v3+, which
         /// carries format modifiers).
         pub dmabuf: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
-        /// How many `format` events the compositor sent (diagnostic).
+        /// How many `format`/`modifier` events the compositor sent (diagnostic).
         pub dmabuf_formats: u32,
+        /// The `(fourcc, modifier)` pairs the compositor advertised. v1-v2 send
+        /// `format` only (modifier 0); v3+ send `modifier` events, and v4 may
+        /// send *only* those, so both are recorded.
+        pub dmabuf_supported: Vec<(u32, u64)>,
         /// Result flags for the dmabuf self-test.
         pub dmabuf_created: bool,
         pub dmabuf_failed: bool,
@@ -397,7 +401,16 @@ mod imp {
 
         /// Number of dmabuf formats the compositor advertised.
         pub fn dmabuf_format_count(&self) -> u32 {
-            self.state.dmabuf_formats
+            self.state.dmabuf_supported.len() as u32
+        }
+
+        /// Whether the compositor advertised this exact `(fourcc, modifier)`.
+        /// A modifier of 0 matches a plain `format` advertisement.
+        pub fn dmabuf_supports(&self, fourcc: u32, modifier: u64) -> bool {
+            self.state
+                .dmabuf_supported
+                .iter()
+                .any(|(f, m)| *f == fourcc && (*m == modifier || *m == 0))
         }
 
         /// Process pending Wayland events (a blocking round-trip). Mostly useful
@@ -543,8 +556,21 @@ mod imp {
             _: &Connection,
             _: &QueueHandle<Self>,
         ) {
-            if let zwp_linux_dmabuf_v1::Event::Format { .. } = event {
-                state.dmabuf_formats = state.dmabuf_formats.saturating_add(1);
+            match event {
+                zwp_linux_dmabuf_v1::Event::Format { format } => {
+                    state.dmabuf_formats = state.dmabuf_formats.saturating_add(1);
+                    if !state.dmabuf_supported.iter().any(|(f, _)| *f == format) {
+                        state.dmabuf_supported.push((format, 0));
+                    }
+                }
+                zwp_linux_dmabuf_v1::Event::Modifier { format, modifier_hi, modifier_lo } => {
+                    state.dmabuf_formats = state.dmabuf_formats.saturating_add(1);
+                    let modifier = ((modifier_hi as u64) << 32) | modifier_lo as u64;
+                    if !state.dmabuf_supported.contains(&(format, modifier)) {
+                        state.dmabuf_supported.push((format, modifier));
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -699,6 +725,9 @@ mod imp {
         }
         pub fn dmabuf_format_count(&self) -> u32 {
             0
+        }
+        pub fn dmabuf_supports(&self, _fourcc: u32, _modifier: u64) -> bool {
+            false
         }
         pub fn refresh(&mut self) {}
         #[allow(clippy::too_many_arguments)]

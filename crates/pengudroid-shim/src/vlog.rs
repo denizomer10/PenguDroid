@@ -19,6 +19,22 @@ extern int vsnprintf(char *buf, __SIZE_TYPE__ size, const char *fmt, __pd_va_lis
 extern void __pengudroid_log_rendered(int prio, const char *tag, const char *rendered);
 extern void __pengudroid_assert_message(const char *cond, const char *tag, const char *rendered)
     __attribute__((noreturn));
+extern int __pengudroid_fprintf_va(void *stream, const char *fmt, __pd_va_list ap);
+
+/*
+ * `fprintf(stream, fmt, ...)`
+ *
+ * Rust cannot define a C-variadic function on stable, so the arguments are
+ * collected here and the ready `va_list` is handed to Rust, which forwards it
+ * to the host `vfprintf` after translating Bionic's `__sF` stream.
+ */
+int fprintf(void *stream, const char *fmt, ...) {
+    __pd_va_list ap;
+    __builtin_va_start(ap, fmt);
+    int r = __pengudroid_fprintf_va(stream, fmt, ap);
+    __builtin_va_end(ap);
+    return r;
+}
 
 /*
  * `__android_log_print(prio, tag, fmt, ...)`

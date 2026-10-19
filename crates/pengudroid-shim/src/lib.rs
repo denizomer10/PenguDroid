@@ -1,5 +1,7 @@
 // `rust-lld` warns when a version script reassigns an already-global symbol to a
 // version node; the reassignment is intentional and succeeds, so silence it.
+// (The lint name only exists on some toolchains, hence the allow-by-name below.)
+#![allow(unknown_lints)]
 #![allow(linker_messages)]
 
 //! `pengudroid-shim` — an `LD_PRELOAD` Bionic→glibc translation shim.
@@ -48,7 +50,9 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 
 use libc::{c_char, c_int, c_void};
 
+mod android_native;
 mod vlog;
+mod zip;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1089,147 +1093,6 @@ pub unsafe extern "C" fn __system_property_foreach(
     _callback: Option<extern "C" fn(*const c_void, *mut c_void)>,
     _cookie: *mut c_void,
 ) {
-}
-
-// ---------------------------------------------------------------------------
-// AAsset (<android/asset_manager.h>) — minimal stubs
-// ---------------------------------------------------------------------------
-
-/// Non-null sentinel returned by [`AAssetManager_fromJava`] so that callers
-/// which only null-check the manager pointer do not dereference `NULL`.
-static AASSET_MANAGER_SENTINEL: u8 = 0;
-
-/// `AAssetManager_fromJava(env, mgr)`.
-///
-/// // STUB: APK asset extraction is not implemented. We hand back the address of
-/// a static sentinel (never `NULL`) so guests that merely check for a non-null
-/// manager keep running; it is not backed by a real asset manager.
-#[no_mangle]
-pub unsafe extern "C" fn AAssetManager_fromJava(
-    _env: *mut c_void,
-    _mgr: *mut c_void,
-) -> *mut c_void {
-    std::ptr::addr_of!(AASSET_MANAGER_SENTINEL) as *mut c_void
-}
-
-/// `AAssetManager_open(mgr, filename, mode)`.
-///
-/// // STUB: APK asset extraction is not implemented, so no asset can be opened;
-/// this always returns `NULL`.
-#[no_mangle]
-pub unsafe extern "C" fn AAssetManager_open(
-    _mgr: *mut c_void,
-    _filename: *const c_char,
-    _mode: c_int,
-) -> *mut c_void {
-    std::ptr::null_mut()
-}
-
-/// `AAsset_getLength(asset)`.
-///
-/// // STUB: APK asset extraction is not implemented; no asset exists to measure,
-/// so this reports a zero length.
-#[no_mangle]
-pub unsafe extern "C" fn AAsset_getLength(_asset: *mut c_void) -> i64 {
-    0
-}
-
-/// `AAsset_getBuffer(asset)`.
-///
-/// // STUB: APK asset extraction is not implemented; no asset memory is mapped,
-/// so this returns `NULL`.
-#[no_mangle]
-pub unsafe extern "C" fn AAsset_getBuffer(_asset: *mut c_void) -> *const c_void {
-    std::ptr::null()
-}
-
-/// `AAsset_read(asset, buf, count)`.
-///
-/// // STUB: APK asset extraction is not implemented; there is no data to read,
-/// so this reports an error (`-1`).
-#[no_mangle]
-pub unsafe extern "C" fn AAsset_read(
-    _asset: *mut c_void,
-    _buf: *mut c_void,
-    _count: usize,
-) -> c_int {
-    -1
-}
-
-/// `AAsset_close(asset)`.
-///
-/// // STUB: APK asset extraction is not implemented; nothing was ever opened, so
-/// this is a no-op.
-#[no_mangle]
-pub unsafe extern "C" fn AAsset_close(_asset: *mut c_void) {}
-
-/// `AAsset_seek(asset, offset, whence)`.
-///
-/// // STUB: APK asset extraction is not implemented; there is no asset to seek
-/// within, so this reports an error (`-1`).
-#[no_mangle]
-pub unsafe extern "C" fn AAsset_seek(_asset: *mut c_void, _offset: i32, _whence: c_int) -> i32 {
-    -1
-}
-
-// ---------------------------------------------------------------------------
-// ANativeWindow (<android/native_window.h>) — minimal stubs
-// ---------------------------------------------------------------------------
-
-/// `ANativeWindow_fromSurface(env, surface)`.
-///
-/// // STUB: no host surface is bridged into the guest, so no window can be
-/// produced; this always returns `NULL`.
-#[no_mangle]
-pub unsafe extern "C" fn ANativeWindow_fromSurface(
-    _env: *mut c_void,
-    _surface: *mut c_void,
-) -> *mut c_void {
-    std::ptr::null_mut()
-}
-
-/// `ANativeWindow_acquire(w)`.
-///
-/// // STUB: no real window exists to reference-count, so this is a no-op.
-#[no_mangle]
-pub unsafe extern "C" fn ANativeWindow_acquire(_w: *mut c_void) {}
-
-/// `ANativeWindow_release(w)`.
-///
-/// // STUB: no real window exists to reference-count, so this is a no-op.
-#[no_mangle]
-pub unsafe extern "C" fn ANativeWindow_release(_w: *mut c_void) {}
-
-/// `ANativeWindow_getWidth(w)`.
-///
-/// // STUB: no host surface is bridged into the guest, so the width is unknown;
-/// this reports `0`.
-#[no_mangle]
-pub unsafe extern "C" fn ANativeWindow_getWidth(_w: *mut c_void) -> i32 {
-    0
-}
-
-/// `ANativeWindow_getHeight(w)`.
-///
-/// // STUB: no host surface is bridged into the guest, so the height is unknown;
-/// this reports `0`.
-#[no_mangle]
-pub unsafe extern "C" fn ANativeWindow_getHeight(_w: *mut c_void) -> i32 {
-    0
-}
-
-/// `ANativeWindow_setBuffersGeometry(w, width, height, format)`.
-///
-/// // STUB: the real buffer geometry is owned by the shim's EGL surface; this
-/// accepts the request and reports success.
-#[no_mangle]
-pub unsafe extern "C" fn ANativeWindow_setBuffersGeometry(
-    _w: *mut c_void,
-    _width: i32,
-    _height: i32,
-    _format: i32,
-) -> i32 {
-    0
 }
 
 // ---------------------------------------------------------------------------
@@ -2701,15 +2564,31 @@ type Fputc = unsafe extern "C" fn(c_int, *mut c_void) -> c_int;
 type Fflush = unsafe extern "C" fn(*mut c_void) -> c_int;
 type Fclose = unsafe extern "C" fn(*mut c_void) -> c_int;
 
-/// `fprintf(stream, fmt, ...)`.
-///
-/// LIMITATION: stable Rust cannot build a `va_list`, so this variadic entry
-/// point cannot forward its arguments. It writes `fmt` literally (no `%`
-/// expansion) to the translated stream. The fully-correct path is
-/// [`vfprintf`], which receives a ready `va_list` and is forwarded intact;
-/// libc++ and friends generally call that internally.
+// `fprintf(stream, fmt, ...)` is defined in C (`src/vlog.rs`) because stable
+// Rust cannot define a C-variadic function. The C shim collects the arguments
+// and calls `__pengudroid_fprintf_va`, which forwards the ready `va_list` to the
+// host `vfprintf` with the `__sF` stream translated, so `%` expansion is real.
+#[cfg(has_variadic_log)]
+extern "C" {
+    pub fn fprintf(stream: *mut c_void, fmt: *const c_char, ...) -> c_int;
+}
+
+/// The `va_list` half of the C `fprintf` shim.
+#[cfg(has_variadic_log)]
 #[no_mangle]
-pub unsafe extern "C" fn fprintf(stream: *mut c_void, fmt: *const c_char, _: ...) -> c_int {
+pub unsafe extern "C" fn __pengudroid_fprintf_va(
+    stream: *mut c_void,
+    fmt: *const c_char,
+    ap: *mut c_void,
+) -> c_int {
+    vfprintf(stream, fmt, ap)
+}
+
+/// Fallback when no C compiler was available at build time: write the format
+/// string literally (no `%` expansion) to the translated stream.
+#[cfg(not(has_variadic_log))]
+#[no_mangle]
+pub unsafe extern "C" fn fprintf(stream: *mut c_void, fmt: *const c_char) -> c_int {
     if fmt.is_null() {
         return -1;
     }
@@ -4129,7 +4008,12 @@ mod tests {
 
     #[test]
     fn asset_manager_from_java_is_non_null() {
-        let mgr = unsafe { AAssetManager_fromJava(std::ptr::null_mut(), std::ptr::null_mut()) };
+        let mgr = unsafe {
+            crate::android_native::AAssetManager_fromJava(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
         assert!(!mgr.is_null());
     }
 

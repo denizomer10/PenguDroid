@@ -203,7 +203,7 @@ fn run_dmabuf_selftest() {
     };
     g.refresh();
     println!(
-        "compositor dmabuf: {} ({} formats)",
+        "compositor dmabuf: {} ({} formats advertised)",
         if g.dmabuf_available() { "available" } else { "unavailable" },
         g.dmabuf_format_count()
     );
@@ -233,6 +233,10 @@ fn run_dmabuf_selftest() {
     println!(
         "exported dmabuf: {}x{} stride {} fourcc {:#010x} modifier {:#x}",
         d.width, d.height, d.stride, d.fourcc, d.modifier
+    );
+    println!(
+        "compositor supports this format: {}",
+        if g.dmabuf_supports(d.fourcc, d.modifier) { "yes" } else { "not advertised" }
     );
 
     match g.dmabuf_selftest(d.width, d.height, d.fd, d.stride, d.fourcc, d.modifier, d.offset) {

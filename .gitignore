@@ -7,3 +7,7 @@ fixtures/*/lib/
 fixtures/*/*.apk
 fixtures/egl-app/egl-app
 fixtures/opensl-app/opensl-app
+
+# Built C fixtures (run their build.sh)
+fixtures/*/libmain.so
+fixtures/*/*.o

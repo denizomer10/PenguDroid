@@ -144,6 +144,15 @@ pub fn ensure_compat_dir() -> Result<PathBuf, String> {
         let _ = symlink(&dir.join("libGLESv1_CM.so"), &gles1);
     }
 
+    // Vulkan: Android's `libvulkan.so` is a loader; the host's loader is the
+    // right implementation (it finds the NVIDIA/AMD/Intel ICDs), so map the
+    // Bionic soname straight onto it. No translation layer is needed because
+    // Vulkan's ABI is identical on Android and Linux.
+    if let Some(vk) = find_host_lib(&["libvulkan.so.1"]) {
+        let _ = symlink(&dir.join("libvulkan.so"), &vk);
+        let _ = symlink(&dir.join("libvulkan.so.1"), &vk);
+    }
+
     if let Some(z) = find_host_lib(&["libz.so.1"]) {
         let _ = symlink(&dir.join("libz.so"), &z);
     }
@@ -201,7 +210,7 @@ pub fn de_bionic(args: &[String]) -> i32 {
 }
 
 /// Best-effort host-architecture check so we can explain cross-arch failures.
-fn host_can_load(info: &pengudroid_elf::ElfInfo) -> Result<(), String> {
+pub(crate) fn host_can_load(info: &pengudroid_elf::ElfInfo) -> Result<(), String> {
     let host64 = std::mem::size_of::<usize>() == 8;
     let class_ok = matches!(
         (info.class, host64),
@@ -275,7 +284,7 @@ fn parse_args(args: &[String]) -> Result<NativeArgs, String> {
 }
 
 /// The Android ABI directory that matches this host's architecture.
-fn host_abi() -> &'static str {
+pub(crate) fn host_abi() -> &'static str {
     match std::env::consts::ARCH {
         "x86_64" => "x86_64",
         "x86" => "x86",

@@ -14,10 +14,14 @@ mod apk;
 mod audio;
 mod client;
 mod deps;
+mod doctor;
 mod gpu;
 mod guest;
+mod isolate;
 mod nativelib;
+mod native;
 mod runner;
+mod sysroot;
 mod telephony;
 
 use pengudroid_proto::{default_socket_path, Message, Role, PROTO_VERSION};
@@ -50,12 +54,18 @@ fn real_main() -> i32 {
         "ps" => cmd_ps(),
         "info" | "inspect" => cmd_info(&args[2..]),
         "deps" => deps::run(&args[2..]),
+        "doctor" => doctor::run(&args[2..]),
+        "sysroot" => sysroot::sysroot(&args[2..]),
+        "art-test" => sysroot::art_test(&args[2..]),
+        "__art" => sysroot::art_main(&args[2..]),
         "gpu-info" => gpu::info(),
         "gpu-test" => gpu::test(),
         "audio-test" => audio::test(&args[2..]),
         "libpath" => nativelib::libpath(&args[2..]),
         "de-bionic" => nativelib::de_bionic(&args[2..]),
         "nativelib" => nativelib::nativelib(&args[2..]),
+        "native" => native::native(&args[2..]),
+        "__native" => native::native_main(&args[2..]),
         "__dlopen" => nativelib::dlopen_helper(&args[2..]),
         "getprop" => cmd_getprop(&args[2..]),
         "setprop" => cmd_setprop(&args[2..]),
@@ -409,11 +419,15 @@ fn print_help() {
          \x20   ps                                          list running guests\n\
          \x20   info <app.apk>                              show manifest details\n\
          \x20   deps <lib.so>                               bionic import coverage\n\
+         \x20   doctor <app.apk>                            can this APK run? what is missing?\n\
+         \x20   sysroot <dir>                               inspect an extracted Android system tree\n\
+         \x20   art-test --sysroot <dir>                    try JNI_CreateJavaVM against it\n\
          \x20   gpu-info                                    report host EGL/GLES/GPU capabilities\n\
          \x20   gpu-test                                    render offscreen on the GPU + export a dmabuf\n\
          \x20   audio-test [--seconds N] [--tone]           play silence (or a tone) through PipeWire\n\
          \x20   nativelib <lib.so> [--call SYM] [--lib-dir D]  de-bionic + dlopen (+ call) a .so\n\
          \x20   nativelib --apk <app.apk> [--abi <abi>]      load an APK's own native libraries\n\
+         \x20   native <app.apk> [--seconds N]              run a NativeActivity app (no ART)\n\
          \x20   libpath                                     print the bionic-compat LD_LIBRARY_PATH dir\n\
          \x20   de-bionic <in.so> <out.so>                  strip Android symbol versioning\n\
          \x20   getprop [NAME]                              read a property (no NAME: list all)\n\

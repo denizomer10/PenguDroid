@@ -48,7 +48,11 @@ lookups, the boot classpath, and the boot-image load. It now fails *gracefully*
 rather than crashing.
 
 **What remains.** Getting `JNI_CreateJavaVM` to return a live `JavaVM` needs an
-Android-shaped environment, not more ABI translation:
+Android-shaped environment, not more ABI translation. `pengudroid sysroot <dir>`
+now reports exactly which files an extracted Android system tree must provide,
+and `pengudroid art-test --sysroot <dir>` loads `libart.so` and calls
+`JNI_CreateJavaVM` against it, printing ART's own diagnostic. The missing pieces
+are:
 
 * the **APEX manifests** (`/apex/com.android.art/apex_manifest.pb`, ...) so the
   boot image's `ValidateApexVersions` check passes — without them ART reports an
@@ -119,12 +123,18 @@ EGL/GLES, renders the app's drawing into an FBO, and exports each
 `eglSwapBuffers` as a dma-buf presented by the daemon. `fixtures/egl-app` swaps
 five frames through it.
 
-Still missing: `gralloc`/`AHardwareBuffer` compatibility, hardware composition,
-Vulkan (the host Vulkan ICDs can be loaded, but no translation layer drives them
-yet), and GLES coverage beyond the exported core functions (apps that call less
-common GL entry points directly, rather than via `eglGetProcAddress`, may fail
-to resolve). Note that the compat directory maps `libGLESv2.so` to the *host*
-driver, which covers this in practice.
+**Vulkan works.** Android's `libvulkan.so` is a loader, and Vulkan's ABI is
+identical on Android and Linux, so the compat directory maps the Bionic soname
+onto the *host* loader (`libvulkan.so.1`). An Android app's `vkCreateInstance`,
+`vkEnumeratePhysicalDevices` and `vkCreateDevice` therefore reach the real
+driver: `fixtures/native-vulkan` enumerates an RTX 3080 (API 1.4.329) and
+creates a logical device and graphics queue.
+
+Still missing: `gralloc`/`AHardwareBuffer` compatibility (apps that allocate GPU
+buffers through it fail), hardware composition, and GLES coverage beyond the
+exported core functions. The compat directory maps `libGLESv2.so` to the *host*
+driver and the shim loads it `RTLD_GLOBAL`, so an app's direct GL imports resolve
+in practice.
 
 **OpenSL ES is implemented for the common case.** `slCreateEngine`, the object
 model, engine/output-mix/player interfaces and the Android simple buffer queue
@@ -167,11 +177,18 @@ placeholders, not partial implementations.
 
 ## 8. Security
 
-There is **no** sandbox: guests are ordinary host processes with the user's
-privileges and full host filesystem access. This is the opposite of Android's
-process-per-app isolation. A production design would need to reintroduce
-isolation (at least a seccomp filter and a private mount view) without
-reintroducing a container. Do not run untrusted APKs under PenguDroid.
+By default there is **no** sandbox: guests are ordinary host processes with the
+user's privileges and full host filesystem access. This is the opposite of
+Android's process-per-app isolation.
+
+`--isolate` narrows the gap without a container: it sets `PR_SET_NO_NEW_PRIVS`
+and installs a seccomp filter that refuses 33 syscalls an app never needs and
+that are the usual escape hatches (`ptrace`, `process_vm_*`, `mount`/`umount2`,
+`pivot_root`, `chroot`, `unshare`/`setns`, module loading, `bpf`,
+`perf_event_open`, `keyctl`, `reboot`, `kexec_*`, `swapon`, `acct`,
+`open_by_handle_at`, `syslog`, `iopl`/`ioperm`, clock/hostname changes). It does
+**not** restrict the filesystem or the network; a production design would add a
+private mount view. Do not run untrusted APKs under PenguDroid.
 
 ## 9. Protocol is versioned but young
 
@@ -218,5 +235,11 @@ hanging forever, so a wedged guest cannot freeze its peers.
    real `ITelephony` transaction codes and `Parcel` replies for the
    `TelephonyManager` subset, exercised by `pengudroid telephony`. Camera
    remains a stub.
-8. Add seccomp + a private mount namespace for isolation without a full
-   container.
+8. ~~Add seccomp for isolation without a full container.~~ **Done** (`--isolate`:
+   seccomp + `no_new_privs`). A private mount namespace remains.
+9. ~~Run NativeActivity apps without ART.~~ **Done**: `pengudroid native` hosts
+   the lifecycle, `AAssetManager` reads the APK, `ALooper` is a real `poll(2)`
+   loop, and `fixtures/native-game` renders a playable game on the host GPU.
+10. ~~Vulkan.~~ **Done**: the Bionic soname maps to the host loader;
+    `fixtures/native-vulkan` enumerates the GPU and creates a device.
+11. `AHardwareBuffer`/`gralloc` on dma-buf, then hardware composition.

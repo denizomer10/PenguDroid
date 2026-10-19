@@ -126,6 +126,7 @@ name = "pengudroid-shim"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "miniz_oxide",
  "pengudroid-proto",
 ]
 

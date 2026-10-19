@@ -258,6 +258,20 @@ impl Host {
 
 static HOST: OnceLock<Result<Host, String>> = OnceLock::new();
 
+/// Load the host driver at process start.
+///
+/// An app library is `dlopen`ed with `RTLD_NOW`, so every GLES symbol it imports
+/// must already be resolvable. Loading the host driver here (before any app
+/// code runs) makes its symbols global in time; doing it lazily on the first EGL
+/// call would be too late.
+#[used]
+#[link_section = ".init_array"]
+static PENGUDROID_GLESHIM_CTOR: extern "C" fn() = gleshim_init;
+
+extern "C" fn gleshim_init() {
+    let _ = host();
+}
+
 fn host() -> Result<&'static Host, String> {
     HOST.get_or_init(Host::load).as_ref().map_err(Clone::clone)
 }
@@ -265,9 +279,14 @@ fn host() -> Result<&'static Host, String> {
 fn open_first(names: &[&str]) -> Option<*mut c_void> {
     for name in names {
         if let Ok(c_name) = CString::new(*name) {
+            // RTLD_GLOBAL: an app's native library imports the whole GLES2 API
+            // (glGenBuffers, glDrawElements, ...), not just the handful this
+            // shim wraps. Making the host driver's symbols global lets those
+            // resolve directly; the shim's own exports still interpose first
+            // because it is preloaded.
             // SAFETY: `c_name` is a valid NUL-terminated soname.
             let handle =
-                unsafe { libc::dlopen(c_name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+                unsafe { libc::dlopen(c_name.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
             if !handle.is_null() {
                 return Some(handle);
             }
@@ -921,8 +940,37 @@ pub unsafe extern "C" fn eglChooseConfig(
     config_size: c_int,
     num_config: *mut c_int,
 ) -> u32 {
+    // A Bionic app asks for `EGL_WINDOW_BIT` because it expects a real window.
+    // PenguDroid's display is surfaceless (frames are FBOs exported as
+    // dma-bufs), so the request is rewritten to `EGL_PBUFFER_BIT`; otherwise the
+    // host reports "no matching config" and the app cannot create a context.
+    const EGL_SURFACE_TYPE: c_int = 0x3033;
+    const EGL_PBUFFER_BIT: c_int = 0x0001;
+    const EGL_NONE: c_int = 0x3038;
+    let mut rewritten: Vec<c_int> = Vec::new();
+    if !attribs.is_null() {
+        let mut i = 0isize;
+        loop {
+            let key = *attribs.offset(i);
+            if key == EGL_NONE {
+                rewritten.push(EGL_NONE);
+                break;
+            }
+            let val = *attribs.offset(i + 1);
+            if key == EGL_SURFACE_TYPE {
+                rewritten.push(EGL_SURFACE_TYPE);
+                rewritten.push(EGL_PBUFFER_BIT);
+            } else {
+                rewritten.push(key);
+                rewritten.push(val);
+            }
+            i += 2;
+        }
+    }
+    let attribs = if rewritten.is_empty() { attribs } else { rewritten.as_ptr() };
     match host() {
-        // SAFETY: forwarded verbatim.
+        // SAFETY: the attribute list is NUL-terminated and the out-pointers are
+        // the caller's.
         Ok(host) => (host.choose_config)(dpy, attribs, configs, config_size, num_config),
         Err(_) => EGL_FALSE,
     }

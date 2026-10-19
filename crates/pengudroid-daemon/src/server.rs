@@ -758,7 +758,10 @@ fn handle_present_dmabuf(
         );
     };
     match gfx.present_dmabuf(surface_id, fd, width, height, stride, fourcc, modifier, offset) {
-        Ok(()) => (Some(Message::Ack), vec![], false),
+        Ok(()) => {
+            crate::debug!("presented dmabuf on surface {surface_id} ({width}x{height})");
+            (Some(Message::Ack), vec![], false)
+        }
         Err(e) => (Some(Message::Error { code: -5, message: e }), vec![], false),
     }
 }

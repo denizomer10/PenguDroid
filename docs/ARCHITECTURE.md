@@ -458,6 +458,56 @@ classpath and the boot-image load — failing *gracefully* with a diagnostic
 (`Boot classpath is empty`) rather than crashing. The remaining gap is the
 APEX/boot-image environment, not ABI translation — see `docs/LIMITATIONS.md` §2.
 
+## 11. NativeActivity apps without ART
+
+A meaningful class of Android games is `android.app.NativeActivity`: the
+framework loads `libmain.so` and calls `ANativeActivity_onCreate`. That lifecycle
+is small enough to host directly, so `pengudroid native` runs those apps with no
+Android runtime at all.
+
+1. The CLI extracts the APK's `lib/<abi>/*.so`, strips Android versioning, and
+   picks the library that exports `ANativeActivity_onCreate`.
+2. It re-execs itself as `__native` under `LD_PRELOAD=<shim>:<gleshim>` and
+   `LD_LIBRARY_PATH=<compat>:<libdir>`.
+3. `__native` builds the `ANativeActivity` structure (callbacks table, data
+   paths, asset manager, SDK level), calls `onCreate`, then `onStart`,
+   `onResume`, `onWindowFocusChanged` and `onNativeWindowCreated`, and keeps the
+   process alive until the app calls `ANativeActivity_finish`, the window closes,
+   or `--seconds` elapses.
+4. The app's EGL/GLES calls go to `pengudroid-gleshim`; every `eglSwapBuffers`
+   exports the FBO as a dma-buf and the daemon commits it to the Wayland
+   surface.
+
+The NDK surface the app needs is implemented in the shim:
+
+* **`AAssetManager`** reads entries straight out of the APK (a small ZIP reader
+  in `pengudroid-shim/src/zip.rs`), including `AAssetDir` enumeration.
+* **`ALooper`** is a real `poll(2)` loop (`addFd`/`removeFd`/`pollOnce`/
+  `pollAll`/`wake`), so an app's main thread blocks instead of spinning.
+* **`ANativeWindow`** reports the surface geometry from
+  `PENGUDROID_SURFACE_W`/`_H`; the pointer itself is opaque to the EGL shim.
+* **`ANativeActivity_finish`** sets a flag the host polls.
+
+`fixtures/native-game` is a playable game built this way: 1280×720 at ~56 fps on
+an RTX 3080, with one dma-buf per frame.
+
+## 12. Vulkan
+
+Vulkan's ABI is identical on Android and Linux, and Android's `libvulkan.so` is
+a loader. PenguDroid therefore does not translate Vulkan: `pengudroid libpath`
+maps the Bionic soname `libvulkan.so` onto the **host** loader
+(`libvulkan.so.1`), which finds the real ICDs (NVIDIA/AMD/Intel). An app's
+`vkCreateInstance`/`vkEnumeratePhysicalDevices`/`vkCreateDevice` reach the
+driver directly; `fixtures/native-vulkan` verifies this against an RTX 3080.
+
+## 13. Optional isolation
+
+`--isolate` applies `PR_SET_NO_NEW_PRIVS` and a seccomp BPF filter that refuses
+33 syscalls an app never needs and that are the usual escape hatches (`ptrace`,
+`process_vm_*`, `mount`, `pivot_root`, `chroot`, `unshare`/`setns`, module
+loading, `bpf`, `perf_event_open`, `keyctl`, `reboot`, `kexec_*`, ...). It is a
+hardening filter, not a sandbox: the filesystem and network are still shared.
+
 ## Why this is faster than a container
 
 Waydroid/Anbox boot an Android userspace inside an LXC container (or a VM):

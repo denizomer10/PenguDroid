@@ -62,16 +62,24 @@ milestone. Nothing below is overstated.
 | Guest launched by the **daemon** (`RunApk`, `pengudroid start --wait`) | **Working** | daemon forks the CLI's `__guest`, reaps it, and reports its exit through `QueryRun`; an exited guest's window is destroyed and it leaves `ps` |
 | Fallback when the sandbox forbids `bind(2)` | **Working** | the daemon retries on an abstract (`@name`) Unix socket and clients connect to it transparently |
 | `pengudroid demo` | **Working** | built-in animated window, no APK and no manifest needed |
-| Host GPU via EGL/GLES/GBM (`gpu-info`, `gpu-test`) | **Working** | dlopen'd host EGL/GLES/GBM; offscreen render + pixel readback verified on Intel UHD 630 |
+| Host GPU via EGL/GLES/GBM (`gpu-info`, `gpu-test`) | **Working** | dlopen'd host EGL/GLES/GBM; offscreen render + pixel readback verified on Intel UHD 630 and NVIDIA RTX 3080 (EGL 1.5, GLES 3.2, dma-buf export/import) |
 | Zero-copy GPU presentation (`zwp_linux_dmabuf_v1`) | **Working** | the guest renders on the GPU, exports a dma-buf, the daemon imports and commits it |
 | Bionic `libEGL`/`libGLESv2` shim (`pengudroid-gleshim`) | **Working** | exports the EGL API; an app's EGL/GL calls render on the host GPU and swap into Wayland as dma-bufs — `fixtures/egl-app` swaps 5 frames |
 | Real apps' native libraries load | **Working** | after soname mapping + Bionic stubs: Dolphin `libmain.so` (15 MB) and PPSSPP `libppsspp_jni.so` (27 MB) both `dlopen` |
+| **NativeActivity apps without ART** (`pengudroid native`) | **Working** | the host builds `ANativeActivity`, drives the lifecycle, and the app renders on the host GPU; `fixtures/native-game` is a playable game at 1280×720, ~56 fps on an RTX 3080 |
+| APK assets (`AAssetManager`) | **Working** | `AAssetManager_open`/`read`/`seek`/`getBuffer` and directory enumeration read entries straight out of the APK |
+| `ALooper` | **Working** | a real `poll(2)` loop with `addFd`/`removeFd`/`pollOnce`/`pollAll`/`wake`, so an app's main thread blocks instead of spinning |
+| **Vulkan** | **Working** | Android's `libvulkan.so` maps to the host loader; `fixtures/native-vulkan` enumerates the RTX 3080 and creates a logical device + graphics queue |
+| `pengudroid doctor <apk>` | **Working** | reports ABIs, loadable libraries, NativeActivity entry point, graphics APIs, DEX size, assets, and a verdict |
+| `pengudroid sysroot` / `art-test` | **Working (diagnostic)** | validates an extracted Android system tree and attempts `JNI_CreateJavaVM` against it |
+| Optional isolation (`--isolate`) | **Working** | seccomp filter (33 syscalls denied) + `PR_SET_NO_NEW_PRIVS`; not a filesystem/network sandbox |
+| `AHardwareBuffer` / `gralloc` | **Not implemented** | apps that allocate GPU buffers through it still fail |
+| Camera | **Stub** | reports zero cameras |
 | OpenSL ES (audio) | **Working** | engine/output-mix/buffer-queue player implemented; `Enqueue` forwards PCM to `pw-cat`; `fixtures/opensl-app` verifies PLAYING + callbacks against the canonical headers |
 | `LD_PRELOAD` Bionic→glibc shim (`libashmem`, logging, props, API level) | **Working** | interposes real Bionic symbol names; `__android_log_print` formats with the host `vsnprintf` |
 | Service registry + `phone`/`media.camera`/AMS/PMS/SurfaceFlinger stubs | **Stub** | correctly-named interfaces, minimal replies |
 | Audio: PipeWire | **Working** | the daemon owns a shared ring and drains it into `pw-cat` (or `aplay`); `audio-test [--via-daemon]` streams PCM |
 | Telephony (`ITelephony`) | **Working (no-SIM model)** | real AIDL transaction codes and `Parcel`-marshalled replies for the methods apps reach through `TelephonyManager`; `pengudroid telephony` transacts and decodes them |
-| Camera | **Stub** | reports zero cameras |
 | **Running real DEX bytecode (ART)** | **Partial** | `libart.so` and its whole dependency closure now `dlopen` on glibc, and `JNI_CreateJavaVM` executes into ART's runtime setup; full runtime bring-up is the open problem — see `docs/LIMITATIONS.md` |
 | Android packed relocations (`APS2` / `ANDROID_RELA` / `ANDROID_RELR`) | **Working** | `de-bionic` expands them into standard `RELA`/`RELR` (new `PT_LOAD` + retagged dynamic entries); without this a modern Android `.so` loads with *no* relocations applied |
 | Android linker API (`android_dlopen_ext`, namespaces, `__loader_*`) | **Working** | translated to glibc's flat namespace by the shim; `libdl_android.so` / `ld-android.so` resolve to the shim |
@@ -125,6 +133,16 @@ pengudroid de-bionic in.so out.so
 
 # See it work with no APK at all: the built-in demo window.
 pengudroid demo
+
+# Run a NativeActivity app (no ART): a real game renders on the host GPU.
+pengudroid native fixtures/native-game/libmain.so --width 1280 --height 720
+
+# Can this APK run? What is missing?
+pengudroid doctor app.apk
+
+# Inspect an extracted Android system tree / try to start ART against it.
+pengudroid sysroot /path/to/android-system
+pengudroid art-test --sysroot /path/to/android-system
 
 # Launch an app as a native Wayland window; Ctrl-C stops the guest.
 pengudroid run app.apk
@@ -264,14 +282,14 @@ gpu-test` renders offscreen and verifies the pixels, then exports a dma-buf:
 
 ```
 $ pengudroid gpu-info
-GL renderer:      Mesa Intel(R) UHD Graphics 630 (CFL GT2)
-GL version:       OpenGL ES 3.2 Mesa 25.0.7
+GL renderer:      NVIDIA GeForce RTX 3080/PCIe/SSE2
+GL version:       OpenGL ES 3.2 NVIDIA 595.99.02
 zero-copy ready:  yes
 
 $ pengudroid gpu-test
-rendered 128x128 on the GPU; corner pixel RGBA = (26,51,230,255)
+rendered 128x128 on the GPU; corner pixel RGBA = (25,51,229,255)
 pixel verification: OK
-dmabuf: 128x128 stride 512 fourcc 0x34324241 modifier 0x100000000000002 offset 0 fd 7
+dmabuf: 128x128 stride 512 fourcc 0x34324241 modifier 0x300000000e08014 offset 0 fd 27
 zero-copy hand-off: OK
 ```
 
@@ -287,6 +305,10 @@ $ pengudroid run app.apk
 guest pid 9734: rendering on the host GPU via dma-buf
 guest: first dma-buf presented (720x1280, fourcc 0x34324241) — zero-copy
 ```
+
+A real game runs through the same path: `fixtures/native-game` is a playable
+NativeActivity game that renders 1280×720 at ~56 fps on an RTX 3080, one dma-buf
+per frame.
 
 Health-check it directly:
 
@@ -333,6 +355,9 @@ crates/
   pengudroid-shim/     LD_PRELOAD Bionic->glibc translation shim
 fixtures/
   native-demo/         a reproducible Android-style versioned test library
+  native-activity/     a NativeActivity app that renders a spinning triangle
+  native-vulkan/       a NativeActivity app that enumerates the host GPU via Vulkan
+  native-game/         a playable NativeActivity game (PenguDroid Invaders)
 docs/
   ARCHITECTURE.md      how each translation layer works
   API.md               CLI surface and the control protocol, in one place
@@ -348,8 +373,14 @@ cargo test --workspace
 Unit tests cover the wire protocol round-trips, `SCM_RIGHTS` fd passing, socket
 timeouts, ashmem sealing, binder ioctl-number correctness, the property store,
 service stubs and guest-service ownership, daemon dispatch (including guest
-calls, `RunApk` validation and process bookkeeping), ZIP + AXML parsing, and the
-shim's property/ashmem/log-formatting entry points.
+calls, `RunApk` validation and process bookkeeping), ZIP + AXML parsing, the
+shim's property/ashmem/log-formatting/asset/looper entry points, and the seccomp
+filter.
+
+End-to-end tests drive a real daemon: the CLI commands, detached launches, and
+the NativeActivity path (`tests/native_e2e.rs`, which renders the game fixture
+and skips cleanly when there is no Wayland session or the C fixture was not
+built).
 
 The shim's variadic `__android_log_print` / `__android_log_assert` are compiled
 from a small C file generated by `crates/pengudroid-shim/build.rs` (Rust cannot
