@@ -164,6 +164,45 @@ otherwise picks the x86-64 `libc++.so` that lives in the host system tree.
 Nothing about this path is vendor specific — the translator's proxy libraries
 forward the guest's EGL/GLES/Vulkan calls to whatever host driver is installed.
 
+### 2.3 Worked example: Beach Buggy Racing 2 (APKM bundle)
+
+A real Play bundle (`com.vectorunit.cobalt.googleplay`, 262 MB, APKMirror
+`.apkm`) is a good end-to-end test of the pieces above. `pengudroid info`
+resolves it without manual unzipping:
+
+```
+bundle:  ...apkm (apkm)   base apk: base.apk
+splits:  36
+  split_config.armeabi_v7a.apk   abi armeabi-v7a
+  split_config.arm64_v8a.apk     abi arm64-v8a
+  split_asset_pack.apk           (213 MB of assets)
+  split_gpdeku.apk / split_gpdeku.config.arm64_v8a.apk
+  ... density and language splits
+abis:    arm64-v8a, armeabi-v7a
+```
+
+`pengudroid extract ... --abi arm64-v8a` writes the base APK plus the arm64 split
+(and the OBB payload, if a bundle ships one), and `doctor` then reports the truth
+about the *game* rather than about `base.apk`:
+
+```
+bundle splits:    36
+native libraries: 37        (these live in the ABI split, not in base.apk)
+ABIs:             arm64-v8a, armeabi-v7a
+host ABI (x86_64): no
+main activity:    com.vectorunit.cobalt.MainActivity
+DEX:              9188 classes
+verdict:          not runnable natively: ARM-only code (needs the ARM translator)
+```
+
+Its engine is `lib/arm64-v8a/libmain.so` (17.8 MB, SDL3-based) plus `libSDL3.so`,
+`libfmod*.so`, crash reporters and ad SDKs. So it needs both missing pieces at
+once: ARM64 execution (§2.1) **and** an `Activity` start, i.e. `system_server`.
+`pengudroid launch` gets as far as materialising the bundle into the per-app
+prefix, creating the VM, registering the framework natives and invoking
+`ActivityThread.main` — and stops exactly there, with the note
+`starting com.vectorunit.cobalt.MainActivity needs system_server`.
+
 **Consequences for real games.**
 
 * **Native x86_64 `NativeActivity` games run today, on the GPU** —

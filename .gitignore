@@ -16,3 +16,11 @@ fixtures/*/*.o
 # have no system Rust/gcc. Never part of the repo.
 /.toolchain
 /.cargo
+
+# App packages dropped in for testing (plain APKs and Play bundles). These are
+# multi-hundred-MB binaries and must never be committed.
+/*.apk
+/*.apkm
+/*.apkx
+/*.xapk
+/*.apks

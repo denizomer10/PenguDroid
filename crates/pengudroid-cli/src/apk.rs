@@ -69,6 +69,12 @@ pub fn read_apk(path: &str) -> Result<ApkInfo, String> {
     parse_axml(&manifest)
 }
 
+/// Read and parse an APK that is already in memory.
+pub fn read_apk_bytes(data: &[u8]) -> Result<ApkInfo, String> {
+    let manifest = extract_named_bytes(data, "AndroidManifest.xml")?;
+    parse_axml(&manifest)
+}
+
 // ---------------------------------------------------------------------------
 // Little-endian read helpers (every access is bounds-checked; nothing panics).
 // ---------------------------------------------------------------------------
@@ -184,7 +190,12 @@ pub fn extract_manifest(path: &str) -> Result<Vec<u8>, String> {
 /// List the entry names in an APK's central directory.
 pub fn apk_entries(path: &str) -> Result<Vec<String>, String> {
     let data = std::fs::read(path).map_err(|e| format!("cannot read `{path}`: {e}"))?;
-    let entries = read_central_directory(&data)?;
+    apk_entries_bytes(&data)
+}
+
+/// List the entry names of an in-memory ZIP/APK.
+pub fn apk_entries_bytes(data: &[u8]) -> Result<Vec<String>, String> {
+    let entries = read_central_directory(data)?;
     Ok(entries.into_iter().map(|e| e.name).collect())
 }
 
@@ -211,8 +222,14 @@ impl NativeLib {
 
 /// List the native libraries in an APK across every ABI it ships.
 pub fn native_libs(path: &str) -> Result<Vec<NativeLib>, String> {
+    let data = std::fs::read(path).map_err(|e| format!("cannot read `{path}`: {e}"))?;
+    native_libs_bytes(&data)
+}
+
+/// List the native libraries of an in-memory APK.
+pub fn native_libs_bytes(data: &[u8]) -> Result<Vec<NativeLib>, String> {
     let mut out = Vec::new();
-    for entry in apk_entries(path)? {
+    for entry in apk_entries_bytes(data)? {
         // Shape: lib/<abi>/<file>.so
         let parts: Vec<&str> = entry.split('/').collect();
         if parts.len() == 3 && parts[0] == "lib" && parts[2].ends_with(".so") {
@@ -230,12 +247,17 @@ pub fn native_libs(path: &str) -> Result<Vec<NativeLib>, String> {
 /// Extract a named entry from an APK (any file, not just the manifest).
 pub fn extract_named(path: &str, name: &str) -> Result<Vec<u8>, String> {
     let data = std::fs::read(path).map_err(|e| format!("cannot read `{path}`: {e}"))?;
-    let entries = read_central_directory(&data)?;
+    extract_named_bytes(&data, name)
+}
+
+/// Extract a named entry from an in-memory ZIP/APK.
+pub fn extract_named_bytes(data: &[u8], name: &str) -> Result<Vec<u8>, String> {
+    let entries = read_central_directory(data)?;
     let entry = entries
         .iter()
         .find(|e| e.name == name)
-        .ok_or_else(|| format!("`{path}` contains no entry `{name}`"))?;
-    extract_entry(&data, entry)
+        .ok_or_else(|| format!("no entry `{name}`"))?;
+    extract_entry(data, entry)
 }
 
 // ---------------------------------------------------------------------------

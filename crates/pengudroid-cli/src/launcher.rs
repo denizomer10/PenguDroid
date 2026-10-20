@@ -45,6 +45,10 @@ pub struct Plan {
 /// because that path needs no Java runtime at all. Otherwise the presence of
 /// `classes.dex` means ART is the only option.
 pub fn plan(apk_path: &str) -> Result<(ApkInfo, Plan), String> {
+    let path = std::path::Path::new(apk_path);
+    if crate::bundle::is_bundle(path) {
+        return plan_bundle(path);
+    }
     let info = apk::read_apk(apk_path)?;
     let entries = apk::apk_entries(apk_path).unwrap_or_default();
     let has_x86_64_lib = entries
@@ -80,6 +84,54 @@ pub fn plan(apk_path: &str) -> Result<(ApkInfo, Plan), String> {
     } else {
         Err(format!(
             "{apk_path} has neither an x86_64 native payload nor classes.dex"
+        ))
+    }
+}
+
+/// Decide a backend for a bundle, whose libraries live in an ABI split.
+fn plan_bundle(path: &std::path::Path) -> Result<(ApkInfo, Plan), String> {
+    let b = crate::bundle::Bundle::open(path)?;
+    let info = b.info()?;
+    let host = crate::nativelib::host_abi();
+    let libs = b.native_libs()?;
+    let host_lib = libs.iter().any(|(_, l)| l.abi == host);
+    let has_dex = b
+        .base_bytes()
+        .ok()
+        .and_then(|d| apk::extract_named_bytes(&d, "classes.dex").ok())
+        .is_some();
+
+    if host_lib {
+        Ok((
+            info,
+            Plan {
+                backend: Backend::Native,
+                reason: format!("bundle ships {host} native libraries"),
+            },
+        ))
+    } else if !b.abis.is_empty() {
+        Ok((
+            info,
+            Plan {
+                backend: Backend::Art,
+                reason: format!(
+                    "bundle is {}-only; ART plus an ARM translator is required",
+                    b.abis.join("/")
+                ),
+            },
+        ))
+    } else if has_dex {
+        Ok((
+            info,
+            Plan {
+                backend: Backend::Art,
+                reason: "DEX only, needs the Android runtime".into(),
+            },
+        ))
+    } else {
+        Err(format!(
+            "{}: bundle has neither native libraries nor classes.dex",
+            path.display()
         ))
     }
 }
@@ -203,6 +255,38 @@ pub fn launch(args: &[String]) -> i32 {
         }
     };
 
+    // A bundle is materialised into the prefix once: `base.apk`, the split for
+    // the architecture we intend to use, and the OBB payload. Everything after
+    // this point works on an ordinary APK path.
+    let mut app_path = apk_path.clone();
+    if crate::bundle::is_bundle(std::path::Path::new(&apk_path)) {
+        match crate::bundle::Bundle::open(std::path::Path::new(&apk_path)) {
+            Ok(b) => {
+                let dir = prefix.join("bundle");
+                let abi = bundle_abi(&b, backend);
+                match b.extract_to(&dir, abi.as_deref()) {
+                    Ok(written) => {
+                        println!("  bundle  : {} ({} members -> {})", b.kind.name(), written.len(), dir.display());
+                        if !b.obb.is_empty() {
+                            println!("  obb     : {} file(s)", b.obb.len());
+                        }
+                        if let Some(base) = written.first() {
+                            app_path = base.display().to_string();
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("pengudroid launch: {e}");
+                        return 1;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("pengudroid launch: {e}");
+                return 1;
+            }
+        }
+    }
+
     println!("PenguDroid launch");
     println!("  package : {}", info.package);
     if let Some(v) = &info.version_name {
@@ -219,7 +303,7 @@ pub fn launch(args: &[String]) -> i32 {
     match backend {
         Backend::Native => {
             let mut cmd = std::process::Command::new(std::env::current_exe().unwrap_or_default());
-            cmd.arg("native").arg(&apk_path);
+            cmd.arg("native").arg(&app_path);
             if let Some(c) = &component {
                 cmd.arg("--component").arg(c);
             }
@@ -239,22 +323,57 @@ pub fn launch(args: &[String]) -> i32 {
                 .arg("--sysroot")
                 .arg(&sysroot)
                 .arg("--classpath")
-                .arg(&apk_path)
+                .arg(&app_path)
                 // The framework's JNI natives live in libandroid_runtime.so and
                 // are registered by calling every exported `register_*` entry
                 // point, which is what app_process does.
                 .arg("--register-natives")
                 .arg("libandroid_runtime.so");
-            let main = component
-                .clone()
-                .or_else(|| info.main_activity_name().map(str::to_string))
-                .unwrap_or_else(|| "android.app.ActivityThread".to_string());
+            let main = component.clone().unwrap_or_else(|| {
+                // An Activity has no `main(String[])`; the closest honest entry
+                // point is the app_process one, `ActivityThread.main`, which is
+                // what a device's zygote calls for every app.
+                "android.app.ActivityThread".to_string()
+            });
+            if info.main_activity_name().is_some() && component.is_none() {
+                println!(
+                    "  note    : launching via ActivityThread.main; starting {} needs \
+                     system_server (see docs/LIMITATIONS.md \u{a7}2)",
+                    info.main_activity_name().unwrap_or("the activity")
+                );
+            }
             cmd.arg("--main").arg(main);
             if !app_args.is_empty() {
                 cmd.arg("--").args(&app_args);
             }
             apply_env(&mut cmd, &env);
             run_child(cmd)
+        }
+    }
+}
+
+/// Which ABI split to keep for the chosen backend: the host ABI for a native
+/// run, and for ART the architecture the translator can handle best (arm64
+/// before armv7, because 32-bit translation needs a 32-bit host process).
+fn bundle_abi(b: &crate::bundle::Bundle, backend: Backend) -> Option<String> {
+    if b.abis.is_empty() {
+        return None;
+    }
+    match backend {
+        Backend::Native => {
+            let host = crate::nativelib::host_abi();
+            if b.abis.iter().any(|a| a == host) {
+                Some(host.to_string())
+            } else {
+                Some(b.abis[0].clone())
+            }
+        }
+        Backend::Art => {
+            if b.abis.iter().any(|a| a == "arm64-v8a") {
+                Some("arm64-v8a".to_string())
+            } else {
+                b.abis.first().cloned()
+            }
         }
     }
 }

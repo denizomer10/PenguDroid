@@ -12,6 +12,7 @@
 
 mod apk;
 mod audio;
+mod bundle;
 mod client;
 mod deps;
 mod doctor;
@@ -52,6 +53,7 @@ fn real_main() -> i32 {
     match cmd {
         "run" => cmd_run(&args[2..]),
         "launch" => launcher::launch(&args[2..]),
+        "extract" => cmd_extract(&args[2..]),
         "demo" => cmd_demo(&args[2..]),
         "start" => cmd_start(&args[2..]),
         "ps" => cmd_ps(),
@@ -225,9 +227,13 @@ fn cmd_ps() -> i32 {
 
 fn cmd_info(args: &[String]) -> i32 {
     let Some(path) = args.first() else {
-        eprintln!("usage: pengudroid info <app.apk>");
+        eprintln!("usage: pengudroid info <app.apk|.apkm|.xapk|.apks>");
         return 2;
     };
+    let p = std::path::Path::new(path);
+    if bundle::is_bundle(p) {
+        return info_bundle(p);
+    }
     match apk::read_apk(path) {
         Ok(info) => {
             println!("{info:#?}");
@@ -238,6 +244,97 @@ fn cmd_info(args: &[String]) -> i32 {
         }
         Err(e) => fail(&e),
     }
+}
+
+fn info_bundle(path: &std::path::Path) -> i32 {
+    let b = match bundle::Bundle::open(path) {
+        Ok(b) => b,
+        Err(e) => return fail(&e),
+    };
+    let info = match b.info() {
+        Ok(i) => i,
+        Err(e) => return fail(&e),
+    };
+    println!("bundle:       {} ({})", path.display(), b.kind.name());
+    println!("base apk:     {}", b.base);
+    println!("{info:#?}");
+    println!("splits:       {}", b.splits.len());
+    for s in &b.splits {
+        match &s.abi {
+            Some(abi) => println!("  {:<40} abi {abi}", s.name),
+            None => println!("  {}", s.name),
+        }
+    }
+    if !b.abis.is_empty() {
+        println!("abis:         {}", b.abis.join(", "));
+    }
+    if !b.obb.is_empty() {
+        println!("obb files:    {}", b.obb.len());
+        for (name, size) in &b.obb {
+            println!("  {:<40} {} MB", name, size / 1_048_576);
+        }
+    }
+    0
+}
+
+/// `pengudroid extract <file> [--dest DIR] [--abi A]`
+///
+/// Unpacks an APK or any bundle flavour: the base APK, the splits (filtered to
+/// one ABI when asked), and the OBB data in its `Android/obb/<pkg>/` layout.
+fn cmd_extract(args: &[String]) -> i32 {
+    let mut src: Option<String> = None;
+    let mut dest: Option<String> = None;
+    let mut abi: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--dest" | "-d" => dest = it.next().cloned(),
+            "--abi" => abi = it.next().cloned(),
+            other if other.starts_with('-') => {
+                eprintln!("pengudroid extract: unknown option {other}");
+                return 2;
+            }
+            other => src = Some(other.to_string()),
+        }
+    }
+    let Some(src) = src else {
+        eprintln!("usage: pengudroid extract <app.apk|.apkm|.xapk|.apks> [--dest DIR] [--abi ABI]");
+        return 2;
+    };
+    let path = std::path::Path::new(&src);
+    let out = dest
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            path.file_stem()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("extracted"))
+        });
+
+    let b = match bundle::Bundle::open(path) {
+        Ok(b) => b,
+        Err(e) => return fail(&e),
+    };
+    let written = match b.extract_to(&out, abi.as_deref()) {
+        Ok(w) => w,
+        Err(e) => return fail(&e),
+    };
+    println!(
+        "extracted {} {} member(s) from {} to {}",
+        written.len(),
+        b.kind.name(),
+        path.display(),
+        out.display()
+    );
+    for p in &written {
+        println!("  {}", p.display());
+    }
+    if !b.abis.is_empty() && abi.is_none() {
+        println!(
+            "note: every ABI split was written; pass --abi <{}> to keep one",
+            b.abis.join("|")
+        );
+    }
+    0
 }
 
 fn cmd_getprop(args: &[String]) -> i32 {
@@ -418,6 +515,8 @@ fn print_help() {
          \x20   run <app.apk> [--component C] [-- ARGS]    launch a guest window\n\
          \x20   launch <app.apk> [--backend auto|native|art]\n\
          \x20                                              Proton-style launcher (prefix + backend)\n\
+         \x20   extract <app.apkm|.xapk|.apks|.apk> [--dest DIR] [--abi A]\n\
+         \x20                                              unpack a bundle: base + splits + OBB\n\
          \x20   demo                                        launch the built-in demo window\n\
          \x20   start <app.apk> [--wait]                   let the daemon fork the guest\n\
          \x20   start --demo [--wait]                       same, for the built-in demo\n\

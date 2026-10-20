@@ -31,6 +31,8 @@ pub struct Report {
     pub abis: Vec<String>,
     pub host_abi_present: bool,
     pub native_libs: usize,
+    /// Number of split APKs the bundle shipped (0 for a plain APK).
+    pub splits: usize,
     pub native_entry: Option<String>,
     pub uses_egl: bool,
     pub uses_gles: bool,
@@ -49,7 +51,11 @@ impl Report {
         if self.native_entry.is_some() && self.host_abi_present {
             "runnable now: NativeActivity app (pengudroid native)"
         } else if self.native_libs > 0 && !self.host_abi_present {
-            "not runnable: no native libraries for this host's ABI"
+            if self.abis.iter().any(|a| a.starts_with("arm")) {
+                "not runnable natively: ARM-only code (needs the ARM translator)"
+            } else {
+                "not runnable: no native libraries for this host's ABI"
+            }
         } else if self.native_libs > 0 {
             "needs ART: native libraries exist but no NativeActivity entry point"
         } else {
@@ -82,6 +88,10 @@ pub fn run(args: &[String]) -> i32 {
 
 /// Collect everything `doctor` reports.
 pub fn analyse(path: &str) -> Result<Report, String> {
+    let p = std::path::Path::new(path);
+    if crate::bundle::is_bundle(p) {
+        return analyse_bundle(p);
+    }
     // A manifest that cannot be parsed is not fatal: the native-library facts
     // are what decide runnability, and a hand-built test APK may carry a
     // placeholder manifest.
@@ -94,7 +104,62 @@ pub fn analyse(path: &str) -> Result<Report, String> {
     };
     let entries = apk::apk_entries(path)?;
     let libs = apk::native_libs(path)?;
+    let dex = apk::extract_named(path, "classes.dex").ok();
+    let libs = libs
+        .into_iter()
+        .map(|l| {
+            let data = apk::extract_named(path, &l.entry).ok();
+            (l, data)
+        })
+        .collect();
+    Ok(build_report(info, entries, libs, dex, 0))
+}
 
+/// The same analysis for a Play-style bundle.
+///
+/// The library facts live in the ABI split, not in `base.apk`, so reading only
+/// the base would make an ARM game look like it ships no native code at all.
+fn analyse_bundle(path: &std::path::Path) -> Result<Report, String> {
+    let b = crate::bundle::Bundle::open(path)?;
+    let info = match b.info() {
+        Ok(info) => info,
+        Err(e) => {
+            eprintln!("warning: {e}");
+            apk::ApkInfo::default()
+        }
+    };
+    let base = b.base_bytes()?;
+    let mut entries = apk::apk_entries_bytes(&base).unwrap_or_default();
+    let dex = apk::extract_named_bytes(&base, "classes.dex").ok();
+    let mut libs = Vec::new();
+    for (member, lib) in b.native_libs()? {
+        // Read the bytes now: the library lives in a split, not in the base.
+        let data = b.member(&member).ok().and_then(|bytes| {
+            apk::extract_named_bytes(&bytes, &lib.entry).ok()
+        });
+        libs.push((lib, data));
+    }
+    for split in &b.splits {
+        if let Ok(bytes) = b.member(&split.name) {
+            if let Ok(more) = apk::apk_entries_bytes(&bytes) {
+                for name in more {
+                    if !entries.contains(&name) {
+                        entries.push(name);
+                    }
+                }
+            }
+        }
+    }
+    Ok(build_report(info, entries, libs, dex, b.splits.len()))
+}
+
+fn build_report(
+    info: apk::ApkInfo,
+    entries: Vec<String>,
+    libs: Vec<(apk::NativeLib, Option<Vec<u8>>)>,
+    dex: Option<Vec<u8>>,
+    splits: usize,
+) -> Report {
     let mut report = Report {
         package: info.package.clone(),
         version: info.version_name.clone(),
@@ -102,11 +167,12 @@ pub fn analyse(path: &str) -> Result<Report, String> {
         target_sdk: info.target_sdk,
         main_activity: info.main_activity.clone(),
         native_libs: libs.len(),
+        splits,
         ..Default::default()
     };
 
     let mut abis: BTreeSet<String> = BTreeSet::new();
-    for lib in &libs {
+    for (lib, _) in &libs {
         abis.insert(lib.abi.clone());
     }
     report.abis = abis.into_iter().collect();
@@ -124,18 +190,16 @@ pub fn analyse(path: &str) -> Result<Report, String> {
     }
 
     // DEX: count classes from the first classes.dex header.
-    if entries.iter().any(|e| e == "classes.dex") {
-        if let Ok(bytes) = apk::extract_named(path, "classes.dex") {
-            report.dex_classes = dex_class_count(&bytes);
-        }
+    if let Some(bytes) = dex {
+        report.dex_classes = dex_class_count(&bytes);
     }
 
     // Native libraries for the host ABI: entry point, graphics imports, and
     // whether they load at all.
     let mut imports: BTreeSet<String> = BTreeSet::new();
-    for lib in libs.iter().filter(|l| l.abi == host) {
-        let Ok(bytes) = apk::extract_named(path, &lib.entry) else { continue };
-        let Ok(elf) = pengudroid_elf::parse(&bytes) else { continue };
+    for (lib, data) in libs.iter().filter(|(l, _)| l.abi == host) {
+        let Some(bytes) = data.as_ref() else { continue };
+        let Ok(elf) = pengudroid_elf::parse(bytes) else { continue };
         if elf.exports.iter().any(|s| s == "ANativeActivity_onCreate") {
             report.native_entry = Some(lib.file.clone());
         }
@@ -155,7 +219,7 @@ pub fn analyse(path: &str) -> Result<Report, String> {
     report.uses_vulkan = imports.iter().any(|s| s.starts_with("vk"));
     report.uses_opensl = imports.iter().any(|s| s.starts_with("slCreate") || s.starts_with("SL_IID"));
 
-    Ok(report)
+    report
 }
 
 /// `classes.dex` header: `class_defs_size` is a little-endian u32 at offset 96.
@@ -189,6 +253,9 @@ fn print_report(r: &Report, path: &str) {
         println!("main activity:  {a}");
     }
     println!();
+    if r.splits > 0 {
+        println!("bundle splits:    {}", r.splits);
+    }
     println!("native libraries: {}", r.native_libs);
     println!("ABIs:             {}", if r.abis.is_empty() { "<none>".into() } else { r.abis.join(", ") });
     println!("host ABI ({}): {}", host_abi(), yesno(r.host_abi_present));
