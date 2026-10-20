@@ -61,24 +61,28 @@ pub fn plan(apk_path: &str) -> Result<(ApkInfo, Plan), String> {
         .iter()
         .any(|e| e.starts_with("lib/x86_64/") && e.ends_with("libmain.so"));
 
-    if has_x86_64_lib && (has_native_activity || has_dex) {
+    if has_native_activity {
         Ok((
             info,
             Plan {
                 backend: Backend::Native,
-                reason: if has_native_activity {
-                    "x86_64 NativeActivity payload (libmain.so)".into()
-                } else {
-                    "x86_64 native libraries".into()
-                },
+                reason: "x86_64 NativeActivity payload (libmain.so)".into(),
             },
         ))
     } else if has_dex {
+        // Native libraries alone do not make an app runnable without ART: the
+        // Java entry point still has to exist. Only a NativeActivity payload
+        // (`lib/<abi>/libmain.so` + the NativeActivity manifest entry) can skip
+        // the Java runtime.
         Ok((
             info,
             Plan {
                 backend: Backend::Art,
-                reason: "DEX only, needs the Android runtime".into(),
+                reason: if has_x86_64_lib {
+                    "x86_64 libraries but no NativeActivity entry point".into()
+                } else {
+                    "DEX only, needs the Android runtime".into()
+                },
             },
         ))
     } else {
@@ -95,21 +99,24 @@ fn plan_bundle(path: &std::path::Path) -> Result<(ApkInfo, Plan), String> {
     let host = crate::nativelib::host_abi();
     let libs = b.native_libs()?;
     let host_lib = libs.iter().any(|(_, l)| l.abi == host);
+    let host_native_activity = libs
+        .iter()
+        .any(|(_, l)| l.abi == host && l.file == "libmain.so");
     let has_dex = b
         .base_bytes()
         .ok()
         .and_then(|d| apk::extract_named_bytes(&d, "classes.dex").ok())
         .is_some();
 
-    if host_lib {
+    if host_native_activity {
         Ok((
             info,
             Plan {
                 backend: Backend::Native,
-                reason: format!("bundle ships {host} native libraries"),
+                reason: format!("bundle ships a {host} NativeActivity payload"),
             },
         ))
-    } else if !b.abis.is_empty() {
+    } else if !b.abis.is_empty() && !host_lib {
         Ok((
             info,
             Plan {
@@ -125,7 +132,11 @@ fn plan_bundle(path: &std::path::Path) -> Result<(ApkInfo, Plan), String> {
             info,
             Plan {
                 backend: Backend::Art,
-                reason: "DEX only, needs the Android runtime".into(),
+                reason: if host_lib {
+                    format!("bundle has {host} libraries but no NativeActivity entry point")
+                } else {
+                    "DEX only, needs the Android runtime".into()
+                },
             },
         ))
     } else {

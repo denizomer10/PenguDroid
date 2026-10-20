@@ -392,6 +392,7 @@ pub fn art_test(args: &[String]) -> i32 {
                     other,
                     "--main" | "--find-class" | "--classpath" | "--jni-lib" | "--register-natives"
                         | "--init-bridge" | "--native-bridge" | "--bridge-lib" | "--xmx"
+                        | "--bridge-selftest"
                 ) {
                     if let Some(v) = it.next() {
                         passthrough.push(v.clone());
@@ -541,6 +542,7 @@ pub fn art_main(args: &[String]) -> i32 {
     let mut jni_libs: Vec<String> = Vec::new();
     let mut register_libs: Vec<String> = Vec::new();
     let mut init_bridge: Option<String> = None;
+    let mut bridge_selftest: Option<String> = None;
     let mut xmx: String = "512m".to_string();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -560,6 +562,7 @@ pub fn art_main(args: &[String]) -> i32 {
                 }
             }
             "--init-bridge" => init_bridge = it.next().cloned(),
+            "--bridge-selftest" => bridge_selftest = it.next().cloned(),
             "--xmx" => {
                 if let Some(v) = it.next() {
                     xmx = v.clone();
@@ -647,7 +650,7 @@ pub fn art_main(args: &[String]) -> i32 {
         ignore_unrecognized: 1,
     };
 
-    let bridge_setup = if let Some(isa) = init_bridge.as_deref() {
+    let bridge_setup = if let Some(isa) = init_bridge.as_deref().or(bridge_selftest.as_deref().map(|_| "arm64")) {
         let data_dir = std::env::var_os("PENGUDROID_BRIDGE_DATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir().join("pengudroid-bridge"));
@@ -686,7 +689,13 @@ pub fn art_main(args: &[String]) -> i32 {
                 }
             }
             if let Some(setup) = &bridge_setup {
-                finish_native_bridge(setup, &env);
+                if let Some(spec) = bridge_selftest.as_deref() {
+                    // Direct Itf use: no libnativebridge state machine, so no
+                    // guest app_process is started.
+                    run_bridge_selftest(setup, &env, spec);
+                } else {
+                    finish_native_bridge(setup, &env);
+                }
             }
             if version != crate::jni::JNI_VERSION_1_6 {
                 eprintln!("art: unexpected JNI version; the function table is misaligned");
@@ -768,6 +777,9 @@ unsafe extern "C" fn bridge_get_native_methods(
 /// The native bridge, loaded but not yet handed the VM.
 struct BridgeSetup {
     handle: *mut c_void,
+    /// Handle of the translator itself (`libndk_translation.so`), so its
+    /// `NativeBridgeItf` vtable can be called directly.
+    translator: *mut c_void,
     initialize: unsafe extern "C" fn(*mut c_void, *const c_char) -> bool,
     isa: String,
 }
@@ -856,11 +868,140 @@ fn setup_native_bridge(libs: Option<&Path>, data_dir: &Path, isa: &str) -> Optio
         diag(&format!("art: {probe_len} byte probe mmap ok at {probe:p}"));
         unsafe { libc::munmap(probe, probe_len) };
     }
+    // Load the translator a second time through our own handle: the Itf is a
+    // table of function pointers we can drive without libnativebridge's state
+    // machine (which would start a guest app_process).
+    let translator = unsafe { libc::dlopen(cname.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+    if translator.is_null() {
+        diag(&format!("art: dlopen({name}) failed: {}", dlerror()));
+        return None;
+    }
+
     Some(BridgeSetup {
         handle,
+        translator,
         initialize: unsafe { std::mem::transmute(init) },
         isa: isa.to_string(),
     })
+}
+
+/// Alternative call shapes for the translator's initialiser.
+///
+/// This ndk_translation build declares `native_bridge_initialize(callbacks,
+/// const char*, const char*)`. Which strings it wants, and whether one of them
+/// selects "do not start a guest app_process", is not documented, so the
+/// selftest can try the shapes out with `PENGUDROID_BRIDGE_MODE`.
+fn bridge_init_mode() -> String {
+    std::env::var("PENGUDROID_BRIDGE_MODE").unwrap_or_else(|_| "dir+isa".into())
+}
+
+/// Drive the translator's `NativeBridgeItf` table directly.
+///
+/// libnativebridge's state machine calls `Itf.initialize` *and* something that
+/// starts `/system/bin/arm64/app_process64` on a thread. For running an ARM
+/// library inside our own (x86_64) ART we only need the first half:
+///
+/// ```text
+///   Itf.initialize(callbacks)                 set up the JIT + signal handlers
+///   Itf.loadLibrary(path, RTLD_NOW)           map/parse the guest ELF
+///   Itf.getTrampoline(handle, name, shorty)   host-callable entry point
+/// ```
+///
+/// `spec` is `<lib path>#<symbol>`; the symbol is called with a JNI-static
+/// shape `(JNIEnv*, jclass) -> jint` and its return value printed, so a guest
+/// function that returns a known constant proves translation end to end.
+fn run_bridge_selftest(setup: &BridgeSetup, env: &crate::jni::JniEnv, spec: &str) {
+    let (lib, symbol) = match spec.split_once('#') {
+        Some(v) => v,
+        None => {
+            eprintln!("art: --bridge-selftest expects <lib>#<symbol>");
+            return;
+        }
+    };
+    let itf = unsafe { libc::dlsym(setup.translator, c"NativeBridgeItf".as_ptr()) };
+    if itf.is_null() {
+        eprintln!("art: the translator does not export NativeBridgeItf");
+        return;
+    }
+    // struct NativeBridgeCallbacks { uint32_t version; <function pointers...> }
+    let version = unsafe { *(itf as *const u32) };
+    let slot = |i: usize| -> *const c_void {
+        // Slot 0 is the 32-bit version; the pointers start at offset 8.
+        unsafe { *(itf as *const *const c_void).add(i) }
+    };
+    diag(&format!("art: NativeBridgeItf.version = {version}"));
+
+    let callbacks = BridgeCallbacks {
+        get_method_shorty: bridge_get_method_shorty,
+        get_native_method_count: bridge_get_native_method_count,
+        get_native_methods: bridge_get_native_methods,
+    };
+
+    let init_ptr = {
+        // Offset 8 = slot 1. This ndk_translation build takes three arguments:
+        // (callbacks, app_data_dir, instruction_set) — passing only the
+        // callbacks leaves the other two as garbage, and it strcmp()s them.
+        unsafe { *(itf as *const u8).add(8).cast::<*const c_void>() }
+    };
+    if !init_ptr.is_null() {
+        type Init = unsafe extern "C" fn(*const BridgeCallbacks, *const c_char, *const c_char) -> bool;
+        let f: Init = unsafe { std::mem::transmute(init_ptr) };
+        let data_dir = std::env::var_os("PENGUDROID_BRIDGE_DATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("pengudroid-bridge"));
+        let _ = std::fs::create_dir_all(&data_dir);
+        let (Ok(cdata), Ok(cisa)) = (
+            CString::new(data_dir.display().to_string()),
+            CString::new("arm64"),
+        ) else {
+            return;
+        };
+        let mode = bridge_init_mode();
+        let (p2, p3) = match mode.as_str() {
+            "nulls" => (std::ptr::null(), std::ptr::null()),
+            "dir" => (cdata.as_ptr(), std::ptr::null()),
+            "isa+dir" => (cisa.as_ptr(), cdata.as_ptr()),
+            _ => (cdata.as_ptr(), cisa.as_ptr()),
+        };
+        let ok = unsafe { f(&callbacks, p2, p3) };
+        diag(&format!("art: Itf.initialize(mode={mode}) = {ok}"));
+    }
+
+    let load = slot(2);
+    if load.is_null() {
+        eprintln!("art: Itf.loadLibrary is null");
+        return;
+    }
+    type LoadLib = unsafe extern "C" fn(*const c_char, c_int) -> *mut c_void;
+    let f: LoadLib = unsafe { std::mem::transmute(load) };
+    let Ok(clib) = CString::new(lib) else { return };
+    let handle = unsafe { f(clib.as_ptr(), 2) }; // RTLD_NOW
+    diag(&format!("art: Itf.loadLibrary({lib}) = {handle:p}"));
+    if handle.is_null() {
+        return;
+    }
+
+    let tramp = slot(3);
+    if tramp.is_null() {
+        eprintln!("art: Itf.getTrampoline is null");
+        return;
+    }
+    type GetTramp = unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> *mut c_void;
+    let f: GetTramp = unsafe { std::mem::transmute(tramp) };
+    let (Ok(csym), Ok(cshorty)) = (CString::new(symbol), CString::new("()I")) else {
+        return;
+    };
+    let entry = unsafe { f(handle, csym.as_ptr(), cshorty.as_ptr()) };
+    diag(&format!("art: Itf.getTrampoline({symbol}) = {entry:p}"));
+    if entry.is_null() {
+        return;
+    }
+
+    type StaticIntFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
+    let call: StaticIntFn = unsafe { std::mem::transmute(entry) };
+    diag("art: calling the translated guest function");
+    let value = unsafe { call(env.0, std::ptr::null_mut()) };
+    diag(&format!("art: guest {symbol}() returned {value}"));
 }
 
 /// Re-install the translator's signal handlers over ART's.

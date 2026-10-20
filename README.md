@@ -34,6 +34,11 @@ $ ps -eo pid,comm,args | grep pengudroid
 
 ---
 
+> **Where we are right now:** `docs/STATUS.md` is the up-to-date handoff note
+> (what runs, what does not, and the exact failure point of each attempt).
+> Last verified: NewPipe 0.29.1 and Beach Buggy Racing 2 both stop at
+> `ActivityThread.main`; x86_64 NativeActivity games run on the GPU.
+
 ## Status: what actually works vs. what is stubbed
 
 This is an **MVP skeleton with a genuinely working spine**. The infrastructure
