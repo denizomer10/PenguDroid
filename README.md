@@ -88,6 +88,7 @@ milestone. Nothing below is overstated.
 | **Framework native registration** | **Working** | all 150 `register_android_*` groups exported by `libandroid_runtime.so` are called in `gRegJNI`-like order, so `android.os.Trace`, `android.util.Log`, Binder and friends have their natives |
 | **`ActivityThread.main`** | **Partial** | invoked on the live VM; it runs Java code up to the first thing that needs `system_server` (binder to AMS/PMS) or SurfaceFlinger |
 | **Bionic `sigaction`/`sigset_t` translation** | **Working** | Bionic's `sigset_t` is 8 bytes and `struct sigaction` 32; glibc's are 128/152. Interposing the whole signal API is what made ART stop corrupting its own globals |
+| **ARM→x86_64 translation (Intel NDK translation)** | **Partial** | the emulator's `libndk_translation.so` loads and initialises (`Initialized NDK translation (aarch64)`), the guest linker resolves the ARM64 runtime and `ExecuteGuest` starts running the real ARM64 `app_process64`; it then dies in the translator's lazy code-translation fault handler. See `docs/LIMITATIONS.md` §2.1 |
 | **`pengudroid launch` (Proton-style prefixes)** | **Working** | per-app prefix (`~/.local/share/pengudroid/prefixes/<pkg>`) with `files`/`cache`/`code_cache`/`shared_prefs` and `pengudroid.env` overrides; picks `native` or `art` from the APK |
 | **Real Bionic/EGL in a guest** | **Not started** | needs the Android userspace `.so`s loaded in-process |
 

@@ -2408,6 +2408,19 @@ pub struct AndroidLogMessage {
     pub message: *const c_char,
 }
 
+/// `__android_log_stderr_logger(log_message)` — liblog's debug logger.
+///
+/// Since API 30 the logger signature takes the whole `__android_log_message`
+/// record; this is the implementation `libndk_translation.so` picks up.
+#[no_mangle]
+pub unsafe extern "C" fn __android_log_stderr_logger(log_message: *const AndroidLogMessage) {
+    if log_message.is_null() {
+        return;
+    }
+    let m = &*log_message;
+    let _ = log_to_stderr(m.priority, &cstr_lossy(m.tag), &cstr_lossy(m.message));
+}
+
 /// `__android_log_write_log_message(log_message)` — emit a log record.
 #[no_mangle]
 pub unsafe extern "C" fn __android_log_write_log_message(log_message: *mut AndroidLogMessage) {
@@ -2422,6 +2435,15 @@ pub unsafe extern "C" fn __android_log_write_log_message(log_message: *mut Andro
 #[no_mangle]
 pub unsafe extern "C" fn __android_log_set_aborter(aborter: *mut c_void) {
     ABORTER.store(aborter, Ordering::Relaxed);
+}
+
+/// `__android_log_default_aborter(abort_message)` — liblog's default abort
+/// handler: report the message and terminate.
+#[no_mangle]
+pub unsafe extern "C" fn __android_log_default_aborter(abort_message: *const c_char) {
+    let msg = cstr_lossy(abort_message);
+    let _ = log_to_stderr(ANDROID_LOG_FATAL, "abort", &msg);
+    libc::abort();
 }
 
 /// `__android_log_call_aborter(message)` — invoke the abort handler, or abort.
@@ -2663,6 +2685,26 @@ pub unsafe extern "C" fn sigaddset(set: *mut BionicSigset, signum: c_int) -> c_i
     *set |= 1u64 << (signum - 1);
     0
 }
+
+/// `sigsetjmp` — Bionic exports this as a real function, while glibc only has
+/// the `__sigsetjmp` it is a macro for.
+///
+/// The forwarding has to be a *tail jump*: `__sigsetjmp` saves its caller's
+/// return address, so an ordinary wrapper function would make `longjmp` return
+/// into a frame that no longer exists. A `jmp` keeps the original return
+/// address on the stack and passes `rdi`/`rsi` through untouched.
+///
+/// NOTE: this inherits glibc's `sigjmp_buf` layout, which is larger than
+/// Bionic's. Callers must allocate the glibc-sized buffer; the ARM translator's
+/// own uses are internal and never cross the boundary.
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    ".globl sigsetjmp",
+    ".type sigsetjmp,@function",
+    "sigsetjmp:",
+    "jmp __sigsetjmp@PLT",
+    ".size sigsetjmp, .-sigsetjmp",
+);
 
 /// `sigdelset(set, signum)`.
 #[no_mangle]
@@ -4369,6 +4411,10 @@ pub static __pengudroid_ver_libc_o: u8 = 0;
 pub static __pengudroid_ver_libc_p: u8 = 0;
 #[no_mangle]
 pub static __pengudroid_ver_libc_q: u8 = 0;
+#[no_mangle]
+pub static __pengudroid_ver_liblog: u8 = 0;
+#[no_mangle]
+pub static __pengudroid_ver_liblog_r: u8 = 0;
 #[no_mangle]
 pub static __pengudroid_ver_liblog_m: u8 = 0;
 #[no_mangle]

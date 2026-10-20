@@ -70,19 +70,74 @@ the Android system services — the thing Waydroid gets by booting a real system
 image inside a container. PenguDroid deliberately does not boot a container; it
 runs apps as host processes. Those two goals meet at the system-service boundary.
 
+### 2.1 ARM translation (Intel's NDK translation / Houdini lineage)
+
+Most real Android games ship `arm64-v8a` only, so a translator is needed on an
+x86_64 host. PenguDroid uses the same one the official emulator uses:
+`libndk_translation.so` from Google's Android 11 (API 30) x86_64 Google-APIs
+system image — the maintained descendant of Intel's Houdini.
+
+What is wired up and verified:
+
+* `art-test --bridge-lib <dir> --native-bridge libndk_translation.so --init-bridge arm64`
+  runs the three-step sequence `app_process` uses, because each step asserts the
+  previous one happened: `LoadNativeBridge(name, callbacks)` →
+  `PreInitializeNativeBridge(<data dir>, "arm64")` (creates
+  `<dir>/arm64/code_cache`) → `InitializeNativeBridge(env, "arm64")`.
+* The translator's guest runtime is unpacked next to the system tree:
+  `/system/lib64/arm64/*` (59 ARM64 libs), `/system/lib/arm/*`,
+  `/system/bin/arm64/{app_process64,linker64}`, and the
+  `libndk_translation_proxy_*` graphics shims that forward the guest's
+  EGL/GLES/Vulkan calls to the host driver — so translation stays
+  vendor-neutral.
+* Output on this host:
+  `ndk_translation: Initialized NDK translation (aarch64)`, then the guest
+  linker resolves the ARM64 libraries, loads `/system/bin/arm64/app_process64`,
+  and `ndk_translation::ExecuteGuest` begins executing real ARM64 code.
+
+Three findings worth keeping:
+
+1. **Bionic VERNEED entries.** The translator is a normal x86-64 `.so`, but it
+   carries Android version needs (`LIBLOG`, `LIBLOG_R`, `LIBC`, ...) and imports
+   such as `pthread_exit@LIBC` and `sigsetjmp` (which glibc only has as
+   `__sigsetjmp`). It is therefore run through `de-bionic` as well, and the shim
+   exports `sigsetjmp` as a **tail jump** to `__sigsetjmp` so `longjmp` still
+   returns to the original caller.
+2. **The bridge eats address space.** Once the translator has reserved the ARM
+   guest layout, ART's default 1 GiB region space no longer fits and
+   `JNI_CreateJavaVM` aborts with `region_space_mem_map.IsValid()` /
+   `Cannot allocate memory`. `--xmx 128m` is what makes the VM come up with the
+   bridge loaded.
+3. **Absolute paths are mandatory.** The translator opens
+   `/system/bin/arm64/app_process64` and `/system/lib64/arm64/...` by absolute
+   path, and the guest linker will happily pick `libc++.so` from `/system/lib64`
+   if an x86-64 library is there. The run needs `/system` and `/apex` mounted at
+   their real locations (a `bwrap` mount namespace does this without root) with
+   `/system/lib64` pointing at the **ARM** directory.
+
+**Not solved yet.** `ExecuteGuest` reaches the translator's lazy code-translation
+fault handler (`ndk_translation_HandleNoExec`) and dies there with a SIGSEGV.
+That is inside the translator's own page-fault/trampoline machinery, not in the
+shim's ABI surface, and it is where this line of work currently stops: ARM64
+code *starts* executing but does not yet run. Booting the guest ARM
+`app_process64`/zygote is additionally the emulator-style "second Android
+runtime" path, so even a fixed handler would need the same `system_server` work
+that blocks Activities above.
+
 **Consequences for real games.**
 
 * **Native x86_64 `NativeActivity` games run today, on the GPU** —
   `pengudroid native`, with `AAssetManager`, `ALooper`, EGL/GLES and Vulkan. This
   is the path `pengudroid launch` picks, and `fixtures/native-game` is a playable
   game at ~56 fps on an RTX 3080.
-* **Genshin Impact cannot run here.** Independently of ART, its Android build is
-  `arm64-v8a` only (this host is x86_64, so it would need a full ARM→x86_64
-  translator), it ships ~20 GB of OBB data plus a proprietary anti-cheat, and it
-  needs `system_server` for login/rendering surfaces. There is no legitimate way
-to obtain or run it in this environment, so "Genshin renders" is not a claim
-this project can make. What it *can* claim is the same class of workload:
-NativeActivity games that call EGL/GLES/Vulkan directly.
+* **Genshin Impact still cannot run here.** Its Android build is `arm64-v8a`
+  only; the NDK translator above is the right tool for that and now initialises
+  and starts ARM64 code, but it does not yet complete guest execution (see 2.1).
+  On top of that it ships ~20 GB of OBB data, a proprietary anti-cheat, and it
+  needs `system_server` for login and rendering surfaces. There is no legitimate
+  way to obtain or run it in this environment, so "Genshin renders" is not a
+  claim this project can make. What it *can* claim is the same class of workload:
+  NativeActivity games that call EGL/GLES/Vulkan directly.
 
 ## 3. Native `.so` compatibility
 

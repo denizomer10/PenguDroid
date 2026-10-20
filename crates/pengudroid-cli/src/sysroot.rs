@@ -315,22 +315,83 @@ fn prepare_art_libs(layout: &Layout, work: &Path) -> Result<PathBuf, String> {
     Ok(out)
 }
 
+/// Remove work directories left behind by earlier runs.
+///
+/// Each run copies the whole de-bionic'd library closure (~250 MB) into a
+/// per-pid directory. On a tmpfs `/tmp` a handful of runs will fill it, and the
+/// failure mode is silent (every write fails, so ART sees an empty directory).
+fn prune_stale_work_dirs() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    let me = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(pid) = name.strip_prefix("pengudroid-art-") else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else { continue };
+        if pid == me {
+            continue;
+        }
+        // A pid that is still alive owns its directory; anything else is stale.
+        let alive = Path::new(&format!("/proc/{pid}")).exists();
+        if !alive {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Copy the top-level `.so` files of `src` into `dst` with their Android symbol
+/// versions stripped. Subdirectories (the ARM guest runtime) are left alone:
+/// those are ARM ELF files that only the translator's own loader reads.
+fn de_bionic_dir(src: &Path, dst: &Path) -> Result<usize, String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("cannot create {}: {e}", dst.display()))?;
+    let entries = std::fs::read_dir(src)
+        .map_err(|e| format!("cannot read {}: {e}", src.display()))?;
+    let mut written = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.contains(".so") {
+            continue;
+        }
+        let Ok(data) = std::fs::read(&path) else { continue };
+        let out = pengudroid_elf::strip_android_versions(&data).unwrap_or(data);
+        if std::fs::write(dst.join(name), out).is_ok() {
+            written += 1;
+        }
+    }
+    Ok(written)
+}
+
 /// `pengudroid art-test --sysroot <dir>`
 pub fn art_test(args: &[String]) -> i32 {
     let mut root: Option<PathBuf> = None;
     let mut passthrough: Vec<String> = Vec::new();
+    let mut native_bridge: Option<String> = None;
+    let mut bridge_lib: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--sysroot" => {
                 root = it.next().map(PathBuf::from);
             }
+            "--native-bridge" => native_bridge = it.next().cloned(),
+            "--bridge-lib" => bridge_lib = it.next().cloned(),
             other if other.starts_with('-') => {
                 passthrough.push(other.to_string());
                 // Options that take a value: keep the next token with them.
                 if matches!(
                     other,
                     "--main" | "--find-class" | "--classpath" | "--jni-lib" | "--register-natives"
+                        | "--init-bridge" | "--native-bridge" | "--bridge-lib" | "--xmx"
                 ) {
                     if let Some(v) = it.next() {
                         passthrough.push(v.clone());
@@ -372,6 +433,7 @@ pub fn art_test(args: &[String]) -> i32 {
 
     let work = std::env::temp_dir().join(format!("pengudroid-art-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
+    prune_stale_work_dirs();
     let art_libs = match prepare_art_libs(&layout, &work) {
         Ok(d) => d,
         Err(e) => {
@@ -387,11 +449,30 @@ pub fn art_test(args: &[String]) -> i32 {
         .arg("--libs")
         .arg(&art_libs);
     cmd.args(&passthrough);
+    let mut ld_path = format!(
+        "{}:{}:{}",
+        art_libs.display(),
+        compat.display(),
+        layout.ld_library_path()
+    );
+    if let Some(dir) = &bridge_lib {
+        // The translator is a normal x86-64 `.so` but carries Bionic VERNEED
+        // entries (`LIBLOG`, `LIBC`, ...) and references like
+        // `pthread_exit@LIBC` that glibc neither provides nor version-matches.
+        // Stripping the versions makes those references resolve by name
+        // against the shim or glibc itself.
+        let prepared = work.join("bridge-libs");
+        match de_bionic_dir(Path::new(dir), &prepared) {
+            Ok(n) => println!("art: prepared {n} bridge libraries in {}", prepared.display()),
+            Err(e) => {
+                eprintln!("pengudroid: {e}");
+                return 1;
+            }
+        }
+        ld_path = format!("{}:{ld_path}", prepared.display());
+    }
     cmd.env("LD_PRELOAD", &shim)
-        .env(
-            "LD_LIBRARY_PATH",
-            format!("{}:{}:{}", art_libs.display(), compat.display(), layout.ld_library_path()),
-        )
+        .env("LD_LIBRARY_PATH", &ld_path)
         .env("ANDROID_ROOT", &layout.android_root)
         .env("ANDROID_ART_ROOT", &layout.art_root)
         .env("ANDROID_DATA", layout.root.join("data"))
@@ -401,6 +482,19 @@ pub fn art_test(args: &[String]) -> i32 {
         .env("ANDROID_CONSCRYPT_ROOT", layout.root.join("system/apex/com.android.conscrypt"))
         .env("BOOTCLASSPATH", layout.boot_classpath())
         .env("PENGUDROID_SUPPRESS_DESTRUCTORS", "1");
+    if let Some(bridge) = &native_bridge {
+        // Enabling the bridge is pure property configuration, exactly as on a
+        // device: ART's libnativebridge dlopens the named library and reads its
+        // `NativeBridgeItf` callbacks, and the ISA properties tell ART that ARM
+        // code runs on an x86 CPU.
+        cmd.env("PENGUDROID_PROP_ro.dalvik.vm.native.bridge", bridge)
+            .env("PENGUDROID_PROP_ro.dalvik.vm.isa.arm64", "x86_64")
+            .env("PENGUDROID_PROP_ro.dalvik.vm.isa.arm", "x86")
+            .env("PENGUDROID_PROP_ro.enable.native.bridge.exec", "1")
+            .env("PENGUDROID_PROP_ro.dalvik.vm.isa.arm64.variant", "generic")
+            .env("PENGUDROID_PROP_ro.dalvik.vm.isa.arm.variant", "generic");
+        println!("art: native bridge = {bridge}");
+    }
     match cmd.status() {
         Ok(s) if s.success() => 0,
         Ok(_) => 1,
@@ -446,6 +540,8 @@ pub fn art_main(args: &[String]) -> i32 {
     let mut app_args: Vec<String> = Vec::new();
     let mut jni_libs: Vec<String> = Vec::new();
     let mut register_libs: Vec<String> = Vec::new();
+    let mut init_bridge: Option<String> = None;
+    let mut xmx: String = "512m".to_string();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -461,6 +557,12 @@ pub fn art_main(args: &[String]) -> i32 {
             "--register-natives" => {
                 if let Some(v) = it.next() {
                     register_libs.push(v.clone());
+                }
+            }
+            "--init-bridge" => init_bridge = it.next().cloned(),
+            "--xmx" => {
+                if let Some(v) = it.next() {
+                    xmx = v.clone();
                 }
             }
             "--classpath" => {
@@ -526,7 +628,7 @@ pub fn art_main(args: &[String]) -> i32 {
         CString::new(format!("-Ximage:{}", layout.framework.join("boot.art").display()))
             .unwrap_or_default(),
         CString::new(format!("-Djava.library.path={}", layout.ld_library_path())).unwrap_or_default(),
-        CString::new("-Xmx512m").unwrap_or_default(),
+        CString::new(format!("-Xmx{xmx}")).unwrap_or_default(),
     ];
     if !classpath.is_empty() {
         options.push(CString::new(format!("-Djava.class.path={}", classpath.join(":"))).unwrap_or_default());
@@ -543,6 +645,16 @@ pub fn art_main(args: &[String]) -> i32 {
         n_options: vm_options.len() as c_int,
         options: vm_options.as_mut_ptr(),
         ignore_unrecognized: 1,
+    };
+
+    let bridge_setup = if let Some(isa) = init_bridge.as_deref() {
+        let data_dir = std::env::var_os("PENGUDROID_BRIDGE_DATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("pengudroid-bridge"));
+        let _ = std::fs::create_dir_all(&data_dir);
+        setup_native_bridge(libs.as_deref(), &data_dir, isa)
+    } else {
+        None
     };
 
     let mut vm: *mut c_void = std::ptr::null_mut();
@@ -572,6 +684,9 @@ pub fn art_main(args: &[String]) -> i32 {
                 if register_framework_natives(&env, lib, libs.as_deref()) != 0 {
                     return 1;
                 }
+            }
+            if let Some(setup) = &bridge_setup {
+                finish_native_bridge(setup, &env);
             }
             if version != crate::jni::JNI_VERSION_1_6 {
                 eprintln!("art: unexpected JNI version; the function table is misaligned");
@@ -619,6 +734,151 @@ fn dlerror() -> String {
         } else {
             std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
         }
+    }
+}
+
+/// `NativeBridgeRuntimeCallbacks` — the three hooks ART gives the bridge so it
+/// can walk a class's native methods (`libnativebridge` only uses them when the
+/// translated code calls `RegisterNatives`).
+#[repr(C)]
+struct BridgeCallbacks {
+    get_method_shorty: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *const c_char,
+    get_native_method_count: unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32,
+    get_native_methods:
+        unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u32) -> u32,
+}
+
+unsafe extern "C" fn bridge_get_method_shorty(_env: *mut c_void, _method: *mut c_void) -> *const c_char {
+    c"".as_ptr()
+}
+
+unsafe extern "C" fn bridge_get_native_method_count(_env: *mut c_void, _class: *mut c_void) -> u32 {
+    0
+}
+
+unsafe extern "C" fn bridge_get_native_methods(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    _methods: *mut c_void,
+    _count: u32,
+) -> u32 {
+    0
+}
+
+/// The native bridge, loaded but not yet handed the VM.
+struct BridgeSetup {
+    handle: *mut c_void,
+    initialize: unsafe extern "C" fn(*mut c_void, *const c_char) -> bool,
+    isa: String,
+}
+
+/// Steps 1 and 2 of the bridge state machine, run before the VM exists.
+///
+/// `app_process` does `LoadNativeBridge` and `PreInitializeNativeBridge` before
+/// `JNI_CreateJavaVM`, and `InitializeNativeBridge` afterwards; the order is
+/// load-bearing because each step asserts the previous one happened.
+fn setup_native_bridge(libs: Option<&Path>, data_dir: &Path, isa: &str) -> Option<BridgeSetup> {
+    let dir = libs.map(|d| d.display().to_string()).unwrap_or_default();
+    let path = if dir.is_empty() {
+        "libnativebridge.so".to_string()
+    } else {
+        format!("{dir}/libnativebridge.so")
+    };
+    let cpath = CString::new(path.as_str()).ok()?;
+    let handle = unsafe { libc::dlopen(cpath.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+    if handle.is_null() {
+        diag(&format!("art: dlopen {path} failed: {}", dlerror()));
+        return None;
+    }
+    let load = unsafe { libc::dlsym(handle, c"LoadNativeBridge".as_ptr()) };
+    let pre = unsafe { libc::dlsym(handle, c"PreInitializeNativeBridge".as_ptr()) };
+    let init = unsafe { libc::dlsym(handle, c"InitializeNativeBridge".as_ptr()) };
+    if load.is_null() || pre.is_null() || init.is_null() {
+        diag("art: libnativebridge is missing part of the state machine");
+        return None;
+    }
+
+    let name = std::env::var("PENGUDROID_PROP_ro.dalvik.vm.native.bridge")
+        .unwrap_or_else(|_| "libndk_translation.so".to_string());
+    let cname = CString::new(name.as_str()).ok()?;
+    let callbacks = BridgeCallbacks {
+        get_method_shorty: bridge_get_method_shorty,
+        get_native_method_count: bridge_get_native_method_count,
+        get_native_methods: bridge_get_native_methods,
+    };
+    type Load = unsafe extern "C" fn(*const c_char, *const BridgeCallbacks) -> bool;
+    let f: Load = unsafe { std::mem::transmute(load) };
+    let loaded = unsafe { f(cname.as_ptr(), &callbacks) };
+    diag(&format!("art: LoadNativeBridge({name}) = {loaded}"));
+    if !loaded {
+        return None;
+    }
+
+    type PreInit = unsafe extern "C" fn(*const c_char, *const c_char) -> bool;
+    let cdata = CString::new(data_dir.display().to_string()).ok()?;
+    let cisa = CString::new(isa).ok()?;
+    let f: PreInit = unsafe { std::mem::transmute(pre) };
+    let pre_ok = unsafe { f(cdata.as_ptr(), cisa.as_ptr()) };
+    diag(&format!(
+        "art: PreInitializeNativeBridge({}, {isa}) = {pre_ok}",
+        data_dir.display()
+    ));
+    if !pre_ok {
+        return None;
+    }
+
+    // ART needs a 1 GiB region space immediately after this point. Report the
+    // limits and probe the allocation, because a bridge that changed either is
+    // otherwise very hard to see from ART's "Cannot allocate memory".
+    let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut lim) };
+    diag(&format!(
+        "art: RLIMIT_AS = {}/{} bytes",
+        lim.rlim_cur, lim.rlim_max
+    ));
+    let probe_len = 1074003968usize;
+    let probe = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            probe_len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if probe == libc::MAP_FAILED {
+        diag(&format!(
+            "art: {probe_len} byte probe mmap FAILED: {}",
+            std::io::Error::last_os_error()
+        ));
+    } else {
+        diag(&format!("art: {probe_len} byte probe mmap ok at {probe:p}"));
+        unsafe { libc::munmap(probe, probe_len) };
+    }
+    Some(BridgeSetup {
+        handle,
+        initialize: unsafe { std::mem::transmute(init) },
+        isa: isa.to_string(),
+    })
+}
+
+/// Step 3: hand the live VM to the bridge.
+fn finish_native_bridge(setup: &BridgeSetup, env: &crate::jni::JniEnv) {
+    let Ok(cisa) = CString::new(setup.isa.as_str()) else {
+        return;
+    };
+    let ok = unsafe { (setup.initialize)(env.0, cisa.as_ptr()) };
+    diag(&format!("art: InitializeNativeBridge({}) = {ok}", setup.isa));
+    let available = unsafe { libc::dlsym(setup.handle, c"NativeBridgeAvailable".as_ptr()) };
+    if !available.is_null() {
+        let g: unsafe extern "C" fn() -> bool = unsafe { std::mem::transmute(available) };
+        diag(&format!("art: NativeBridgeAvailable() = {}", unsafe { g() }));
+    }
+    let version = unsafe { libc::dlsym(setup.handle, c"NativeBridgeGetVersion".as_ptr()) };
+    if !version.is_null() {
+        let g: unsafe extern "C" fn() -> u32 = unsafe { std::mem::transmute(version) };
+        diag(&format!("art: NativeBridgeGetVersion() = {}", unsafe { g() }));
     }
 }
 

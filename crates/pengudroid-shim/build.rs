@@ -108,7 +108,9 @@ fn write_version_script(out_dir: &PathBuf) {
          LIBC_Q {{ global: __pengudroid_ver_libc_q; }};\
          LIBM {{ global: __pengudroid_ver_libm; }};\
          LD   {{ global: __pengudroid_ver_ld; }};\
+         LIBLOG {{ global: __pengudroid_ver_liblog; }};\
          LIBLOG_M {{ global: __pengudroid_ver_liblog_m; }};\
+         LIBLOG_R {{ global: __pengudroid_ver_liblog_r; }};\
          LIBDL_ANDROID {{ global: __pengudroid_ver_libdl_android; }};\
          LIBSTATSSOCKET {{ global: __pengudroid_ver_libstatssocket; }};\
          LIBARTPALETTE_1 {{ global: __pengudroid_ver_libartpalette_1; }};\
