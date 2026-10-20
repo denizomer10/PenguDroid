@@ -51,6 +51,8 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 use libc::{c_char, c_int, c_void};
 
 mod android_native;
+mod pathshim;
+mod rootfs;
 mod vlog;
 mod zip;
 
@@ -2553,6 +2555,47 @@ pub unsafe extern "C" fn __cxa_demangle(
         *status = -2;
     }
     std::ptr::null_mut()
+}
+
+// ---------------------------------------------------------------------------
+// `AndroidRuntime` entry points
+// ---------------------------------------------------------------------------
+
+/// `AndroidRuntime::setArgv0(proc_name, set_proc_name)`
+///
+/// On a device, `app_process` constructs an `AndroidRuntime` and publishes it
+/// through `AndroidRuntime::getRuntime()`. PenguDroid hosts ART *without*
+/// `app_process` (that is the entire point — no zygote, no boot), so
+/// `getRuntime()` returns null. `Process.setArgV0`, which
+/// `ActivityThread.main` calls before its main loop, passes that null pointer
+/// here, and the function dereferences `this->mArgv0` (offset 0x38) and dies.
+///
+/// Setting the thread name is the only externally visible effect that remains
+/// meaningful without an `AndroidRuntime` instance, so that is what we
+/// reproduce. The call is reached through the PLT (`android_os_Process_
+/// setArgV0` -> `setArgv0@plt`), so an `LD_PRELOAD` interposition takes effect.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android14AndroidRuntime8setArgv0EPKcb(
+    runtime: *mut c_void,
+    proc_name: *const c_char,
+    set_proc_name: bool,
+) {
+    if runtime.is_null() {
+        if set_proc_name && !proc_name.is_null() {
+            let bytes = CStr::from_ptr(proc_name).to_bytes();
+            // Bionic keeps the *last* 15 bytes when the name is longer; the
+            // kernel allows 15 bytes plus NUL.
+            let tail = if bytes.len() > 15 { &bytes[bytes.len() - 15..] } else { bytes };
+            if let Ok(name) = std::ffi::CString::new(tail) {
+                libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
+            }
+        }
+        return;
+    }
+    type SetArgv0 = unsafe extern "C" fn(*mut c_void, *const c_char, bool);
+    if let Some(real) = dlsym_next::<SetArgv0>(b"_ZN7android14AndroidRuntime8setArgv0EPKcb\0") {
+        real(runtime, proc_name, set_proc_name);
+    }
 }
 
 // ---------------------------------------------------------------------------

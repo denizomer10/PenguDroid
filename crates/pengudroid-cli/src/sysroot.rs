@@ -54,6 +54,87 @@ pub struct Layout {
     pub android_root: PathBuf,
 }
 
+/// Collect the boot classpath fragments published by APEXes.
+///
+/// Every mainline APEX ships `etc/classpaths/bootclasspath.pb`; init
+/// concatenates them into `BOOTCLASSPATH` on a device. Sorted by APEX name so
+/// the order is stable across runs.
+fn apex_bootclasspath_fragments(system: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(system.join("apex")) else {
+        return out;
+    };
+    let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    dirs.sort();
+    for dir in dirs {
+        let pb = dir.join("etc/classpaths/bootclasspath.pb");
+        let Ok(data) = std::fs::read(&pb) else { continue };
+        for path in jar_paths_in_bootclasspath_pb(&data) {
+            if !out.contains(&path) {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// Read a protobuf varint, returning the value and the bytes consumed.
+fn read_varint(data: &[u8], mut pos: usize) -> Option<(usize, usize)> {
+    let start = pos;
+    let mut value = 0usize;
+    let mut shift = 0;
+    loop {
+        let byte = *data.get(pos)?;
+        pos += 1;
+        value |= ((byte & 0x7f) as usize) << shift;
+        if byte < 0x80 {
+            return Some((value, pos - start));
+        }
+        shift += 7;
+        if shift > 28 {
+            return None;
+        }
+    }
+}
+
+/// Extract the jar paths from a serialized `BootClasspath` message.
+///
+/// Layout, verified against the image's fragments:
+///
+/// ```text
+/// BootClasspath { repeated Jar paths = 1; }
+/// Jar           { string path = 1; }
+/// ```
+///
+/// A tiny hand-written parser keeps the CLI free of a protobuf dependency.
+fn jar_paths_in_bootclasspath_pb(data: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos < data.len() {
+        // Outer field 1, wire type 2 (length-delimited).
+        if data[pos] != 0x0a {
+            break;
+        }
+        pos += 1;
+        let Some((len, used)) = read_varint(data, pos) else { break };
+        pos += used;
+        let end = pos.saturating_add(len).min(data.len());
+        if pos < end && data[pos] == 0x0a {
+            let mut inner = pos + 1;
+            if let Some((slen, u2)) = read_varint(data, inner) {
+                inner += u2;
+                if inner + slen <= data.len() {
+                    if let Ok(s) = std::str::from_utf8(&data[inner..inner + slen]) {
+                        out.push(s.to_string());
+                    }
+                }
+            }
+        }
+        pos = end;
+    }
+    out
+}
+
 impl Layout {
     /// Detect the layout under `root`.
     pub fn detect(root: &Path) -> Result<Layout, String> {
@@ -164,6 +245,27 @@ impl Layout {
             if p.exists() {
                 boot_jars.push(p);
                 boot_locations.push(format!("/system/framework/{name}"));
+            }
+        }
+
+        // Extra boot classpath entries that are *not* covered by the boot image:
+        // Android 13 moved connectivity, bluetooth, conscrypt, permission and
+        // friends into mainline APEX modules, each publishing its own
+        // `etc/classpaths/bootclasspath.pb` fragment. On a device init
+        // concatenates those fragments into BOOTCLASSPATH, so the boot loader
+        // can resolve the classes; without them a native FindClass for (say)
+        // `android.net.ProxyInfo` fails with "Class not found using the boot
+        // class loader". The image covers the first 12 entries, so these are
+        // appended after them.
+        for loc in apex_bootclasspath_fragments(&system) {
+            if boot_locations.contains(&loc) {
+                continue;
+            }
+            let Some(rest) = loc.strip_prefix("/apex/") else { continue };
+            let file = system.join("apex").join(rest);
+            if file.exists() {
+                boot_jars.push(file);
+                boot_locations.push(loc);
             }
         }
 
@@ -392,7 +494,7 @@ pub fn art_test(args: &[String]) -> i32 {
                     other,
                     "--main" | "--find-class" | "--classpath" | "--jni-lib" | "--register-natives"
                         | "--init-bridge" | "--native-bridge" | "--bridge-lib" | "--xmx"
-                        | "--bridge-selftest"
+                        | "--bridge-selftest" | "--vm-option"
                 ) {
                     if let Some(v) = it.next() {
                         passthrough.push(v.clone());
@@ -443,7 +545,21 @@ pub fn art_test(args: &[String]) -> i32 {
         }
     };
 
-    let mut cmd = Command::new(exe);
+    let mut cmd = if let Some(wrap) = std::env::var_os("PENGUDROID_DEBUG_WRAP") {
+        // Diagnostic hook: prefix the ART helper with a wrapper such as a
+        // ptrace tracer. The value may carry wrapper arguments, e.g.
+        // `PENGUDROID_DEBUG_WRAP="/tmp/bp 0x41cd60"`.
+        let text = wrap.to_string_lossy().into_owned();
+        let mut parts = text.split_whitespace();
+        let mut c = Command::new(parts.next().unwrap_or(""));
+        for p in parts {
+            c.arg(p);
+        }
+        c.arg(&exe);
+        c
+    } else {
+        Command::new(&exe)
+    };
     cmd.arg("__art")
         .arg("--sysroot")
         .arg(&root)
@@ -482,6 +598,14 @@ pub fn art_test(args: &[String]) -> i32 {
         .env("ANDROID_I18N_ROOT", layout.root.join("system/apex/com.android.i18n"))
         .env("ANDROID_CONSCRYPT_ROOT", layout.root.join("system/apex/com.android.conscrypt"))
         .env("BOOTCLASSPATH", layout.boot_classpath())
+        // The boot class path *locations* ART recorded (`/apex/...`,
+        // `/system/...`) do not exist on the host. The shim rewrites lookups
+        // under those mount points into this tree, so ART's Java-side boot
+        // class loader can open them without a chroot or a mount namespace.
+        .env(
+            "PENGUDROID_ROOT",
+            std::fs::canonicalize(&layout.root).unwrap_or_else(|_| layout.root.clone()),
+        )
         .env("PENGUDROID_SUPPRESS_DESTRUCTORS", "1");
     if let Some(bridge) = &native_bridge {
         // Enabling the bridge is pure property configuration, exactly as on a
@@ -498,7 +622,18 @@ pub fn art_test(args: &[String]) -> i32 {
     }
     match cmd.status() {
         Ok(s) if s.success() => 0,
-        Ok(_) => 1,
+        Ok(s) => {
+            if let Some(code) = s.code() {
+                eprintln!("art: helper exited with status {code}");
+            } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    eprintln!("art: helper killed by signal {:?}", s.signal());
+                }
+            }
+            1
+        }
         Err(e) => {
             eprintln!("pengudroid: cannot start the ART helper: {e}");
             1
@@ -544,6 +679,7 @@ pub fn art_main(args: &[String]) -> i32 {
     let mut init_bridge: Option<String> = None;
     let mut bridge_selftest: Option<String> = None;
     let mut xmx: String = "512m".to_string();
+    let mut vm_extra: Vec<String> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -566,6 +702,13 @@ pub fn art_main(args: &[String]) -> i32 {
             "--xmx" => {
                 if let Some(v) = it.next() {
                     xmx = v.clone();
+                }
+            }
+            // Escape hatch for diagnostics: pass an arbitrary ART option
+            // through (e.g. `-verbose:class` or `-Xlog:class+load`).
+            "--vm-option" => {
+                if let Some(v) = it.next() {
+                    vm_extra.push(v.clone());
                 }
             }
             "--classpath" => {
@@ -633,6 +776,9 @@ pub fn art_main(args: &[String]) -> i32 {
         CString::new(format!("-Djava.library.path={}", layout.ld_library_path())).unwrap_or_default(),
         CString::new(format!("-Xmx{xmx}")).unwrap_or_default(),
     ];
+    for opt in &vm_extra {
+        options.push(CString::new(opt.as_str()).unwrap_or_default());
+    }
     if !classpath.is_empty() {
         options.push(CString::new(format!("-Djava.class.path={}", classpath.join(":"))).unwrap_or_default());
     }
@@ -672,6 +818,10 @@ pub fn art_main(args: &[String]) -> i32 {
         JNI_OK => {
             println!("art: JNI_CreateJavaVM returned JNI_OK (vm={vm:p}, env={env:p})");
             println!("art: a live JavaVM is available");
+            if std::env::var_os("PENGUDROID_TRACE_FINDCLASS").is_some() {
+                // SAFETY: `env` is the live JNIEnv returned above.
+                unsafe { install_findclass_tracer(env) };
+            }
             let env = crate::jni::JniEnv(env);
             let version = env.version();
             println!("art: JNIEnv::GetVersion() = 0x{version:08x}");
@@ -1256,6 +1406,69 @@ fn dump_jni_table(env: &crate::jni::JniEnv) {
     }
 }
 
+/// Slot of `FindClass` in the JNI native interface table.
+///
+/// Layout (JNI spec): four reserved pointers, then `GetVersion`, `DefineClass`,
+/// `FindClass` — so `FindClass` is index 6.
+const JNI_FINDCLASS_INDEX: usize = 6;
+
+type FindClassFn = unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void;
+
+/// The real `FindClass` captured before the table slot is patched.
+static REAL_FIND_CLASS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Wrapper that reports every `FindClass` call and its outcome.
+///
+/// Writes directly with `write(2)`: logging here would itself call back into
+/// the JVM and recurse through `FindClass`.
+unsafe extern "C" fn traced_find_class(env: *mut c_void, name: *const c_char) -> *mut c_void {
+    use std::sync::atomic::Ordering;
+    let addr = REAL_FIND_CLASS.load(Ordering::Relaxed);
+    if addr == 0 {
+        return std::ptr::null_mut();
+    }
+    let real: FindClassFn = std::mem::transmute(addr);
+    let result = real(env, name);
+    let mut line: Vec<u8> = Vec::with_capacity(160);
+    line.extend_from_slice(if result.is_null() {
+        b"[findclass MISS] ".as_slice()
+    } else {
+        b"[findclass ok] ".as_slice()
+    });
+    if !name.is_null() {
+        line.extend_from_slice(std::ffi::CStr::from_ptr(name).to_bytes());
+    }
+    line.push(b'\n');
+    libc::write(2, line.as_ptr() as *const c_void, line.len());
+    result
+}
+
+/// Replace the `FindClass` slot of the process-wide JNI table.
+///
+/// Every `JNIEnv` points at this one table, so patching it instruments calls
+/// made by native libraries as well as by this harness. Used to name the class
+/// a failing `ActivityThread.main` cannot resolve.
+unsafe fn install_findclass_tracer(env: *mut c_void) {
+    use std::sync::atomic::Ordering;
+    if env.is_null() {
+        return;
+    }
+    let table = *(env as *const *mut *mut c_void);
+    if table.is_null() {
+        return;
+    }
+    let slot = table.add(JNI_FINDCLASS_INDEX);
+    REAL_FIND_CLASS.store(*slot as usize, Ordering::Relaxed);
+    let page = (slot as usize) & !0xfff;
+    if libc::mprotect(page as *mut c_void, 0x1000, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+        eprintln!("art: cannot make the JNI table writable");
+        return;
+    }
+    *slot = traced_find_class as *mut c_void;
+    let _ = libc::mprotect(page as *mut c_void, 0x1000, libc::PROT_READ);
+    println!("art: tracing JNI FindClass (PENGUDROID_TRACE_FINDCLASS)");
+}
+
 /// Run `<class>.main(String[])` on a live VM.
 ///
 /// The class name may be written in either slash or dot form; JNI wants the
@@ -1323,6 +1536,55 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pd-layout-empty-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         assert!(Layout::detect(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Serialize one `BootClasspath { repeated Jar paths = 1 }` entry.
+    fn pb_entry(path: &str) -> Vec<u8> {
+        let mut inner = vec![0x0a];
+        inner.push(path.len() as u8);
+        inner.extend_from_slice(path.as_bytes());
+        let mut out = vec![0x0a];
+        out.push(inner.len() as u8);
+        out.extend_from_slice(&inner);
+        out
+    }
+
+    #[test]
+    fn parses_a_bootclasspath_fragment() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&pb_entry("/apex/com.android.tethering/javalib/framework-connectivity.jar"));
+        data.extend_from_slice(&pb_entry("/apex/com.android.tethering/javalib/framework-tethering.jar"));
+        assert_eq!(
+            jar_paths_in_bootclasspath_pb(&data),
+            vec![
+                "/apex/com.android.tethering/javalib/framework-connectivity.jar",
+                "/apex/com.android.tethering/javalib/framework-tethering.jar",
+            ]
+        );
+    }
+
+    #[test]
+    fn collects_fragments_from_every_apex() {
+        let dir = std::env::temp_dir().join(format!("pd-apex-pb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (apex, jar) in [
+            ("com.android.tethering", "framework-connectivity.jar"),
+            ("com.android.conscrypt", "conscrypt.jar"),
+        ] {
+            let etc = dir.join("apex").join(apex).join("etc/classpaths");
+            std::fs::create_dir_all(&etc).unwrap();
+            let path = format!("/apex/{apex}/javalib/{jar}");
+            std::fs::write(etc.join("bootclasspath.pb"), pb_entry(&path)).unwrap();
+        }
+        let found = apex_bootclasspath_fragments(&dir);
+        assert_eq!(
+            found,
+            vec![
+                "/apex/com.android.conscrypt/javalib/conscrypt.jar",
+                "/apex/com.android.tethering/javalib/framework-connectivity.jar",
+            ]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -19,24 +19,45 @@ Testler: **153 geçiyor** (`cargo test --workspace`).
 
 ## Çalışmayanlar ve tam olarak nerede durduğu
 
-### NewPipe 0.29.1 (`org.schabi.newpipe`) — AÇILMIYOR
+### NewPipe 0.29.1 (`org.schabi.newpipe`) — AÇILMIYOR (ilerleme var)
+
+Bu oturumda `NoClassDefFoundError` zinciri çözüldü. `ActivityThread.main`
+artık çalışıyor ve **binder'a bağlanma noktasına** kadar geliyor:
 ```
-pengudroid launch NewPipe_v0.29.1.apk --sysroot <tree>
-  backend : art (x86_64 libraries but no NativeActivity entry point)
-  art: registered 150 of 150 native groups
-  art: invoking android.app.ActivityThread.main with 0 argument(s)
-  java.lang.NoClassDefFoundError: Class not found using the boot class loader
-  art: android.app.ActivityThread.main threw
+art: registered 150/150 (0 missing)
+art: invoking android.app.ActivityThread.main with 0 argument(s)
+[pengudroid:log] ERROR ProcessState: Binder driver /dev/binder is unavailable...
+[pengudroid:log] FATAL ProcessState: Binder driver '/dev/binder' could not be opened
 ```
-ART tamamen açılıyor, framework native'leri kayıtlı, `ActivityThread.main`
-çağrılıyor — sonra native bir `FindClass` boot loader'da sınıfı bulamıyor.
-Elimizdeki `bootclasspath` imajdaki `/system/etc/classpaths/bootclasspath.pb`
-ile **birebir aynı** (12 jar), yani eksik jar değil. Şüphe: `ActivityThread.main`
-çalıştıran thread'in *class loader override*'ı yok (cihazda app_process bunu
-`Thread.attach` ile kurar) ve/veya bir sonraki adım `system_server`'a binder
-çağrısı. **Sıradaki adım:** ART'ı `-verbose:class`/`-Xlog` ile çalıştırıp eksik
-sınıfın adını almak; sonra `Thread.setContextClassLoader` veya
-`ActivityThread.systemMain()` yolunu denemek.
+
+Çözülen üç ayrı kök neden:
+
+1. **`/apex` ve `/system` yolları host'ta yok.** ART boot classpath'i *konum*
+   olarak kaydeder (`/system/framework/framework.jar`, `/apex/...`) ve Java
+   tarafındaki `VMClassLoader` bu jar'ları bu adlarla açmaya çalışır. Shim artık
+   `PENGUDROID_ROOT` verildiğinde `/apex`, `/system`, `/vendor`, `/product`,
+   `/odm`, `/data`, `/system_ext` altındaki yolları o ağaca yönlendiriyor
+   (`open`/`openat`/`fopen`/`stat`/`access`/`readlink`/`opendir`/`realpath`).
+   Böylece 12 boot jar'ının tamamı açılıyor — chroot/mount namespace yok.
+2. **Boot classpath eksikti.** Android 13'te connectivity, bluetooth,
+   conscrypt, permission, tethering, wifi, mediaprovider, ... sınıfları mainline
+   APEX modüllerine taşındı ve her APEX kendi
+   `etc/classpaths/bootclasspath.pb` parçasını yayınlıyor. `Layout::android`
+   artık bu parçaları okuyup imajın 12 bileşeninden **sonra** ekliyor (31 jar).
+   Eksikken `android.net.ProxyInfo`/`ConnectivityManager`,
+   `com.android.org.conscrypt.*`, `android.bluetooth.*` boot loader'da
+   bulunamıyordu.
+3. **`AndroidRuntime::setArgv0` null `gCurRuntime`.** `ActivityThread.main`
+   `Process.setArgV0` çağırıyor; native tarafı `AndroidRuntime::getRuntime()`
+   (app_process kurar, bizde yok) sonucunu `setArgv0`'a veriyor ve fonksiyon
+   `this->mArgv0` üzerinden null deref yapıyordu. Shim bu sembolü (PLT üzerinden
+   geliyor) interpose edip yalnızca thread adını ayarlıyor.
+
+**Sıradaki adım:** binder. `ProcessState` `/dev/binder`'ı açamayınca `LOG(FATAL)`
+ile süreci öldürüyor. Bu, `docs/LIMITATIONS.md` §2'deki "system_server yok"
+sınırının ta kendisi. Yapılacak: `/dev/binder` açılışını + `BINDER_VERSION`
+ioctl'ini + `mmap`/transaction ioctl'lerini daemon'ın kullanıcı-uzayı binder
+broker'ına köprülemek (shim'de `ioctl` interposition).
 
 ### Beach Buggy Racing 2 (`com.vectorunit.cobalt`, .apkm) — AÇILMIYOR
 - Bundle sorunsuz açılıyor (36 split, 37 native lib, arm64-v8a + armeabi-v7a,
@@ -86,13 +107,38 @@ tek gerçekçi "oyun açılsın" yolu VM/container, ki bu projenin önermesinin 
 (old weather karar: kullanıcı henüz VM'i seçmedi).
 
 ## Yerel araçlar (git'e girmez, `.toolchain/` ignore'da)
+- `.toolchain/sysroot/` — LineageOS 20 (Android 13) x86_64 sistem ağacı.
+  Yeniden üretmek için (Waydroid imajından, sudo gerekmez):
+  ```sh
+  mkdir -p .toolchain/sysroot
+  /sbin/debugfs -R "rdump /system $PWD/.toolchain/sysroot" \
+      /var/lib/waydroid/images/system.img
+  python3 tools/art/sysroot-relink.py .toolchain/sysroot   # kırık /apex symlink'leri
+  ```
 - `.toolchain/armrun.sh` — çevirici için gereken bwrap mount namespace'i.
 - `.toolchain/arm-hello` — minimal ARM64 statik ikili (section header'lı).
 - `.toolchain/libarmtest.so` — `arm_answer()` → 42 döndüren elle üretilmiş ARM64 `.so`.
 - `.toolchain/ndk/x86_64/system.img` — Android 11 x86_64 imajı (sparse değil; ext4
   offset `0x300000`; `EXT4_OFFSET=3145728 python3 .toolchain/ext4.py ...`).
 - `.toolchain/ndk-arm/` — çıkarılmış çevirici + ARM runtime.
-- `.toolchain/sysroot/` — LineageOS 20 (Android 13) x86_64 sistem ağacı.
+
+## Depodaki ART teşhis araçları
+- `tools/art/jni_probe.c` — `libart.so`'yu dlopen edip `JNI_CreateJavaVM` çağıran
+  minimal sonda (Bionic shim'in `fprintf`'ini atlamak için `write(2)` kullanır).
+- `tools/art/oat_kv.py` — OAT key-value store'unda tek bir anahtarı yeniden yazar
+  (`apex-versions` boş değere çekmek için).
+- `tools/art/sysroot-relink.py` — çıkarılmış ağaçtaki mutlak symlink'leri göreli
+  yapar ve `apex -> system/apex` bağını kurar.
+- `tools/art/findclass_bp.c` — ptrace ile `ClassLinker::FindClass` /
+  `jni::FindClass` çağrılarını ve çökme yerini (modül + sembol ofseti) loglar.
+  `PENGUDROID_DEBUG_WRAP="/tmp/findclass_bp <sym>"` ile `art-test`'e takılır.
+
+## `art-test` teşhis anahtarları
+- `--vm-option <opt>` — ART'a rastgele seçenek geçir (`-verbose:class`, ...).
+- `PENGUDROID_TRACE_FINDCLASS=1` — JNI tablosundaki `FindClass` slotunu sarar ve
+  her çağrının sonucunu (ok/MISS) yazar.
+- `PENGUDROID_DEBUG_WRAP` — iç `__art` sürecini bir sarmalayıcı ile başlatır
+  (ptrace aracı gibi).
 
 ## Bu oturumun son commit'leri
 `0a82e39` ARM bridge sinyal handler'ları + bulgular · `bfb3675` bundle desteği ·
@@ -101,7 +147,14 @@ launcher.
 
 ## Yeni makinede ilk adımlar
 1. `cargo build --workspace` (sistemde Rust yoksa `.toolchain` yeniden kurulmalı).
-2. `cargo test --workspace` → 153 test.
-3. NewPipe için: `art-test --sysroot <tree> --classpath NewPipe.apk --main android.app.ActivityThread`
-   ve eksik sınıfı bulmak için ART log seviyesini yükselt.
-4. Çevirici için: `docs/LIMITATIONS.md` §2.2 komutu, sonra misafir ARM ART sorunu.
+2. `cargo test --workspace` → 160 test.
+3. `.toolchain/sysroot` yoksa yukarıdaki `debugfs` + `sysroot-relink.py` komutları.
+4. ART'ı doğrula:
+   ```sh
+   target/release/pengudroid art-test --sysroot .toolchain/sysroot \
+       --register-natives libandroid_runtime.so --main android.app.ActivityThread
+   ```
+   Beklenen: `registered 150/150`, `invoking android.app.ActivityThread.main`,
+   ardından `ProcessState` binder hatası (yani ART tarafı sağlam).
+5. Sıradaki iş: binder köprüsü (yukarıdaki NewPipe bölümü).
+6. Çevirici için: `docs/LIMITATIONS.md` §2.2 komutu, sonra misafir ARM ART sorunu.

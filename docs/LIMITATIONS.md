@@ -60,15 +60,41 @@ The path there was ABI translation, not environment emulation:
   from a static table. `--register-natives` reads the library's exported
   `register_*` symbols and calls them in the same shape as `gRegJNI` (logging
   natives first, `Binder` last), which is what makes `Trace` and `Log` work.
+* **A virtual root, not a mount namespace.** ART records the boot class path as
+  *locations* (`/system/framework/framework.jar`, `/apex/.../core-oj.jar`)
+  because the boot image was built with those names, and libcore's
+  `VMClassLoader` later re-opens those exact strings. Rather than `chroot`,
+  bind-mount or boot a container, the shim rewrites absolute paths under the
+  guest mount points (`/apex`, `/system`, `/system_ext`, `/vendor`, `/product`,
+  `/odm`, `/data`, ...) into `$PENGUDROID_ROOT` at the libc boundary —
+  `open`/`openat`, `fopen`, `stat`, `access`, `readlink`, `opendir`, `realpath`.
+  Host paths (`/proc`, `/dev`, `/etc`) are untouched.
+* **The boot class path is not just the boot image.** The image covers 12 jars,
+  but Android 13 moved connectivity, bluetooth, conscrypt, permission,
+  tethering, wifi, mediaprovider and friends into mainline APEX modules, each
+  publishing `etc/classpaths/bootclasspath.pb`. On a device init concatenates
+  those fragments into `BOOTCLASSPATH`; `pengudroid` now does the same (31 jars
+  here). Missing them makes a native `FindClass` for `android.net.ProxyInfo`
+  fail with ART's *preallocated* `NoClassDefFoundError`, which has no message
+  and no stack trace.
+* **`AndroidRuntime::setArgv0` without `app_process`.** `ActivityThread.main`
+  calls `Process.setArgV0`, whose native half passes
+  `AndroidRuntime::getRuntime()` to `setArgv0`. That global is installed by
+  `app_process`, which PenguDroid deliberately does not run, so it is null and
+  the function dereferences `this->mArgv0` and segfaults. The shim interposes
+  the symbol (reached through the PLT) and sets the thread name only.
 
 **What remains — and why it is not a small patch.** An *Activity* cannot start,
 because starting one is a request to `ActivityManagerService` over binder, and
 there is no `system_server`: no package manager, no window manager, no
-SurfaceFlinger. `ActivityThread.main` now runs until exactly that point and then
-throws `NoClassDefFoundError`. Closing the gap means implementing (or hosting)
-the Android system services — the thing Waydroid gets by booting a real system
-image inside a container. PenguDroid deliberately does not boot a container; it
-runs apps as host processes. Those two goals meet at the system-service boundary.
+SurfaceFlinger. `ActivityThread.main` now runs all the way to that boundary and
+dies in `ProcessState` with `Binder driver '/dev/binder' could not be opened`
+(`LOG(FATAL)`), i.e. the next piece of work is a binder driver bridge from the
+shim to the daemon's userspace broker. Closing the gap means implementing (or
+hosting) the Android system services — the thing Waydroid gets by booting a
+real system image inside a container. PenguDroid deliberately does not boot a
+container; it runs apps as host processes. Those two goals meet at the
+system-service boundary.
 
 ### 2.1 ARM translation (Intel's NDK translation / Houdini lineage)
 
