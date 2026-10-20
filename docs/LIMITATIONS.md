@@ -124,6 +124,46 @@ code *starts* executing but does not yet run. Booting the guest ARM
 runtime" path, so even a fixed handler would need the same `system_server` work
 that blocks Activities above.
 
+### 2.2 Reproducing the translator run
+
+The translator and its guest runtime come from Google's Android 11 (API 30)
+x86_64 Google-APIs image (`system-images;android-30;google_apis;x86_64`,
+`x86_64-30_r16.zip`, sha1 `6ae21030eaadc041078444d3798e4b399f3e787d`). Inside
+its `system.img` (raw ext4 at offset `0x300000`):
+
+```
+/system/lib64/libndk_translation.so          # the translator
+/system/lib64/libndk_translation_proxy_*.so  # GLES/EGL/Vulkan proxies
+/system/lib64/arm64/                         # 59 ARM64 guest libs
+/system/lib/arm/                             # 32-bit guest libs
+/system/bin/arm64/{app_process64,linker64}   # guest runtime entry points
+```
+
+The run needs `/system` and `/apex` at their real paths, because the translator
+opens them by absolute path. `bwrap` gives that without root:
+
+```sh
+SYS=$PWD/.toolchain/sysroot/system                 # the Android 13 system tree
+ARM=$PWD/.toolchain/ndk-arm                        # the extracted ARM runtime
+bwrap --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
+      --ro-bind /bin /bin --ro-bind /sbin /sbin --ro-bind /etc /etc \
+      --bind /home /home --bind /tmp /tmp --bind /run /run \
+      --dev /dev --proc /proc --bind /sys /sys \
+      --ro-bind $SYS /system --ro-bind $SYS/apex /apex \
+      --ro-bind $ARM/lib64/arm64 /system/lib64 \
+      --ro-bind $ARM/lib/arm /system/lib/arm \
+      --ro-bind $ARM/bin/arm64 /system/bin/arm64 \
+      --dir /data --dir /dev/socket --chdir $PWD \
+      ./target/debug/pengudroid art-test --sysroot .toolchain/sysroot \
+        --bridge-lib .toolchain/ndk-arm/lib64 \
+        --native-bridge libndk_translation.so --init-bridge arm64 --xmx 128m
+```
+
+Note `/system/lib64` is bound to the **ARM64** directory: the guest linker
+otherwise picks the x86-64 `libc++.so` that lives in the host system tree.
+Nothing about this path is vendor specific — the translator's proxy libraries
+forward the guest's EGL/GLES/Vulkan calls to whatever host driver is installed.
+
 **Consequences for real games.**
 
 * **Native x86_64 `NativeActivity` games run today, on the GPU** —
