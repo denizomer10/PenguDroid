@@ -54,10 +54,27 @@ art: invoking android.app.ActivityThread.main with 0 argument(s)
    geliyor) interpose edip yalnızca thread adını ayarlıyor.
 
 **Sıradaki adım:** binder. `ProcessState` `/dev/binder`'ı açamayınca `LOG(FATAL)`
-ile süreci öldürüyor. Bu, `docs/LIMITATIONS.md` §2'deki "system_server yok"
-sınırının ta kendisi. Yapılacak: `/dev/binder` açılışını + `BINDER_VERSION`
-ioctl'ini + `mmap`/transaction ioctl'lerini daemon'ın kullanıcı-uzayı binder
-broker'ına köprülemek (shim'de `ioctl` interposition).
+ile süreci öldürüyordu. Bu adım artık geçildi: shim `/dev/binder`'ı (ve
+`hwbinder`/`vndbinder`) `memfd` tabanlı bir aygıt olarak sunuyor,
+`BINDER_VERSION` → 8, `SET_MAX_THREADS`/`SET_CONTEXT_MGR`/`THREAD_EXIT` → 0
+dönüyor, `mmap` memfd üzerinde çalışıyor. Transaction (`BINDER_WRITE_READ`)
+şimdilik `EINVAL` dönüyor; `libbinder` bunu düzgün bir Java hatasına çeviriyor:
+```
+java.lang.IllegalArgumentException
+  at android.os.BinderProxy.transactNative(Native Method)
+  at android.os.IServiceManager$Stub$Proxy.checkService(...)
+  at android.app.ActivityThread.attach(ActivityThread.java:7610)
+  at android.app.ActivityThread.main(ActivityThread.java:7911)
+art: android.app.ActivityThread.main threw
+```
+Yani native abort/segfault yok; `ActivityThread.main` baştan sona çalışıp
+`system_server` sınırında temiz bir Java istisnasıyla duruyor.
+
+**Sıradaki adım (binder broker):** `BINDER_WRITE_READ`'i gerçekten emüle etmek —
+`BC_TRANSACTION`/`BR_REPLY`, `flat_binder_object` marshalling'i ve daemon'ın
+kullanıcı-uzayı servis tablosu. İlk hedef `IServiceManager.checkService` /
+`getService` çağrılarına cevap vermek, böylece AMS proxy'si gerçek bir handle
+alır.
 
 ### Beach Buggy Racing 2 (`com.vectorunit.cobalt`, .apkm) — AÇILMIYOR
 - Bundle sorunsuz açılıyor (36 split, 37 native lib, arm64-v8a + armeabi-v7a,

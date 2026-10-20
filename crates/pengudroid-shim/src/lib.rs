@@ -51,6 +51,7 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 use libc::{c_char, c_int, c_void};
 
 mod android_native;
+mod binder;
 mod pathshim;
 mod rootfs;
 mod vlog;

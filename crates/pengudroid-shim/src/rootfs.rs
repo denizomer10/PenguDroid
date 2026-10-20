@@ -299,6 +299,12 @@ pub unsafe extern "C" fn realpath(path: *const c_char, resolved: *mut c_char) ->
 /// `__open_2(path, flags)` — the `_FORTIFY_SOURCE` form without a mode.
 #[no_mangle]
 pub unsafe extern "C" fn __open_2(path: *const c_char, flags: c_int) -> c_int {
+    if !path.is_null() {
+        let bfd = crate::binder::__pengudroid_binder_open(path);
+        if bfd >= 0 {
+            return bfd;
+        }
+    }
     match next::<Open2Fn>(b"__open_2\0") {
         Some(f) => with_path(path, |p| f(p, flags)),
         None => -1,
@@ -308,6 +314,12 @@ pub unsafe extern "C" fn __open_2(path: *const c_char, flags: c_int) -> c_int {
 /// `__openat_2(dirfd, path, flags)`.
 #[no_mangle]
 pub unsafe extern "C" fn __openat_2(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int {
+    if !path.is_null() {
+        let bfd = crate::binder::__pengudroid_binder_open(path);
+        if bfd >= 0 {
+            return bfd;
+        }
+    }
     match next::<OpenAt2Fn>(b"__openat_2\0") {
         Some(f) => with_path(path, |p| f(dirfd, p, flags)),
         None => -1,

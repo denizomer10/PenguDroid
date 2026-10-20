@@ -87,14 +87,16 @@ The path there was ABI translation, not environment emulation:
 **What remains — and why it is not a small patch.** An *Activity* cannot start,
 because starting one is a request to `ActivityManagerService` over binder, and
 there is no `system_server`: no package manager, no window manager, no
-SurfaceFlinger. `ActivityThread.main` now runs all the way to that boundary and
-dies in `ProcessState` with `Binder driver '/dev/binder' could not be opened`
-(`LOG(FATAL)`), i.e. the next piece of work is a binder driver bridge from the
-shim to the daemon's userspace broker. Closing the gap means implementing (or
-hosting) the Android system services — the thing Waydroid gets by booting a
-real system image inside a container. PenguDroid deliberately does not boot a
-container; it runs apps as host processes. Those two goals meet at the
-system-service boundary.
+SurfaceFlinger. `ActivityThread.main` now runs end to end and stops at the first
+binder transaction with a clean Java `IllegalArgumentException` from
+`IServiceManager.checkService` — no native abort, no crash. The shim presents
+`/dev/binder` as an in-process `memfd` device (protocol version 8,
+`SET_MAX_THREADS`/`SET_CONTEXT_MGR` accepted, `mmap` works) and refuses
+transactions until they are wired to the daemon's userspace broker. Closing the
+gap means implementing (or hosting) the Android system services — the thing
+Waydroid gets by booting a real system image inside a container. PenguDroid
+deliberately does not boot a container; it runs apps as host processes. Those
+two goals meet at the system-service boundary.
 
 ### 2.1 ARM translation (Intel's NDK translation / Houdini lineage)
 
