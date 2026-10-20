@@ -450,13 +450,52 @@ Two traps are worth recording because they cost real debugging time:
   are not Bionic names the table translates. The translation must reach the real
   `sysconf` through `dlsym(RTLD_NEXT)`: naming it directly resolves to the shim's
   own definition and recurses forever.
+* **Structs that look compatible are not.** `sigset_t` and `struct sigaction`
+  are the ones that bit us. Bionic (LP64) has an 8-byte `sigset_t` and a 32-byte
+  `struct sigaction`; glibc has 128 and 152. `libart`'s `fault_handler.cc`
+  static initialiser stores the *current* `SIGSEGV` action into a 32-byte field
+  at offset `0x30` of the 88-byte `gFaultManager` — glibc's 152-byte write ran
+  120 bytes past it and cleared `initialized_` (offset `0x50`), so
+  `FaultManager::Init()` always tripped `CHECK(!initialized_)`. The shim now
+  interposes the signal API and converts: the bit numbering is shared (signal
+  `n` is bit `n-1`), so a `sigset_t` is a widening of one 64-bit word, and a
+  `sigaction` is a field-by-field copy.
 
 With those in place `libart.so` (9 MB) and its closure load, and
-`JNI_CreateJavaVM` **executes ART's whole startup path** — palette init, the
-page-size check, the `ANDROID_ROOT`/`ANDROID_ART_ROOT` lookups, the boot
-classpath and the boot-image load — failing *gracefully* with a diagnostic
-(`Boot classpath is empty`) rather than crashing. The remaining gap is the
-APEX/boot-image environment, not ABI translation — see `docs/LIMITATIONS.md` §2.
+`JNI_CreateJavaVM` returns **`JNI_OK`** with a live `JavaVM`. `GetVersion()`
+confirms `JNI_VERSION_1_6`, so the JNI table layout is right; the JNI wrapper in
+`crates/pengudroid-cli/src/jni.rs` indexes the table by the standard slot
+numbers and `--dump-jni` prints the resolved table for debugging (field
+accessors have no `V`/`A` variants, which makes a hand-written table easy to get
+wrong by exactly 44 slots — the VM's own symbol table settles it).
+
+Java then executes: a real APK's `classes.dex` is put on `-Djava.class.path` and
+resolved through the system class loader (`FindClass` alone only sees the boot
+class path), and `android.app.ActivityThread.main` can be invoked.
+
+### 10.1 Framework natives
+
+`libandroid_runtime.so` exports ~150 `register_android_*` functions but has **no
+`JNI_OnLoad`**: on a device `app_process` holds them in a static array (`gRegJNI`)
+and calls each with the `JNIEnv`. `--register-natives <lib>` does the same thing
+generically — it reads the library's exported `register_*` symbols and calls them
+— but the *order* matters: `gRegJNI` registers the logging natives first and
+`Binder` last, because `register_android_os_Binder` triggers `StrictMode.<clinit>`,
+whose natives must already exist. Symbol-table order is arbitrary, so the shim
+imposes that shape explicitly. With all 150 registered, `android.os.Trace`,
+`android.util.Log` and Binder have their natives and `ActivityThread.main` runs
+until it needs `system_server`.
+
+### 10.2 Launching apps (`pengudroid launch`)
+
+`launch` is the Proton-shaped front end. It creates a per-application *prefix*
+(`$XDG_DATA_HOME/pengudroid/prefixes/<package>`) holding `files`, `cache`,
+`code_cache`, `shared_prefs`, and a `pengudroid.env` file of `KEY=VALUE`
+overrides, and picks a backend from the APK itself: an x86_64 `NativeActivity`
+payload means `native` (no Java at all), otherwise the presence of `classes.dex`
+means `art`. `--backend` overrides the choice, and `--sysroot` (or
+`PENGUDROID_ART_SYSROOT`) points the ART backend at an extracted system tree.
+Nothing in the choice depends on the GPU vendor.
 
 ## 11. NativeActivity apps without ART
 

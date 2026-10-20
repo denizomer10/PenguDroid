@@ -18,6 +18,8 @@ mod doctor;
 mod gpu;
 mod guest;
 mod isolate;
+mod jni;
+mod launcher;
 mod nativelib;
 mod native;
 mod runner;
@@ -49,6 +51,7 @@ fn real_main() -> i32 {
     };
     match cmd {
         "run" => cmd_run(&args[2..]),
+        "launch" => launcher::launch(&args[2..]),
         "demo" => cmd_demo(&args[2..]),
         "start" => cmd_start(&args[2..]),
         "ps" => cmd_ps(),
@@ -412,7 +415,9 @@ fn print_help() {
          USAGE:\n    pengudroid <COMMAND> [ARGS]\n\
          \n\
          COMMANDS:\n\
-         \x20   run <app.apk> [--component C] [-- ARGS]   launch a guest window\n\
+         \x20   run <app.apk> [--component C] [-- ARGS]    launch a guest window\n\
+         \x20   launch <app.apk> [--backend auto|native|art]\n\
+         \x20                                              Proton-style launcher (prefix + backend)\n\
          \x20   demo                                        launch the built-in demo window\n\
          \x20   start <app.apk> [--wait]                   let the daemon fork the guest\n\
          \x20   start --demo [--wait]                       same, for the built-in demo\n\
@@ -422,6 +427,8 @@ fn print_help() {
          \x20   doctor <app.apk>                            can this APK run? what is missing?\n\
          \x20   sysroot <dir>                               inspect an extracted Android system tree\n\
          \x20   art-test --sysroot <dir>                    try JNI_CreateJavaVM against it\n\
+         \x20     [--classpath <apk|jar>] [--find-class <C>] [--main <C>]\n\
+         \x20     [--jni-lib <so>] [--register-natives <so>]\n\
          \x20   gpu-info                                    report host EGL/GLES/GPU capabilities\n\
          \x20   gpu-test                                    render offscreen on the GPU + export a dmabuf\n\
          \x20   audio-test [--seconds N] [--tone]           play silence (or a tone) through PipeWire\n\

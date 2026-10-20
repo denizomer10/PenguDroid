@@ -584,10 +584,152 @@ pub unsafe extern "C" fn android_create_namespace(
     &DUMMY_NAMESPACE as *const u8 as *mut c_void
 }
 
-/// `android_get_exported_namespace(name)` — no namespaces exist, so `NULL`.
+/// Bionic's per-network DNS entry points.
+///
+/// The host has one network namespace, so the `netid`/`mark` arguments are
+/// ignored and the calls go straight to glibc's resolver.
+#[no_mangle]
+pub unsafe extern "C" fn android_getaddrinfofornet(
+    hostname: *const c_char,
+    servname: *const c_char,
+    hints: *const libc::addrinfo,
+    _netid: u32,
+    _mark: u32,
+    res: *mut *mut libc::addrinfo,
+) -> c_int {
+    libc::getaddrinfo(hostname, servname, hints, res)
+}
+
+/// `android_getaddrinfofornetwork(hostname, servname, hints, network, res)`.
+#[no_mangle]
+pub unsafe extern "C" fn android_getaddrinfofornetwork(
+    hostname: *const c_char,
+    servname: *const c_char,
+    hints: *const libc::addrinfo,
+    _network: *mut c_void,
+    res: *mut *mut libc::addrinfo,
+) -> c_int {
+    libc::getaddrinfo(hostname, servname, hints, res)
+}
+
+/// `android_getaddrinfo(hostname, servname, hints, res)`.
+#[no_mangle]
+pub unsafe extern "C" fn android_getaddrinfo(
+    hostname: *const c_char,
+    servname: *const c_char,
+    hints: *const libc::addrinfo,
+    res: *mut *mut libc::addrinfo,
+) -> c_int {
+    libc::getaddrinfo(hostname, servname, hints, res)
+}
+
+/// `android_freeaddrinfo(res)`.
+#[no_mangle]
+pub unsafe extern "C" fn android_freeaddrinfo(res: *mut libc::addrinfo) {
+    libc::freeaddrinfo(res)
+}
+
+/// `__b64_ntop(src, srclen, target, targsize)` — Bionic's base64 encoder.
+///
+/// glibc keeps the same implementation in `libresolv`, which the shim loads
+/// globally at startup.
+#[no_mangle]
+pub unsafe extern "C" fn __b64_ntop(
+    src: *const u8,
+    srclen: usize,
+    target: *mut c_char,
+    targsize: usize,
+) -> c_int {
+    type F = unsafe extern "C" fn(*const u8, usize, *mut c_char, usize) -> c_int;
+    match dlsym_next::<F>(b"__b64_ntop\0") {
+        Some(f) => f(src, srclen, target, targsize),
+        None => -1,
+    }
+}
+
+/// `__b64_pton(src, target, targsize)` — Bionic's base64 decoder.
+#[no_mangle]
+pub unsafe extern "C" fn __b64_pton(
+    src: *const c_char,
+    target: *mut u8,
+    targsize: usize,
+) -> c_int {
+    type F = unsafe extern "C" fn(*const c_char, *mut u8, usize) -> c_int;
+    match dlsym_next::<F>(b"__b64_pton\0") {
+        Some(f) => f(src, target, targsize),
+        None => -1,
+    }
+}
+
+/// Bionic allocator introspection (`libmemunreachable`).
+///
+/// The host allocator cannot enumerate its heap, so these report "unsupported"
+/// instead of pretending to walk it.
+#[no_mangle]
+pub unsafe extern "C" fn malloc_iterate(
+    _base: usize,
+    _size: usize,
+    _callback: *mut c_void,
+    _arg: *mut c_void,
+) -> c_int {
+    -1
+}
+
+/// `malloc_disable()` — no-op (the host allocator has no stop-the-world mode).
+#[no_mangle]
+pub unsafe extern "C" fn malloc_disable() {}
+
+/// `malloc_enable()` — no-op.
+#[no_mangle]
+pub unsafe extern "C" fn malloc_enable() {}
+
+/// `malloc_info()` — unsupported.
+#[no_mangle]
+pub unsafe extern "C" fn malloc_info() -> c_int {
+    -1
+}
+
+/// `malloc_backtrace(ptr, frames, count)` — no frames available.
+#[no_mangle]
+pub unsafe extern "C" fn malloc_backtrace(
+    _ptr: *mut c_void,
+    _frames: *mut *mut c_void,
+    _frame_count: usize,
+) -> usize {
+    0
+}
+
+/// `__get_h_errno()` — Bionic's accessor for the thread's `h_errno`.
+///
+/// glibc keeps the same value behind `__h_errno_location()`.
+#[no_mangle]
+pub unsafe extern "C" fn __get_h_errno() -> *mut c_int {
+    extern "C" {
+        fn __h_errno_location() -> *mut c_int;
+    }
+    __h_errno_location()
+}
+
+/// `android_mallopt(opcode, arg, arg_size)` — Bionic allocator controls.
+///
+/// The host allocator has no equivalent knobs, so every request reports
+/// "unsupported" (`false`); callers treat that as a no-op.
+#[no_mangle]
+pub unsafe extern "C" fn android_mallopt(
+    _opcode: c_int,
+    _arg: *mut c_void,
+    _arg_size: usize,
+) -> bool {
+    false
+}
+
+/// `android_get_exported_namespace(name)` — the single global namespace.
+///
+/// ART's `libnativebridge` asks for the "system" namespace and asserts when it
+/// is `NULL`, so every name resolves to the same stateless handle.
 #[no_mangle]
 pub unsafe extern "C" fn android_get_exported_namespace(_name: *const c_char) -> *mut c_void {
-    std::ptr::null_mut()
+    &DUMMY_NAMESPACE as *const u8 as *mut c_void
 }
 
 /// `android_link_namespaces(from, to, sonames)` — a no-op success, since the
@@ -1694,10 +1836,10 @@ pub unsafe extern "C" fn __ppoll_chk(
     fds: *mut libc::pollfd,
     nfds: libc::nfds_t,
     timeout: *const libc::timespec,
-    sigmask: *const libc::sigset_t,
+    sigmask: *const BionicSigset,
     _fds_size: usize,
 ) -> c_int {
-    libc::ppoll(fds, nfds, timeout, sigmask)
+    ppoll(fds, nfds, timeout, sigmask)
 }
 
 // ---------------------------------------------------------------------------
@@ -1851,6 +1993,24 @@ pub unsafe extern "C" fn android_fdsan_exchange_owner_tag(
 ) {
 }
 
+/// `android_fdsan_get_owner_tag(fd)` — the shim tracks no tags.
+#[no_mangle]
+pub unsafe extern "C" fn android_fdsan_get_owner_tag(_fd: c_int) -> u64 {
+    0
+}
+
+/// `android_fdsan_get_tag_type(tag)`.
+#[no_mangle]
+pub unsafe extern "C" fn android_fdsan_get_tag_type(tag: u64) -> c_int {
+    ((tag >> 56) & 0xff) as c_int
+}
+
+/// `android_fdsan_get_tag_value(tag)`.
+#[no_mangle]
+pub unsafe extern "C" fn android_fdsan_get_tag_value(tag: u64) -> usize {
+    (tag & 0x00ff_ffff_ffff_ffff) as usize
+}
+
 /// `android_fdsan_close_with_tag(fd, tag)` — close the fd, ignoring the tag.
 #[no_mangle]
 pub unsafe extern "C" fn android_fdsan_close_with_tag(fd: c_int, _tag: u64) -> c_int {
@@ -1910,6 +2070,160 @@ pub unsafe extern "C" fn create_android_log_parser(_msg: *const c_char, _len: us
 /// `android_log_write_int32(msg, value)` — accept and drop the field.
 #[no_mangle]
 pub unsafe extern "C" fn android_log_write_int32(_msg: *mut c_void, _value: i32) -> c_int {
+    0
+}
+
+/// `__android_log_close()`.
+#[no_mangle]
+pub unsafe extern "C" fn __android_log_close() {}
+
+/// `__android_log_reset()`.
+#[no_mangle]
+pub unsafe extern "C" fn __android_log_reset() {}
+
+/// `__android_log_btwrite(prio, tag, buf, len)` — binary event log.
+///
+/// There is no binary log transport, so the record is dropped.
+#[no_mangle]
+pub unsafe extern "C" fn __android_log_btwrite(
+    _prio: c_int,
+    _tag: *const c_char,
+    _buf: *const c_void,
+    _len: usize,
+) -> c_int {
+    0
+}
+
+/// `__android_log_bwrite(tag, buf, len)` — binary event log.
+#[no_mangle]
+pub unsafe extern "C" fn __android_log_bwrite(
+    _tag: *const c_char,
+    _buf: *const c_void,
+    _len: usize,
+) -> c_int {
+    0
+}
+
+/// `__android_log_security(buf, len)` — security log.
+#[no_mangle]
+pub unsafe extern "C" fn __android_log_security(_buf: *const c_void, _len: usize) -> c_int {
+    0
+}
+
+/// `__android_log_security_bwrite(tag, buf, len)` — security log.
+#[no_mangle]
+pub unsafe extern "C" fn __android_log_security_bwrite(
+    _tag: *const c_char,
+    _buf: *const c_void,
+    _len: usize,
+) -> c_int {
+    0
+}
+
+/// `__android_log_security_bswrite(tag, str)` — security log.
+#[no_mangle]
+pub unsafe extern "C" fn __android_log_security_bswrite(
+    _tag: *const c_char,
+    _s: *const c_char,
+) -> c_int {
+    0
+}
+
+/// `android_logger_open(list, log_id)` — no log reader.
+#[no_mangle]
+pub unsafe extern "C" fn android_logger_open(_list: *mut c_void, _log_id: c_int) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `android_logger_close(logger)`.
+#[no_mangle]
+pub unsafe extern "C" fn android_logger_close(_logger: *mut c_void) {}
+
+/// `android_logger_get_log_size(logger)`.
+#[no_mangle]
+pub unsafe extern "C" fn android_logger_get_log_size(_logger: *mut c_void) -> u32 {
+    0
+}
+
+/// `android_logger_get_log_readable_size(logger)`.
+#[no_mangle]
+pub unsafe extern "C" fn android_logger_get_log_readable_size(_logger: *mut c_void) -> u32 {
+    0
+}
+
+/// `android_logger_get_log_version(logger)`.
+#[no_mangle]
+pub unsafe extern "C" fn android_logger_get_log_version(_logger: *mut c_void) -> c_int {
+    0
+}
+
+/// `android_logger_get_id(logger)`.
+#[no_mangle]
+pub unsafe extern "C" fn android_logger_get_id(_logger: *mut c_void) -> c_int {
+    0
+}
+
+/// `android_logger_get_statistics(logger, buf, len)` — unsupported.
+#[no_mangle]
+pub unsafe extern "C" fn android_logger_get_statistics(
+    _logger: *mut c_void,
+    _buf: *mut c_char,
+    _len: usize,
+) -> c_int {
+    -1
+}
+
+/// `android_logger_clear(logger)` — unsupported.
+#[no_mangle]
+pub unsafe extern "C" fn android_logger_clear(_logger: *mut c_void) -> c_int {
+    -1
+}
+
+/// `android_logger_set_log_size(logger, size)` — unsupported.
+#[no_mangle]
+pub unsafe extern "C" fn android_logger_set_log_size(_logger: *mut c_void, _size: usize) -> c_int {
+    -1
+}
+
+/// `android_logger_list_alloc(mode, tail, pid)` — no log reader.
+#[no_mangle]
+pub unsafe extern "C" fn android_logger_list_alloc(
+    _mode: c_int,
+    _tail: u32,
+    _pid: u32,
+) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `android_logger_list_alloc_time(mode, start, pid)` — no log reader.
+#[no_mangle]
+pub unsafe extern "C" fn android_logger_list_alloc_time(
+    _mode: c_int,
+    _start: u64,
+    _pid: u32,
+) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// `android_logger_list_free(list)`.
+#[no_mangle]
+pub unsafe extern "C" fn android_logger_list_free(_list: *mut c_void) {}
+
+/// `android_logger_list_read(list, msg)` — end of stream.
+#[no_mangle]
+pub unsafe extern "C" fn android_logger_list_read(_list: *mut c_void, _msg: *mut c_void) -> c_int {
+    -1
+}
+
+/// `android_log_write_int64(msg, value)` — accept and drop the field.
+#[no_mangle]
+pub unsafe extern "C" fn android_log_write_int64(_msg: *mut c_void, _value: i64) -> c_int {
+    0
+}
+
+/// `android_log_write_float32(msg, value)` — accept and drop the field.
+#[no_mangle]
+pub unsafe extern "C" fn android_log_write_float32(_msg: *mut c_void, _value: f32) -> c_int {
     0
 }
 
@@ -2220,91 +2534,390 @@ pub unsafe extern "C" fn __cxa_demangle(
 }
 
 // ---------------------------------------------------------------------------
-// 64-bit signal API (`*64` variants)
+// Signal API: Bionic layout on a glibc libc
 // ---------------------------------------------------------------------------
 //
-// Bionic exposes `sigset64_t`-based entry points (`sigfillset64`, `sigaction64`,
-// ...) alongside the legacy 32-bit ones. On glibc/x86-64 `sigset_t` is already
-// the full 1024-bit type and `struct sigaction` has the same layout as Bionic's
-// `struct sigaction64`, so each forwards directly.
+// `sigset_t` and `struct sigaction` are *not* ABI compatible between Bionic and
+// glibc:
+//
+// | type                  | Bionic (LP64) | glibc (x86-64) |
+// |-----------------------|---------------|----------------|
+// | `sigset_t`            | 8 bytes       | 128 bytes      |
+// | `struct sigaction`    | 32 bytes      | 152 bytes      |
+//
+// Handing a Bionic 8-byte `sigset_t` to glibc's `sigfillset` writes 128 bytes,
+// and letting glibc's `sigaction` fill in a Bionic 32-byte `struct sigaction`
+// writes 152 bytes. Both are silent buffer overruns; the second one is what
+// corrupted `art::gFaultManager` (whose `sigaction` sits at offset 0x30 of an
+// 88-byte object), because libart's static initializer does
+//
+//     sigaction(SIGSEGV, nullptr, &gFaultManager.sa_);   // query the handler
+//
+// So every signal entry point a guest library can reach is interposed and
+// translated here. The bit numbering is identical (signal `n` is bit `n - 1`),
+// so the conversion is just a widening/narrowing of the bit set.
 
-/// `sigemptyset64(set)`.
+/// Bionic's `sigset_t` on LP64.
+pub type BionicSigset = u64;
+
+/// Bionic's `struct sigaction` on LP64.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BionicSigAction {
+    /// Union of `sa_handler` and `sa_sigaction`.
+    pub sa_handler: usize,
+    pub sa_mask: BionicSigset,
+    pub sa_flags: c_int,
+    pub _pad: c_int,
+    pub sa_restorer: usize,
+}
+
+const _: () = assert!(std::mem::size_of::<BionicSigAction>() == 32);
+const _: () = assert!(std::mem::size_of::<libc::sigset_t>() == 128);
+
+/// Widen a Bionic signal set to glibc's 1024-bit representation.
+fn sigset_to_glibc(mask: BionicSigset) -> libc::sigset_t {
+    // glibc's `sigset_t` is `unsigned long __val[16]` on x86-64.
+    let mut words = [0u64; 16];
+    words[0] = mask;
+    // SAFETY: the two types are both 128 bytes and alignment-compatible.
+    unsafe { std::mem::transmute::<[u64; 16], libc::sigset_t>(words) }
+}
+
+/// Narrow glibc's signal set to Bionic's 64-bit representation.
+fn sigset_from_glibc(set: &libc::sigset_t) -> BionicSigset {
+    // SAFETY: see `sigset_to_glibc`.
+    let words: &[u64; 16] = unsafe { &*(set as *const libc::sigset_t as *const [u64; 16]) };
+    words[0]
+}
+
+/// Translate a Bionic `struct sigaction` into glibc's.
+fn sigaction_to_glibc(a: &BionicSigAction) -> libc::sigaction {
+    let mut out: libc::sigaction = unsafe { std::mem::zeroed() };
+    out.sa_sigaction = a.sa_handler;
+    out.sa_mask = sigset_to_glibc(a.sa_mask);
+    out.sa_flags = a.sa_flags;
+    out.sa_restorer = unsafe {
+        std::mem::transmute::<usize, Option<extern "C" fn()>>(a.sa_restorer)
+    };
+    out
+}
+
+/// Translate a glibc `struct sigaction` back into Bionic's.
+fn sigaction_from_glibc(g: &libc::sigaction) -> BionicSigAction {
+    BionicSigAction {
+        sa_handler: g.sa_sigaction,
+        sa_mask: sigset_from_glibc(&g.sa_mask),
+        sa_flags: g.sa_flags,
+        _pad: 0,
+        sa_restorer: unsafe {
+            std::mem::transmute::<Option<extern "C" fn()>, usize>(g.sa_restorer)
+        },
+    }
+}
+
+type RealSigaction = unsafe extern "C" fn(
+    c_int,
+    *const libc::sigaction,
+    *mut libc::sigaction,
+) -> c_int;
+type RealSigprocmask =
+    unsafe extern "C" fn(c_int, *const libc::sigset_t, *mut libc::sigset_t) -> c_int;
+type RealSigpending = unsafe extern "C" fn(*mut libc::sigset_t) -> c_int;
+type RealSigsuspend = unsafe extern "C" fn(*const libc::sigset_t) -> c_int;
+type RealSigwait = unsafe extern "C" fn(*const libc::sigset_t, *mut c_int) -> c_int;
+type RealSigaltstack = unsafe extern "C" fn(*const libc::stack_t, *mut libc::stack_t) -> c_int;
+type RealPpoll = unsafe extern "C" fn(
+    *mut libc::pollfd,
+    libc::nfds_t,
+    *const libc::timespec,
+    *const libc::sigset_t,
+) -> c_int;
+
+/// `sigemptyset(set)`.
 #[no_mangle]
-pub unsafe extern "C" fn sigemptyset64(set: *mut libc::sigset_t) -> c_int {
-    libc::sigemptyset(set)
+pub unsafe extern "C" fn sigemptyset(set: *mut BionicSigset) -> c_int {
+    if set.is_null() {
+        return -1;
+    }
+    *set = 0;
+    0
+}
+
+/// `sigfillset(set)` — every one of the 64 signals.
+#[no_mangle]
+pub unsafe extern "C" fn sigfillset(set: *mut BionicSigset) -> c_int {
+    if set.is_null() {
+        return -1;
+    }
+    *set = u64::MAX;
+    0
+}
+
+/// `sigaddset(set, signum)`.
+#[no_mangle]
+pub unsafe extern "C" fn sigaddset(set: *mut BionicSigset, signum: c_int) -> c_int {
+    if set.is_null() || !(1..=64).contains(&signum) {
+        return -1;
+    }
+    *set |= 1u64 << (signum - 1);
+    0
+}
+
+/// `sigdelset(set, signum)`.
+#[no_mangle]
+pub unsafe extern "C" fn sigdelset(set: *mut BionicSigset, signum: c_int) -> c_int {
+    if set.is_null() || !(1..=64).contains(&signum) {
+        return -1;
+    }
+    *set &= !(1u64 << (signum - 1));
+    0
+}
+
+/// `sigismember(set, signum)`.
+#[no_mangle]
+pub unsafe extern "C" fn sigismember(set: *const BionicSigset, signum: c_int) -> c_int {
+    if set.is_null() || !(1..=64).contains(&signum) {
+        return -1;
+    }
+    ((*set >> (signum - 1)) & 1) as c_int
+}
+
+/// `sigaction(signum, act, oldact)` — Bionic `struct sigaction` in and out.
+#[no_mangle]
+pub unsafe extern "C" fn sigaction(
+    signum: c_int,
+    act: *const BionicSigAction,
+    oldact: *mut BionicSigAction,
+) -> c_int {
+    let Some(real) = dlsym_next::<RealSigaction>(b"sigaction\0") else {
+        return -1;
+    };
+    let gact = if act.is_null() {
+        None
+    } else {
+        Some(sigaction_to_glibc(&*act))
+    };
+    let mut gold: libc::sigaction = std::mem::zeroed();
+    let rc = real(
+        signum,
+        gact.as_ref().map_or(std::ptr::null(), |a| a as *const _),
+        if oldact.is_null() { std::ptr::null_mut() } else { &mut gold },
+    );
+    if rc == 0 && !oldact.is_null() {
+        *oldact = sigaction_from_glibc(&gold);
+    }
+    rc
+}
+
+/// `sigprocmask(how, set, oldset)`.
+#[no_mangle]
+pub unsafe extern "C" fn sigprocmask(
+    how: c_int,
+    set: *const BionicSigset,
+    oldset: *mut BionicSigset,
+) -> c_int {
+    let Some(real) = dlsym_next::<RealSigprocmask>(b"sigprocmask\0") else {
+        return -1;
+    };
+    let gset = if set.is_null() {
+        None
+    } else {
+        Some(sigset_to_glibc(*set))
+    };
+    let mut gold: libc::sigset_t = std::mem::zeroed();
+    let rc = real(
+        how,
+        gset.as_ref().map_or(std::ptr::null(), |s| s as *const _),
+        if oldset.is_null() { std::ptr::null_mut() } else { &mut gold },
+    );
+    if rc == 0 && !oldset.is_null() {
+        *oldset = sigset_from_glibc(&gold);
+    }
+    rc
+}
+
+/// `pthread_sigmask(how, set, oldset)`.
+#[no_mangle]
+pub unsafe extern "C" fn pthread_sigmask(
+    how: c_int,
+    set: *const BionicSigset,
+    oldset: *mut BionicSigset,
+) -> c_int {
+    let Some(real) = dlsym_next::<RealSigprocmask>(b"pthread_sigmask\0") else {
+        return -1;
+    };
+    let gset = if set.is_null() {
+        None
+    } else {
+        Some(sigset_to_glibc(*set))
+    };
+    let mut gold: libc::sigset_t = std::mem::zeroed();
+    let rc = real(
+        how,
+        gset.as_ref().map_or(std::ptr::null(), |s| s as *const _),
+        if oldset.is_null() { std::ptr::null_mut() } else { &mut gold },
+    );
+    if rc == 0 && !oldset.is_null() {
+        *oldset = sigset_from_glibc(&gold);
+    }
+    rc
+}
+
+/// `sigpending(set)`.
+#[no_mangle]
+pub unsafe extern "C" fn sigpending(set: *mut BionicSigset) -> c_int {
+    let Some(real) = dlsym_next::<RealSigpending>(b"sigpending\0") else {
+        return -1;
+    };
+    let mut gold: libc::sigset_t = std::mem::zeroed();
+    let rc = real(&mut gold);
+    if rc == 0 && !set.is_null() {
+        *set = sigset_from_glibc(&gold);
+    }
+    rc
+}
+
+/// `sigsuspend(set)`.
+#[no_mangle]
+pub unsafe extern "C" fn sigsuspend(set: *const BionicSigset) -> c_int {
+    let Some(real) = dlsym_next::<RealSigsuspend>(b"sigsuspend\0") else {
+        return -1;
+    };
+    let gset = if set.is_null() {
+        None
+    } else {
+        Some(sigset_to_glibc(*set))
+    };
+    real(gset.as_ref().map_or(std::ptr::null(), |s| s as *const _))
+}
+
+/// `sigwait(set, sig)`.
+#[no_mangle]
+pub unsafe extern "C" fn sigwait(set: *const BionicSigset, sig: *mut c_int) -> c_int {
+    let Some(real) = dlsym_next::<RealSigwait>(b"sigwait\0") else {
+        return -1;
+    };
+    let gset = if set.is_null() {
+        None
+    } else {
+        Some(sigset_to_glibc(*set))
+    };
+    real(gset.as_ref().map_or(std::ptr::null(), |s| s as *const _), sig)
+}
+
+/// `sigaltstack(ss, old_ss)` — `stack_t` has the same layout in both libcs.
+#[no_mangle]
+pub unsafe extern "C" fn sigaltstack(
+    ss: *const libc::stack_t,
+    old_ss: *mut libc::stack_t,
+) -> c_int {
+    match dlsym_next::<RealSigaltstack>(b"sigaltstack\0") {
+        Some(real) => real(ss, old_ss),
+        None => -1,
+    }
+}
+
+/// `ppoll(fds, nfds, timeout, sigmask)`.
+#[no_mangle]
+pub unsafe extern "C" fn ppoll(
+    fds: *mut libc::pollfd,
+    nfds: libc::nfds_t,
+    timeout: *const libc::timespec,
+    sigmask: *const BionicSigset,
+) -> c_int {
+    let Some(real) = dlsym_next::<RealPpoll>(b"ppoll\0") else {
+        return -1;
+    };
+    let gmask = if sigmask.is_null() {
+        None
+    } else {
+        Some(sigset_to_glibc(*sigmask))
+    };
+    real(
+        fds,
+        nfds,
+        timeout,
+        gmask.as_ref().map_or(std::ptr::null(), |s| s as *const _),
+    )
+}
+
+/// `sigemptyset64(set)` — Bionic's 64-bit-signal-set variant.
+#[no_mangle]
+pub unsafe extern "C" fn sigemptyset64(set: *mut BionicSigset) -> c_int {
+    sigemptyset(set)
 }
 
 /// `sigfillset64(set)`.
 #[no_mangle]
-pub unsafe extern "C" fn sigfillset64(set: *mut libc::sigset_t) -> c_int {
-    libc::sigfillset(set)
+pub unsafe extern "C" fn sigfillset64(set: *mut BionicSigset) -> c_int {
+    sigfillset(set)
 }
 
 /// `sigaddset64(set, signum)`.
 #[no_mangle]
-pub unsafe extern "C" fn sigaddset64(set: *mut libc::sigset_t, signum: c_int) -> c_int {
-    libc::sigaddset(set, signum)
+pub unsafe extern "C" fn sigaddset64(set: *mut BionicSigset, signum: c_int) -> c_int {
+    sigaddset(set, signum)
 }
 
 /// `sigdelset64(set, signum)`.
 #[no_mangle]
-pub unsafe extern "C" fn sigdelset64(set: *mut libc::sigset_t, signum: c_int) -> c_int {
-    libc::sigdelset(set, signum)
+pub unsafe extern "C" fn sigdelset64(set: *mut BionicSigset, signum: c_int) -> c_int {
+    sigdelset(set, signum)
 }
 
 /// `sigismember64(set, signum)`.
 #[no_mangle]
-pub unsafe extern "C" fn sigismember64(set: *const libc::sigset_t, signum: c_int) -> c_int {
-    libc::sigismember(set, signum)
+pub unsafe extern "C" fn sigismember64(set: *const BionicSigset, signum: c_int) -> c_int {
+    sigismember(set, signum)
 }
 
 /// `sigprocmask64(how, set, oldset)`.
 #[no_mangle]
 pub unsafe extern "C" fn sigprocmask64(
     how: c_int,
-    set: *const libc::sigset_t,
-    oldset: *mut libc::sigset_t,
+    set: *const BionicSigset,
+    oldset: *mut BionicSigset,
 ) -> c_int {
-    libc::sigprocmask(how, set, oldset)
+    sigprocmask(how, set, oldset)
 }
 
 /// `pthread_sigmask64(how, set, oldset)`.
 #[no_mangle]
 pub unsafe extern "C" fn pthread_sigmask64(
     how: c_int,
-    set: *const libc::sigset_t,
-    oldset: *mut libc::sigset_t,
+    set: *const BionicSigset,
+    oldset: *mut BionicSigset,
 ) -> c_int {
-    libc::pthread_sigmask(how, set, oldset)
+    pthread_sigmask(how, set, oldset)
 }
 
 /// `sigpending64(set)`.
 #[no_mangle]
-pub unsafe extern "C" fn sigpending64(set: *mut libc::sigset_t) -> c_int {
-    libc::sigpending(set)
+pub unsafe extern "C" fn sigpending64(set: *mut BionicSigset) -> c_int {
+    sigpending(set)
 }
 
 /// `sigsuspend64(set)`.
 #[no_mangle]
-pub unsafe extern "C" fn sigsuspend64(set: *const libc::sigset_t) -> c_int {
-    libc::sigsuspend(set)
+pub unsafe extern "C" fn sigsuspend64(set: *const BionicSigset) -> c_int {
+    sigsuspend(set)
 }
 
 /// `sigwait64(set, sig)`.
 #[no_mangle]
-pub unsafe extern "C" fn sigwait64(set: *const libc::sigset_t, sig: *mut c_int) -> c_int {
-    libc::sigwait(set, sig)
+pub unsafe extern "C" fn sigwait64(set: *const BionicSigset, sig: *mut c_int) -> c_int {
+    sigwait(set, sig)
 }
 
-/// `sigaction64(signum, act, oldact)` — layout-compatible with glibc's
-/// `struct sigaction` on x86-64.
+/// `sigaction64(signum, act, oldact)`.
 #[no_mangle]
 pub unsafe extern "C" fn sigaction64(
     signum: c_int,
-    act: *const libc::sigaction,
-    oldact: *mut libc::sigaction,
+    act: *const BionicSigAction,
+    oldact: *mut BionicSigAction,
 ) -> c_int {
-    libc::sigaction(signum, act, oldact)
+    sigaction(signum, act, oldact)
 }
 
 // ---------------------------------------------------------------------------
@@ -2394,6 +3007,24 @@ const RTLD_DEFAULT: *mut c_void = std::ptr::null_mut();
 ///
 /// Returns `None` when the host libc does not export the symbol, letting each
 /// wrapper fall back gracefully instead of crashing.
+/// `AddSpecialSignalHandlerFn(signal, action)` — Android's `libsigchain`.
+///
+/// ART installs its fault handlers through this Bionic-specific chain, which
+/// manipulates Bionic TLS and an alternate signal stack. On glibc that corrupts
+/// the caller's stack, so the shim reports success without installing anything:
+/// ART's own `sigaction`-based handlers still work, and startup proceeds.
+#[no_mangle]
+pub unsafe extern "C" fn AddSpecialSignalHandlerFn(_signal: c_int, _action: *const c_void) -> bool {
+    true
+}
+
+/// `RemoveSpecialSignalHandlerFn(signal, action)` — see
+/// [`AddSpecialSignalHandlerFn`].
+#[no_mangle]
+pub unsafe extern "C" fn RemoveSpecialSignalHandlerFn(_signal: c_int, _action: *const c_void) -> bool {
+    true
+}
+
 unsafe fn dlsym_next<T: Copy>(name: &[u8]) -> Option<T> {
     debug_assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<*mut c_void>());
     let p = libc::dlsym(RTLD_NEXT, name.as_ptr() as *const c_char);
@@ -2711,6 +3342,19 @@ pub unsafe extern "C" fn fclose(stream: *mut c_void) -> c_int {
 static PENGUDROID_CTOR: extern "C" fn() = pengudroid_init;
 
 extern "C" fn pengudroid_init() {
+    // Android's libc++ (and ART) import the Itanium unwinder (`_Unwind_*`),
+    // which lives in libgcc_s on glibc. The host binary may not link it, so load
+    // it globally here; otherwise a Bionic C++ library fails with
+    // "undefined symbol: _Unwind_RaiseException".
+    for soname in ["libgcc_s.so.1", "libstdc++.so.6", "libresolv.so.2"] {
+        if let Ok(name) = CString::new(soname) {
+            // SAFETY: `name` is a valid NUL-terminated soname; the handle is
+            // intentionally kept for the life of the process.
+            unsafe {
+                libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
+            }
+        }
+    }
     let _ = log_to_stderr(
         ANDROID_LOG_INFO,
         "PenguDroid",
@@ -3718,6 +4362,28 @@ pub unsafe extern "C" fn slCreateEngine(
 #[no_mangle]
 pub static __pengudroid_ver_libc: u8 = 0;
 #[no_mangle]
+pub static __pengudroid_ver_libc_n: u8 = 0;
+#[no_mangle]
+pub static __pengudroid_ver_libc_o: u8 = 0;
+#[no_mangle]
+pub static __pengudroid_ver_libc_p: u8 = 0;
+#[no_mangle]
+pub static __pengudroid_ver_libc_q: u8 = 0;
+#[no_mangle]
+pub static __pengudroid_ver_liblog_m: u8 = 0;
+#[no_mangle]
+pub static __pengudroid_ver_libdl_android: u8 = 0;
+#[no_mangle]
+pub static __pengudroid_ver_libstatssocket: u8 = 0;
+#[no_mangle]
+pub static __pengudroid_ver_libartpalette_1: u8 = 0;
+#[no_mangle]
+pub static __pengudroid_ver_heapprofd_api_s: u8 = 0;
+#[no_mangle]
+pub static __pengudroid_ver_zlib_1_2_2: u8 = 0;
+#[no_mangle]
+pub static __pengudroid_ver_zlib_ndk: u8 = 0;
+#[no_mangle]
 pub static __pengudroid_ver_libm: u8 = 0;
 #[no_mangle]
 pub static __pengudroid_ver_ld: u8 = 0;
@@ -4275,5 +4941,58 @@ mod tests {
             (object_vt.Destroy.unwrap())(mix);
             (object_vt.Destroy.unwrap())(engine);
         }
+    }
+
+    #[test]
+    fn bionic_sigset_roundtrips_through_glibc() {
+        // Signal n is bit n-1 in both libcs, so the widening must be lossless.
+        let mask: u64 = 0b1011;
+        let g = sigset_to_glibc(mask);
+        assert_eq!(sigset_from_glibc(&g), mask);
+
+        // Every one of the 64 signals survives the round trip.
+        let all = u64::MAX;
+        assert_eq!(sigset_from_glibc(&sigset_to_glibc(all)), all);
+    }
+
+    #[test]
+    fn bionic_sigset_set_operations() {
+        let mut set: BionicSigset = 0;
+        unsafe {
+            assert_eq!(sigaddset(&mut set, 9), 0); // SIGKILL
+            assert_eq!(sigismember(&set, 9), 1);
+            assert_eq!(sigismember(&set, 8), 0);
+            assert_eq!(sigdelset(&mut set, 9), 0);
+            assert_eq!(sigismember(&set, 9), 0);
+            assert_eq!(sigaddset(&mut set, 0), -1);
+            assert_eq!(sigaddset(&mut set, 65), -1);
+            assert_eq!(sigfillset(&mut set), 0);
+            assert_eq!(set, u64::MAX);
+            assert_eq!(sigemptyset(&mut set), 0);
+            assert_eq!(set, 0);
+        }
+    }
+
+    #[test]
+    fn bionic_sigaction_layout_is_32_bytes() {
+        // Bionic's `struct sigaction` is 32 bytes on LP64. If this ever changes,
+        // glibc's 152-byte version starts scribbling over guest memory again.
+        assert_eq!(std::mem::size_of::<BionicSigAction>(), 32);
+        assert_eq!(std::mem::align_of::<BionicSigAction>(), 8);
+
+        let act = BionicSigAction {
+            sa_handler: 0x1234,
+            sa_mask: 0b10,
+            sa_flags: 0x0400_0004,
+            _pad: 0,
+            sa_restorer: 0,
+        };
+        let g = sigaction_to_glibc(&act);
+        assert_eq!(g.sa_sigaction, 0x1234);
+        assert_eq!(g.sa_flags, 0x0400_0004);
+        let back = sigaction_from_glibc(&g);
+        assert_eq!(back.sa_handler, act.sa_handler);
+        assert_eq!(back.sa_mask, act.sa_mask);
+        assert_eq!(back.sa_flags, act.sa_flags);
     }
 }

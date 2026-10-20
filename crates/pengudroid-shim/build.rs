@@ -95,10 +95,26 @@ fn write_version_script(out_dir: &PathBuf) {
         libc_globals.push_str("; ");
         libc_globals.push_str(sym);
     }
+    // Android's libc/libm/libdl/liblog/libdl_android and the APEX libraries
+    // version their symbols against these nodes. A `VERNEED` is satisfied as
+    // long as the node exists, so each gets an anchor symbol; the actual
+    // symbols resolve by name once `de-bionic` has made the references
+    // unversioned.
     let script = format!(
         "LIBC {{ global: {libc_globals}; }};\
+         LIBC_N {{ global: __pengudroid_ver_libc_n; }};\
+         LIBC_O {{ global: __pengudroid_ver_libc_o; }};\
+         LIBC_P {{ global: __pengudroid_ver_libc_p; }};\
+         LIBC_Q {{ global: __pengudroid_ver_libc_q; }};\
          LIBM {{ global: __pengudroid_ver_libm; }};\
-         LD   {{ global: __pengudroid_ver_ld; }};\n"
+         LD   {{ global: __pengudroid_ver_ld; }};\
+         LIBLOG_M {{ global: __pengudroid_ver_liblog_m; }};\
+         LIBDL_ANDROID {{ global: __pengudroid_ver_libdl_android; }};\
+         LIBSTATSSOCKET {{ global: __pengudroid_ver_libstatssocket; }};\
+         LIBARTPALETTE_1 {{ global: __pengudroid_ver_libartpalette_1; }};\
+         HEAPPROFD_API_S {{ global: __pengudroid_ver_heapprofd_api_s; }};\
+         ZLIB_1.2.2 {{ global: __pengudroid_ver_zlib_1_2_2; }};\
+         ZLIB_NDK {{ global: __pengudroid_ver_zlib_ndk; }};\n"
     );
     std::fs::write(&map, script).expect("write version script");
 

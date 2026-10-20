@@ -80,11 +80,15 @@ milestone. Nothing below is overstated.
 | Service registry + `phone`/`media.camera`/AMS/PMS/SurfaceFlinger stubs | **Stub** | correctly-named interfaces, minimal replies |
 | Audio: PipeWire | **Working** | the daemon owns a shared ring and drains it into `pw-cat` (or `aplay`); `audio-test [--via-daemon]` streams PCM |
 | Telephony (`ITelephony`) | **Working (no-SIM model)** | real AIDL transaction codes and `Parcel`-marshalled replies for the methods apps reach through `TelephonyManager`; `pengudroid telephony` transacts and decodes them |
-| **Running real DEX bytecode (ART)** | **Partial** | `libart.so` and its whole dependency closure now `dlopen` on glibc, and `JNI_CreateJavaVM` executes into ART's runtime setup; full runtime bring-up is the open problem — see `docs/LIMITATIONS.md` |
+| **Running real DEX bytecode (ART)** | **Working (VM + DEX)** | `JNI_CreateJavaVM` now returns `JNI_OK` against an extracted LineageOS 20 (Android 13) tree: ART's whole startup path completes and Java code executes. Classes from a real APK's `classes.dex` load and link through the system class loader. Launching an *Activity* still needs the Android system services, which do not exist here — see `docs/LIMITATIONS.md` §2 |
 | Android packed relocations (`APS2` / `ANDROID_RELA` / `ANDROID_RELR`) | **Working** | `de-bionic` expands them into standard `RELA`/`RELR` (new `PT_LOAD` + retagged dynamic entries); without this a modern Android `.so` loads with *no* relocations applied |
 | Android linker API (`android_dlopen_ext`, namespaces, `__loader_*`) | **Working** | translated to glibc's flat namespace by the shim; `libdl_android.so` / `ld-android.so` resolve to the shim |
 | **Loading `libart.so` (the Android runtime)** | **Working** | the ART APEX closure (`libart`, `libartbase`, `libdexfile`, `libc++`, `libnativebridge`, `libunwindstack`, ...) `dlopen`s |
-| **Running `JNI_CreateJavaVM`** | **Partial** | ART executes its whole startup path — palette init, page-size check, `ANDROID_ROOT`/`ANDROID_ART_ROOT`, boot classpath, boot-image load — and now fails *gracefully* with a diagnostic instead of crashing; the remaining gap is the APEX/boot-image environment, not ABI translation |
+| **Running `JNI_CreateJavaVM`** | **Working** | returns `JNI_OK` with a live `JavaVM`/`JNIEnv`; `GetVersion()` reports `JNI_VERSION_1_6` and the JNI function table is validated against the VM |
+| **Framework native registration** | **Working** | all 150 `register_android_*` groups exported by `libandroid_runtime.so` are called in `gRegJNI`-like order, so `android.os.Trace`, `android.util.Log`, Binder and friends have their natives |
+| **`ActivityThread.main`** | **Partial** | invoked on the live VM; it runs Java code up to the first thing that needs `system_server` (binder to AMS/PMS) or SurfaceFlinger |
+| **Bionic `sigaction`/`sigset_t` translation** | **Working** | Bionic's `sigset_t` is 8 bytes and `struct sigaction` 32; glibc's are 128/152. Interposing the whole signal API is what made ART stop corrupting its own globals |
+| **`pengudroid launch` (Proton-style prefixes)** | **Working** | per-app prefix (`~/.local/share/pengudroid/prefixes/<pkg>`) with `files`/`cache`/`code_cache`/`shared_prefs` and `pengudroid.env` overrides; picks `native` or `art` from the APK |
 | **Real Bionic/EGL in a guest** | **Not started** | needs the Android userspace `.so`s loaded in-process |
 
 The honest framing of "no `system.img`": the *container/VM* image is gone, but

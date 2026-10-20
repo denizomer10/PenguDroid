@@ -13,9 +13,10 @@ açısından tek yerde toplar. Uygulamanın neyi çalıştırdığı/neyi çalı
 | `pengudroid stop` | daemon'ı kapatır ve soketin yok olmasını bekler | çalışır |
 | `pengudroid demo` | dahili demo penceresi (APK gerekmez) | çalışır (Wayland oturumu gerekir) |
 | `pengudroid native <apk>` / `--lib lib.so` | NativeActivity uygulamasını ART olmadan çalıştırır; `--isolate` seccomp ekler | çalışır |
+| `pengudroid launch <apk>` | Proton tarzı başlatıcı: uygulama başına prefix (`~/.local/share/pengudroid/prefixes/<pkg>`), `pengudroid.env` ile ortam geçersiz kılma, arka ucu (`native`/`art`) APK'dan seçer; `--backend`, `--prefix`, `--sysroot` | çalışır |
 | `pengudroid doctor <apk>` | APK çalışabilir mi, ne eksik? | çalışır |
 | `pengudroid sysroot <dir>` | çıkarılmış Android sistem ağacını denetler | çalışır |
-| `pengudroid art-test --sysroot <dir>` | `JNI_CreateJavaVM`'i dener | tanılama |
+| `pengudroid art-test --sysroot <dir>` | `JNI_CreateJavaVM`'i dener; ek olarak `--classpath <apk>`, `--find-class <C>`, `--main <C>`, `--jni-lib <so>`, `--register-natives <so>` | ÇALIŞIR — canlı `JavaVM` (`JNI_OK`) |
 | `pengudroid run app.apk` | guest'i CLI altında başlatır, Ctrl-C ile birlikte durur; olmayan APK hata olur | çalışır (Wayland oturumu gerekir) |
 | `pengudroid start app.apk [--wait]` | guest'i *daemon* altında başlatır; `--wait` çıkış kodunu bekler | çalışır |
 | `pengudroid start --demo [--wait]` | aynısı, dahili demo ile | çalışır |

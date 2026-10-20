@@ -24,48 +24,65 @@ namespace. The Android libraries are meant to be loaded into ordinary host
 processes behind the shim. Removing the container is achievable; removing the
 need for the libraries is not.
 
-## 2. ART on glibc is the central unsolved problem
+## 2. ART on glibc: the VM runs, the *system* does not
 
 Wine works because the Win32 ABI is stable, documented, and — crucially —
 Wine reimplements the entire platform rather than hosting Microsoft's
 `ntdll`. PenguDroid's plan is the harder, opposite bet: host *Google's* ART.
 
-**What now works.** The ART APEX closure loads on glibc. `pengudroid de-bionic`
-expands Android's packed relocations (`APS2`) into standard `RELA`/`RELR` and
-retags the dynamic entries, the shim supplies the linker API
-(`android_dlopen_ext`, `android_create_namespace`, the `__loader_*` entry
-points), the CFI/fdsan/fortify/`_ctype_` surface, the liblog logger API, the
-Bionic `sysconf` numbering, and the Bionic log and property calls, and the whole
-set — `libart.so` (9 MB), `libartbase`, `libdexfile`, `libc++`,
-`libnativebridge`, `libnativeloader`, `libunwindstack`, `libsigchain`,
-`libartpalette` + `libartpalette-system`, and the system-library chain they pull
-in — `dlopen`s.
+**Where it stands now.** `pengudroid art-test --sysroot <tree>` against an
+extracted LineageOS 20 (Android 13, x86_64) tree returns **`JNI_OK`**. A live
+`JavaVM` and `JNIEnv` come back, `GetVersion()` reports `JNI_VERSION_1_6`, and
+Java code executes: classes taken from a real APK's `classes.dex` are loaded and
+linked through the system class loader, and `android.app.ActivityThread.main`
+can be invoked.
 
-`JNI_CreateJavaVM` then **executes ART's whole startup path**: palette
-initialisation, the page-size check, the `ANDROID_ROOT`/`ANDROID_ART_ROOT`
-lookups, the boot classpath, and the boot-image load. It now fails *gracefully*
-— returning `JNI_ERR` with a diagnostic such as `Boot classpath is empty` —
-rather than crashing.
+The path there was ABI translation, not environment emulation:
 
-**What remains.** Getting `JNI_CreateJavaVM` to return a live `JavaVM` needs an
-Android-shaped environment, not more ABI translation. `pengudroid sysroot <dir>`
-now reports exactly which files an extracted Android system tree must provide,
-and `pengudroid art-test --sysroot <dir>` loads `libart.so` and calls
-`JNI_CreateJavaVM` against it, printing ART's own diagnostic. The missing pieces
-are:
+* Android's packed relocations (`APS2`) are expanded into standard
+  `RELA`/`RELR` by `pengudroid de-bionic` (new `PT_LOAD` + retagged dynamic
+  entries), so a modern Android `.so` no longer loads with zero relocations.
+* The linker API (`android_dlopen_ext`, namespaces, `__loader_*`), CFI/fdsan/
+  fortify/`_ctype_`, liblog's logger API, Bionic `sysconf` numbering, the log and
+  property calls, and libc++'s needs are all supplied by the shim.
+* **Signal ABI.** This was the last hard blocker and is worth spelling out:
+  Bionic's `sigset_t` is 8 bytes and its `struct sigaction` 32; glibc's are 128
+  and 152. `libart`'s static initialiser for `fault_handler.cc` does
+  `sigaction(SIGSEGV, nullptr, &gFaultManager.sa_)` into a *32-byte* field of an
+  88-byte global, so glibc's 152-byte write silently zeroed the object's
+  `initialized_` flag and every later `FaultManager::Init()` hit
+  `CHECK(!initialized_)`. The shim now interposes the whole signal API
+  (`sigaction`, `sigemptyset`/`fillset`/`addset`/`delset`/`ismember`,
+  `sigprocmask`, `pthread_sigmask`, `sigpending`, `sigsuspend`, `sigwait`,
+  `ppoll`, plus the `*64` variants) and converts between the two layouts.
+* **Framework natives.** `libandroid_runtime.so` has no `JNI_OnLoad`; on a
+  device its ~150 `register_android_*` entry points are called by `app_process`
+  from a static table. `--register-natives` reads the library's exported
+  `register_*` symbols and calls them in the same shape as `gRegJNI` (logging
+  natives first, `Binder` last), which is what makes `Trace` and `Log` work.
 
-* the **APEX manifests** (`/apex/com.android.art/apex_manifest.pb`, ...) so the
-  boot image's `ValidateApexVersions` check passes — without them ART reports an
-  APEX version mismatch and falls back to imageless running;
-* the **boot image** (`boot.art`/`boot.oat`/`boot.vdex` per boot-classpath jar)
-  and the profile files it references by absolute path;
-* the runtime's thread/GC machinery, which expects Bionic-specific suspend and
-  TLS mechanisms.
+**What remains — and why it is not a small patch.** An *Activity* cannot start,
+because starting one is a request to `ActivityManagerService` over binder, and
+there is no `system_server`: no package manager, no window manager, no
+SurfaceFlinger. `ActivityThread.main` now runs until exactly that point and then
+throws `NoClassDefFoundError`. Closing the gap means implementing (or hosting)
+the Android system services — the thing Waydroid gets by booting a real system
+image inside a container. PenguDroid deliberately does not boot a container; it
+runs apps as host processes. Those two goals meet at the system-service boundary.
 
-Making this work is a research project measured in years, not a patch.
-`pengudroid run` therefore still brings up a real process and a real window so
-the surrounding plumbing (binder, ashmem, graphics, audio, properties, fd
-passing) can be built and tested against a running system first.
+**Consequences for real games.**
+
+* **Native x86_64 `NativeActivity` games run today, on the GPU** —
+  `pengudroid native`, with `AAssetManager`, `ALooper`, EGL/GLES and Vulkan. This
+  is the path `pengudroid launch` picks, and `fixtures/native-game` is a playable
+  game at ~56 fps on an RTX 3080.
+* **Genshin Impact cannot run here.** Independently of ART, its Android build is
+  `arm64-v8a` only (this host is x86_64, so it would need a full ARM→x86_64
+  translator), it ships ~20 GB of OBB data plus a proprietary anti-cheat, and it
+  needs `system_server` for login/rendering surfaces. There is no legitimate way
+to obtain or run it in this environment, so "Genshin renders" is not a claim
+this project can make. What it *can* claim is the same class of workload:
+NativeActivity games that call EGL/GLES/Vulkan directly.
 
 ## 3. Native `.so` compatibility
 
