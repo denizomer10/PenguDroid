@@ -203,6 +203,51 @@ prefix, creating the VM, registering the framework natives and invoking
 `ActivityThread.main` — and stops exactly there, with the note
 `starting com.vectorunit.cobalt.MainActivity needs system_server`.
 
+### 2.4 Where the translator stops, precisely
+
+Two things were fixed after the first bring-up, and two are still open.
+
+**Fixed: ART and the translator both want SIGSEGV.** The bridge installs its
+handlers inside `NativeBridgeItf.initialize` (during `LoadNativeBridge`, i.e.
+before the VM exists), and then `Runtime::Init` → `FaultManager::Init` replaces
+them with ART's crash dumper. Both runtimes share this one process, so the
+guest's lazy-translation faults would be handed to ART. `NativeBridgeGetSignalHandler
+(sig)` returns the bridge's own action; `--init-bridge` now reinstalls it for
+SIGILL/SIGBUS/SIGFPE/SIGSEGV once the VM is up, converting Bionic's 32-byte
+`struct sigaction` to glibc's 152-byte one through the shim. (On a device
+`sigchain` does the equivalent.)
+
+**Fixed: the guest ELF is validated strictly.** Swapping in a hand-built ARM64
+binary produced `unsupported e_shentsize: 0x0 (expected 0x40)` and then
+`invalid e_shstrndx`, i.e. ndk_translation insists on a complete section-header
+table and a real `.shstrtab` even for a static executable.
+
+**Open: the guest runtime's handshake.** `InitializeNativeBridge` calls into the
+bridge's `exec` slot, which starts `/system/bin/arm64/app_process64` on a
+thread. Two outcomes were observed:
+
+* with the real guest `app_process64`, the process dies in
+  `ndk_translation_HandleNoExec` (guest code translation);
+* with a trivial static ARM64 program that only does `write(2)` + `exit(2)`,
+  there is no crash and no output: every thread ends up blocked on a futex (one
+  on `do_sigtimedwait`, the translator's signal catcher), so the guest is
+  waiting for a handshake it never gets.
+
+So the translator itself initialises and parses guest ELFs, but running a guest
+*Android userspace* — guest bionic init, guest linker namespaces, guest ART for
+the ARM ABI — is the remaining piece, and that is what the emulator's own
+`system.img` boots. Reaching that from a bare `JNI_CreateJavaVM` means
+implementing the second half of an emulator.
+
+**What that means for “make the game open”.** Beach Buggy Racing 2 needs ARM64
+execution *and* `system_server`; a working ARM guest userspace would provide the
+first and would itself need the second. The only configuration known to open
+this game is an Android system image with ARM translation booted as a real
+system (the emulator, or Waydroid-style container). This host does have
+`/dev/kvm`, so that is possible as a *VM/container* — a different architecture
+from PenguDroid's “apps as host processes” premise, and a decision for the
+project owner rather than something to silently switch to.
+
 **Consequences for real games.**
 
 * **Native x86_64 `NativeActivity` games run today, on the GPU** —

@@ -2656,6 +2656,32 @@ type RealPpoll = unsafe extern "C" fn(
     *const libc::sigset_t,
 ) -> c_int;
 
+/// Install a signal action that a *guest* library built for Bionic handed us.
+///
+/// `libnativebridge` exports `NativeBridgeGetSignalHandler(sig)`, which returns
+/// the translator's own `struct sigaction` (Bionic layout). Guests need those
+/// handlers installed: without them the translator cannot resolve the page
+/// faults it uses for lazy code translation, and ART's fault manager ends up
+/// handling them instead (which looks like a silent crash).
+///
+/// The action is converted to glibc's layout and installed through the real
+/// `sigaction` (`dlsym(RTLD_NEXT)`), never through our own interposed one.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_install_bridge_handler(
+    signum: c_int,
+    act: *const c_void,
+) -> c_int {
+    if act.is_null() {
+        return -1;
+    }
+    let Some(real) = dlsym_next::<RealSigaction>(b"sigaction\0") else {
+        return -1;
+    };
+    let bionic = &*(act as *const BionicSigAction);
+    let gact = sigaction_to_glibc(bionic);
+    real(signum, &gact, std::ptr::null_mut())
+}
+
 /// `sigemptyset(set)`.
 #[no_mangle]
 pub unsafe extern "C" fn sigemptyset(set: *mut BionicSigset) -> c_int {

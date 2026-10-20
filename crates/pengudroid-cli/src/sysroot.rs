@@ -863,6 +863,44 @@ fn setup_native_bridge(libs: Option<&Path>, data_dir: &Path, isa: &str) -> Optio
     })
 }
 
+/// Re-install the translator's signal handlers over ART's.
+///
+/// Both runtimes live in this one process. The bridge installs its handlers in
+/// `Itf.initialize` (during `LoadNativeBridge`, before the VM), then ART's
+/// `FaultManager::Init` replaces them with its crash dumper while the VM comes
+/// up. Guest code needs the bridge's handlers to resolve the lazy-translation
+/// page faults, so they are put back once the VM exists.
+fn install_bridge_handlers(handle: *mut c_void) {
+    let get = unsafe { libc::dlsym(handle, c"NativeBridgeGetSignalHandler".as_ptr()) };
+    if get.is_null() {
+        diag("art: libnativebridge has no NativeBridgeGetSignalHandler");
+        return;
+    }
+    type GetHandler = unsafe extern "C" fn(c_int) -> *const c_void;
+    let f: GetHandler = unsafe { std::mem::transmute(get) };
+    let install = unsafe {
+        libc::dlsym(
+            libc::RTLD_DEFAULT,
+            c"__pengudroid_install_bridge_handler".as_ptr(),
+        )
+    };
+    if install.is_null() {
+        diag("art: shim does not export __pengudroid_install_bridge_handler");
+        return;
+    }
+    type Install = unsafe extern "C" fn(c_int, *const c_void) -> c_int;
+    let g: Install = unsafe { std::mem::transmute(install) };
+    for sig in [4, 7, 8, 11] {
+        let act = unsafe { f(sig) };
+        if act.is_null() {
+            diag(&format!("art: bridge has no handler for signal {sig}"));
+            continue;
+        }
+        let rc = unsafe { g(sig, act) };
+        diag(&format!("art: installed bridge handler for signal {sig} (rc={rc})"));
+    }
+}
+
 /// Step 3: hand the live VM to the bridge.
 fn finish_native_bridge(setup: &BridgeSetup, env: &crate::jni::JniEnv) {
     let Ok(cisa) = CString::new(setup.isa.as_str()) else {
@@ -870,6 +908,13 @@ fn finish_native_bridge(setup: &BridgeSetup, env: &crate::jni::JniEnv) {
     };
     let ok = unsafe { (setup.initialize)(env.0, cisa.as_ptr()) };
     diag(&format!("art: InitializeNativeBridge({}) = {ok}", setup.isa));
+
+    // ART's FaultManager::Init() installed its own SIGSEGV/SIGBUS/SIGILL/SIGFPE
+    // actions while the VM came up, silently replacing the translator's. Both
+    // runtimes live in this one process, so the guest's lazy-translation faults
+    // would land in ART's crash dumper. Re-install the bridge's handlers now
+    // that the VM is up (on a device, sigchain does the equivalent).
+    install_bridge_handlers(setup.handle);
     let available = unsafe { libc::dlsym(setup.handle, c"NativeBridgeAvailable".as_ptr()) };
     if !available.is_null() {
         let g: unsafe extern "C" fn() -> bool = unsafe { std::mem::transmute(available) };
