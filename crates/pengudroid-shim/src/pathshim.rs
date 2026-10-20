@@ -27,6 +27,8 @@ extern char *__pengudroid_map_path(const char *path);
 extern void __pengudroid_free_path(char *p);
 extern int __pengudroid_binder_open(const char *path);
 extern long __pengudroid_binder_ioctl(int fd, unsigned long request, void *arg);
+extern void __pengudroid_binder_mapping(int fd, void *addr, unsigned long len);
+extern int __pengudroid_binder_mmap_prot(int fd, int prot);
 
 #define PD_IOCTL_NOT_HANDLED (-4096L)
 
@@ -35,18 +37,22 @@ extern long syscall(long number, ...);
 #if defined(__x86_64__)
 # define PD_SYS_OPENAT 257
 # define PD_SYS_IOCTL 16
+# define PD_SYS_MMAP 9
 # define PD_AT_FDCWD (-100)
 #elif defined(__aarch64__)
 # define PD_SYS_OPENAT 56
 # define PD_SYS_IOCTL 29
+# define PD_SYS_MMAP 222
 # define PD_AT_FDCWD (-100)
 #elif defined(__i386__)
 # define PD_SYS_OPENAT 295
 # define PD_SYS_IOCTL 54
+# define PD_SYS_MMAP 90
 # define PD_AT_FDCWD (-100)
 #elif defined(__arm__)
 # define PD_SYS_OPENAT 322
 # define PD_SYS_IOCTL 54
+# define PD_SYS_MMAP 192
 # define PD_AT_FDCWD (-100)
 #else
 # error "pengudroid path shim: unsupported architecture"
@@ -127,11 +133,42 @@ int openat64(int dirfd, const char *path, int flags, ...) {
     __builtin_va_end(ap);
     return pd_openat(dirfd, path, flags, mode);
 }
+
+/* `mmap(addr, len, prot, flags, fd, off)`
+ *
+ * Only the emulated binder device is interesting: libbinder maps the transfer
+ * area and replies must be written inside that same mapping. Everything else
+ * is a plain syscall. */
+void *mmap(void *addr, __SIZE_TYPE__ len, int prot, int flags, int fd, long off) {
+    /* The emulated device keeps its transfer area in a memfd. libbinder maps it
+     * read-only, but replies have to be written into it, so ask for write
+     * permission on the device fd only. */
+    if (fd >= 0) {
+        prot = __pengudroid_binder_mmap_prot(fd, prot);
+    }
+    long r = syscall(PD_SYS_MMAP, addr, len, prot, flags, fd, off);
+    if (fd >= 0) {
+        __pengudroid_binder_mapping(fd, (void *)r, (unsigned long)len);
+    }
+    return (void *)r;
+}
+
+void *mmap64(void *addr, __SIZE_TYPE__ len, int prot, int flags, int fd, long off) {
+    return mmap(addr, len, prot, flags, fd, off);
+}
 "#;
 
 /// Every symbol this translation unit defines.
 #[allow(dead_code)]
-pub const C_SYMBOLS: &[&str] = &["open", "open64", "openat", "openat64", "ioctl"];
+pub const C_SYMBOLS: &[&str] = &[
+    "open",
+    "open64",
+    "openat",
+    "openat64",
+    "ioctl",
+    "mmap",
+    "mmap64",
+];
 
 /// The translation unit `build.rs` compiles.
 #[allow(dead_code)]

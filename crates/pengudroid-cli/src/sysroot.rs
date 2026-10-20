@@ -851,6 +851,9 @@ pub fn art_main(args: &[String]) -> i32 {
                 eprintln!("art: unexpected JNI version; the function table is misaligned");
                 return 1;
             }
+            if let Ok(name) = std::env::var("PENGUDROID_PROBE_SERVICE") {
+                probe_service(&env, &name);
+            }
             if let Some(class) = main_class {
                 return run_main(&env, &class, &app_args);
             }
@@ -1473,6 +1476,53 @@ unsafe fn install_findclass_tracer(env: *mut c_void) {
 ///
 /// The class name may be written in either slash or dot form; JNI wants the
 /// slash form with an `L...;` wrapper.
+/// Call `android.os.ServiceManager.getService(name)` and report the result.
+///
+/// Verifies that the binder bridge answered `checkService` with a real handle,
+/// independently of whatever else `ActivityThread.main` does.
+fn probe_service(env: &crate::jni::JniEnv, name: &str) {
+    // Handle 0 is the context object; if this returns a proxy, the
+    // BinderProxy creation path itself works and a null from getService is
+    // specific to the handle we returned.
+    if let Some(klass) = env.find_class("com/android/internal/os/BinderInternal") {
+        match env.static_method_id(klass, "getContextObject", "()Landroid/os/IBinder;") {
+            Some(m) => match env.call_static_object(klass, m, &[]) {
+                Some(o) if o.is_null() => println!("art: getContextObject() = null"),
+                Some(_) => println!("art: getContextObject() = non-null"),
+                None => {
+                    println!("art: getContextObject() threw");
+                    env.describe_exception();
+                }
+            },
+            None => println!("art: BinderInternal.getContextObject not found"),
+        }
+    } else {
+        println!("art: BinderInternal not found");
+    }
+    let Some(klass) = env.find_class("android/os/ServiceManager") else {
+        eprintln!("art: ServiceManager not found");
+        return;
+    };
+    let Some(method) = env.static_method_id(
+        klass,
+        "getService",
+        "(Ljava/lang/String;)Landroid/os/IBinder;",
+    ) else {
+        eprintln!("art: ServiceManager.getService not found");
+        return;
+    };
+    let s = env.new_string(name);
+    let args = [crate::jni::JValue { l: s }];
+    match env.call_static_object(klass, method, &args) {
+        Some(obj) if obj.is_null() => println!("art: getService({name}) = null"),
+        Some(_) => println!("art: getService({name}) = non-null"),
+        None => {
+            println!("art: getService({name}) threw");
+            env.describe_exception();
+        }
+    }
+}
+
 fn run_main(env: &crate::jni::JniEnv, class: &str, args: &[String]) -> i32 {
     let descriptor = format!("L{};", class.replace('.', "/"));
     let Some(klass) = env

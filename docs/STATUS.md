@@ -53,28 +53,48 @@ art: invoking android.app.ActivityThread.main with 0 argument(s)
    `this->mArgv0` üzerinden null deref yapıyordu. Shim bu sembolü (PLT üzerinden
    geliyor) interpose edip yalnızca thread adını ayarlıyor.
 
-**Sıradaki adım:** binder. `ProcessState` `/dev/binder`'ı açamayınca `LOG(FATAL)`
-ile süreci öldürüyordu. Bu adım artık geçildi: shim `/dev/binder`'ı (ve
-`hwbinder`/`vndbinder`) `memfd` tabanlı bir aygıt olarak sunuyor,
-`BINDER_VERSION` → 8, `SET_MAX_THREADS`/`SET_CONTEXT_MGR`/`THREAD_EXIT` → 0
-dönüyor, `mmap` memfd üzerinde çalışıyor. Transaction (`BINDER_WRITE_READ`)
-şimdilik `EINVAL` dönüyor; `libbinder` bunu düzgün bir Java hatasına çeviriyor:
-```
-java.lang.IllegalArgumentException
-  at android.os.BinderProxy.transactNative(Native Method)
-  at android.os.IServiceManager$Stub$Proxy.checkService(...)
-  at android.app.ActivityThread.attach(ActivityThread.java:7610)
-  at android.app.ActivityThread.main(ActivityThread.java:7911)
-art: android.app.ActivityThread.main threw
-```
-Yani native abort/segfault yok; `ActivityThread.main` baştan sona çalışıp
-`system_server` sınırında temiz bir Java istisnasıyla duruyor.
+**Binder köprüsü — ÇALIŞIYOR (ilk aşama).**
 
-**Sıradaki adım (binder broker):** `BINDER_WRITE_READ`'i gerçekten emüle etmek —
-`BC_TRANSACTION`/`BR_REPLY`, `flat_binder_object` marshalling'i ve daemon'ın
-kullanıcı-uzayı servis tablosu. İlk hedef `IServiceManager.checkService` /
-`getService` çağrılarına cevap vermek, böylece AMS proxy'si gerçek bir handle
-alır.
+- Shim `/dev/binder` (ve `hwbinder`/`vndbinder`) için `memfd` tabanlı bir aygıt
+  sunuyor; `BINDER_VERSION` → 8, `SET_MAX_THREADS`/`SET_CONTEXT_MGR`/`THREAD_EXIT`
+  kabul, `mmap` çalışıyor (shim `PROT_WRITE` ekliyor, çünkü yanıtları aynı
+  eşlemeye yazıyor).
+- `BINDER_WRITE_READ` yazma tamponunu ayrıştırıyor (`BC_TRANSACTION`,
+  `BC_FREE_BUFFER`, ref-count komutları, `BC_ENTER_LOOPER`) ve her senkron
+  transaction için `BR_TRANSACTION_COMPLETE` + `BR_REPLY` üretiyor. Yanıt
+  parcel'ı libbinder'ın transfer alanına (mmap) yazılıyor.
+- Hizmet yöneticisi (`handle 0`) `checkService`/`getService` çağrıları
+  yanıtlanıyor: parcel = AIDL durum sözcüğü (0) + `flat_binder_object`
+  (tip `0x73682a85`, handle) + **stability** alanı. Handle'lar isme göre sabit.
+
+İki ince ABI ayrıntısı keşfedilerek çözüldü (ikisi de artık kodda yorumlu):
+
+1. `flat_binder_object.type` `0x73682a85`'tir (`B_PACK_CHARS('s','h','*',0x85)`),
+   `0x…0002` değil; değer libbinder'ın kendi karşılaştırmalarından okundu.
+2. Nesneden **hemen sonra** bir stability alanı gelir ve
+   `Parcel::finishUnflattenBinder` onu okur. libbinder yalnızca `3` (vendor),
+   `0xc` (system), `0x3f` bitmask'lerini kabul eder; `0` → "Can only set known
+   stability", `3` → "Cannot do a user transaction on a vendor stability
+   binder ... in a system stability context". Doğru değer **`0xc`**.
+
+Sonuç:
+```
+art: registered 150/150 (0 missing)
+art: invoking android.app.ActivityThread.main
+[pengudroid:log] ERROR ProcessState: Binder driver /dev/binder is unavailable...
+(12 saniye boyunca canlı kalıyor; rc=124 = timeout)
+```
+Yani `ServiceManager.getService("activity")` non-null bir `BinderProxy`
+döndürüyor, `IActivityManager.attachApplication` transaction'ı kabul ediliyor ve
+`ActivityThread.main` `attach()`'i tamamlayıp **`Looper.loop()`'a giriyor** —
+gerçek bir app süreci gibi, `system_server`'dan `bindApplication` bekleyerek.
+
+**Sıradaki adım:** uygulamayı gerçekten başlatmak için sunucu tarafını taklit
+etmek: `attachApplication` sonrası `bindApplication` çağrısını (uygulama
+bilgisi parcel'ı ile) uygulamaya iletmek ve AMS/PMS'in temel sorgularını
+(`getPackageInfo`, `getActivityInfo`, ...) yanıtlamak. Bu, `system_server`
+semantiğinin başlangıcı; daemon'daki kullanıcı-uzayı broker'ı burada devreye
+girecek.
 
 ### Beach Buggy Racing 2 (`com.vectorunit.cobalt`, .apkm) — AÇILMIYOR
 - Bundle sorunsuz açılıyor (36 split, 37 native lib, arm64-v8a + armeabi-v7a,
