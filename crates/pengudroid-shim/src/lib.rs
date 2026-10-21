@@ -3491,6 +3491,32 @@ unsafe fn dlsym_next<T: Copy>(name: &[u8]) -> Option<T> {
     }
 }
 
+/// `setpriority(which, who, prio)` — a scheduling hint, not a contract.
+///
+/// Android raises `RLIMIT_NICE` to 40 for app processes, so
+/// `Process.setThreadPriority` can lower a thread's nice value (raise its
+/// priority) without `CAP_SYS_NICE`. A desktop session normally has
+/// `RLIMIT_NICE = 0`, and the hard limit cannot be raised without root, so the
+/// same call fails with `EACCES`; the framework turns that into a
+/// `SecurityException` and `HandlerThread.run` dies on it (NewPipe's ACRA
+/// thread hits exactly this). The guest only ever asks for a hint, so a refused
+/// change is reported as success.
+#[no_mangle]
+pub unsafe extern "C" fn setpriority(which: c_int, who: libc::id_t, prio: c_int) -> c_int {
+    type SetPriority = unsafe extern "C" fn(c_int, libc::id_t, c_int) -> c_int;
+    let Some(real) = dlsym_next::<SetPriority>(b"setpriority\0") else {
+        return -1;
+    };
+    if real(which, who, prio) == 0 {
+        return 0;
+    }
+    let err = *libc::__errno_location();
+    if err == libc::EACCES || err == libc::EPERM {
+        return 0;
+    }
+    -1
+}
+
 // ---------------------------------------------------------------------------
 // Destructor suppression
 // ---------------------------------------------------------------------------

@@ -1618,6 +1618,12 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) {
     ] {
         let _ = std::fs::create_dir_all(&dir);
     }
+    // `StatFs("/data")` is how apps ask for the free space on the data
+    // partition; the shim maps `/data` into the sysroot, so the directory has to
+    // exist or `statvfs` fails with ENOENT and the app sees "Invalid path".
+    if let Some(root) = std::env::var_os("PENGUDROID_ROOT") {
+        let _ = std::fs::create_dir_all(std::path::Path::new(&root).join("data"));
+    }
     // `System.loadLibrary` resolves through `ApplicationInfo.nativeLibraryDir`,
     // so the APK's own `lib/<abi>/*.so` have to exist on disk there. Without
     // this every `native*` method is an UnsatisfiedLinkError (Roblox's
@@ -1648,6 +1654,7 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) {
         target_sdk: info.target_sdk.map(|v| v as i32).unwrap_or(35),
         min_sdk: info.min_sdk.map(|v| v as i32).unwrap_or(23),
         app_class: info.application_class.as_deref(),
+        providers: &info.providers,
         // `ActivityInfo.theme` decides whether AppCompat accepts the activity:
         // with no theme the framework falls back to the platform default and
         // `setContentView` throws "You need to use a Theme.AppCompat theme".

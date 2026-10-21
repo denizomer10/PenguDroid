@@ -72,7 +72,41 @@ işleniyor (cevap parcel'i atılıyor). `display_event_connection` code 3'te
 (216 bayt: `Header{type,displayId,timestamp}` + `VSync{count,VsyncEventData}`,
 `frameInterval` 16.67 ms). Böylece `Choreographer` ilk kareyi alıyor.
 
-### Şu anki tam durak noktası (SIGSEGV)
+### NewPipe: layout inflate ediliyor, Activity onCreate'de duruyor
+
+Bu turda NewPipe için düzeltilenler:
+
+* **`setpriority` reddi.** Android uygulama süreçlerine `RLIMIT_NICE=40` verir;
+  masaüstünde `(0,0)` olduğu için `Process.setThreadPriority` `EACCES` alıp
+  `SecurityException` atıyor ve `HandlerThread.run` ölüyordu. Shim artık
+  reddedilen nice değişikliğini kabul ediyor (yalnızca bir ipucu).
+* **`IContentProvider` çift statü kelimesi.** `make_reply` zaten statüyü
+  yazıyordu, `provider_reply` bir tane daha yazıyordu; `readBundle` fazladan
+  sıfırı uzunluk sanıp boş `Bundle` döndürüyordu. Bu yüzden
+  `Settings.NameValueCache.getStringsForPrefix` null map üzerinde NPE atıyordu.
+* **ContentProvider kurulumu.** `AppBindData.providers` boştu, yani
+  `androidx.startup.InitializationProvider` hiç çalışmıyordu ve WorkManager
+  "not initialized properly" diyordu. Manifest'in `<provider>` girdileri artık
+  `ProviderInfo` olarak geçiliyor (`grantUriPermissions` ve `<meta-data>` dahil).
+* **`IPackageManager.getProviderInfo`** (code 15) cevaplanıyor; istek parceli
+  sınıf adıyla eşleştiriliyor (parcel `[token][ComponentName][flags][userId]`
+  olduğu için "son String16" yaklaşımı çalışmıyor).
+* **`PackageInfo.signingInfo`** artık boş bir `SigningInfo` (ACRA ve Play
+  Integrity null kontrolü yapmıyor).
+* **`statvfs`/`statfs`** shim'de interpose edildi: `StatFs("/data")`
+  `SQLiteGlobal.getDefaultPageSize` içinde her veritabanı açılışında çağrılıyor
+  ve yol çevrilmediği için "Invalid path: /data" atıyordu.
+* **`ResourcesManager.applyConfigurationToResources`** doğru imzayla
+  (`getInstance()` + instance metodu, `Z` dönüşü) çağrılıyor.
+
+Kalan durak: `MainActivity.onCreate` içinde
+`LocaleListPlatformWrapper.get(0)` → `mLocaleList` null. Activity'nin kendi
+`Resources`'u `ResourcesManager`'dan geliyor ve o `Configuration`'ın locale
+listesi hâlâ null. Sıradaki adım: `ActivityClientRecord.overrideConfig`'in
+gerçekten kullanıldığını doğrulamak ya da `Configuration.mSeq`'i artırıp
+`applyConfigurationToResources`'ın config'i gerçekten yaymasını sağlamak.
+
+### Roblox: şu anki tam durak noktası (SIGSEGV)
 
 ```
 rbx.JNIRobloxSettings: Setting default app policy file: content/guac/...GlobalDist.json

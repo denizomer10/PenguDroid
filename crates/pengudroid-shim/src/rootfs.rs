@@ -176,6 +176,7 @@ type AccessAtFn = unsafe extern "C" fn(c_int, *const c_char, c_int, c_int) -> c_
 type ReadlinkFn = unsafe extern "C" fn(*const c_char, *mut c_char, usize) -> isize;
 type ReadlinkAtFn = unsafe extern "C" fn(c_int, *const c_char, *mut c_char, usize) -> isize;
 type OpenDirFn = unsafe extern "C" fn(*const c_char) -> *mut c_void;
+type StatVfsFn = unsafe extern "C" fn(*const c_char, *mut c_void) -> c_int;
 type FopenFn = unsafe extern "C" fn(*const c_char, *const c_char) -> *mut c_void;
 type FreopenFn = unsafe extern "C" fn(*const c_char, *const c_char, *mut c_void) -> *mut c_void;
 type RealpathFn = unsafe extern "C" fn(*const c_char, *mut c_char) -> *mut c_char;
@@ -308,6 +309,47 @@ pub unsafe extern "C" fn readlinkat(
 ) -> isize {
     match next::<ReadlinkAtFn>(b"readlinkat\0") {
         Some(f) => with_path(path, |p| f(dirfd, p, buf, size)),
+        None => -1,
+    }
+}
+
+/// `statvfs(path, buf)`.
+///
+/// `StatFs("/data")` is how the framework asks for the free space on the data
+/// partition (`SQLiteGlobal.getDefaultPageSize` does it on every database
+/// open). Without the rewrite the path does not exist on the host and the
+/// framework throws "Invalid path: /data".
+#[no_mangle]
+pub unsafe extern "C" fn statvfs(path: *const c_char, buf: *mut c_void) -> c_int {
+    match next::<StatVfsFn>(b"statvfs\0") {
+        Some(f) => with_path(path, |p| f(p, buf)),
+        None => -1,
+    }
+}
+
+/// `statvfs64(path, buf)`.
+#[no_mangle]
+pub unsafe extern "C" fn statvfs64(path: *const c_char, buf: *mut c_void) -> c_int {
+    match next::<StatVfsFn>(b"statvfs64\0") {
+        Some(f) => with_path(path, |p| f(p, buf)),
+        None => -1,
+    }
+}
+
+/// `statfs(path, buf)` — the raw syscall wrapper, which `Os.statfs` uses.
+#[no_mangle]
+pub unsafe extern "C" fn statfs(path: *const c_char, buf: *mut c_void) -> c_int {
+    match next::<StatVfsFn>(b"statfs\0") {
+        Some(f) => with_path(path, |p| f(p, buf)),
+        None => -1,
+    }
+}
+
+/// `statfs64(path, buf)`.
+#[no_mangle]
+pub unsafe extern "C" fn statfs64(path: *const c_char, buf: *mut c_void) -> c_int {
+    match next::<StatVfsFn>(b"statfs64\0") {
+        Some(f) => with_path(path, |p| f(p, buf)),
         None => -1,
     }
 }

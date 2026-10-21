@@ -54,6 +54,7 @@ mod slot {
     pub const GET_METHOD_ID: usize = 33;
     pub const CALL_OBJECT_METHOD_A: usize = 36;
     pub const CALL_INT_METHOD_A: usize = 51;
+    pub const CALL_BOOLEAN_METHOD_A: usize = 39;
     pub const NEW_OBJECT_A: usize = 30;
     pub const GET_FIELD_ID: usize = 94;
     pub const GET_OBJECT_FIELD: usize = 95;
@@ -253,6 +254,14 @@ impl JniEnv {
             unsafe { self.func(slot::CALL_VOID_METHOD_A) };
         unsafe { f(self.0, obj, method, args.as_ptr()) };
         self.exception_check()
+    }
+
+    /// `CallBooleanMethodA(obj, method, args)`.
+    pub fn call_boolean(&self, obj: JObject, method: JMethodId, args: &[JValue]) -> Option<bool> {
+        let f: unsafe extern "C" fn(*mut c_void, JObject, JMethodId, *const JValue) -> u8 =
+            unsafe { self.func(slot::CALL_BOOLEAN_METHOD_A) };
+        let v = unsafe { f(self.0, obj, method, args.as_ptr()) };
+        self.exception_check().then_some(v != 0)
     }
 
     /// `CallIntMethodA(obj, method, args)`.

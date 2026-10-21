@@ -144,6 +144,13 @@ const IPM_GET_APPLICATION_INFO: u32 = 9;
 /// the platform theme, which is not an AppCompat theme.
 const IPM_GET_ACTIVITY_INFO: u32 = 11;
 
+/// `IPackageManager` transaction code for `getProviderInfo`.
+///
+/// `androidx.startup.InitializationProvider.onCreate` reads its own
+/// `ProviderInfo.metaData` to find the initializer list, so this has to answer
+/// with the entry the host marshalled for that class.
+const IPM_GET_PROVIDER_INFO: u32 = 15;
+
 /// `IActivityTaskManager` transaction code for `getActivityClientController`.
 ///
 /// `ActivityClient.getDisplayId` calls it through a `Singleton`; with no system
@@ -305,6 +312,11 @@ static APPLICATION_INFO: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
 /// A serialized `ActivityInfo`, for `IPackageManager.getActivityInfo`.
 static ACTIVITY_INFO: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// Marshalled `ProviderInfo`s, keyed by class name.
+static PROVIDER_ENTRIES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
 
 /// `flat_binder_object.type` for a handle that belongs to another process.
 ///
@@ -557,8 +569,10 @@ fn push_flat_fd(parcel: &mut Vec<u8>, objects: &mut Vec<u64>, fd: RawFd) {
 /// `ContentProviderNative.onTransact` and `ContentProviderProxy` in this
 /// framework.jar, not from guesswork.
 fn provider_reply(code: u32, parcel: &mut Vec<u8>, objects: &mut Vec<u64>) {
-    // Every non-oneway method starts with `writeNoException()`.
-    parcel.extend_from_slice(&0u32.to_ne_bytes());
+    // The status word was already written by `make_reply`; writing another one
+    // here shifts every result by four bytes, which turns the `call` reply's
+    // `Bundle` into an empty one (`readBundle` reads the extra zero as a length)
+    // and makes `Settings.NameValueCache.getStringsForPrefix` NPE on a null map.
     match code {
         ICP_QUERY => {
             // `[presence=1][BulkCursorDescriptor]`. The descriptor is
@@ -806,6 +820,12 @@ fn vsync_channel() -> Option<(RawFd, RawFd)> {
     Some((fds[0], fds[1]))
 }
 
+/// Whether `data` contains `s` encoded as UTF-16LE (a `String16` payload).
+fn parcel_contains_utf16(data: &[u8], s: &str) -> bool {
+    let needle: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    !needle.is_empty() && data.windows(needle.len()).any(|w| w == needle.as_slice())
+}
+
 /// Reverse lookup of a handle, for diagnostics.
 fn name_for_handle(handle: u32) -> Option<String> {
     let map = SERVICE_HANDLES.lock().unwrap_or_else(|e| e.into_inner());
@@ -1023,6 +1043,33 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
     }
     if tr.target_handle == handle_for("window_session") {
         window_session_reply(tr.code, &mut parcel, &mut objects);
+    }
+    if tr.target_handle == handle_for("package") && tr.code == IPM_GET_PROVIDER_INFO {
+        // The request is `[interface token][ComponentName][flags][userId]`, so
+        // the class name is not the last thing in the parcel. Match the parcel
+        // against the names we installed instead of trying to parse it.
+        let data = if tr.data_size > 0 && tr.data_ptr != 0 {
+            Some(std::slice::from_raw_parts(
+                tr.data_ptr as *const u8,
+                tr.data_size as usize,
+            ))
+        } else {
+            None
+        };
+        let entry = data.and_then(|data| {
+            let entries = PROVIDER_ENTRIES.lock().unwrap_or_else(|e| e.into_inner());
+            entries
+                .iter()
+                .find(|(name, _)| parcel_contains_utf16(data, name))
+                .map(|(_, bytes)| bytes.clone())
+        });
+        if let Some(bytes) = entry {
+            parcel.extend_from_slice(&1u32.to_ne_bytes());
+            parcel.extend_from_slice(&bytes);
+            if trace_enabled() {
+                diag(&format!("[binder]   -> ProviderInfo ({} bytes)\n", bytes.len()));
+            }
+        }
     }
     if tr.target_handle == handle_for("package") && tr.code == IPM_GET_ACTIVITY_INFO {
         let cached = ACTIVITY_INFO.lock().unwrap_or_else(|e| e.into_inner());
@@ -1510,6 +1557,29 @@ pub unsafe extern "C" fn __pengudroid_binder_set_application_info(ptr: *const u8
     }
     let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
     *APPLICATION_INFO.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
+}
+
+/// `void __pengudroid_binder_set_provider_entry(const char *name, size_t name_len,
+///                                            const uint8_t *bytes, size_t len)`
+///
+/// # Safety
+/// Both pointers must be readable for their stated lengths.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_provider_entry(
+    name: *const u8,
+    name_len: usize,
+    bytes: *const u8,
+    len: usize,
+) {
+    if name.is_null() || bytes.is_null() || name_len == 0 || len == 0 {
+        return;
+    }
+    let key = String::from_utf8_lossy(std::slice::from_raw_parts(name, name_len)).into_owned();
+    let value = std::slice::from_raw_parts(bytes, len).to_vec();
+    PROVIDER_ENTRIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, value);
 }
 
 /// `void __pengudroid_binder_set_insets_size(int size)`

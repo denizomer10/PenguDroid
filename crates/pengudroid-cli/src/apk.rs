@@ -10,6 +10,16 @@
 
 use miniz_oxide::inflate::decompress_to_vec;
 
+/// A `<meta-data>` value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetaValue {
+    Str(String),
+    Int(i32),
+    Bool(bool),
+    /// `android:resource` — a resource id.
+    Ref(u32),
+}
+
 /// A declared Android component (`activity`, `service`, ...).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Component {
@@ -21,6 +31,13 @@ pub struct Component {
     pub is_launcher: bool,
     /// `android:theme` as a resource id, when the manifest names one.
     pub theme: Option<u32>,
+    /// `android:authorities` of a `<provider>` (a `;`-separated list is kept
+    /// verbatim, which is what `ProviderInfo.authority` expects).
+    pub authority: Option<String>,
+    /// `android:grantUriPermissions` of a `<provider>`.
+    pub grant_uri_permissions: bool,
+    /// The component's `<meta-data>` children.
+    pub meta: Vec<(String, MetaValue)>,
 }
 
 /// Everything PenguDroid extracts from a manifest.
@@ -37,6 +54,8 @@ pub struct ApkInfo {
     pub application_class: Option<String>,
     /// `android:theme` of `<application>` as a resource id.
     pub application_theme: Option<u32>,
+    /// `<meta-data>` children of `<application>`.
+    pub application_meta: Vec<(String, MetaValue)>,
     pub activities: Vec<Component>,
     pub services: Vec<Component>,
     pub receivers: Vec<Component>,
@@ -389,6 +408,26 @@ fn attr_int(pool: &[String], attrs: &[Attr], want: &str) -> Option<u32> {
     parse_sdk_number(&as_str)
 }
 
+/// Read a `<meta-data>` value: `android:value` (string, int, boolean) or
+/// `android:resource` (a resource id).
+fn attr_meta_value(pool: &[String], attrs: &[Attr]) -> Option<MetaValue> {
+    if let Some(a) = attrs.iter().find(|a| a.name == "value") {
+        return Some(match a.typed_type {
+            TYPE_STRING => MetaValue::Str(pool_get(pool, a.typed_data).unwrap_or_default()),
+            TYPE_INT_DEC | TYPE_INT_HEX => MetaValue::Int(a.typed_data as i32),
+            TYPE_INT_BOOLEAN => MetaValue::Bool(a.typed_data != 0),
+            _ => match &a.raw {
+                Some(raw) => MetaValue::Str(raw.clone()),
+                None => MetaValue::Str(pool_get(pool, a.typed_data).unwrap_or_default()),
+            },
+        });
+    }
+    attrs
+        .iter()
+        .find(|a| a.name == "resource")
+        .map(|a| MetaValue::Ref(a.typed_data))
+}
+
 /// Read an attribute's value as a resource reference (typed `0x01`).
 ///
 /// `android:theme` is always a reference to a style in the APK's resources, so
@@ -471,6 +510,13 @@ struct Frame {
     is_intent: bool,
     intent_main: bool,
     intent_launcher: bool,
+    /// This frame is `<application>`.
+    is_application: bool,
+    /// `<meta-data>` name and value, set on a `meta-data` frame.
+    meta_name: Option<String>,
+    meta_value: Option<MetaValue>,
+    /// `<meta-data>` collected from this frame's children.
+    meta: Vec<(String, MetaValue)>,
 }
 
 /// Parse binary Android XML (as found in `AndroidManifest.xml`).
@@ -527,6 +573,7 @@ pub fn parse_axml(data: &[u8]) -> Result<ApkInfo, String> {
                         }
                     }
                     "application" => {
+                        frame.is_application = true;
                         // A label that is a resource reference is not resolvable
                         // here, so only inline strings are kept.
                         info.label = attr_str(&pool, &attrs, "label");
@@ -551,6 +598,10 @@ pub fn parse_axml(data: &[u8]) -> Result<ApkInfo, String> {
                             exported: explicit.unwrap_or(false),
                             is_launcher: false,
                             theme: attr_ref(&attrs, "theme"),
+                            authority: attr_str(&pool, &attrs, "authorities"),
+                            grant_uri_permissions: attr_bool(&attrs, "grantUriPermissions")
+                                .unwrap_or(false),
+                            meta: Vec::new(),
                         };
                         let idx = match kind {
                             CompKind::Activity => {
@@ -578,6 +629,10 @@ pub fn parse_axml(data: &[u8]) -> Result<ApkInfo, String> {
                     "intent-filter" => {
                         frame.is_intent = true;
                     }
+                    "meta-data" => {
+                        frame.meta_name = attr_str(&pool, &attrs, "name");
+                        frame.meta_value = attr_meta_value(&pool, &attrs);
+                    }
                     "action" => {
                         if let Some(top) = stack.last_mut() {
                             if attr_str(&pool, &attrs, "name").as_deref()
@@ -602,6 +657,14 @@ pub fn parse_axml(data: &[u8]) -> Result<ApkInfo, String> {
             }
             RES_XML_END_ELEMENT_TYPE => {
                 let Some(frame) = stack.pop() else { continue };
+
+                // A `<meta-data>` child belongs to its enclosing component or
+                // to `<application>`.
+                if let (Some(name), Some(value)) = (frame.meta_name.clone(), frame.meta_value.clone()) {
+                    if let Some(parent) = stack.last_mut() {
+                        parent.meta.push((name, value));
+                    }
+                }
 
                 // Closing an intent-filter marks its enclosing component.
                 if frame.is_intent {
@@ -646,6 +709,16 @@ pub fn parse_axml(data: &[u8]) -> Result<ApkInfo, String> {
                             CompKind::Service => {}
                         }
                     }
+                    // Hand the collected `<meta-data>` to the component.
+                    match kind {
+                        CompKind::Activity => info.activities[idx].meta = frame.meta.clone(),
+                        CompKind::Service => info.services[idx].meta = frame.meta.clone(),
+                        CompKind::Receiver => info.receivers[idx].meta = frame.meta.clone(),
+                        CompKind::Provider => info.providers[idx].meta = frame.meta.clone(),
+                    }
+                }
+                if frame.is_application {
+                    info.application_meta = frame.meta.clone();
                 }
             }
             // Resource map, namespaces, etc. carry no information we need.

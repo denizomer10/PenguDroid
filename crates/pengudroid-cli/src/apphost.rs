@@ -35,6 +35,14 @@ pub struct AppSpec<'a> {
     /// instantiate a plain `android.app.Application`, so the app's own
     /// `onCreate` (where Roblox loads its native library) never runs.
     pub app_class: Option<&'a str>,
+    /// The manifest's `<provider>` entries.
+    ///
+    /// `handleBindApplication` calls `installContentProviders(app, providers)`,
+    /// and that is how `androidx.startup.InitializationProvider` runs — which is
+    /// what initialises WorkManager, EmojiCompat and friends. With an empty list
+    /// every one of those stays uninitialised and the app dies on
+    /// "WorkManager is not initialized properly".
+    pub providers: &'a [crate::apk::Component],
     /// `android:theme` resource id for the launched activity, if the manifest
     /// declares one (the activity's own, else the application's).
     pub theme: Option<u32>,
@@ -126,6 +134,18 @@ fn new_configuration(env: &JniEnv) -> Option<JObject> {
         if let Some(m) = env.method_id(class, "setLocales", "(Landroid/os/LocaleList;)V") {
             env.call_void(config, m, &[JValue { l: loc }]);
         }
+        // `Resources` builds its own `Configuration` from the process default,
+        // and `ConfigurationCompat.getLocales(...)` NPEs when that one's locale
+        // list is null (NewPipe's `Localization.getAppLocale`).
+        if let Some(list_class) = env.find_class("android/os/LocaleList") {
+            if let Some(m) = env.static_method_id(
+                list_class,
+                "setDefault",
+                "(Landroid/os/LocaleList;)V",
+            ) {
+                env.call_static_void(list_class, m, &[JValue { l: loc }]);
+            }
+        }
     }
     // `setToDefaults()` leaves `densityDpi` at DPI_UNDEFINED (0), which makes
     // `DisplayMetrics.scaledDensity` zero -- and then every `sp` dimension
@@ -161,6 +181,112 @@ fn locale_list(env: &JniEnv) -> Option<JObject> {
     let array = env.new_object_array(1, arr_class, std::ptr::null_mut())?;
     env.set_object_array_element(array, 0, locale);
     env.new_object(list_class, list_ctor, &[JValue { l: array }])
+}
+
+/// Give the app's `Resources` a usable `Configuration`.
+///
+/// `Resources` keeps its own `Configuration` instance, separate from the one in
+/// `AppBindData`, and `ConfigurationCompat.getLocales(...)` NPEs when that
+/// instance's locale list is null (NewPipe's `Localization.getAppLocale`).
+fn fix_app_configuration(env: &JniEnv, data: JObject) {
+    let Some(bind_class) = env.find_class("android/app/ActivityThread$AppBindData") else {
+        return;
+    };
+    let Some(info_field) = env.field_id(bind_class, "info", "Landroid/app/LoadedApk;") else {
+        return;
+    };
+    let loaded_apk = env.object_field(data, info_field);
+    if loaded_apk.is_null() {
+        return;
+    }
+    let Some(apk_class) = env.find_class("android/app/LoadedApk") else {
+        return;
+    };
+    let Some(get_res) = env.method_id(
+        apk_class,
+        "getResources",
+        "()Landroid/content/res/Resources;",
+    ) else {
+        return;
+    };
+    let Some(res) = env.call_object(loaded_apk, get_res, &[]) else {
+        return;
+    };
+    if res.is_null() {
+        return;
+    }
+    let Some(res_class) = env.find_class("android/content/res/Resources") else {
+        return;
+    };
+    let Some(get_cfg) = env.method_id(
+        res_class,
+        "getConfiguration",
+        "()Landroid/content/res/Configuration;",
+    ) else {
+        return;
+    };
+    let Some(cfg) = env.call_object(res, get_cfg, &[]) else {
+        return;
+    };
+    if cfg.is_null() {
+        return;
+    }
+    let Some(cfg_class) = env.find_class("android/content/res/Configuration") else {
+        return;
+    };
+    if let Some(loc) = locale_list(env) {
+        if let Some(m) = env.method_id(cfg_class, "setLocales", "(Landroid/os/LocaleList;)V") {
+            env.call_void(cfg, m, &[JValue { l: loc }]);
+        } else {
+            eprintln!("apphost: Configuration.setLocales missing");
+        }
+    } else {
+        eprintln!("apphost: cannot build a LocaleList");
+    }
+    if let Some(get_locales) = env.method_id(
+        cfg_class,
+        "getLocales",
+        "()Landroid/os/LocaleList;",
+    ) {
+        let locales = env.call_object(cfg, get_locales, &[]);
+        match locales {
+            Some(l) if !l.is_null() => println!("apphost: app Resources locales = ok"),
+            _ => eprintln!("apphost: app Resources locales = NULL"),
+        }
+    }
+    if let Some(id) = env.field_id(cfg_class, "densityDpi", "I") {
+        env.set_int_field(cfg, id, 420);
+    }
+    // `ResourcesManager` keeps a process-wide configuration that every new
+    // `Resources` is built from; the system server normally pushes it with
+    // `applyConfigurationToResources`. Without it the activity's own
+    // `Resources` gets a bare `Configuration` whose locale list is null.
+    if let Some(rm_class) = env.find_class("android/app/ResourcesManager") {
+        // `applyConfigurationToResources` is an *instance* method returning
+        // boolean; the singleton comes from `ResourcesManager.getInstance()`.
+        if let (Some(get_instance), Some(apply)) = (
+            env.static_method_id(
+                rm_class,
+                "getInstance",
+                "()Landroid/app/ResourcesManager;",
+            ),
+            env.method_id(
+                rm_class,
+                "applyConfigurationToResources",
+                "(Landroid/content/res/Configuration;Landroid/content/res/CompatibilityInfo;)Z",
+            ),
+        ) {
+            if let Some(rm) = env.call_static_object(rm_class, get_instance, &[]) {
+                let compat = system_compat_info(env).unwrap_or(std::ptr::null_mut());
+                if env.call_boolean(rm, apply, &[JValue { l: cfg }, JValue { l: compat }]).is_some() {
+                    println!("apphost: applied the configuration to ResourcesManager");
+                } else {
+                    eprintln!("apphost: applyConfigurationToResources threw");
+                }
+            }
+        }
+    }
+    println!("apphost: patched the app Resources configuration");
 }
 
 /// Print how many families `Typeface`'s system font map holds.
@@ -464,6 +590,7 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         eprintln!("apphost: cannot build provider list");
         return false;
     };
+    install_provider_list(env, providers, app_info, spec);
     // `LoadedApk` needs a CompatibilityInfo. There is no public constant or
     // constructor to build one in this release, so borrow the system's:
     // `ActivityThread.currentActivityThread().getSystemContext()` exposes the
@@ -558,6 +685,7 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
             probe_app_class(env, data, &name);
         }
         report_display_metrics(env);
+        fix_app_configuration(env, data);
         report_application(env, thread);
         if let Ok(name) = std::env::var("PENGUDROID_LOAD_LIB") {
             probe_load_library(env, &name);
@@ -878,6 +1006,13 @@ fn launch_activity(
     set("activityInfo", "Landroid/content/pm/ActivityInfo;", activity_info);
     set("intent", "Landroid/content/Intent;", intent);
     set("packageInfo", "Landroid/app/LoadedApk;", loaded_apk);
+    // The activity gets its own `Resources`, built from this override
+    // configuration. Leaving it null makes `ResourcesManager` fall back to a
+    // bare `Configuration` whose locale list is null, and
+    // `ConfigurationCompat.getLocales(...)` then NPEs.
+    if let Some(config) = new_configuration(env) {
+        set("overrideConfig", "Landroid/content/res/Configuration;", config);
+    }
 
     let Some(handle) = env.method_id(
         thread_class,
@@ -1243,6 +1378,15 @@ fn install_package_manager_replies(env: &JniEnv, app_info: JObject, package: &st
     if let Some(id) = env.field_id(pi_class, "versionCode", "I") {
         env.set_int_field(pi, id, 1);
     }
+    // `PackageInfo.signingInfo` is null unless a package manager fills it in,
+    // and signature checks (`org.acra`, Play Integrity, ...) dereference it
+    // without a null check. A default `SigningInfo` reports "no signatures",
+    // which is the truthful answer for an APK we never verified.
+    if let Some((_, signing)) = new_instance(env, "android/content/pm/SigningInfo") {
+        if let Some(id) = env.field_id(pi_class, "signingInfo", "Landroid/content/pm/SigningInfo;") {
+            env.set_object_field(pi, id, signing);
+        }
+    }
 
     if let Some(data) = marshal_object(env, pi, "android/content/pm/PackageInfo") {
         install_reply(&data, "__pengudroid_binder_set_package_info");
@@ -1395,6 +1539,128 @@ fn shim_symbol(name: &str) -> Option<*mut std::ffi::c_void> {
     } else {
         Some(p)
     }
+}
+
+/// Fill `list` with a `ProviderInfo` for every `<provider>` in the manifest.
+///
+/// `ActivityThread.installContentProviders` walks this list and calls
+/// `provider.attachInfo()` + `provider.onCreate()` for each entry, which is how
+/// `androidx.startup.InitializationProvider` gets to run its initializers.
+fn install_provider_list(env: &JniEnv, list: JObject, app_info: JObject, spec: &AppSpec<'_>) {
+    if spec.providers.is_empty() {
+        return;
+    }
+    let Some(list_class) = env.find_class("java/util/List") else {
+        return;
+    };
+    let Some(add) = env.method_id(list_class, "add", "(Ljava/lang/Object;)Z") else {
+        return;
+    };
+    let Some(pi_class) = env.find_class("android/content/pm/ProviderInfo") else {
+        return;
+    };
+    let mut added = 0usize;
+    for provider in spec.providers {
+        let Some((_, info)) = new_instance(env, "android/content/pm/ProviderInfo") else {
+            continue;
+        };
+        if let Some(id) = env.field_id(pi_class, "name", "Ljava/lang/String;") {
+            env.set_object_field(info, id, env.new_string(&provider.name));
+        }
+        if let Some(id) = env.field_id(pi_class, "packageName", "Ljava/lang/String;") {
+            env.set_object_field(info, id, env.new_string(spec.package));
+        }
+        if let Some(authority) = &provider.authority {
+            if let Some(id) = env.field_id(pi_class, "authority", "Ljava/lang/String;") {
+                env.set_object_field(info, id, env.new_string(authority));
+            }
+        }
+        if let Some(id) = env.field_id(
+            pi_class,
+            "applicationInfo",
+            "Landroid/content/pm/ApplicationInfo;",
+        ) {
+            env.set_object_field(info, id, app_info);
+        }
+        if let Some(id) = env.field_id(pi_class, "exported", "Z") {
+            env.set_boolean_field(info, id, provider.exported);
+        }
+        if let Some(id) = env.field_id(pi_class, "enabled", "Z") {
+            env.set_boolean_field(info, id, true);
+        }
+        if let Some(id) = env.field_id(pi_class, "grantUriPermissions", "Z") {
+            env.set_boolean_field(info, id, provider.grant_uri_permissions);
+        }
+        if let Some(bundle) = build_meta_bundle(env, &provider.meta) {
+            if let Some(id) = env.field_id(pi_class, "metaData", "Landroid/os/Bundle;") {
+                env.set_object_field(info, id, bundle);
+            }
+        }
+        // `androidx.startup.InitializationProvider.onCreate` asks the package
+        // manager for its own `ProviderInfo` to read the initializer list out of
+        // `metaData`; publish the same object under the class name.
+        if let Some(bytes) = marshal_object(env, info, "android/content/pm/ProviderInfo") {
+            install_provider_entry(&provider.name, &bytes);
+        }
+        if env.call_boolean(list, add, &[JValue { l: info }]) == Some(true) {
+            added += 1;
+        }
+    }
+    println!("apphost: queued {added} content providers for install");
+}
+
+/// Build a `Bundle` from a component's `<meta-data>`.
+fn build_meta_bundle(
+    env: &JniEnv,
+    meta: &[(String, crate::apk::MetaValue)],
+) -> Option<JObject> {
+    if meta.is_empty() {
+        return None;
+    }
+    let (bundle_class, bundle) = new_instance(env, "android/os/Bundle")?;
+    let put_string = env.method_id(
+        bundle_class,
+        "putString",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+    );
+    let put_int = env.method_id(bundle_class, "putInt", "(Ljava/lang/String;I)V");
+    let put_bool = env.method_id(bundle_class, "putBoolean", "(Ljava/lang/String;Z)V");
+    for (key, value) in meta {
+        let k = env.new_string(key);
+        match value {
+            crate::apk::MetaValue::Str(s) => {
+                if let Some(m) = put_string {
+                    env.call_void(bundle, m, &[JValue { l: k }, JValue { l: env.new_string(s) }]);
+                }
+            }
+            crate::apk::MetaValue::Int(i) => {
+                if let Some(m) = put_int {
+                    env.call_void(bundle, m, &[JValue { l: k }, JValue { i: *i }]);
+                }
+            }
+            crate::apk::MetaValue::Bool(b) => {
+                if let Some(m) = put_bool {
+                    env.call_void(bundle, m, &[JValue { l: k }, JValue { z: *b as u8 }]);
+                }
+            }
+            crate::apk::MetaValue::Ref(r) => {
+                if let Some(m) = put_int {
+                    env.call_void(bundle, m, &[JValue { l: k }, JValue { i: *r as i32 }]);
+                }
+            }
+        }
+    }
+    Some(bundle)
+}
+
+/// Publish one marshalled `ProviderInfo` under its class name.
+fn install_provider_entry(name: &str, bytes: &[u8]) {
+    let Some(f) = shim_symbol("__pengudroid_binder_set_provider_entry") else {
+        return;
+    };
+    let f: unsafe extern "C" fn(*const u8, usize, *const u8, usize) =
+        unsafe { std::mem::transmute(f) };
+    unsafe { f(name.as_ptr(), name.len(), bytes.as_ptr(), bytes.len()) };
 }
 
 /// Install the replies the `settings` provider needs.
