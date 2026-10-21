@@ -85,6 +85,120 @@ fn bytes_for(desc: &HardwareBufferDesc) -> usize {
     (stride as usize) * (desc.height.max(1) as usize) * (desc.layers.max(1) as usize) * bpp
 }
 
+/// `android::GraphicBufferMapper::GraphicBufferMapper()`.
+///
+/// The real constructor looks up a gralloc mapper (HIDL, via
+/// `hwservicemanager`) and calls `LOG_ALWAYS_FATAL("gralloc-mapper is
+/// missing")` when none is found, which is what kills the render thread inside
+/// `BufferQueueProducer::allocateBuffers`. The singleton's storage is zeroed
+/// `.bss`, so leaving it untouched gives a mapper with a null backend; the next
+/// call tells us which method has to be implemented.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android19GraphicBufferMapperC1Ev(_this: *mut c_void) {
+    if std::env::var_os("PENGUDROID_TRACE_AHB").is_some() {
+        eprintln!("[ahb] GraphicBufferMapper constructed without a gralloc HAL");
+    }
+}
+
+/// `android::GraphicBufferMapper::GraphicBufferMapper()` (complete-object alias).
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android19GraphicBufferMapperC2Ev(this: *mut c_void) {
+    _ZN7android19GraphicBufferMapperC1Ev(this)
+}
+
+/// `android::GraphicBufferAllocator::GraphicBufferAllocator()`.
+///
+/// Same story as the mapper: the real constructor looks up a gralloc allocator
+/// and aborts when it is missing.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android22GraphicBufferAllocatorC1Ev(_this: *mut c_void) {
+    if std::env::var_os("PENGUDROID_TRACE_AHB").is_some() {
+        eprintln!("[ahb] GraphicBufferAllocator constructed without a gralloc HAL");
+    }
+}
+
+/// `android::GraphicBufferAllocator::GraphicBufferAllocator()` (alias).
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android22GraphicBufferAllocatorC2Ev(this: *mut c_void) {
+    _ZN7android22GraphicBufferAllocatorC1Ev(this)
+}
+
+/// `native_handle_t` (system/core/libcutils/include/cutils/native_handle.h).
+#[repr(C)]
+pub struct NativeHandle {
+    pub version: i32,
+    pub num_fds: i32,
+    pub num_ints: i32,
+    pub data: [i32; 8],
+}
+
+/// `android::GraphicBufferAllocator::allocate(w, h, format, layerCount, usage,
+/// outHandle, outStride, outBufferId, requestorName)`.
+///
+/// The real implementation delegates to a gralloc allocator. This one backs the
+/// buffer with a `memfd` and describes it with the classic gralloc0 layout that
+/// `GraphicBuffer` reads back: `data[0]=stride`, `[1]=format`, `[2]=width`,
+/// `[3]=height`, `[4..5]=usage`.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android22GraphicBufferAllocator8allocateEjjijmPPK13native_handlePjmNSt3__112basic_stringIcNS6_11char_traitsIcEENS6_9allocatorIcEEEE(
+    width: u32,
+    height: u32,
+    format: i32,
+    layer_count: u32,
+    usage: u64,
+    out_handle: *mut *const NativeHandle,
+    out_stride: *mut u32,
+    out_buffer_id: *mut u64,
+    _requestor: *mut c_void,
+) -> i32 {
+    if out_handle.is_null() {
+        return -22;
+    }
+    let stride = width.max(1);
+    let bpp: usize = match format {
+        0x16 => 8, // RGBA_F16
+        4 => 2,    // RGB_565
+        _ => 4,
+    };
+    let size = (stride as usize) * (height.max(1) as usize) * (layer_count.max(1) as usize) * bpp;
+    let fd = libc::memfd_create(c"pengudroid-gbuf".as_ptr(), libc::MFD_CLOEXEC);
+    if fd < 0 {
+        return -12;
+    }
+    if libc::ftruncate(fd, size as libc::off_t) != 0 {
+        libc::close(fd);
+        return -12;
+    }
+    let handle = Box::new(NativeHandle {
+        version: std::mem::size_of::<NativeHandle>() as i32,
+        num_fds: 1,
+        num_ints: 6,
+        // `data` holds the fds first, then the ints.
+        data: [
+            fd,
+            stride as i32,
+            format,
+            width as i32,
+            height as i32,
+            usage as u32 as i32,
+            (usage >> 32) as u32 as i32,
+            0,
+        ],
+    });
+    let raw = Box::into_raw(handle);
+    *out_handle = raw;
+    if !out_stride.is_null() {
+        *out_stride = stride;
+    }
+    if !out_buffer_id.is_null() {
+        *out_buffer_id = 0;
+    }
+    if std::env::var_os("PENGUDROID_TRACE_AHB").is_some() {
+        eprintln!("[ahb] allocated {width}x{height} fmt={format} stride={stride} ({size} bytes)");
+    }
+    0
+}
+
 /// `AHardwareBuffer_allocate(desc, out)`.
 #[no_mangle]
 pub unsafe extern "C" fn AHardwareBuffer_allocate(

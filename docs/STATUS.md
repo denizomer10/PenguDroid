@@ -74,10 +74,26 @@ kullandığı beş giriş noktası (`allocate`, `describe`, `acquire`, `release`
 `to_ANativeWindowBuffer`) memfd tabanlı bir `AHardwareBuffer` ile
 uygulanıyor. **Ancak ölçüm şunu gösterdi:** `AHardwareBuffer_allocate` hiç
 çağrılmıyor (`PENGUDROID_TRACE_AHB=1` ile doğrulandı); mapper **libgui/libui
-içinden** isteniyor (hwui bu sembolü import etmiyor). Yani sıradaki adım
-`GraphicBufferMapper::getInstance()`'ı interpose edip kendi mapper nesnemizi
-döndürmek — bu, `GrallocMapper` vtable'ının (`allocate`, `lock`, `unlock`,
-`importBuffer`, `getTransportSize`) uygulanmasını gerektiriyor.
+içinden** isteniyor (hwui bu sembolü import etmiyor).
+
+Aynı dosyada `GraphicBufferMapper` ve `GraphicBufferAllocator` **kurucuları**
+interpose edildi; böylece iki `LOG_ALWAYS_FATAL` ("gralloc-mapper is missing",
+"gralloc-allocator is missing") kalktı. Çökme şimdi `allocateHelper` içinde:
+
+```
+#0 GraphicBufferAllocator::allocateHelper
+#2 GraphicBuffer::initWithSize
+#4 BufferQueueProducer::allocateBuffers
+```
+
+`allocateHelper` `mAllocator`'ı (`this+0x8`) yükleyip **vtable slot 0**'ı
+çağırıyor; `mAllocator` null olduğu için çöküyor. `allocate`'ı interpose etmek
+yetmiyor çünkü `allocate → allocateHelper` çağrısı PLT'den geçmiyor.
+
+**Sıradaki adım (net):** kurucuda `this+0x8`'e kendi `GrallocAllocator`
+nesnemizi yazmak ve vtable slot 0'ı (`allocate`) uygulamak. Çağrı sitesi
+söküldü: `rdi=nesne, rsi=descriptor, edx=count, ecx, r8, r9d` + yığın
+argümanları. Bu, çizim hattının kalan tek büyük parçası.
 
 `eglQuerySurface` artık `EGL_SWAP_BEHAVIOR` (→ `EGL_BUFFER_DESTROYED`) ve
 `EGL_BUFFER_AGE_EXT` (→ 1) yanıtlıyor; "Unable to match the desired swap
