@@ -152,6 +152,46 @@ fn is_hidl_request(tr: &TransactionData) -> bool {
     &data[8..12] != b"TSYS"
 }
 
+/// Append a `binder_buffer_object` to `parcel` and record its offset.
+///
+/// HIDL never inlines a string: `writeEmbeddedBuffer` writes this 40-byte
+/// record into the parcel data and puts its position in the offsets array,
+/// which `readObject<T>(handle)` then indexes. Returns the object's index in
+/// `objects`, which is what a child's `parent` field refers to.
+fn push_buffer_object(
+    parcel: &mut Vec<u8>,
+    objects: &mut Vec<u64>,
+    flags: u32,
+    data: u64,
+    length: u64,
+    parent: u64,
+    parent_offset: u64,
+) -> u64 {
+    let off = parcel.len() as u64;
+    parcel.extend_from_slice(&0x7074_2a85u32.to_ne_bytes()); // type
+    parcel.extend_from_slice(&flags.to_ne_bytes());
+    parcel.extend_from_slice(&data.to_ne_bytes());
+    parcel.extend_from_slice(&length.to_ne_bytes());
+    parcel.extend_from_slice(&parent.to_ne_bytes());
+    parcel.extend_from_slice(&parent_offset.to_ne_bytes());
+    objects.push(off);
+    objects.len() as u64 - 1
+}
+
+/// Leak a NUL-terminated copy of `s` and return its address.
+///
+/// The reply parcel is copied into the shared mapping after it is built, so a
+/// pointer into the `Vec` would dangle; the client dereferences the pointer
+/// after the reply has been handed over, and the number of HIDL strings we
+/// emit is tiny.
+fn leak_cstr(s: &str) -> (u64, u64) {
+    let mut bytes = s.as_bytes().to_vec();
+    bytes.push(0);
+    let len = bytes.len() as u64;
+    let boxed: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+    (boxed.as_ptr() as u64, len)
+}
+
 /// Write a `hidl_string` the way libhidlbase does.
 ///
 /// Measured from a live `getTransport` request: a string is a 40-byte struct
@@ -278,20 +318,25 @@ unsafe fn hidl_service_manager_reply(
         // (`vec<hidl_string>`), not `InstanceDebugInfo` records.
         5 | 13 => {
             parcel.extend_from_slice(&0u32.to_ne_bytes()); // status: ok
-            // `hidl_vec<hidl_string>` is a 16-byte struct `{ptr, size}` whose
-            // size is read as a `u32` at offset 8, followed by the elements
-            // inline, 16 bytes each. Each element is a `hidl_string` whose
-            // bytes are read *in place* at the element's own offset, so short
-            // names live in the first eight bytes.
-            parcel.extend_from_slice(&0u64.to_ne_bytes()); // mData
-            parcel.extend_from_slice(&1u32.to_ne_bytes()); // mSize
-            parcel.extend_from_slice(&0u32.to_ne_bytes()); // padding
-            let name: &[u8] = b"default\0";
-            parcel.extend_from_slice(name);
-            for _ in name.len()..8 {
-                parcel.push(0);
-            }
-            parcel.extend_from_slice(&(name.len() as u64 - 1).to_ne_bytes());
+            // `hidl_vec<hidl_string>`: a 16-byte vec struct, a 16-byte element
+            // array, and the string bytes — each one a `binder_buffer_object`
+            // recorded in the offsets array.
+            let mut vec = Vec::with_capacity(16);
+            vec.extend_from_slice(&0u64.to_ne_bytes()); // mData (unused)
+            vec.extend_from_slice(&1u32.to_ne_bytes()); // mSize
+            vec.extend_from_slice(&0u32.to_ne_bytes()); // padding
+            let vec: &'static [u8] = Box::leak(vec.into_boxed_slice());
+            let vec_idx = push_buffer_object(parcel, objects, 0, vec.as_ptr() as u64, 16, 0, 0);
+
+            let (data_ptr, data_len) = leak_cstr("default");
+            let mut arr = Vec::with_capacity(16);
+            arr.extend_from_slice(&data_ptr.to_ne_bytes()); // mData
+            arr.extend_from_slice(&(data_len - 1).to_ne_bytes()); // mSize
+            let arr: &'static [u8] = Box::leak(arr.into_boxed_slice());
+            let arr_idx =
+                push_buffer_object(parcel, objects, 0, arr.as_ptr() as u64, 16, vec_idx, 0);
+
+            push_buffer_object(parcel, objects, 1, data_ptr, data_len, arr_idx, 0);
             if trace_enabled() {
                 diag(&format!("[binder]   -> hidl listManifestByInterface (code {code}): [default]\n"));
             }
