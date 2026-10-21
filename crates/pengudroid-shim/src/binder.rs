@@ -275,10 +275,19 @@ unsafe fn hidl_service_manager_reply(
     }
     match code {
         PING_TRANSACTION => {
-            parcel.extend_from_slice(&0u32.to_ne_bytes()); // status: ok
+            // `make_reply` already wrote the status word for this handle.
+        }
+        // `IServiceManager::getTransport(fqName, name)` returns a `Transport`
+        // enum; without it `getService` cannot decide how to reach the service
+        // and reports it as inaccessible.
+        3 => {
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // Transport::HWBINDER
+            if trace_enabled() {
+                diag("[binder]   -> hidl getTransport: hwbinder\n");
+            }
         }
         INTERFACE_TRANSACTION => {
-            parcel.extend_from_slice(&0u32.to_ne_bytes()); // status: ok
+            // `make_reply` already wrote the status word for this handle.
             let chain = [
                 "android.hidl.manager@1.0::IServiceManager",
                 "android.hidl.manager@1.1::IServiceManager",
@@ -299,7 +308,7 @@ unsafe fn hidl_service_manager_reply(
                 let mut pos = 0usize;
                 fq = read_hidl_string(data, &mut pos).unwrap_or_default();
             }
-            parcel.extend_from_slice(&0u32.to_ne_bytes()); // status: ok
+            // `make_reply` already wrote the status word for this handle.
             let handle = if fq.contains("ICodec2") {
                 handle_for("codec2")
             } else {
@@ -317,7 +326,7 @@ unsafe fn hidl_service_manager_reply(
         // `IComponentStore::descriptor` and expects the *instance names* back
         // (`vec<hidl_string>`), not `InstanceDebugInfo` records.
         5 | 13 => {
-            parcel.extend_from_slice(&0u32.to_ne_bytes()); // status: ok
+            // `make_reply` already wrote the status word for this handle.
             // `hidl_vec<hidl_string>`: a 16-byte vec struct, a 16-byte element
             // array, and the string bytes — each one a `binder_buffer_object`
             // recorded in the offsets array.
@@ -336,7 +345,8 @@ unsafe fn hidl_service_manager_reply(
             vec.extend_from_slice(&0u32.to_ne_bytes()); // padding
             let vec: &'static [u8] = Box::leak(vec.into_boxed_slice());
 
-            let vec_idx = push_buffer_object(parcel, objects, 1, vec.as_ptr() as u64, 16, 0, 0);
+            // `readBuffer` verifies `flags == 0`; the embedded reads verify 1.
+            let vec_idx = push_buffer_object(parcel, objects, 0, vec.as_ptr() as u64, 16, 0, 0);
             let arr_idx =
                 push_buffer_object(parcel, objects, 1, arr.as_ptr() as u64, 16, vec_idx, 0);
             push_buffer_object(parcel, objects, 1, data_ptr, data_len, arr_idx, 0);
@@ -345,7 +355,7 @@ unsafe fn hidl_service_manager_reply(
             }
         }
         _ => {
-            parcel.extend_from_slice(&0u32.to_ne_bytes()); // status: ok
+            // `make_reply` already wrote the status word for this handle.
         }
     }
     if trace_enabled() {
