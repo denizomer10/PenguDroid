@@ -152,13 +152,36 @@ fn is_hidl_request(tr: &TransactionData) -> bool {
     &data[8..12] != b"TSYS"
 }
 
-/// Write a `hidl_string`: `[u32 len][bytes][NUL]`, padded to four bytes.
-fn push_hidl_string(parcel: &mut Vec<u8>, s: &str) {
+/// Write a `hidl_string` as `Parcel::writeBuffer` does: `[u32 len][bytes][NUL]`
+/// padded to four bytes.
+fn push_hidl_buffer_string(parcel: &mut Vec<u8>, s: &str) {
     parcel.extend_from_slice(&(s.len() as u32).to_ne_bytes());
     parcel.extend_from_slice(s.as_bytes());
     parcel.push(0);
     while parcel.len() % 4 != 0 {
         parcel.push(0);
+    }
+}
+
+/// Write a `hidl_string` the way libhidlbase does.
+///
+/// Measured from a live `getTransport` request: a string is **two** 40-byte
+/// blocks, `[u32 tag][u32 heap][u64 data][u32 size][20 bytes inline]`. The
+/// first block carries the inline copy, the second the heap one, and the reader
+/// follows `data`. Because the broker runs inside the guest process, a pointer
+/// into our own memory is valid for the client.
+fn push_hidl_string(parcel: &mut Vec<u8>, s: &str) {
+    const TAG: u32 = 0x7074_2a85;
+    // Leaked on purpose: the client dereferences this pointer after the reply
+    // has been handed over. The number of HIDL strings we emit is tiny.
+    let bytes: &'static [u8] = Box::leak(s.as_bytes().to_vec().into_boxed_slice());
+    let ptr = bytes.as_ptr() as u64;
+    for (heap, size) in [(0u32, 16u32), (1u32, s.len() as u32)] {
+        parcel.extend_from_slice(&TAG.to_ne_bytes());
+        parcel.extend_from_slice(&heap.to_ne_bytes());
+        parcel.extend_from_slice(&ptr.to_ne_bytes());
+        parcel.extend_from_slice(&size.to_ne_bytes());
+        parcel.extend_from_slice(&[0u8; 20]);
     }
 }
 
@@ -197,12 +220,30 @@ unsafe fn hidl_service_manager_reply(
     if trace_enabled() && tr.data_size > 0 && tr.data_ptr != 0 {
         let n = (tr.data_size as usize).min(256);
         let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, n);
-        let mut hex = format!("[binder]   hidl payload ({}) :", tr.data_size);
-        for b in data {
-            hex.push_str(&format!(" {b:02x}"));
+        // The parcel starts with the interface token (a NUL-terminated string
+        // padded to four bytes), then 40-byte `hidl_string` blocks:
+        // `[u32 hash][u32 flag][u64 data][u32 size][20 bytes inline]`.
+        let mut off = 0usize;
+        while off < data.len() && data[off] != 0 {
+            off += 1;
         }
-        hex.push('\n');
-        diag(&hex);
+        off = (off + 1 + 3) & !3;
+        let mut line = format!("[binder]   hidl args from {off}:\n");
+        while off + 40 <= data.len() {
+            let block = &data[off..off + 40];
+            let flag = u32::from_ne_bytes(block[4..8].try_into().unwrap());
+            let ptr = u64::from_ne_bytes(block[8..16].try_into().unwrap()) as usize;
+            let size = u32::from_ne_bytes(block[16..20].try_into().unwrap()) as usize;
+            let text = if ptr != 0 && size > 0 && size < 256 {
+                let bytes = std::slice::from_raw_parts(ptr as *const u8, size);
+                String::from_utf8_lossy(bytes).into_owned()
+            } else {
+                String::new()
+            };
+            line.push_str(&format!("      flag={flag} size={size} text={text:?}\n"));
+            off += 40;
+        }
+        diag(&line);
     }
     match code {
         PING_TRANSACTION => {
@@ -241,23 +282,20 @@ unsafe fn hidl_service_manager_reply(
                 diag(&format!("[binder]   -> hidl get({fq}) handle {handle}\n"));
             }
         }
-        // `IServiceManager::listByInterface(fqName)`.
+        // `IServiceManager::listManifestByInterface(fqName)` (code 5 on the
+        // wire; HIDL 1.2 numbers it 13).
         //
-        // The HIDL argument layout is not decoded yet, so this always reports
-        // the one HIDL service PenguDroid provides. `Codec2Client` is the only
-        // caller that matters today.
-        5 => {
+        // `Codec2Client::GetServiceNames()` calls this with
+        // `IComponentStore::descriptor` and expects the *instance names* back
+        // (`vec<hidl_string>`), not `InstanceDebugInfo` records.
+        5 | 13 => {
             parcel.extend_from_slice(&0u32.to_ne_bytes()); // status: ok
-            // `vec<InstanceDebugInfo>`: interfaceName, instanceName, pid,
-            // clientPids, arch.
-            parcel.extend_from_slice(&1u32.to_ne_bytes());
-            push_hidl_string(parcel, "android.hardware.media.c2@1.0::ICodec2");
-            push_hidl_string(parcel, "default");
-            parcel.extend_from_slice(&(std::process::id() as i32).to_ne_bytes());
-            parcel.extend_from_slice(&0u32.to_ne_bytes()); // clientPids
-            parcel.extend_from_slice(&0u32.to_ne_bytes()); // arch
+            // `hidl_vec<hidl_string>`: the count is a `size_t` and each element
+            // is a `writeBuffer` string (`[u32 len][bytes][NUL]`, padded).
+            parcel.extend_from_slice(&1u64.to_ne_bytes());
+            push_hidl_buffer_string(parcel, "default");
             if trace_enabled() {
-                diag("[binder]   -> hidl listByInterface: ICodec2/default\n");
+                diag(&format!("[binder]   -> hidl listManifestByInterface (code {code}): [default]\n"));
             }
         }
         _ => {

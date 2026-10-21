@@ -58,15 +58,16 @@ pengudroid nativelib .toolchain/sysroot/system/lib64/libcodec2_soft_avcdec.so \
 `Codec2Client` önce VINTF manifest'ine bakıyor ("No Codec2 services declared in
 the manifest"), sonra `listByInterface` ile servis arıyor. Yapılacaklar:
 
-1. `listByInterface("android.hardware.media.c2@1.0::ICodec2")` → `["default"]`.
-   Şu an koşulsuz tek kayıt dönüyor ama `Codec2Client` yine "No Codec2 services
-   declared in the manifest" diyor, yani yanıtın **yerleşimi** yanlış.
-   `PENGUDROID_TRACE_BINDER=1` ile parcel'ın ilk 256 baytı dökülüyor; ölçülen
-   yapı şu: 44 baytlık interface token'ından sonra **40 baytlık bloklar**
-   geliyor (`[u64 0x70742a85][u64 ptr][u32 0x10][20 sıfır]` ve
-   `[u64 0x70742a85][u32 1][ptr][u32 len][20 sıfır]`). Yani HIDL `hidl_string`
-   bu sürümde düz `[len][bytes]` değil; blok düzeni çözülmeden argüman da
-   yanıt da doğru yazılamaz. Sıradaki iş bu.
+1. `listManifestByInterface("android.hardware.media.c2@1.0::IComponentStore")`
+   → `["default"]`. Çağrı **kod 5** olarak geliyor (`Codec2Client::GetServiceNames`
+   `IServiceManager1_2` üzerinden yapıyor) ve yanıt `vec<hidl_string>`
+   (instance adları). Şu an `[status][u64 count][buffer string]` yazılıyor ama
+   istemci hâlâ boş liste görüyor — **yanıtın yerleşimi hâlâ yanlış**.
+   Ölçülen istek yerleşimi: parcel = `[interface token][40 baytlık hidl_string
+   struct][gömülü string verisi]`; her argüman iki 40 baytlık blok. Yanıt için
+   doğru kodlama `libhidlbase`'in `BnHwServiceManager` tarafındaki yazma
+   sırasından çıkarılmalı (ya da `hidl_vec`'in `size_t` mi `u32` mi olduğu
+   doğrulanmalı).
 2. `get(...)` → `codec2` handle'ı (hazır).
 3. `ICodec2::listComponents` → `ComponentInfo` listesi.
 4. `ICodec2::createComponent` + `ICodec2Component` (`configure`, `start`,
@@ -77,7 +78,7 @@ the manifest"), sonra `listByInterface` ile servis arıyor. Yapılacaklar:
 Not: sysroot'un `system/etc/vintf/manifest.xml` dosyasına elle
 `@1.0::ICodec2/default` eklendi (yerel artefakt, git'te değil). Manifest'in
 hiç açılmadığı `PENGUDROID_TRACE_ROOTFS=1` ile görüldü — yani sorun manifest
-değil, `listByInterface` yanıtı.
+değil, `listManifestByInterface` yanıtı.
 
 Çıktı tarafı ayrı bir iş: `SurfaceView` ayrı bir yüzey istiyor, bizim
 compositor'ımızda katman yok. İlk hedef çözülen kareyi `PENGUDROID_DUMP_FRAME`
