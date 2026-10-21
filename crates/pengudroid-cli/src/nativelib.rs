@@ -244,6 +244,10 @@ struct NativeArgs {
     abi: Option<String>,
     call: Option<String>,
     lib_dir: Option<PathBuf>,
+    /// Stage the whole sysroot library closure (de-bionic'd) and use it as the
+    /// search path. Needed for libraries whose dependencies are themselves
+    /// Android `.so`s with packed relocations.
+    sysroot: Option<PathBuf>,
     /// Exercise `dlclose` (teardown) instead of exiting via `_exit`.
     dlclose: bool,
     /// Ask the shim to suppress Bionic C++ destructors (default on).
@@ -256,6 +260,7 @@ fn parse_args(args: &[String]) -> Result<NativeArgs, String> {
     let mut abi = None;
     let mut call = None;
     let mut lib_dir = None;
+    let mut sysroot = None;
     let mut dlclose = false;
     let mut suppress_destructors = true;
     let mut it = args.iter();
@@ -263,6 +268,7 @@ fn parse_args(args: &[String]) -> Result<NativeArgs, String> {
         match a.as_str() {
             "--call" => call = Some(it.next().ok_or("--call needs a SYMBOL")?.clone()),
             "--lib-dir" => lib_dir = Some(PathBuf::from(it.next().ok_or("--lib-dir needs a DIR")?)),
+            "--sysroot" => sysroot = Some(PathBuf::from(it.next().ok_or("--sysroot needs a DIR")?)),
             "--apk" => apk = Some(it.next().ok_or("--apk needs a PATH")?.clone()),
             "--abi" => abi = Some(it.next().ok_or("--abi needs a NAME")?.clone()),
             "--dlclose" => dlclose = true,
@@ -280,7 +286,7 @@ fn parse_args(args: &[String]) -> Result<NativeArgs, String> {
                 .into(),
         );
     }
-    Ok(NativeArgs { lib, apk, abi, call, lib_dir, dlclose, suppress_destructors })
+    Ok(NativeArgs { lib, apk, abi, call, lib_dir, sysroot, dlclose, suppress_destructors })
 }
 
 /// The Android ABI directory that matches this host's architecture.
@@ -392,6 +398,20 @@ pub fn nativelib(args: &[String]) -> i32 {
             ld_path.push(':');
         }
         ld_path.push_str(&dir.display().to_string());
+    }
+    if let Some(root) = &na.sysroot {
+        match crate::sysroot::stage_libraries(root) {
+            Ok(dir) => {
+                if !ld_path.is_empty() {
+                    ld_path.push(':');
+                }
+                ld_path.push_str(&dir.display().to_string());
+            }
+            Err(e) => {
+                eprintln!("pengudroid: {e}");
+                return 1;
+            }
+        }
     }
     cmd.env("LD_PRELOAD", &shim)
         .env("LD_LIBRARY_PATH", ld_path)

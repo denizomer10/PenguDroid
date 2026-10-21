@@ -1140,6 +1140,11 @@ pub fn default_props() -> BTreeMap<String, String> {
         ("ro.soc.manufacturer", "PenguDroid"),
         ("ro.soc.model", "PenguDroid"),
         ("ro.sf.lcd_density", "420"),
+        // `libhidlbase` waits for `hwservicemanager.ready` before it will hand
+        // out any HIDL service. The manager is emulated in-process (the broker
+        // answers handle 0), so it is always ready.
+        ("hwservicemanager.ready", "true"),
+        ("init.svc.hwservicemanager", "running"),
     ];
     for (k, v) in seed {
         props.insert(k.to_string(), v.to_string());

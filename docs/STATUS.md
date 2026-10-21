@@ -3,7 +3,76 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
-## Bu oturum: NewPipe ekranda — çizim ve sunum çalışıyor
+## Bu oturum: MediaCodec — HIDL yolu açıldı
+
+Hedef: `MediaCodecList` codec görsün, `MediaCodec` kare üretsin. Bu oturumda
+zincirin **HIDL tarafı** çalışır hale geldi; codec servisi henüz yok.
+
+Ölçülen son durum:
+
+```
+[binder]   -> hidl manager code 0x5f504e47   (ping)
+[binder]   -> hidl manager code 0x3          (getTransport)
+[binder]   -> hidl manager code 0x5          (listByInterface)
+Codec2Client: No Codec2 services declared in the manifest.
+media: MediaCodecList.getCodecCount() = 0    ← çökmüyor, asılmıyor
+```
+
+### Yol boyunca bulunan dört gerçek hata
+
+1. **Binder komutları ioctl-kodlu.** `BC_TRANSACTION` = `0x40406300`,
+   `BC_ACQUIRE` = `0x40046302`, … ve **yük boyutu komut sözcüğünün 16–30.
+   bitlerinde**. Elle yazılmış bir tablo (`BC_ACQUIRE => 4` gibi) bir komut
+   farklı bir argüman tipiyle gelince sessizce kayıyordu. Ayrıca libbinder
+   `BC_TRANSACTION` değil **`BC_TRANSACTION_SG`** (`0x40486311`, 72 bayt)
+   gönderiyor; bu tanınmadığı için HIDL transaction'ı hiç işlenmiyordu.
+   Çözüm: `command_payload` artık boyutu komut sözcüğünden okuyor.
+2. **`libhidlbase` HIDL'i `access("/dev/hwbinder")` ile kapılıyor.** Sanal
+   cihaz host'ta olmadığı için `ENOENT` dönüyordu ve her HIDL araması
+   "Hardware service manager is not running" ile ölüyordu. Shim artık
+   `/dev/binder`, `/dev/hwbinder`, `/dev/vndbinder`, `/dev/ashmem` için 0 diyor.
+3. **`hwservicemanager.ready` özelliği.** `libhidlbase` bu özellik "true"
+   olana kadar bekliyor; varsayılan özellik tablosuna eklendi.
+4. **HIDL servis yöneticisi yanıtları.** Broker artık handle 0'da `ping`,
+   `interfaceChain`, `get`, `getTransport` ve `listByInterface` çağrılarını
+   yanıtlıyor. Java `Parcel` ile HIDL parcel'ı, parcel'ın 8. baytındaki `TSYS`
+   interface token'ından ayırt ediliyor.
+
+### Codec kütüphanesi süreç içinde yükleniyor
+
+`libcodec2_soft_avcdec.so` (APEX'teki yazılım H.264 çözücü) artık `dlopen`
+ediliyor. Bunun için `AHardwareBuffer` shim'ine beş giriş noktası eklendi:
+`getNativeHandle`, `createFromHandle`, `lock`, `unlock`, `lockPlanes`,
+`isSupported`. Handle gerçek bir gralloc0 `native_handle_t` (fd + stride/format/
+width/height/usage).
+
+Denemek için (sysroot'un tüm kütüphane kümesini de-bionic'leyip yükler):
+
+```sh
+pengudroid nativelib .toolchain/sysroot/system/lib64/libcodec2_soft_avcdec.so \
+  --sysroot .toolchain/sysroot
+```
+
+### Sıradaki adım: `ICodec2` servisi
+
+`Codec2Client` önce VINTF manifest'ine bakıyor ("No Codec2 services declared in
+the manifest"), sonra `listByInterface` ile servis arıyor. Yapılacaklar:
+
+1. `listByInterface("android.hardware.media.c2@1.0::ICodec2")` → `["default"]`
+   (kod yazıldı; HIDL parcel'ının argüman yerleşimi henüz çözülmedi —
+   `hidl payload` izi `PENGUDROID_TRACE_BINDER=1` ile görülebilir).
+2. `get(...)` → `codec2` handle'ı (hazır).
+3. `ICodec2::listComponents` → `ComponentInfo` listesi.
+4. `ICodec2::createComponent` + `ICodec2Component` (`configure`, `start`,
+   `queue`, `dequeue`, `setOutputSurface`) ve `ICodec2ComponentListener`
+   geri çağrıları (broker'ın uygulamaya transaction göndermesi gerekir;
+   `APP_THREAD` altyapısı bunun için var).
+
+Çıktı tarafı ayrı bir iş: `SurfaceView` ayrı bir yüzey istiyor, bizim
+compositor'ımızda katman yok. İlk hedef çözülen kareyi `PENGUDROID_DUMP_FRAME`
+benzeri bir yolla diske yazıp doğrulamak.
+
+## Önceki oturum: NewPipe ekranda — çizim ve sunum çalışıyor
 
 **`pengudroid launch NewPipe_v0.29.1.apk` bir Wayland penceresi açıyor ve
 NewPipe'ın canlı akışını gerçek verilerle çiziyor.** Kareler hwui tarafından

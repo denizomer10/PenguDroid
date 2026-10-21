@@ -71,6 +71,9 @@ pub struct FakeHardwareBuffer {
     fd: i32,
     refs: AtomicI32,
     window_buffer: NativeWindowBuffer,
+    /// The gralloc0-style handle `AHardwareBuffer_getNativeHandle` returns.
+    /// `window_buffer.handle` points at it.
+    handle: NativeHandle,
 }
 
 fn bytes_for(desc: &HardwareBufferDesc) -> usize {
@@ -322,7 +325,24 @@ pub unsafe extern "C" fn AHardwareBuffer_allocate(
             fence_fd: -1,
             _pad: 0,
         },
+        handle: NativeHandle {
+            version: std::mem::size_of::<NativeHandle>() as i32,
+            num_fds: 1,
+            num_ints: 6,
+            data: [
+                fd,
+                d.stride as i32,
+                d.format as i32,
+                d.width as i32,
+                d.height as i32,
+                d.usage as u32 as i32,
+                (d.usage >> 32) as u32 as i32,
+                0,
+            ],
+        },
     });
+    let mut buf = buf;
+    buf.window_buffer.handle = &buf.handle as *const NativeHandle as *const c_void;
     *out = Box::into_raw(buf);
     0
 }
@@ -372,6 +392,172 @@ pub unsafe extern "C" fn AHardwareBuffer_release(buffer: *mut FakeHardwareBuffer
         libc::close(b.fd);
         drop(Box::from_raw(buffer));
     }
+}
+
+/// `AHardwareBuffer_createFromHandle(desc, handle, handleType, out)`.
+///
+/// The handle's first int is the dma-buf/memfd; it is duplicated so the new
+/// buffer owns its own descriptor.
+#[no_mangle]
+pub unsafe extern "C" fn AHardwareBuffer_createFromHandle(
+    desc: *const HardwareBufferDesc,
+    handle: *const NativeHandle,
+    _handle_type: i32,
+    out: *mut *mut FakeHardwareBuffer,
+) -> i32 {
+    if desc.is_null() || handle.is_null() || out.is_null() {
+        return -22;
+    }
+    if (*handle).num_fds < 1 {
+        return -22;
+    }
+    let fd = libc::dup((*handle).data[0]);
+    if fd < 0 {
+        return -9;
+    }
+    let mut d = *desc;
+    if d.stride == 0 {
+        d.stride = d.width;
+    }
+    let mut buf = Box::new(FakeHardwareBuffer {
+        magic: AHB_MAGIC,
+        desc: d,
+        fd,
+        refs: AtomicI32::new(1),
+        window_buffer: NativeWindowBuffer {
+            width: d.width as i32,
+            height: d.height as i32,
+            stride: d.stride as i32,
+            format: d.format as i32,
+            usage: d.usage,
+            handle: std::ptr::null(),
+            fence_fd: -1,
+            _pad: 0,
+        },
+        handle: NativeHandle {
+            version: std::mem::size_of::<NativeHandle>() as i32,
+            num_fds: 1,
+            num_ints: 6,
+            data: [
+                fd,
+                d.stride as i32,
+                d.format as i32,
+                d.width as i32,
+                d.height as i32,
+                d.usage as u32 as i32,
+                (d.usage >> 32) as u32 as i32,
+                0,
+            ],
+        },
+    });
+    buf.window_buffer.handle = &buf.handle as *const NativeHandle as *const c_void;
+    *out = Box::into_raw(buf);
+    0
+}
+
+/// `AHardwareBuffer_lockPlanes(buffer, usage, fence, rect, outPlanes)`.
+///
+/// `AHardwareBuffer_Planes` is `{ uint32_t planeCount; AHardwareBuffer_Plane
+/// planes[4]; }` and each plane is `{ void* data; uint32_t stride; uint32_t
+/// rowStride; uint32_t pixelStride; }`.
+#[no_mangle]
+pub unsafe extern "C" fn AHardwareBuffer_lockPlanes(
+    buffer: *mut FakeHardwareBuffer,
+    usage: u64,
+    fence: i32,
+    rect: *const c_void,
+    out_planes: *mut c_void,
+) -> i32 {
+    if out_planes.is_null() {
+        return -22;
+    }
+    let mut addr: *mut c_void = std::ptr::null_mut();
+    let rc = AHardwareBuffer_lock(buffer, usage, fence, rect, &mut addr);
+    if rc != 0 {
+        return rc;
+    }
+    let Some(b) = as_buf(buffer) else {
+        return -22;
+    };
+    // `[u32 planeCount][pad][plane0..3]`, each plane 24 bytes on LP64
+    // (`void*` + three `u32` + padding).
+    let out = out_planes as *mut u8;
+    std::ptr::write_bytes(out, 0, 8 + 4 * 24);
+    *(out as *mut u32) = 1;
+    let plane = out.add(8);
+    *(plane as *mut *mut c_void) = addr;
+    *(plane.add(8) as *mut u32) = b.desc.stride * 4;
+    *(plane.add(12) as *mut u32) = b.desc.stride * 4;
+    *(plane.add(16) as *mut u32) = 4;
+    0
+}
+
+/// `AHardwareBuffer_isSupported(desc)` — every format we back with a memfd is
+/// supported, so this always answers 1.
+#[no_mangle]
+pub unsafe extern "C" fn AHardwareBuffer_isSupported(_desc: *const HardwareBufferDesc) -> i32 {
+    1
+}
+
+/// `AHardwareBuffer_getNativeHandle(buffer)`.
+///
+/// codec2's buffer pool imports buffers through this handle, so it has to be a
+/// real gralloc0 `native_handle_t` (one fd, then stride/format/width/height/
+/// usage) rather than a null pointer.
+#[no_mangle]
+pub unsafe extern "C" fn AHardwareBuffer_getNativeHandle(
+    buffer: *mut FakeHardwareBuffer,
+) -> *const NativeHandle {
+    match as_buf(buffer) {
+        Some(b) => &b.handle,
+        None => std::ptr::null(),
+    }
+}
+
+/// `AHardwareBuffer_lock(buffer, usage, fence, rect, outVirtualAddress)`.
+#[no_mangle]
+pub unsafe extern "C" fn AHardwareBuffer_lock(
+    buffer: *mut FakeHardwareBuffer,
+    _usage: u64,
+    _fence: i32,
+    _rect: *const c_void,
+    out_addr: *mut *mut c_void,
+) -> i32 {
+    let Some(b) = as_buf(buffer) else {
+        return -22;
+    };
+    if out_addr.is_null() {
+        return -22;
+    }
+    let size = bytes_for(&b.desc);
+    let p = libc::mmap(
+        std::ptr::null_mut(),
+        size,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_SHARED,
+        b.fd,
+        0,
+    );
+    if p == libc::MAP_FAILED {
+        return -12;
+    }
+    *out_addr = p;
+    0
+}
+
+/// `AHardwareBuffer_unlock(buffer, fence)`.
+#[no_mangle]
+pub unsafe extern "C" fn AHardwareBuffer_unlock(
+    buffer: *mut FakeHardwareBuffer,
+    _fence: *mut i32,
+) -> i32 {
+    let Some(b) = as_buf(buffer) else {
+        return -22;
+    };
+    // The mapping is not tracked per buffer; the memfd stays alive as long as
+    // the buffer does, so there is nothing to unmap here.
+    let _ = b;
+    0
 }
 
 /// `AHardwareBuffer_to_ANativeWindowBuffer(buffer)`.

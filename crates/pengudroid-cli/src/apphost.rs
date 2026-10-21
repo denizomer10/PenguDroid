@@ -773,6 +773,9 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         if let Ok(name) = std::env::var("PENGUDROID_LOAD_LIB") {
             probe_load_library(env, &name);
         }
+        if std::env::var_os("PENGUDROID_PROBE_MEDIA").is_some() {
+            probe_media_codecs(env);
+        }
         if let Ok(name) = std::env::var("PENGUDROID_LAUNCH_ACTIVITY") {
             launch_activity(env, thread, data, spec, &name);
         }
@@ -780,6 +783,51 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         eprintln!("apphost: handleBindApplication threw");
     }
     ok
+}
+
+/// `PENGUDROID_PROBE_MEDIA=1`: ask the framework how many codecs it sees.
+///
+/// `MediaCodecList` reaches the codec service through `libmedia_jni` →
+/// `Codec2Client` → HIDL, so this is the cheapest way to tell whether the
+/// codec2 plumbing is in place.
+fn probe_media_codecs(env: &JniEnv) {
+    let Some(list_class) = env.find_class("android/media/MediaCodecList") else {
+        eprintln!("media: MediaCodecList not found");
+        return;
+    };
+    if let Some(count) = env.static_method_id(list_class, "getCodecCount", "()I") {
+        match env.call_static_int(list_class, count, &[]) {
+            Some(n) => println!("media: MediaCodecList.getCodecCount() = {n}"),
+            None => eprintln!("media: getCodecCount threw"),
+        }
+    }
+    if let Some(infos) = env.static_method_id(
+        list_class,
+        "getCodecInfos",
+        "()[Landroid/media/MediaCodecInfo;",
+    ) {
+        if let Some(array) = env.call_static_object(list_class, infos, &[]) {
+            if !array.is_null() {
+                let len = env.array_length(array);
+                println!("media: getCodecInfos() returned {len}");
+                let Some(info_class) = env.find_class("android/media/MediaCodecInfo") else {
+                    return;
+                };
+                let Some(get_name) = env.method_id(info_class, "getName", "()Ljava/lang/String;") else {
+                    return;
+                };
+                for i in 0..len.min(8) {
+                    let item = env.array_get(array, i);
+                    if item.is_null() {
+                        continue;
+                    }
+                    if let Some(name) = env.call_object(item, get_name, &[]).and_then(|n| env.get_string(n)) {
+                        println!("media:   codec {i}: {name}");
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Print the display metrics the app sees.

@@ -393,6 +393,17 @@ pub fn sysroot(args: &[String]) -> i32 {
 /// Sonames the shim provides itself; the Android copies must not shadow them.
 const SHIM_SONAMES: &[&str] = &["libc.so", "libm.so", "libdl.so", "liblog.so", "libdl_android.so"];
 
+/// Stage a sysroot's library closure into a scratch directory and return it.
+///
+/// `nativelib --sysroot` uses this so a library whose dependencies are Android
+/// `.so`s (packed relocations, Android symbol versions) can be `dlopen`ed.
+pub(crate) fn stage_libraries(root: &Path) -> Result<PathBuf, String> {
+    let layout = Layout::detect(root)?;
+    let work = std::env::temp_dir().join(format!("pengudroid-stage-{}", std::process::id()));
+    std::fs::create_dir_all(&work).map_err(|e| format!("cannot create {}: {e}", work.display()))?;
+    prepare_art_libs(&layout, &work)
+}
+
 /// Copy every library ART may load into a scratch directory, with Android's
 /// packed relocations expanded and symbol versioning stripped.
 ///

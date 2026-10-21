@@ -264,12 +264,30 @@ pub unsafe extern "C" fn fstat64(fd: c_int, buf: *mut c_void) -> c_int {
 }
 
 /// `access(path, mode)`.
+///
+/// The binder devices are emulated in-process, so they never exist on the host
+/// filesystem. `libhidlbase`'s `defaultServiceManager` gates the whole HIDL
+/// transport on `access("/dev/hwbinder", R_OK|W_OK)`, so answering `ENOENT`
+/// there makes every HIDL lookup fail with "Hardware service manager is not
+/// running".
 #[no_mangle]
 pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
+    if is_emulated_device(path) {
+        return 0;
+    }
     match next::<AccessFn>(b"access\0") {
         Some(f) => with_path(path, |p| f(p, mode)),
         None => -1,
     }
+}
+
+/// Is `path` one of the devices this shim provides itself?
+unsafe fn is_emulated_device(path: *const c_char) -> bool {
+    if path.is_null() {
+        return false;
+    }
+    let bytes = std::ffi::CStr::from_ptr(path).to_bytes();
+    crate::binder::is_binder_device(bytes) || bytes == b"/dev/ashmem"
 }
 
 /// `faccessat(dirfd, path, mode, flags)`.
@@ -280,6 +298,9 @@ pub unsafe extern "C" fn faccessat(
     mode: c_int,
     flags: c_int,
 ) -> c_int {
+    if is_emulated_device(path) {
+        return 0;
+    }
     match next::<AccessAtFn>(b"faccessat\0") {
         Some(f) => with_path(path, |p| f(dirfd, p, mode, flags)),
         None => -1,

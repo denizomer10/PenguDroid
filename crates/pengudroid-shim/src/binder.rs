@@ -44,20 +44,32 @@ static MAP_BASE: AtomicUsize = AtomicUsize::new(0);
 static MAP_LEN: AtomicUsize = AtomicUsize::new(0);
 
 /// Binder commands that appear on the write side.
+///
+/// These are the *ioctl-encoded* values (`_IOW('c', nr, size)`), which is what
+/// libbinder actually writes: `0x4000_0000 | size << 16 | 'c' << 8 | nr`. The
+/// plain `BC_*` numbers from `binder.h` never appear on the wire, and getting a
+/// payload size wrong desynchronises the whole command stream.
 const BC_TRANSACTION: u32 = 0x4040_6300;
 const BC_REPLY: u32 = 0x4040_6301;
 const BC_ACQUIRE: u32 = 0x4004_6302;
 const BC_RELEASE: u32 = 0x4004_6303;
 const BC_DECREFS: u32 = 0x4004_6304;
-const BC_INCREFS: u32 = 0x4004_6306;
-const BC_FREE_BUFFER: u32 = 0x4008_6303;
+const BC_INCREFS: u32 = 0x4004_6305;
+const BC_ACQUIRE_DONE: u32 = 0x4008_6306;
+const BC_RELEASE_DONE: u32 = 0x4008_6307;
+const BC_INCREFS_DONE: u32 = 0x4008_6308;
+const BC_FREE_BUFFER: u32 = 0x4008_6309;
+const BC_ATTEMPT_ACQUIRE: u32 = 0x4004_630b;
 const BC_ENTER_LOOPER: u32 = 0x0000_630c;
 const BC_EXIT_LOOPER: u32 = 0x0000_630d;
 const BC_REQUEST_DEATH_NOTIFICATION: u32 = 0x4010_630e;
 const BC_CLEAR_DEATH_NOTIFICATION: u32 = 0x4010_630f;
 const BC_DEAD_BINDER_DONE: u32 = 0x4008_6310;
-const BC_INCREFS_DONE: u32 = 0x4010_6308;
-const BC_ACQUIRE_DONE: u32 = 0x4010_6309;
+/// `BC_TRANSACTION_SG` / `BC_REPLY_SG`: the transaction data plus a trailing
+/// `binder_size_t buffers_size`. libbinder uses these for every transaction, so
+/// missing them desynchronises the command stream.
+const BC_TRANSACTION_SG: u32 = 0x4048_6311;
+const BC_REPLY_SG: u32 = 0x4048_6312;
 
 /// Binder commands that appear on the read side.
 const BR_TRANSACTION_COMPLETE: u32 = 0x0000_7206;
@@ -120,6 +132,150 @@ static REPLY_OFFSET: AtomicUsize = AtomicUsize::new(0);
 static SERVICE_HANDLES: std::sync::LazyLock<std::sync::Mutex<std::collections::BTreeMap<String, u32>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
 static NEXT_HANDLE: AtomicU32 = AtomicU32::new(1);
+
+/// `IBinder::PING_TRANSACTION` ("GNP_").
+const PING_TRANSACTION: u32 = 0x5F50_4E47;
+/// `IBinder::INTERFACE_TRANSACTION` ("FTN_").
+const INTERFACE_TRANSACTION: u32 = 0x5F4E_5446;
+
+/// Is this transaction a HIDL call rather than a Java `Parcel` one?
+///
+/// A Java parcel is `[u32 strictModePolicy][i32 workSourceUid][String16
+/// interfaceToken]`, so the token `TSYS` sits at offset 8. HIDL payloads carry
+/// only the method arguments and never have that header.
+fn is_hidl_request(tr: &TransactionData) -> bool {
+    if tr.data_size < 12 || tr.data_ptr == 0 {
+        return true;
+    }
+    // SAFETY: the driver guarantees `data_size` readable bytes at `data_ptr`.
+    let data = unsafe { std::slice::from_raw_parts(tr.data_ptr as *const u8, 12) };
+    &data[8..12] != b"TSYS"
+}
+
+/// Write a `hidl_string`: `[u32 len][bytes][NUL]`, padded to four bytes.
+fn push_hidl_string(parcel: &mut Vec<u8>, s: &str) {
+    parcel.extend_from_slice(&(s.len() as u32).to_ne_bytes());
+    parcel.extend_from_slice(s.as_bytes());
+    parcel.push(0);
+    while parcel.len() % 4 != 0 {
+        parcel.push(0);
+    }
+}
+
+/// Read a `hidl_string` from `data` at `*pos`.
+fn read_hidl_string(data: &[u8], pos: &mut usize) -> Option<String> {
+    if *pos + 4 > data.len() {
+        return None;
+    }
+    let len = u32::from_ne_bytes(data[*pos..*pos + 4].try_into().ok()?) as usize;
+    *pos += 4;
+    if *pos + len > data.len() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&data[*pos..*pos + len]).into_owned();
+    *pos += len;
+    // Skip the NUL and the padding to the next four-byte boundary.
+    *pos += 1;
+    while *pos % 4 != 0 {
+        *pos += 1;
+    }
+    Some(s)
+}
+
+/// Answer the HIDL calls that reach the hardware service manager (handle 0).
+///
+/// `libhidlbase` first pings the manager and then asks for its interface chain;
+/// both have to succeed before `defaultServiceManager1_1()` returns anything,
+/// and without it `Codec2Client` aborts with "Hardware service manager is not
+/// running".
+unsafe fn hidl_service_manager_reply(
+    code: u32,
+    parcel: &mut Vec<u8>,
+    objects: &mut Vec<u64>,
+    tr: &TransactionData,
+) {
+    if trace_enabled() && tr.data_size > 0 && tr.data_ptr != 0 {
+        let n = (tr.data_size as usize).min(256);
+        let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, n);
+        let mut hex = format!("[binder]   hidl payload ({}) :", tr.data_size);
+        for b in data {
+            hex.push_str(&format!(" {b:02x}"));
+        }
+        hex.push('\n');
+        diag(&hex);
+    }
+    match code {
+        PING_TRANSACTION => {
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // status: ok
+        }
+        INTERFACE_TRANSACTION => {
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // status: ok
+            let chain = [
+                "android.hidl.manager@1.0::IServiceManager",
+                "android.hidl.manager@1.1::IServiceManager",
+                "android.hidl.base@1.0::IBase",
+            ];
+            parcel.extend_from_slice(&(chain.len() as u32).to_ne_bytes());
+            for name in chain {
+                push_hidl_string(parcel, name);
+            }
+        }
+        // `IServiceManager::get(fqName, name)`.
+        1 => {
+            let mut fq = String::new();
+            if tr.data_size > 0 && tr.data_ptr != 0 {
+                // SAFETY: `data_size` readable bytes at `data_ptr`.
+                let data =
+                    unsafe { std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize) };
+                let mut pos = 0usize;
+                fq = read_hidl_string(data, &mut pos).unwrap_or_default();
+            }
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // status: ok
+            let handle = if fq.contains("ICodec2") {
+                handle_for("codec2")
+            } else {
+                handle_for(fq.as_str())
+            };
+            push_flat_handle(parcel, objects, handle);
+            if trace_enabled() {
+                diag(&format!("[binder]   -> hidl get({fq}) handle {handle}\n"));
+            }
+        }
+        // `IServiceManager::listByInterface(fqName)`.
+        5 => {
+            let mut fq = String::new();
+            if tr.data_size > 0 && tr.data_ptr != 0 {
+                // SAFETY: `data_size` readable bytes at `data_ptr`.
+                let data =
+                    unsafe { std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize) };
+                let mut pos = 0usize;
+                fq = read_hidl_string(data, &mut pos).unwrap_or_default();
+            }
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // status: ok
+            if fq.contains("ICodec2") {
+                // `vec<InstanceDebugInfo>`: interfaceName, instanceName, pid,
+                // clientPids, arch.
+                parcel.extend_from_slice(&1u32.to_ne_bytes());
+                push_hidl_string(parcel, &fq);
+                push_hidl_string(parcel, "default");
+                parcel.extend_from_slice(&(std::process::id() as i32).to_ne_bytes());
+                parcel.extend_from_slice(&0u32.to_ne_bytes()); // clientPids
+                parcel.extend_from_slice(&0u32.to_ne_bytes()); // arch
+            } else {
+                parcel.extend_from_slice(&0u32.to_ne_bytes());
+            }
+            if trace_enabled() {
+                diag(&format!("[binder]   -> hidl listByInterface({fq})\n"));
+            }
+        }
+        _ => {
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // status: ok
+        }
+    }
+    if trace_enabled() {
+        diag(&format!("[binder]   -> hidl manager code {code:#x}\n"));
+    }
+}
 
 /// `android.os.IServiceManager` transaction codes.
 const ISM_GET_SERVICE: u32 = 1;
@@ -438,7 +594,7 @@ fn trace_enabled() -> bool {
 }
 
 /// Whether `path` names one of Android's binder devices.
-fn is_binder_device(path: &[u8]) -> bool {
+pub(crate) fn is_binder_device(path: &[u8]) -> bool {
     matches!(
         path,
         b"/dev/binder" | b"/dev/binderfs/binder" | b"/dev/hwbinder" | b"/dev/vndbinder"
@@ -510,17 +666,20 @@ pub unsafe fn ioctl(fd: RawFd, request: c_ulong, arg: *mut c_void) -> Option<c_i
 }
 
 /// Payload size of a write-side command, or `None` when it is unknown.
+///
+/// Binder commands are ioctl-encoded (`_IOW('c', nr, type)`), so the payload
+/// size is part of the command word itself: bits 16..30. Deriving it from there
+/// is what keeps the stream aligned — a hand-written table silently desyncs the
+/// moment a command carries a different argument type than expected (which is
+/// exactly how `BC_TRANSACTION_SG` used to swallow the next transaction).
 fn command_payload(cmd: u32) -> Option<u64> {
-    Some(match cmd {
-        BC_TRANSACTION | BC_REPLY => 64,
-        BC_FREE_BUFFER | BC_DEAD_BINDER_DONE => 8,
-        BC_ACQUIRE | BC_RELEASE | BC_INCREFS | BC_DECREFS => 4,
-        0x4004_6305 => 8, // BC_ATTEMPT_ACQUIRE (deprecated)
-        BC_REQUEST_DEATH_NOTIFICATION | BC_CLEAR_DEATH_NOTIFICATION | BC_INCREFS_DONE
-        | BC_ACQUIRE_DONE => 16,
-        BC_ENTER_LOOPER | BC_EXIT_LOOPER => 0,
-        _ => return None,
-    })
+    if cmd & 0x4000_0000 == 0 {
+        // `_IO('c', nr)`: no payload (`BC_ENTER_LOOPER`, `BC_EXIT_LOOPER`).
+        return Some(0);
+    }
+    let size = ((cmd >> 16) & 0x3fff) as u64;
+    // A sane upper bound: `binder_transaction_data_sg` is the largest at 72.
+    (size <= 4096).then_some(size)
 }
 
 fn push_u32(out: &mut Vec<u8>, value: u32) {
@@ -1268,6 +1427,9 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             }
         }
     }
+    if tr.target_handle == 0 && is_hidl_request(tr) {
+        unsafe { hidl_service_manager_reply(tr.code, &mut parcel, &mut objects, tr) };
+    }
     if tr.target_handle == handle_for("activity_task") && tr.code == ATM_GET_ACTIVITY_CLIENT_CONTROLLER {
         push_flat_handle(
             &mut parcel,
@@ -1664,7 +1826,7 @@ unsafe fn handle_write_read(wr: *mut WriteRead) -> c_int {
         if off + size > wr.write_size {
             break;
         }
-        if cmd == BC_TRANSACTION {
+        if cmd == BC_TRANSACTION || cmd == BC_TRANSACTION_SG {
             // The command stream is only 4-byte aligned (a `u32` command code
             // followed by the struct), so this must not be read through a
             // `*const TransactionData` — Rust's alignment check aborts. Copy
@@ -1680,7 +1842,7 @@ unsafe fn handle_write_read(wr: *mut WriteRead) -> c_int {
                 pending.push(None);
             }
         }
-        if cmd == BC_REPLY && trace_enabled() {
+        if (cmd == BC_REPLY || cmd == BC_REPLY_SG) && trace_enabled() {
             // The app answering a transaction we sent it: dump the parcel so the
             // Java exception (if any) is readable.
             let (ptr, size) = tr_reply_data(wr.write_buffer, off).unwrap_or((0, 0));
