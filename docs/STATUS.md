@@ -39,6 +39,26 @@ kurulduktan **sonra** dlopen edilip SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGABRT için
 glibc backtrace basıyor (alt sinyal yığını + `SYS_rt_sigaction` ile, çünkü
 shim'in `sigaction`'ı Bionic düzeni bekliyor).
 
+Şimdi kalan durak: **render thread**'de `DeviceInfo::updateDisplayInfo()`
+(`EglManager::createSurface` içinden) `displays[0]`'ı null dizide okuyor:
+
+```
+#0 DeviceInfo::updateDisplayInfo()  mov (%rax,%rbx,8),%rdi   rax=0
+#2 EglManager::createSurface(...)
+#8 RenderThread::threadLoop()
+```
+
+`ADisplay_acquirePhysicalDisplays` (libnativedisplay) her id için
+`getPhysicalDisplayToken` **ve** `getStaticDisplayInfo` çağırıyor; ikincisi
+`ComposerService` (**legacy** `android.ui.ISurfaceComposer`) üzerinden gidiyor ve
+biz o handle'da yalnızca boş yanıt veriyoruz → `ui::StaticDisplayInfo` okunamıyor
+→ display atlanıyor → dizi boş → çökme. Sıradaki adım: legacy
+`getStaticDisplayInfo` için gerçek `StaticDisplayInfo` parcel'ı
+(`connected`, `density`, `secure`, …) döndürmek.
+
+Bu turda ayrıca `getPhysicalDisplayToken` (AIDL code 5) `[status][strongBinder]`
+olarak yanıtlanıyor.
+
 ## Önceki oturum: Roblox Activity'yi resume ediyor
 
 Hedef Roblox (`/tmp/roblox/base.apk` + `split_config.x86_64.apk`). Zincirin

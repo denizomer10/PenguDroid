@@ -231,8 +231,12 @@ const ISC_GET_PHYSICAL_DISPLAY_IDS: u32 = 3;
 const ISC_GET_PHYSICAL_DISPLAY_IDS_LEGACY: u32 = 54;
 
 /// Third candidate: the trace shows a no-argument call at 5 immediately before
-/// the WCG abort.
+/// the WCG abort. It turned out to be `getPhysicalDisplayToken` instead.
+#[allow(dead_code)]
 const ISC_GET_PHYSICAL_DISPLAY_IDS_ALT: u32 = 5;
+
+/// `ISurfaceComposer.getPhysicalDisplayToken(long id)` (AIDL).
+const ISC_GET_PHYSICAL_DISPLAY_TOKEN: u32 = 5;
 
 /// `ISurfaceComposer` transaction code for `createDisplayEventConnection`.
 ///
@@ -1017,9 +1021,7 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         }
     }
     if is_surface_flinger(tr.target_handle)
-        && (tr.code == ISC_GET_PHYSICAL_DISPLAY_IDS
-            || tr.code == ISC_GET_PHYSICAL_DISPLAY_IDS_LEGACY
-            || tr.code == ISC_GET_PHYSICAL_DISPLAY_IDS_ALT)
+        && (tr.code == ISC_GET_PHYSICAL_DISPLAY_IDS || tr.code == ISC_GET_PHYSICAL_DISPLAY_IDS_LEGACY)
     {
         // AIDL `long[] getPhysicalDisplayIds()`: `[int32 count][int64 id...]`.
         // hwui's `EglManager::initialize` aborts with "Failed to acquire
@@ -1030,6 +1032,16 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         parcel.extend_from_slice(&0i64.to_ne_bytes());
         if trace_enabled() {
             diag("[binder]   -> getPhysicalDisplayIds = [0]\n");
+        }
+    }
+    if is_surface_flinger(tr.target_handle) && tr.code == ISC_GET_PHYSICAL_DISPLAY_TOKEN {
+        // AIDL `IBinder getPhysicalDisplayToken(long id)`: `[status][strongBinder]`.
+        // `ADisplay_acquirePhysicalDisplays` skips a display whose token is null,
+        // and hwui's `DeviceInfo::updateDisplayInfo` then indexes `displays[0]`
+        // of an empty array and faults.
+        push_flat_handle(&mut parcel, &mut objects, handle_for("display_token"));
+        if trace_enabled() {
+            diag("[binder]   -> display_token handle\n");
         }
     }
     if tr.target_handle == 0 && (tr.code == ISM_GET_SERVICE || tr.code == ISM_CHECK_SERVICE) {
