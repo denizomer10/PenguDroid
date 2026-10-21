@@ -138,6 +138,11 @@ fn jar_paths_in_bootclasspath_pb(data: &[u8]) -> Vec<String> {
 impl Layout {
     /// Detect the layout under `root`.
     pub fn detect(root: &Path) -> Result<Layout, String> {
+        // Everything downstream builds absolute guest paths from `root`
+        // (`ANDROID_ROOT + "/etc/fonts.xml"`, boot class path locations, ...),
+        // so a relative `--sysroot` would make them cwd-dependent or plain wrong.
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let root = root.as_path();
         let flat_art = root.join("lib64/libart.so");
         let android_art = root.join("system/apex/com.android.art/lib64/libart.so");
         if flat_art.exists() {

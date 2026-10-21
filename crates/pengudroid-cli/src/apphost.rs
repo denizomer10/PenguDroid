@@ -183,11 +183,22 @@ pub fn seed_font_map(env: &JniEnv) -> bool {
 }
 
 /// Print how many families `Typeface`'s system font map holds.
+///
+/// `loadPreinstalledSystemFontMap()` is normally called from
+/// `ActivityThread.handleBindApplication`, so the diagnostic triggers it too -
+/// otherwise the map is simply still empty.
 pub fn font_map_size(env: &JniEnv) {
     let Some(tf) = env.find_class("android/graphics/Typeface") else {
         eprintln!("--fontmap: no Typeface");
         return;
     };
+    if let Some(load) = env.static_method_id(tf, "loadPreinstalledSystemFontMap", "()V") {
+        if !env.call_static_void(tf, load, &[]) {
+            eprintln!("--fontmap: loadPreinstalledSystemFontMap threw");
+        }
+    } else {
+        eprintln!("--fontmap: no loadPreinstalledSystemFontMap");
+    }
     let Some(get) = env.static_method_id(tf, "getSystemFontMap", "()Ljava/util/Map;") else {
         eprintln!("--fontmap: no Typeface.getSystemFontMap");
         return;

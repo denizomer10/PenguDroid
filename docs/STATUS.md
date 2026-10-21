@@ -66,11 +66,22 @@ Typeface$Builder(File(/system/fonts/Roboto-Regular.ttf)).build()
 ```
 
 Yani `android.graphics.Typeface`'ın **native** tarafı hiç `Typeface` üretemiyor:
-minikin'in font koleksiyonu boş. Ölçülenler: `/system/fonts` 208 dosya (doğru
-imajdan), `/system/etc/fonts.xml` var ve `sans-serif` ailesini tanımlıyor,
-`libhwui.so` dlopen oluyor ve `register_android_graphics_classes` çağrılıyor
-(2/2 grup), `libminikin`/`libexpat`/`libharfbuzz_ng` yerinde. Buna rağmen
-`Typeface.getSystemFontMap()` **0 aile** döndürüyor ve `nativeCreate*` null.
+minikin'in font koleksiyonu boş. `--fontmap` ile daha kesin ölçüm (teşhis artık
+`loadPreinstalledSystemFontMap()`'ı kendisi tetikliyor):
+
+```
+Typeface: Preloading /system/fonts/Roboto-Regular.ttf      <- fonts.xml okundu, TTF açıldı
+Typeface: Preloading /system/fonts/RobotoStatic-Regular.ttf
+NPE ... Typeface.create(null, 0)                            <- ama aile üretilemedi
+--fontmap: loadPreinstalledSystemFontMap threw / 0 families
+```
+
+Yani XML ayrıştırma ve dosya erişimi **çalışıyor**; eksik olan, native
+`Typeface` üretimi (minikin/Skia). Ölçülen ve sağlam olanlar: `/system/fonts` 208
+dosya (framework ile aynı imajdan), `fonts.xml`'de `sans-serif`, `libhwui`
+dlopen + `register_android_graphics_classes` (2/2), `libminikin`/`libexpat`/
+`libharfbuzz_ng`/`libft2` yerinde, `ANDROID_ROOT` artık **mutlak** yol,
+`/product` + `/system_ext` `fonts_customization.xml` stub'ları eklendi.
 
 Bu, sadece font değil **HWUI/EGL** tarafının da (pencere çizimi) önündeki duvar:
 Activity başlasa bile çizmek için SurfaceFlinger yerine kendi EGL/dmabuf
