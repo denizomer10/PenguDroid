@@ -121,24 +121,34 @@ fn write_version_script(out_dir: &PathBuf) {
     // long as the node exists, so each gets an anchor symbol; the actual
     // symbols resolve by name once `de-bionic` has made the references
     // unversioned.
-    let script = format!(
-        "LIBC {{ global: {libc_globals}; }};\
-         LIBC_N {{ global: __pengudroid_ver_libc_n; }};\
-         LIBC_O {{ global: __pengudroid_ver_libc_o; }};\
-         LIBC_P {{ global: __pengudroid_ver_libc_p; }};\
-         LIBC_Q {{ global: __pengudroid_ver_libc_q; }};\
-         LIBM {{ global: __pengudroid_ver_libm; }};\
-         LD   {{ global: __pengudroid_ver_ld; }};\
-         LIBLOG {{ global: __pengudroid_ver_liblog; }};\
-         LIBLOG_M {{ global: __pengudroid_ver_liblog_m; }};\
-         LIBLOG_R {{ global: __pengudroid_ver_liblog_r; }};\
-         LIBDL_ANDROID {{ global: __pengudroid_ver_libdl_android; }};\
-         LIBSTATSSOCKET {{ global: __pengudroid_ver_libstatssocket; }};\
-         LIBARTPALETTE_1 {{ global: __pengudroid_ver_libartpalette_1; }};\
-         HEAPPROFD_API_S {{ global: __pengudroid_ver_heapprofd_api_s; }};\
-         ZLIB_1.2.2 {{ global: __pengudroid_ver_zlib_1_2_2; }};\
-         ZLIB_NDK {{ global: __pengudroid_ver_zlib_ndk; }};\n"
-    );
+    //
+    // The list is every version node the libraries in a LineageOS 20 system
+    // tree demand from each other (collected with `readelf -V`). The shim
+    // stands in for several of those libraries, so it has to satisfy all of
+    // them; missing one makes `dlopen` fail with "version `X' not found".
+    const NODES: &[&str] = &[
+        "LIBC_N", "LIBC_O", "LIBC_OMR1", "LIBC_P", "LIBC_Q", "LIBC_R", "LIBC_S",
+        "LIBM", "LD", "LIBLOG", "LIBLOG_L", "LIBLOG_M", "LIBLOG_O", "LIBLOG_Q",
+        "LIBLOG_R", "LIBDL_ANDROID", "LIBANDROID", "LIBANDROIDICU_EXTERNAL_1",
+        "LIBAAUDIO", "LIBADBCONNECTION_CLIENT_1", "LIBADB_PAIRING_AUTH",
+        "LIBADB_PAIRING_CONNECTION", "LIBADB_PAIRING_SERVER", "LIBANDROIDIO_1",
+        "LIBARTPALETTE_1", "LIBBINDER", "LIBBINDER_NDK", "LIBBINDER_NDK30",
+        "LIBBINDER_NDK31", "LIBBINDER_NDK33", "LIBBINDER_NDK_PLATFORM",
+        "LIBCGROUPRC", "LIBCGROUPRC_30", "LIBEGL", "LIBFT2", "LIBGLESV1_CM",
+        "LIBGLESV2", "LIBHWUI", "LIBHWUI_PLATFORM", "LIBICU_31", "LIBICU_T",
+        "LIBJNIGRAPHICS", "LIBMEDIAMETRICS_1", "LIBMEDIANDK", "LIBMEMUNREACHABLE",
+        "LIBNATIVEDISPLAY", "LIBNATIVEDISPLAY_PLATFORM", "LIBNATIVEHELPER_S",
+        "LIBNATIVELOADER_1", "LIBNATIVEWINDOW", "LIBNATIVEWINDOW_PLATFORM",
+        "LIBNEURALNETWORKS_PACKAGE_INFO", "LIBSELINUX_R", "LIBSTATSPULL",
+        "LIBSTATSSOCKET", "LIBSYNC", "LIBVNDKSUPPORT", "HEAPPROFD_API_S",
+        "ZLIB_1.2.0", "ZLIB_1.2.2", "ZLIB_NDK",
+    ];
+    let mut script = format!("LIBC {{ global: {libc_globals}; }};");
+    for node in NODES {
+        let anchor = format!("__pengudroid_ver_{}", node.to_lowercase().replace('.', "_"));
+        script.push_str(&format!("{node} {{ global: {anchor}; }};"));
+    }
+    script.push('\n');
     std::fs::write(&map, script).expect("write version script");
 
     // Applies to the cdylib target only, so the rlib/tests are unaffected.

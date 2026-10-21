@@ -520,6 +520,9 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
             install_provider_replies(env, app_info, spec.package);
         }
         report_display_metrics(env);
+        if let Ok(name) = std::env::var("PENGUDROID_LOAD_LIB") {
+            probe_load_library(env, &name);
+        }
         install_display_replies(env);
         if let Ok(name) = std::env::var("PENGUDROID_LAUNCH_ACTIVITY") {
             launch_activity(env, thread, data, spec, &name);
@@ -574,6 +577,27 @@ fn report_display_metrics(env: &JniEnv) {
     }
     if let Some(id) = env.field_id(metrics_class, "densityDpi", "I") {
         println!("apphost: DisplayMetrics.densityDpi = {}", unsafe { get_int(env.0, metrics, id) });
+    }
+}
+
+/// `PENGUDROID_LOAD_LIB=<name>`: call `System.loadLibrary(name)` and report.
+///
+/// `UnsatisfiedLinkError: No implementation found` means the library never
+/// registered its natives; this says whether `loadLibrary` itself fails and, if
+/// so, with what.
+fn probe_load_library(env: &JniEnv, name: &str) {
+    let Some(system_class) = env.find_class("java/lang/System") else {
+        return;
+    };
+    let Some(load) = env.static_method_id(system_class, "loadLibrary", "(Ljava/lang/String;)V") else {
+        eprintln!("loadlib: System.loadLibrary missing");
+        return;
+    };
+    let arg = env.new_string(name);
+    if env.call_static_void(system_class, load, &[JValue { l: arg }]) {
+        println!("loadlib: System.loadLibrary({name}) ok");
+    } else {
+        eprintln!("loadlib: System.loadLibrary({name}) failed (see above)");
     }
 }
 

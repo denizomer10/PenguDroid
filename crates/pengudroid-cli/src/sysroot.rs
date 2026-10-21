@@ -322,6 +322,20 @@ impl Layout {
     }
 }
 
+/// The APK paths given to `--classpath`, in order.
+fn classpath_apks(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--classpath" {
+            if let Some(v) = it.next() {
+                out.push(v.clone());
+            }
+        }
+    }
+    out
+}
+
 /// `pengudroid sysroot <dir>`
 pub fn sysroot(args: &[String]) -> i32 {
     let Some(dir) = args.iter().find(|a| !a.starts_with('-')) else {
@@ -577,6 +591,36 @@ pub fn art_test(args: &[String]) -> i32 {
         compat.display(),
         layout.ld_library_path()
     );
+    // `System.loadLibrary` ends up in `dlopen`, and glibc does not know about
+    // the class loader's native library directories (that is an Android linker
+    // feature), so the app's own `lib/<abi>/*.so` have to be on
+    // `LD_LIBRARY_PATH` -- which glibc reads once, before the process starts.
+    for apk in classpath_apks(&passthrough) {
+        let Ok(info) = crate::apk::read_apk(&apk) else { continue };
+        let package = if info.package.is_empty() {
+            "org.pengudroid.app".to_string()
+        } else {
+            info.package.clone()
+        };
+        let dir = std::env::temp_dir().join(format!("pengudroid-libs/{package}"));
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(libs) = crate::apk::native_libs(&apk) {
+            for lib in libs.iter().filter(|l| l.abi == "x86_64") {
+                let dest = dir.join(&lib.file);
+                if dest.exists() {
+                    continue;
+                }
+                if let Ok(bytes) = crate::apk::extract_named(&apk, &lib.entry) {
+                    // The APK's libraries carry Bionic symbol versions
+                    // (`__register_atfork@LIBC`, ...) that glibc cannot match,
+                    // so they need the same treatment as the system libraries.
+                    let out = pengudroid_elf::strip_android_versions(&bytes).unwrap_or(bytes);
+                    let _ = std::fs::write(&dest, out);
+                }
+            }
+        }
+        ld_path = format!("{}:{ld_path}", dir.display());
+    }
     if let Some(dir) = &bridge_lib {
         // The translator is a normal x86-64 `.so` but carries Bionic VERNEED
         // entries (`LIBLOG`, `LIBC`, ...) and references like

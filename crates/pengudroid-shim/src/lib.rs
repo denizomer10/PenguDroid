@@ -2693,6 +2693,18 @@ pub unsafe extern "C" fn __cxa_demangle(
     std::ptr::null_mut()
 }
 
+/// Bionic's stack canary.
+///
+/// Bionic declares `extern uintptr_t* __stack_chk_guard` (a *pointer* to the
+/// canary), while glibc keeps its own hidden. Code compiled for Android reads
+/// the canary through this symbol, so the shim has to provide it; a private
+/// value that nothing writes is enough for the check to pass.
+static mut STACK_CHK_GUARD_VALUE: usize = 0;
+
+/// See [`STACK_CHK_GUARD_VALUE`].
+#[no_mangle]
+pub static mut __stack_chk_guard: *mut usize = core::ptr::addr_of_mut!(STACK_CHK_GUARD_VALUE);
+
 // ---------------------------------------------------------------------------
 // `AndroidRuntime` entry points
 // ---------------------------------------------------------------------------
