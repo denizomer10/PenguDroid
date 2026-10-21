@@ -36,7 +36,9 @@ Pikseller bizim memfd buffer'larında; **Wayland'a sunum henüz yok** (daemon
 logunda pencere yok). Ölçülenler:
 
 - `PENGUDROID_TRACE_GLESHIM=1` ile görüldü ki **`eglSwapBuffers` hiç
-  çağrılmıyor** — hwui kareyi bitirmiyor.
+  çağrılmıyor** — hwui kareyi bitirmiyor. Buna karşılık
+  `eglCreateWindowSurface` **iki kez** çağrılıyor, yani hwui bizim offscreen
+  FBO yüzeyimizi kuruyor ama kareyi swap etmiyor.
 - Broker'a `graphic_buffer_producer` handle'ında **hiç transaction gelmiyor**
   (`queueBuffer` yok).
 - `BufferQueueProducer::allocateBuffers` 6 buffer ayırıyor (bizim memfd'ler),

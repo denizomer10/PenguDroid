@@ -1186,6 +1186,9 @@ pub unsafe extern "C" fn eglCreateWindowSurface(
     native_window: *mut c_void,
     _attribs: *const c_int,
 ) -> EGLSurface {
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+        eprintln!("[gleshim] eglCreateWindowSurface window={native_window:p}");
+    }
     // Bionic hands us an `ANativeWindow*`, which we deliberately ignore: there
     // is no host window, only the FBO that `eglSwapBuffers` exports.
     let _ = native_window;
