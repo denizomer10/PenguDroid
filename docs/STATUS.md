@@ -149,15 +149,24 @@ Sırada:
    `Choreographer` → `DisplayEventReceiver.nativeInit` → `SurfaceFlinger`
    `createDisplayEventConnection` boş yanıt alıyor, `DisplayEventDispatcher`
    `ENODEV` dönüyor ve `DisplayEventReceiver` kurucusu istisna atıyor.
-   Gereken: `ISurfaceComposer.createDisplayEventConnection` → bir
-   `DisplayEventConnection` handle'ı, sonra `stealReceiveChannel` → parcel içinde
-   `BINDER_TYPE_FD` olarak bir BitTube fd'i. Ardından
-   `ISurfaceComposerClient.createSurface` + `IGraphicBufferProducer`
+
+   **Ölçülen ayrıntılar (bu tur):**
+   - `ISurfaceComposer.createConnection` (kod 2) ve `createDisplayEventConnection`
+     (kod 4) **native AIDL**'dir ve yanıtlarında **durum sözcüğü yoktur**:
+     okuyucu doğrudan offset 0'dan `readNullableStrongBinder` yapıyor (durum
+     sözcüğü eklenince libbinder "Attempt to read object from Parcel ... at
+     offset 0 that is not in the object list" diyor).
+   - `DisplayEventConnection.stealReceiveChannel` (kod 1) çağrılıyor;
+     `BitTube::writeToParcel` **iki fd** yazıyor (önce receive, sonra send) ve
+     bunlar `BINDER_TYPE_FD` (`0x66642a85`) nesneleridir. Broker bir socketpair
+     açıp iki ucu yazdığında bile çağrı
+     `Status(-129, EX_TRANSACTION_FAILED): 'PERMISSION_DENIED'` ile dönüyor —
+     yani `transact()` `-EPERM` veriyor. Bu, sıradaki oturumun başlayacağı yer;
+     deneme çalışmadığı için kod geri alındı.
+
+   Gereken: `ISurfaceComposerClient.createSurface` + `IGraphicBufferProducer`
    (`connect`/`dequeueBuffer`/`queueBuffer`/`requestBuffer`/`setBufferCount`/
    `query`) ve bu buffer'ları **kendi EGL/dmabuf sunumumuza** bağlamak.
-   Denenen ve **yetmeyen**: `createConnection`/`createDisplayEventConnection`
-   çağrılarına düz handle döndürmek (parcel şekli yanlış: "Attempt to read
-   object from Parcel at offset 0 that is not in the object list").
 2. `IApplicationThread.scheduleLaunchActivity` (ActivityClientRecord parcel'ı)
    — şu an JNI ile doğrudan çağırıyoruz.
 3. `IPackageManager`'in geri kalanı (`getPackagesForUid`, `checkPermission`, ...)
