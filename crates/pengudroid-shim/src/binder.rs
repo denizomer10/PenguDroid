@@ -165,6 +165,13 @@ static PROVIDER_INFO: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
 static EMPTY_BUNDLE: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
+/// `IDisplayManager` transaction code for `getDisplayInfo(int)`.
+const IDM_GET_DISPLAY_INFO: u32 = 1;
+
+/// A serialized `DisplayInfo` for the default display.
+static DISPLAY_INFO: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
 /// A `PackageInfo` reply serialized by the host with the framework's own
 /// `PackageInfo.writeToParcel`.
 ///
@@ -498,6 +505,17 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         // Without this the framework logs "Failed to find provider info for
         // settings (user not unlocked)" and refuses the provider lookup.
         parcel.extend_from_slice(&1u32.to_ne_bytes());
+    }
+    if tr.target_handle == handle_for("display") && tr.code == IDM_GET_DISPLAY_INFO {
+        let info = DISPLAY_INFO.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if !info.is_empty() {
+            // `getDisplayInfo` reads the result with `readTypedObject`.
+            parcel.extend_from_slice(&1u32.to_ne_bytes());
+            parcel.extend_from_slice(&info);
+            if trace_enabled() {
+                diag(&format!("[binder]   -> DisplayInfo ({} bytes)\n", info.len()));
+            }
+        }
     }
     if tr.target_handle == handle_for("package") && tr.code == IPM_GET_PACKAGE_INFO {
         let cached = PACKAGE_INFO.lock().unwrap_or_else(|e| e.into_inner());
@@ -994,6 +1012,19 @@ pub unsafe extern "C" fn __pengudroid_binder_set_empty_bundle(ptr: *const u8, le
     }
     let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
     *EMPTY_BUNDLE.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
+}
+
+/// `void __pengudroid_binder_set_display_info(const uint8_t *bytes, size_t len)`
+///
+/// # Safety
+/// `ptr` must point to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_display_info(ptr: *const u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
+    *DISPLAY_INFO.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
 }
 
 /// `int __pengudroid_binder_mmap_prot(int fd, int prot)`

@@ -506,6 +506,7 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         if std::env::var_os("PENGUDROID_DUMP_HOLDER").is_some() {
             install_provider_replies(env, app_info, spec.package);
         }
+        install_display_replies(env);
         if let Ok(name) = std::env::var("PENGUDROID_LAUNCH_ACTIVITY") {
             launch_activity(env, thread, data, spec, &name);
         }
@@ -981,6 +982,65 @@ fn install_package_manager_replies(env: &JniEnv, app_info: JObject, package: &st
     }
     if let Some(data) = marshal_object(env, app_info, "android/content/pm/ApplicationInfo") {
         install_reply(&data, "__pengudroid_binder_set_application_info");
+    }
+}
+
+/// Install the replies the display stack needs.
+///
+/// `ContextImpl.getDisplayNoVerify()` asks `ResourcesManager` for the default
+/// display, which goes through `DisplayManagerGlobal.getCompatibleDisplay` ->
+/// `IDisplayManager.getDisplayInfo`. With no display service the reply is
+/// empty, `getDisplayInfo` returns null and `Activity.setContentView` NPEs on
+/// `Display.getDisplayId()`. The `DisplayInfo` is marshalled by the framework
+/// itself so the layout matches this build.
+fn install_display_replies(env: &JniEnv) {
+    let Some(info_class) = env.find_class("android/view/DisplayInfo") else {
+        eprintln!("apphost: DisplayInfo not found");
+        return;
+    };
+    let Some((_, info)) = new_instance(env, "android/view/DisplayInfo") else {
+        eprintln!("apphost: cannot allocate DisplayInfo");
+        return;
+    };
+    let set_int = |field: &str, value: i32| {
+        if let Some(id) = env.field_id(info_class, field, "I") {
+            env.set_int_field(info, id, value);
+        }
+    };
+    let set_str = |field: &str, value: &str| {
+        if let Some(id) = env.field_id(info_class, field, "Ljava/lang/String;") {
+            env.set_object_field(info, id, env.new_string(value));
+        }
+    };
+    set_int("displayId", 0);
+    set_str("name", "PenguDroid");
+    set_str("uniqueId", "local:0");
+    for field in [
+        "appWidth",
+        "appHeight",
+        "logicalWidth",
+        "logicalHeight",
+        "largestNominalAppWidth",
+        "largestNominalAppHeight",
+        "smallestNominalAppWidth",
+        "smallestNominalAppHeight",
+    ] {
+        set_int(field, if field.contains("Height") { 720 } else { 1280 });
+    }
+    // `DisplayInfo` has no `densityDpi` field in this build; the density is
+    // derived from the logical size and the display metrics.
+    // Display.STATE_ON = 2, Display.TYPE_INTERNAL = 1, Surface.ROTATION_0 = 0.
+    set_int("state", 2);
+    set_int("committedState", 2);
+    set_int("type", 1);
+    set_int("rotation", 0);
+    set_int("modeId", 1);
+    set_int("layerStack", 0);
+    set_int("displayGroupId", 0);
+    set_int("colorMode", 0);
+
+    if let Some(data) = marshal_object(env, info, "android/view/DisplayInfo") {
+        install_reply(&data, "__pengudroid_binder_set_display_info");
     }
 }
 

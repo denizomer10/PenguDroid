@@ -114,35 +114,38 @@ doğrudan çağrılıyor (parcel/binder turu atlanıyor). Yol boyunca çözülen
   thread'inde Looper yoksa "Can't create handler inside thread ... that has not
   called Looper.prepare()". Launch öncesi `Looper.prepare()` çağrılıyor.
 
-Şu an durduğu yer: **Activity'nin `onCreate`'i çalışıyor** ve pencere katmanında
-duruyor:
+Şu an durduğu yer: **Activity'nin `onCreate`'i çalışıyor** ve pencere/erişilebilirlik
+katmanında bekliyor.
+
+Ölçülen ilerleme (test APK'sı `SimAppDialog`, çünkü `HTMLViewer` bir `WebView`
+istiyor ve WebView sağlayıcısı yok):
 
 ```
-NullPointerException: 'int android.view.Display.getDisplayId()' on a null object reference
-  at android.app.Activity.setContentView(Activity.java:3625)
-  at android.app.Activity.performCreate(Activity.java:8370)
-  at android.app.Instrumentation.callActivityOnCreate(Instrumentation.java:1417)
+apphost: calling handleLaunchActivity for com.android.simappdialog.InstallCarrierAppActivity
+[pengudroid:log] ERROR HidlServiceManagement: getService: defaultServiceManager() is null
+[pengudroid:log] DEBUG CompatibilityChangeReporter: Compat change id reported: 171228096 ...
+(süreç canlı kalıyor; ana thread binder okuma döngüsünde bekliyor)
 ```
 
-Buraya gelmek için `settings` ContentProvider'ı da taklit edildi:
-`IActivityManager.getContentProvider` (transaction **kodu 23**) yanıtı bir
-`ContentProviderHolder`dır. Düzeni tahmin etmek yerine **ölçüldü**: null
-binder'larla bir holder marshal edilip baytları okundu →
-`[ProviderInfo][provider][connection][int noReleaseNeeded][int mLocal]`,
-`readTypedObject`'in varlık int'i başta. Broker bu düzeni üretiyor ve
-`IContentProvider.call` çağrılarına **boş `Bundle`** döndürüyor (ayarlar
-varsayılana düşüyor). Ayrıca `IUserManager.isUserUnlocked` (kod **79**) artık
-`true` dönüyor; yoksa framework "Failed to find provider info for settings
-(user not unlocked)" deyip sağlayıcıyı hiç istemiyor.
+Buraya gelmek için **display** de taklit edildi: `ContextImpl.getDisplayNoVerify()`
+→ `ResourcesManager.getAdjustedDisplay` → `DisplayManagerGlobal.getCompatibleDisplay`
+→ `IDisplayManager.getDisplayInfo` (transaction **kodu 1**). Boş yanıtta
+`getDisplayInfo` null dönüyor ve `Activity.setContentView` `Display.getDisplayId()`
+üzerinde NPE veriyordu. Broker artık framework'ün kendi `DisplayInfo.writeToParcel`'ı
+ile üretilmiş bir `DisplayInfo` döndürüyor (1280×720, `STATE_ON`, `TYPE_INTERNAL`,
+`ROTATION_0`). Not: bu sürümde `DisplayInfo.densityDpi` alanı **yok**.
 
 Sırada:
-1. **Display/pencere**: `ContextImpl.getDisplay()` null dönüyor. `DisplayManager`
-   / `ResourcesManager.getAdjustedDisplay` yolunu beslemek ve
-   `SurfaceComposerClient`/`SurfaceFlinger` yerine kendi EGL/dmabuf sunumumuzu
-   koymak. HWUI EGL üzerinden çiziyor.
-2. `IApplicationThread.scheduleLaunchActivity` (ActivityClientRecord parcel'ı)
+1. **Ana thread neden binder okuma döngüsünde?** Son transaction'lar
+   `accessibility` (kod 3/20/26/27). Ya bir çağrı yanıt bekliyor ya da bir looper
+   okuması başlatılmış. `/proc/<pid>/task/*/wchan` `hrtimer_nanosleep` gösteriyor
+   (shim'in 20 ms'lik looper uykusu).
+2. **Pencere**: `SurfaceComposerClient`/`SurfaceFlinger` yerine kendi
+   EGL/dmabuf sunumumuz; HWUI EGL üzerinden çiziyor. `window` servisine gelen
+   kodlar (5, 41, 69) bu yolun başlangıcı.
+3. `IApplicationThread.scheduleLaunchActivity` (ActivityClientRecord parcel'ı)
    — şu an JNI ile doğrudan çağırıyoruz.
-3. `IPackageManager`'in geri kalanı (`getPackagesForUid`, `checkPermission`, ...)
+4. `IPackageManager`'in geri kalanı (`getPackagesForUid`, `checkPermission`, ...)
    ve `IActivityManager`'in temel metotları.
 
 ## Binder sunucu tarafı — durum
