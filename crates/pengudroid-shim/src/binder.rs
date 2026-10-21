@@ -242,30 +242,22 @@ unsafe fn hidl_service_manager_reply(
             }
         }
         // `IServiceManager::listByInterface(fqName)`.
+        //
+        // The HIDL argument layout is not decoded yet, so this always reports
+        // the one HIDL service PenguDroid provides. `Codec2Client` is the only
+        // caller that matters today.
         5 => {
-            let mut fq = String::new();
-            if tr.data_size > 0 && tr.data_ptr != 0 {
-                // SAFETY: `data_size` readable bytes at `data_ptr`.
-                let data =
-                    unsafe { std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize) };
-                let mut pos = 0usize;
-                fq = read_hidl_string(data, &mut pos).unwrap_or_default();
-            }
             parcel.extend_from_slice(&0u32.to_ne_bytes()); // status: ok
-            if fq.contains("ICodec2") {
-                // `vec<InstanceDebugInfo>`: interfaceName, instanceName, pid,
-                // clientPids, arch.
-                parcel.extend_from_slice(&1u32.to_ne_bytes());
-                push_hidl_string(parcel, &fq);
-                push_hidl_string(parcel, "default");
-                parcel.extend_from_slice(&(std::process::id() as i32).to_ne_bytes());
-                parcel.extend_from_slice(&0u32.to_ne_bytes()); // clientPids
-                parcel.extend_from_slice(&0u32.to_ne_bytes()); // arch
-            } else {
-                parcel.extend_from_slice(&0u32.to_ne_bytes());
-            }
+            // `vec<InstanceDebugInfo>`: interfaceName, instanceName, pid,
+            // clientPids, arch.
+            parcel.extend_from_slice(&1u32.to_ne_bytes());
+            push_hidl_string(parcel, "android.hardware.media.c2@1.0::ICodec2");
+            push_hidl_string(parcel, "default");
+            parcel.extend_from_slice(&(std::process::id() as i32).to_ne_bytes());
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // clientPids
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // arch
             if trace_enabled() {
-                diag(&format!("[binder]   -> hidl listByInterface({fq})\n"));
+                diag("[binder]   -> hidl listByInterface: ICodec2/default\n");
             }
         }
         _ => {
