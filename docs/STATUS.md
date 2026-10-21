@@ -30,10 +30,30 @@ token**'a göre yapılıyor (`android.ui.ISurfaceComposer` = legacy,
 geliyor (`[u32][-1]["TSYS"]`).
 
 Sonuç: WCG abort **yok**, `DeviceInfo::updateDisplayInfo` çökmesi **yok**.
-Yeni durak: `OpenGLRenderer: Unreachable: unsupported pixel format: 0` —
-display'in renk formatı hâlâ 0. Sıradaki adım: `DynamicDisplayInfo`'nun
-`activeColorMode`/`supportedColorModes` alanlarını (veya `DisplayMode`'un
-pixel-format alanını) doğru doldurmak.
+Yeni durak: `OpenGLRenderer: Unreachable: unsupported pixel format: 0`.
+
+### Pixel format duvarı — ölçülenler
+
+`DeviceInfo::updateDisplayInfo` (libhwui) şu zinciri çalıştırıyor:
+
+```
+ADisplay_acquirePhysicalDisplays
+  → ADisplay_getDisplayType            (0 = physical)
+  → ADisplay_getPreferredWideColorFormat(&dataspace, &format)
+      format 1 (RGBA_8888) veya 0x16 olmalı, yoksa assert
+```
+
+`ADisplay_getPreferredWideColorFormat` yalnızca `ADisplay` nesnesinin
+`+0x0c` (dataspace) ve `+0x10` (format) alanlarını kopyalıyor. gdb'de `ADisplay`
+belleği **tamamen sıfır** çıktı, yani bu iki alan hiç doldurulmamış.
+`ADisplay_acquirePhysicalDisplays` bunları `getCompositionPreference`'ın
+çıktılarından alıyor (legacy code **27**, istemci 5 adet `readInt32` okuyor);
+bu çağrı artık `[status][dataspace][format=1][renderIntent][spare]` olarak
+yanıtlanıyor ve **ret=0** dönüyor, ama değerler `ADisplay`'e ulaşmıyor.
+
+Sıradaki adım: `-0x1a8`/`-0x1a4` yığın alanlarının `getCompositionPreference`
+çıktılarından mı yoksa `DynamicDisplayInfo`'dan mı geldiğini netleştirmek
+(objdump bu bölgede hizasız okuduğu için gdb ile tek adım izlemek gerekiyor).
 
 ## Önceki oturum: WCG duvarı aşıldı, hwui EGL'ye geldi
 

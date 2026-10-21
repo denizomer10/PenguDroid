@@ -235,6 +235,9 @@ const ISC_GET_PHYSICAL_DISPLAY_IDS_LEGACY: u32 = 54;
 #[allow(dead_code)]
 const ISC_GET_PHYSICAL_DISPLAY_IDS_ALT: u32 = 5;
 
+/// Legacy `android.ui.ISurfaceComposer.getCompositionPreference`.
+const ISC_GET_COMPOSITION_PREFERENCE: u32 = 27;
+
 /// Legacy `android.ui.ISurfaceComposer.getDynamicDisplayInfo`.
 const ISC_GET_DYNAMIC_DISPLAY_INFO: u32 = 55;
 
@@ -1137,6 +1140,19 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             "[binder]   SF code={} token={token} binder={has_binder}\n",
             tr.code
         ));
+    }
+    if is_surface_flinger(tr.target_handle) && tr.code == ISC_GET_COMPOSITION_PREFERENCE {
+        // Legacy `getCompositionPreference`: `[status][dataspace][format][renderIntent]`.
+        // hwui's `DeviceInfo::updateDisplayInfo` asserts "Unreachable: unsupported
+        // pixel format" unless the format is 1 (RGBA_8888) or 0x16.
+        parcel.extend_from_slice(&0i32.to_ne_bytes()); // status
+        parcel.extend_from_slice(&0i32.to_ne_bytes()); // dataspace (UNKNOWN)
+        parcel.extend_from_slice(&1i32.to_ne_bytes()); // format RGBA_8888
+        parcel.extend_from_slice(&0i32.to_ne_bytes()); // render intent
+        parcel.extend_from_slice(&0i32.to_ne_bytes()); // spare (client reads 5 ints)
+        if trace_enabled() {
+            diag("[binder]   -> getCompositionPreference (RGBA_8888)\n");
+        }
     }
     if is_surface_flinger(tr.target_handle) && tr.code == ISC_GET_DYNAMIC_DISPLAY_INFO {
         // Legacy `getDynamicDisplayInfo`: `[int32 status][int32 size][blob]`.
