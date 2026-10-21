@@ -698,7 +698,11 @@ unsafe fn handle_write_read(wr: *mut WriteRead) -> c_int {
     }
 
     let pid = libc::getpid();
-    let mut pending: Vec<Reply> = Vec::new();
+    // `None` marks a one-way transaction. libbinder still waits for
+    // `BR_TRANSACTION_COMPLETE` for those (`waitForResponse(nullptr, nullptr)`)
+    // but never for a `BR_REPLY`; emitting nothing leaves the caller spinning in
+    // `talkWithDriver` forever.
+    let mut pending: Vec<Option<Reply>> = Vec::new();
     let mut off = 0u64;
     while off + 4 <= wr.write_size {
         let cmd = *((wr.write_buffer + off) as *const u32);
@@ -714,7 +718,9 @@ unsafe fn handle_write_read(wr: *mut WriteRead) -> c_int {
             // the bytes out and reinterpret them with `read_unaligned`.
             let tr = transaction_at(wr.write_buffer, off);
             if tr.flags & TF_ONE_WAY == 0 {
-                pending.push(make_reply(&tr, pid));
+                pending.push(Some(make_reply(&tr, pid)));
+            } else {
+                pending.push(None);
             }
         }
         if cmd == BC_REPLY && trace_enabled() {
@@ -776,8 +782,9 @@ unsafe fn handle_write_read(wr: *mut WriteRead) -> c_int {
         }
     }
 
-    for reply in &pending {
+    for entry in &pending {
         push_u32(&mut out, BR_TRANSACTION_COMPLETE);
+        let Some(reply) = entry else { continue };
         push_u32(&mut out, BR_REPLY);
         let mut tr = TransactionData {
             sender_pid: pid,
