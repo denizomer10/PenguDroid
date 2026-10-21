@@ -338,8 +338,8 @@ unsafe fn hidl_service_manager_reply(
 
             let vec_idx = push_buffer_object(parcel, objects, 1, vec.as_ptr() as u64, 16, 0, 0);
             let arr_idx =
-                push_buffer_object(parcel, objects, 1, arr.as_ptr() as u64, 16, 0, vec_idx);
-            push_buffer_object(parcel, objects, 1, data_ptr, data_len, 0, arr_idx);
+                push_buffer_object(parcel, objects, 1, arr.as_ptr() as u64, 16, vec_idx, 0);
+            push_buffer_object(parcel, objects, 1, data_ptr, data_len, arr_idx, 0);
             if trace_enabled() {
                 diag(&format!("[binder]   -> hidl listManifestByInterface (code {code}): [default]\n"));
             }
