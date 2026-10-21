@@ -287,6 +287,17 @@ fn fix_app_configuration(env: &JniEnv, data: JObject) {
                     if let Some(id) = env.field_id(cfg_class, "densityDpi", "I") {
                         env.set_int_field(sys_cfg, id, 420);
                     }
+                    if let Some(get_locales) = env.method_id(
+                        cfg_class,
+                        "getLocales",
+                        "()Landroid/os/LocaleList;",
+                    ) {
+                        let l = env.call_object(sys_cfg, get_locales, &[]);
+                        match l {
+                            Some(v) if !v.is_null() => println!("apphost: system locales = ok"),
+                            _ => eprintln!("apphost: system locales = NULL"),
+                        }
+                    }
                 }
             }
         }
@@ -316,6 +327,39 @@ fn fix_app_configuration(env: &JniEnv, data: JObject) {
                     println!("apphost: applied the configuration to ResourcesManager");
                 } else {
                     eprintln!("apphost: applyConfigurationToResources threw");
+                }
+                // JNI field access ignores `private`, so the process-wide
+                // configuration can be inspected (and patched) directly.
+                if let Some(f) = env.field_id(
+                    rm_class,
+                    "mResConfiguration",
+                    "Landroid/content/res/Configuration;",
+                ) {
+                    let res_cfg = env.object_field(rm, f);
+                    if !res_cfg.is_null() {
+                        if let Some(get_locales) = env.method_id(
+                            cfg_class,
+                            "getLocales",
+                            "()Landroid/os/LocaleList;",
+                        ) {
+                            let l = env.call_object(res_cfg, get_locales, &[]);
+                            match l {
+                                Some(v) if !v.is_null() => {
+                                    println!("apphost: mResConfiguration locales = ok")
+                                }
+                                _ => eprintln!("apphost: mResConfiguration locales = NULL"),
+                            }
+                        }
+                        if let Some(loc) = locale_list(env) {
+                            if let Some(m) = env.method_id(
+                                cfg_class,
+                                "setLocales",
+                                "(Landroid/os/LocaleList;)V",
+                            ) {
+                                env.call_void(res_cfg, m, &[JValue { l: loc }]);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1045,7 +1089,25 @@ fn launch_activity(
     // bare `Configuration` whose locale list is null, and
     // `ConfigurationCompat.getLocales(...)` then NPEs.
     if let Some(config) = new_configuration(env) {
-        set("overrideConfig", "Landroid/content/res/Configuration;", config);
+        if let Some(cfg_class) = env.find_class("android/content/res/Configuration") {
+            if let Some(get_locales) = env.method_id(
+                cfg_class,
+                "getLocales",
+                "()Landroid/os/LocaleList;",
+            ) {
+                let locales = env.call_object(config, get_locales, &[]);
+                match locales {
+                    Some(l) if !l.is_null() => println!("apphost: overrideConfig locales = ok"),
+                    _ => eprintln!("apphost: overrideConfig locales = NULL"),
+                }
+            }
+        }
+        // Deliberately *not* setting `overrideConfig`: with an override,
+        // `ResourcesManager.generateConfig` builds a fresh `Configuration` copy,
+        // while without one it hands out the live `mResConfiguration` — the very
+        // object `fix_app_configuration` patched. That is the only way to be
+        // sure the activity sees the locale list.
+        let _ = config;
     }
 
     let Some(handle) = env.method_id(

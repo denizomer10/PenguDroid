@@ -274,7 +274,20 @@ const IDEC_REQUEST_NEXT_VSYNC: u32 = 3;
 /// `{i64 frameInterval; u32 preferredFrameTimelineIndex; FrameTimeline[7]}`
 /// with `FrameTimeline` = three `i64`s — 192 bytes. 24 + 192 = 216.
 const DISPLAY_EVENT_SIZE: usize = 216;
-const DISPLAY_EVENT_VSYNC: u32 = 0x0000_0001;
+/// `DisplayEventReceiver::DISPLAY_EVENT_VSYNC`.
+///
+/// Android 13 spells the event types as `fourcc(...)` tags, and `fourcc` packs
+/// them big-endian: `'v' << 24 | 's' << 16 | 'y' << 8 | 'n'`. The value was
+/// read out of `libgui`'s own comparison in `processPendingEvents`.
+const DISPLAY_EVENT_VSYNC: u32 = 0x7673_796e;
+
+/// `ILocaleManager` transaction codes.
+///
+/// `AppCompatDelegate.getApplicationLocales()` goes through the locale service
+/// on API 33+, and `LocaleListCompat.wrap(null)` makes `get(0)` NPE — which is
+/// exactly how NewPipe's `Localization.getAppLocale()` dies.
+const ILM_GET_APPLICATION_LOCALES: u32 = 2;
+const ILM_GET_SYSTEM_LOCALES: u32 = 3;
 
 /// A serialized `ProviderInfo` for the `settings` provider.
 static PROVIDER_INFO: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
@@ -639,6 +652,24 @@ fn window_session_reply(code: u32, parcel: &mut Vec<u8>, objects: &mut Vec<u64>)
             parcel.extend_from_slice(&0u32.to_ne_bytes()); // status
             parcel.extend_from_slice(&0u32.to_ne_bytes()); // false / no feedback
         }
+        IWS_RELAYOUT => {
+            // `[result][outFrames][outMergedConfiguration][outSurfaceControl]
+            //  [insetsState][activeControls][bundle]`. Every parcelable is
+            // written as absent so `ViewRootImpl` keeps the objects it
+            // pre-allocated; the array still has to match `InsetsState.SIZE`
+            // exactly, and the bundle is a null `Bundle` (-1).
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // result
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // outFrames absent
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // merged config absent
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // surface control absent
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // insets state absent
+            let size = INSETS_SIZE.load(Ordering::Relaxed) as usize;
+            parcel.extend_from_slice(&(size as u32).to_ne_bytes());
+            for _ in 0..size {
+                parcel.extend_from_slice(&0u32.to_ne_bytes()); // null element
+            }
+            parcel.extend_from_slice(&(-1i32).to_ne_bytes()); // null Bundle
+        }
         IWS_GET_WINDOW_ID => {
             parcel.extend_from_slice(&0u32.to_ne_bytes()); // status
             push_flat_handle(parcel, objects, handle_for("window_token"));
@@ -763,21 +794,25 @@ fn send_vsync() {
     event[32..40].copy_from_slice(&16_666_666i64.to_ne_bytes());
 
     let fds = VSYNC_SEND_FDS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut dropped = 0usize;
     for fd in fds.iter() {
         // SAFETY: `event` is a valid buffer and `fd` is a socket we own.
         // `MSG_DONTWAIT` keeps a client that stopped reading from blocking the
         // frame clock; a full socket just drops the pulse.
-        unsafe {
+        let rc = unsafe {
             libc::send(
                 *fd,
                 event.as_ptr() as *const c_void,
                 event.len(),
                 libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
-            );
+            )
+        };
+        if rc < 0 {
+            dropped += 1;
         }
     }
     if trace_enabled() {
-        unsafe { diag(&format!("[binder]   -> vsync frame {frame}\n")) };
+        unsafe { diag(&format!("[binder]   -> vsync frame {frame} dropped={dropped}\n")) };
     }
 }
 
@@ -813,10 +848,23 @@ fn vsync_channel() -> Option<(RawFd, RawFd)> {
     if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr()) } != 0 {
         return None;
     }
+    // The client takes ownership of both descriptors it is handed and closes
+    // them when the `BitTube` dies. Handing it the same numbers we keep would
+    // make its `close()` kill our send end, so the broker keeps a duplicate.
+    // (A real binder driver dups every descriptor it transfers; this is that
+    // dup, done by hand.)
+    let ours = unsafe { libc::dup(fds[1]) };
+    if ours < 0 {
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        return None;
+    }
     VSYNC_SEND_FDS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push(fds[1]);
+        .push(ours);
     Some((fds[0], fds[1]))
 }
 
@@ -1043,6 +1091,17 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
     }
     if tr.target_handle == handle_for("window_session") {
         window_session_reply(tr.code, &mut parcel, &mut objects);
+    }
+    if tr.target_handle == handle_for("locale")
+        && (tr.code == ILM_GET_APPLICATION_LOCALES || tr.code == ILM_GET_SYSTEM_LOCALES)
+    {
+        // `[presence=1][LocaleList]`, and a `LocaleList` is a string array of
+        // language tags — empty means "no per-app override".
+        parcel.extend_from_slice(&1u32.to_ne_bytes());
+        parcel.extend_from_slice(&0u32.to_ne_bytes());
+        if trace_enabled() {
+            diag("[binder]   -> empty LocaleList\n");
+        }
     }
     if tr.target_handle == handle_for("package") && tr.code == IPM_GET_PROVIDER_INFO {
         // The request is `[interface token][ComponentName][flags][userId]`, so

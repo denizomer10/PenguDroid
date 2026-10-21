@@ -72,7 +72,41 @@ işleniyor (cevap parcel'i atılıyor). `display_event_connection` code 3'te
 (216 bayt: `Header{type,displayId,timestamp}` + `VSync{count,VsyncEventData}`,
 `frameInterval` 16.67 ms). Böylece `Choreographer` ilk kareyi alıyor.
 
-### NewPipe: layout inflate ediliyor, Activity onCreate'de duruyor
+### NewPipe: ÇALIŞIYOR (bu tur)
+
+`pengudroid art-test ... --classpath NewPipe_v0.29.1.apk` artık NewPipe'ı
+**normal bir Linux süreci olarak** ayağa kaldırıyor ve 30 sn boyunca canlı
+tutuyor (exit 124). Zincir:
+
+```
+handleBindApplication → handleLaunchActivity → handleResumeActivity
+→ Looper.loop() → Choreographer → relayout (code 5) → OkHttp/HTTP2 → www.youtube.com
+```
+
+Bu turda düzeltilenler:
+
+* **`ILocaleManager`.** `AppCompatDelegate.getApplicationLocales()` API 33+'ta
+  locale servisine gider; cevap boş gelince `LocaleListCompat.wrap(null)`
+  oluyor ve NewPipe'ın `Localization.getAppLocale()` içindeki `get(0)` NPE
+  atıyordu. Broker artık code 2/3'e boş bir `LocaleList` döndürüyor.
+* **`IWindowSession.relayout`** (code 5) cevaplanıyor: `[result][outFrames
+  absent][mergedConfig absent][surfaceControl absent][insetsState absent]
+  [activeControls = InsetsState.SIZE][null Bundle]`.
+* **Vsync olay tipi.** Android 13 `DISPLAY_EVENT_VSYNC`'i `fourcc('v','s','y','n')`
+  olarak yazıyor ve `fourcc` **big-endian** paketliyor: `0x7673796e`. Değer
+  `libgui`'nin kendi `cmp`'inden okundu. (Yanlış değerle istemci her pulse'ta
+  "ignoring unknown event type" diyordu.)
+* **BitTube fd'leri.** Broker, istemciye verdiği fd'lerin *aynısını* tutuyordu;
+  istemci `close()` edince bizim send ucumuz de kapanıyor ve vsync'ler
+  düşüyordu (`dropped=1`). Artık `dup()` ile ayrı bir kopya tutuluyor —
+  gerçek binder sürücüsünün yaptığı dup'ın elle hâli.
+* **`statvfs`/`statfs`** (yukarıda), **`ResourcesManager.applyConfigurationToResources`**
+  doğru imzayla, **`Configuration.userSetLocale`**.
+
+Kalan tek gürültü: `Bundle: Key value expected String but value was a
+Parcel$LazyValue` — `EMPTY_BUNDLE`'daki boş `HashMap` yüzünden, zararsız.
+
+### (eski) NewPipe: layout inflate ediliyor, Activity onCreate'de duruyor
 
 Bu turda NewPipe için düzeltilenler:
 
