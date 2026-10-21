@@ -114,24 +114,35 @@ doğrudan çağrılıyor (parcel/binder turu atlanıyor). Yol boyunca çözülen
   thread'inde Looper yoksa "Can't create handler inside thread ... that has not
   called Looper.prepare()". Launch öncesi `Looper.prepare()` çağrılıyor.
 
-Şu an durduğu yer: `Activity.attach` içinde `Settings.Global.getInt` →
-`ContentResolver` → `IContentProvider` **null** ("settings" sağlayıcısı yok):
+Şu an durduğu yer: **Activity'nin `onCreate`'i çalışıyor** ve pencere katmanında
+duruyor:
 
 ```
-NullPointerException: ... IContentProvider.call(...) on a null object reference
-  at android.provider.Settings$NameValueCache.getStringForUser(Settings.java:3161)
-  at android.app.Activity.attach(Activity.java:8266)
+NullPointerException: 'int android.view.Display.getDisplayId()' on a null object reference
+  at android.app.Activity.setContentView(Activity.java:3625)
+  at android.app.Activity.performCreate(Activity.java:8370)
+  at android.app.Instrumentation.callActivityOnCreate(Instrumentation.java:1417)
 ```
+
+Buraya gelmek için `settings` ContentProvider'ı da taklit edildi:
+`IActivityManager.getContentProvider` (transaction **kodu 23**) yanıtı bir
+`ContentProviderHolder`dır. Düzeni tahmin etmek yerine **ölçüldü**: null
+binder'larla bir holder marshal edilip baytları okundu →
+`[ProviderInfo][provider][connection][int noReleaseNeeded][int mLocal]`,
+`readTypedObject`'in varlık int'i başta. Broker bu düzeni üretiyor ve
+`IContentProvider.call` çağrılarına **boş `Bundle`** döndürüyor (ayarlar
+varsayılana düşüyor). Ayrıca `IUserManager.isUserUnlocked` (kod **79**) artık
+`true` dönüyor; yoksa framework "Failed to find provider info for settings
+(user not unlocked)" deyip sağlayıcıyı hiç istemiyor.
 
 Sırada:
-1. `IActivityManager.getContentProvider` yanıtı: `ContentProviderHolder`
-   (Parcelable) + içinde bir `IContentProvider` handle'ı; `call()` çağrılarına
-   `Bundle` döndürmek. Bu, `settings`/`Settings.Global` okumalarını açar.
+1. **Display/pencere**: `ContextImpl.getDisplay()` null dönüyor. `DisplayManager`
+   / `ResourcesManager.getAdjustedDisplay` yolunu beslemek ve
+   `SurfaceComposerClient`/`SurfaceFlinger` yerine kendi EGL/dmabuf sunumumuzu
+   koymak. HWUI EGL üzerinden çiziyor.
 2. `IApplicationThread.scheduleLaunchActivity` (ActivityClientRecord parcel'ı)
    — şu an JNI ile doğrudan çağırıyoruz.
-3. Pencere yolu: `SurfaceFlinger`/`SurfaceComposerClient` yerine kendi
-   EGL/dmabuf sunumumuz; HWUI EGL üzerinden çiziyor.
-4. `IPackageManager`'in geri kalanı (`getPackagesForUid`, `checkPermission`, ...)
+3. `IPackageManager`'in geri kalanı (`getPackagesForUid`, `checkPermission`, ...)
    ve `IActivityManager`'in temel metotları.
 
 ## Binder sunucu tarafı — durum

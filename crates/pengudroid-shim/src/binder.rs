@@ -144,6 +144,27 @@ const IPM_GET_APPLICATION_INFO: u32 = 9;
 /// inside `createBaseContextForActivity`.
 const ATM_GET_ACTIVITY_CLIENT_CONTROLLER: u32 = 18;
 
+/// `IActivityManager` transaction code for `getContentProvider`.
+///
+/// Arguments are `(IApplicationThread, String opPackageName, String auth,
+/// int userId, boolean stable)`; `Activity.attach` needs the `settings`
+/// provider and NPEs on a null `IContentProvider` without it.
+const IAM_GET_CONTENT_PROVIDER: u32 = 23;
+
+/// `IUserManager` transaction code for `isUserUnlocked(int)`.
+const IUM_IS_USER_UNLOCKED: u32 = 79;
+
+/// A serialized `ProviderInfo` for the `settings` provider.
+static PROVIDER_INFO: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// A serialized empty `Bundle`, the reply to `IContentProvider.call`.
+///
+/// `Settings.NameValueCache` reads `Bundle.getString(VALUE)`; an empty bundle
+/// yields null, so `Settings.Global.getInt` falls back to its default.
+static EMPTY_BUNDLE: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
 /// A `PackageInfo` reply serialized by the host with the framework's own
 /// `PackageInfo.writeToParcel`.
 ///
@@ -445,6 +466,38 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         if trace_enabled() {
             diag("[binder]   -> activity_client_controller handle\n");
         }
+    }
+    if tr.target_handle == handle_for("activity") && tr.code == IAM_GET_CONTENT_PROVIDER {
+        let info = PROVIDER_INFO.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if !info.is_empty() {
+            // `ContentProviderHolder` layout, measured by marshalling one with
+            // null binders: [ProviderInfo][provider][connection][int][int].
+            // `readTypedObject` supplies the presence int, so it goes first.
+            parcel.extend_from_slice(&1u32.to_ne_bytes());
+            parcel.extend_from_slice(&info);
+            let handle = handle_for("settings_provider");
+            push_flat_handle(&mut parcel, &mut objects, handle);
+            push_flat_handle(&mut parcel, &mut objects, handle);
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // noReleaseNeeded
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // mLocal
+            if trace_enabled() {
+                diag(&format!("[binder]   -> ContentProviderHolder ({} bytes)\n", info.len()));
+            }
+        }
+    }
+    if tr.target_handle == handle_for("settings_provider") {
+        let bundle = EMPTY_BUNDLE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if !bundle.is_empty() {
+            parcel.extend_from_slice(&bundle);
+            if trace_enabled() {
+                diag(&format!("[binder]   -> empty Bundle ({} bytes)\n", bundle.len()));
+            }
+        }
+    }
+    if tr.target_handle == handle_for("user") && tr.code == IUM_IS_USER_UNLOCKED {
+        // Without this the framework logs "Failed to find provider info for
+        // settings (user not unlocked)" and refuses the provider lookup.
+        parcel.extend_from_slice(&1u32.to_ne_bytes());
     }
     if tr.target_handle == handle_for("package") && tr.code == IPM_GET_PACKAGE_INFO {
         let cached = PACKAGE_INFO.lock().unwrap_or_else(|e| e.into_inner());
@@ -803,7 +856,7 @@ unsafe fn trace_write_read(wr: *const WriteRead) {
             );
             diag(&line);
             if tr.data_size > 0 && tr.data_ptr != 0 {
-                let show = (tr.data_size as usize).min(160);
+                let show = (tr.data_size as usize).min(400);
                 let bytes = std::slice::from_raw_parts(tr.data_ptr as *const u8, show);
                 let mut hex = String::from("[binder]   parcel:");
                 for b in bytes {
@@ -915,6 +968,32 @@ pub unsafe extern "C" fn __pengudroid_binder_set_application_info(ptr: *const u8
     }
     let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
     *APPLICATION_INFO.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
+}
+
+/// `void __pengudroid_binder_set_provider_info(const uint8_t *bytes, size_t len)`
+///
+/// # Safety
+/// `ptr` must point to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_provider_info(ptr: *const u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
+    *PROVIDER_INFO.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
+}
+
+/// `void __pengudroid_binder_set_empty_bundle(const uint8_t *bytes, size_t len)`
+///
+/// # Safety
+/// `ptr` must point to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_empty_bundle(ptr: *const u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
+    *EMPTY_BUNDLE.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
 }
 
 /// `int __pengudroid_binder_mmap_prot(int fd, int prot)`

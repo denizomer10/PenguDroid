@@ -503,6 +503,9 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         if let Ok(name) = std::env::var("PENGUDROID_PROBE_APP_CLASS") {
             probe_app_class(env, data, &name);
         }
+        if std::env::var_os("PENGUDROID_DUMP_HOLDER").is_some() {
+            install_provider_replies(env, app_info, spec.package);
+        }
         if let Ok(name) = std::env::var("PENGUDROID_LAUNCH_ACTIVITY") {
             launch_activity(env, thread, data, spec, &name);
         }
@@ -978,6 +981,47 @@ fn install_package_manager_replies(env: &JniEnv, app_info: JObject, package: &st
     }
     if let Some(data) = marshal_object(env, app_info, "android/content/pm/ApplicationInfo") {
         install_reply(&data, "__pengudroid_binder_set_application_info");
+    }
+}
+
+/// Install the replies the `settings` provider needs.
+///
+/// `Activity.attach` reads `Settings.Global`, which resolves the `settings`
+/// content provider through `IActivityManager.getContentProvider` and then
+/// calls `IContentProvider.call`. There is no provider here, so the broker
+/// answers with a `ProviderInfo` and a handle, and every `call` returns an
+/// empty `Bundle` (so settings reads fall back to their defaults).
+fn install_provider_replies(env: &JniEnv, app_info: JObject, package: &str) {
+    let Some(pi_class) = env.find_class("android/content/pm/ProviderInfo") else {
+        eprintln!("apphost: ProviderInfo not found");
+        return;
+    };
+    let Some((_, info)) = new_instance(env, "android/content/pm/ProviderInfo") else {
+        return;
+    };
+    if let Some(id) = env.field_id(pi_class, "name", "Ljava/lang/String;") {
+        env.set_object_field(info, id, env.new_string("SettingsProvider"));
+    }
+    if let Some(id) = env.field_id(pi_class, "authority", "Ljava/lang/String;") {
+        env.set_object_field(info, id, env.new_string("settings"));
+    }
+    if let Some(id) = env.field_id(pi_class, "packageName", "Ljava/lang/String;") {
+        env.set_object_field(info, id, env.new_string(package));
+    }
+    if let Some(id) = env.field_id(
+        pi_class,
+        "applicationInfo",
+        "Landroid/content/pm/ApplicationInfo;",
+    ) {
+        env.set_object_field(info, id, app_info);
+    }
+    if let Some(data) = marshal_object(env, info, "android/content/pm/ProviderInfo") {
+        install_reply(&data, "__pengudroid_binder_set_provider_info");
+    }
+    if let Some((_, bundle)) = new_instance(env, "android/os/Bundle") {
+        if let Some(data) = marshal_object(env, bundle, "android/os/Bundle") {
+            install_reply(&data, "__pengudroid_binder_set_empty_bundle");
+        }
     }
 }
 
