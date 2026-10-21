@@ -80,13 +80,30 @@ the manifest"), sonra `listByInterface` ile servis arıyor. Yapılacaklar:
        readEmbeddedFromParcel(hidl_string, parcel, parentOffset, i * 16)
    ```
 
-   Yani yanıt: `[status u32][16 baytlık vec struct {ptr, u32 size, pad}]
-   [elemanlar, her biri 16 bayt, satır içi]` ve her elemanın string verisi
-   `parentOffset + i*16` adresinden **yerinde** okunuyor. Bu yerleşimle de
-   istemci boş liste görüyor; sıradaki adım `readEmbeddedBuffer`'ın
-   (`0x56da0`'dan çağrılan) `parentOffset`'i nasıl yorumladığını okumak —
-   gömülü veri alanının struct'tan sonra mı yoksa struct'ın içinde mi
-   olduğunu bu belirleyecek.
+   **Asıl mekanizma bulundu:** HIDL parcel'ında string'ler düz bayt değil,
+   **`binder_buffer_object`** kayıtlarıdır (`readEmbeddedBuffer`, `0xbc3f0`):
+
+   ```cpp
+   struct binder_buffer_object {   // 40 bayt
+       uint32_t type;        // 0x70742a85
+       uint32_t flags;       // 0 = normal, 1 = gömülü
+       uintptr_t buffer;     // veri işaretçisi
+       size_t length;
+       size_t parent;        // üst nesnenin handle'ı
+       size_t parentOffset;
+   };
+   ```
+
+   `writeEmbeddedBuffer` (`0xbae20`) bu yapıyı parcel'ın **veri alanına** yazıp
+   konumunu **offsets dizisine** ekliyor; okuyucu `readObject<T>(handle)` ile
+   offsets dizisinden buluyor. Yani yanıt için broker'ın `Reply.objects`
+   listesine bu nesnelerin offset'lerini eklemesi gerekiyor — şu an sadece
+   Java `flat_binder_object` handle'ları yazılıyor, bu yüzden HIDL yanıtı
+   okunmuyor.
+
+   Sıradaki somut iş: `make_reply`'in HIDL dalında (a) vec struct'ı,
+   (b) eleman dizisini, (c) her string verisini `binder_buffer_object` olarak
+   yazmak ve `parent`/`parentOffset` alanlarını doğru doldurmak.
 2. `get(...)` → `codec2` handle'ı (hazır).
 3. `ICodec2::listComponents` → `ComponentInfo` listesi.
 4. `ICodec2::createComponent` + `ICodec2Component` (`configure`, `start`,
