@@ -536,26 +536,32 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
 /// `sp` value becomes 0px, which is what breaks NewPipe's auto-size text.
 fn report_display_metrics(env: &JniEnv) {
     let Some(res_class) = env.find_class("android/content/res/Resources") else {
+        eprintln!("metrics: Resources not found");
         return;
     };
     let Some(get_system) = env.static_method_id(res_class, "getSystem", "()Landroid/content/res/Resources;") else {
+        eprintln!("metrics: Resources.getSystem missing");
         return;
     };
     let Some(res) = env.call_static_object(res_class, get_system, &[]) else {
+        eprintln!("metrics: Resources.getSystem threw");
         return;
     };
     let Some(get_metrics) = env.method_id(res_class, "getDisplayMetrics", "()Landroid/util/DisplayMetrics;") else {
+        eprintln!("metrics: getDisplayMetrics missing");
         return;
     };
     let Some(metrics) = env.call_object(res, get_metrics, &[]) else {
+        eprintln!("metrics: getDisplayMetrics threw");
         return;
     };
     let Some(metrics_class) = env.find_class("android/util/DisplayMetrics") else {
+        eprintln!("metrics: DisplayMetrics not found");
         return;
     };
     let get_float: unsafe extern "C" fn(*mut c_void, JObject, JFieldId) -> f32 = unsafe {
         let table = *(env.0 as *const *const *const c_void);
-        std::mem::transmute(*table.add(117)) // GetFloatField
+        std::mem::transmute(*table.add(102)) // GetFloatField
     };
     let get_int: unsafe extern "C" fn(*mut c_void, JObject, JFieldId) -> i32 = unsafe {
         let table = *(env.0 as *const *const *const c_void);
