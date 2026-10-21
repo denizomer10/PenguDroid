@@ -134,6 +134,13 @@ fn new_configuration(env: &JniEnv) -> Option<JObject> {
         if let Some(m) = env.method_id(class, "setLocales", "(Landroid/os/LocaleList;)V") {
             env.call_void(config, m, &[JValue { l: loc }]);
         }
+        // `Configuration.updateFrom` only copies the locale list when the delta
+        // has `userSetLocale` set, and `setLocales` does not set it. Without
+        // this the activity's `Resources` keeps a null locale list and
+        // `ConfigurationCompat.getLocales(...)` NPEs.
+        if let Some(id) = env.field_id(class, "userSetLocale", "Z") {
+            env.set_boolean_field(config, id, true);
+        }
         // `Resources` builds its own `Configuration` from the process default,
         // and `ConfigurationCompat.getLocales(...)` NPEs when that one's locale
         // list is null (NewPipe's `Localization.getAppLocale`).
@@ -256,6 +263,33 @@ fn fix_app_configuration(env: &JniEnv, data: JObject) {
     }
     if let Some(id) = env.field_id(cfg_class, "densityDpi", "I") {
         env.set_int_field(cfg, id, 420);
+    }
+    // `ResourcesManager` builds every new `Resources` from its process-wide
+    // configuration, and `Resources.getSystem()` exposes that same instance.
+    // Patching it directly is the only way to reach the copy the activity gets.
+    if let Some(get_system) = env.static_method_id(
+        res_class,
+        "getSystem",
+        "()Landroid/content/res/Resources;",
+    ) {
+        if let Some(sys) = env.call_static_object(res_class, get_system, &[]) {
+            if let Some(sys_cfg) = env.call_object(sys, get_cfg, &[]) {
+                if !sys_cfg.is_null() {
+                    if let Some(loc) = locale_list(env) {
+                        if let Some(m) = env.method_id(
+                            cfg_class,
+                            "setLocales",
+                            "(Landroid/os/LocaleList;)V",
+                        ) {
+                            env.call_void(sys_cfg, m, &[JValue { l: loc }]);
+                        }
+                    }
+                    if let Some(id) = env.field_id(cfg_class, "densityDpi", "I") {
+                        env.set_int_field(sys_cfg, id, 420);
+                    }
+                }
+            }
+        }
     }
     // `ResourcesManager` keeps a process-wide configuration that every new
     // `Resources` is built from; the system server normally pushes it with
