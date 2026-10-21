@@ -28,6 +28,13 @@ pub struct AppSpec<'a> {
     pub native_lib_dir: &'a Path,
     pub target_sdk: i32,
     pub min_sdk: i32,
+    /// `android:name` of the `<application>` element, if the manifest has one.
+    ///
+    /// `LoadedApk.makeApplicationInner` reads it from
+    /// `ApplicationInfo.className`; leaving it null makes the framework
+    /// instantiate a plain `android.app.Application`, so the app's own
+    /// `onCreate` (where Roblox loads its native library) never runs.
+    pub app_class: Option<&'a str>,
     /// Android uid for the app. There is no package manager here, so a fixed
     /// value is used; it only has to be stable and non-zero.
     pub uid: i32,
@@ -61,6 +68,9 @@ fn build_app_info(env: &JniEnv, spec: &AppSpec<'_>) -> Option<JObject> {
     };
 
     set_str("packageName", spec.package);
+    if let Some(app_class) = spec.app_class {
+        set_str("className", app_class);
+    }
     set_str("sourceDir", &spec.apk.display().to_string());
     set_str("publicSourceDir", &spec.apk.display().to_string());
     set_str("dataDir", &spec.data_dir.display().to_string());
@@ -497,6 +507,26 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
     // (`mCoreSettings.getString(Settings.System.TIME_12_24)`). An empty Bundle
     // is exactly what the framework treats as "no overrides".
     ensure_core_settings(env, thread_class, thread);
+    // Create the `LoadedApk` and give it a working class loader *before* the
+    // bind: `handleBindApplication` instantiates the Application through it, so
+    // the app's own class has to be reachable by then. `getPackageInfoNoCheck`
+    // caches the instance in `ActivityThread.mPackages`, and the bind reuses it
+    // (the app uid is in user 0, so the cache is not skipped).
+    if let Some(compat) = compat {
+        if let Some(get_info) = env.method_id(
+            thread_class,
+            "getPackageInfoNoCheck",
+            "(Landroid/content/pm/ApplicationInfo;Landroid/content/res/CompatibilityInfo;)Landroid/app/LoadedApk;",
+        ) {
+            match env.call_object(thread, get_info, &[JValue { l: app_info }, JValue { l: compat }]) {
+                Some(apk) if !apk.is_null() => {
+                    install_class_loader_on(env, apk, spec.apk, spec.native_lib_dir);
+                }
+                Some(_) => eprintln!("apphost: getPackageInfoNoCheck returned null"),
+                None => eprintln!("apphost: getPackageInfoNoCheck threw"),
+            }
+        }
+    }
     let Some(handle) = env.method_id(
         thread_class,
         "handleBindApplication",
@@ -509,7 +539,6 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
     let ok = env.call_void(thread, handle, &[JValue { l: data }]);
     if ok {
         println!("apphost: handleBindApplication returned normally");
-        install_app_class_loader(env, data, spec.apk, spec.native_lib_dir);
         if let Some(compat) = compat {
             report_include_code(env, thread, app_info, compat, data);
         }
@@ -520,6 +549,7 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
             install_provider_replies(env, app_info, spec.package);
         }
         report_display_metrics(env);
+        report_application(env, thread);
         if let Ok(name) = std::env::var("PENGUDROID_LOAD_LIB") {
             probe_load_library(env, &name);
         }
@@ -577,6 +607,44 @@ fn report_display_metrics(env: &JniEnv) {
     }
     if let Some(id) = env.field_id(metrics_class, "densityDpi", "I") {
         println!("apphost: DisplayMetrics.densityDpi = {}", unsafe { get_int(env.0, metrics, id) });
+    }
+}
+
+/// Print the `Application` the bind created.
+///
+/// `handleBindApplication` instantiates it through `Instrumentation`; if that
+/// silently produced nothing, the app's own `onCreate` (where Roblox loads its
+/// native library) never runs.
+fn report_application(env: &JniEnv, thread: JObject) {
+    let Some(thread_class) = env.find_class("android/app/ActivityThread") else {
+        return;
+    };
+    let Some(field) = env.field_id(thread_class, "mInitialApplication", "Landroid/app/Application;") else {
+        eprintln!("app: ActivityThread.mInitialApplication not found");
+        return;
+    };
+    let app = env.object_field(thread, field);
+    if app.is_null() {
+        eprintln!("app: mInitialApplication is null");
+        return;
+    }
+    let Some(obj_class) = env.find_class("java/lang/Object") else {
+        return;
+    };
+    let Some(get_class) = env.method_id(obj_class, "getClass", "()Ljava/lang/Class;") else {
+        return;
+    };
+    let Some(cls) = env.call_object(app, get_class, &[]) else {
+        return;
+    };
+    let Some(class_class) = env.find_class("java/lang/Class") else {
+        return;
+    };
+    let Some(get_name) = env.method_id(class_class, "getName", "()Ljava/lang/String;") else {
+        return;
+    };
+    if let Some(name) = env.call_object(cls, get_name, &[]).and_then(|n| env.get_string(n)) {
+        println!("app: mInitialApplication = {name}");
     }
 }
 
@@ -866,14 +934,7 @@ fn resume_activity(env: &JniEnv, thread_class: JClass, thread: JObject, record: 
 /// Activity can be instantiated. `LoadedApk.getClassLoader()` returns
 /// `mClassLoader` when it is non-null, so installing one built from the APK is
 /// enough for `performLaunchActivity`.
-fn install_app_class_loader(env: &JniEnv, data: JObject, apk: &Path, native_lib_dir: &Path) -> bool {
-    let Some(bind_class) = env.find_class("android/app/ActivityThread$AppBindData") else {
-        return false;
-    };
-    let Some(info_field) = env.field_id(bind_class, "info", "Landroid/app/LoadedApk;") else {
-        return false;
-    };
-    let loaded_apk = env.object_field(data, info_field);
+fn install_class_loader_on(env: &JniEnv, loaded_apk: JObject, apk: &Path, native_lib_dir: &Path) -> bool {
     if loaded_apk.is_null() {
         return false;
     }

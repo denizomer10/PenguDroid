@@ -1647,6 +1647,7 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) {
         native_lib_dir: &lib_dir,
         target_sdk: info.target_sdk.map(|v| v as i32).unwrap_or(35),
         min_sdk: info.min_sdk.map(|v| v as i32).unwrap_or(23),
+        app_class: info.application_class.as_deref(),
         // Must belong to user 0: `ActivityThread.getPackageInfo` skips its
         // `LoadedApk` cache when `UserHandle.getUserId(uid) != myUserId()`, and
         // a cache miss rebuilds the package info with `mIncludeCode == false`
