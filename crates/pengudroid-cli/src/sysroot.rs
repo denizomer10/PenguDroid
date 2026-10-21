@@ -645,6 +645,9 @@ pub fn art_test(args: &[String]) -> i32 {
         Some(g) => format!("{}:{}", shim.display(), g.display()),
         None => shim.display().to_string(),
     };
+    // Extra preloads for diagnostics are loaded *after* the VM instead (see
+    // `art_main`), because ART installs its fault handler during Runtime::Init
+    // and a preloaded handler would be replaced by it.
     cmd.env("LD_PRELOAD", &preload)
         .env("LD_LIBRARY_PATH", &ld_path)
         .env("ANDROID_ROOT", &layout.android_root)
@@ -923,6 +926,24 @@ pub fn art_main(args: &[String]) -> i32 {
             }
             if let Ok(name) = std::env::var("PENGUDROID_PROBE_SERVICE") {
                 probe_service(&env, &name);
+            }
+            if let Some(extra) = std::env::var_os("PENGUDROID_EXTRA_PRELOAD") {
+                // Load diagnostics *after* the VM: ART installs its fault handler
+                // during `Runtime::Init`, and a preloaded handler would be
+                // replaced by it. Loading here puts ours last.
+                for path in extra.to_string_lossy().split(':') {
+                    if path.is_empty() {
+                        continue;
+                    }
+                    if let Ok(c) = CString::new(path) {
+                        let h = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+                        if h.is_null() {
+                            diag(&format!("art: dlopen({path}) failed: {}", dlerror()));
+                        } else {
+                            diag(&format!("art: loaded diagnostic {path}"));
+                        }
+                    }
+                }
             }
             if let Some(name) = dump_class.as_deref() {
                 crate::apphost::dump_class(&env, name);

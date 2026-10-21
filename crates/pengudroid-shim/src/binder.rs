@@ -223,7 +223,16 @@ const ISCC_CREATE_SURFACE: u32 = 1;
 /// answering it with a `long[]` did not clear the abort, so the code still has
 /// to be pinned down.
 #[allow(dead_code)]
-const ISC_GET_PHYSICAL_DISPLAY_IDS: u32 = 54;
+const ISC_GET_PHYSICAL_DISPLAY_IDS: u32 = 3;
+
+/// The deprecated legacy tag for the same method; both are answered because the
+/// trace shows calls at 3 and 54 and the abort only clears when the right one
+/// returns a non-empty array.
+const ISC_GET_PHYSICAL_DISPLAY_IDS_LEGACY: u32 = 54;
+
+/// Third candidate: the trace shows a no-argument call at 5 immediately before
+/// the WCG abort.
+const ISC_GET_PHYSICAL_DISPLAY_IDS_ALT: u32 = 5;
 
 /// `ISurfaceComposer` transaction code for `createDisplayEventConnection`.
 ///
@@ -919,6 +928,20 @@ fn name_for_handle(handle: u32) -> Option<String> {
     map.iter().find(|(_, h)| **h == handle).map(|(n, _)| n.clone())
 }
 
+/// Whether `handle` is the SurfaceFlinger service.
+///
+/// The name matters: hwui asks the service manager for `SurfaceFlingerAIDL`
+/// while other clients ask for `SurfaceFlinger`, and `handle_for` assigns a
+/// *different* handle per name. Comparing against one literal name silently
+/// missed every reply for the other, which is why answering
+/// `getPhysicalDisplayIds` had no effect.
+fn is_surface_flinger(handle: u32) -> bool {
+    matches!(
+        name_for_handle(handle).as_deref(),
+        Some("SurfaceFlinger") | Some("SurfaceFlingerAIDL")
+    )
+}
+
 /// Whether a reply starts with an AIDL `Status` word.
 ///
 /// Almost every interface here is AIDL, whose generated proxy reads the status
@@ -928,9 +951,20 @@ fn name_for_handle(handle: u32) -> Option<String> {
 /// four bytes, `Parcel::finishUnflattenBinder` cannot find the object in the
 /// offset table, and `readStrongBinder` returns null.
 fn reply_has_status(handle: u32, code: u32) -> bool {
-    if handle == handle_for("SurfaceFlinger") {
-        // `createConnection` and `createDisplayEventConnection` both end in
-        // `reply.readStrongBinder()` with no preceding status.
+    if is_surface_flinger(handle) {
+        // Two different interfaces share the name: the legacy hand-written
+        // `android.ui.ISurfaceComposer` (asked for as "SurfaceFlinger") and the
+        // AIDL `android.gui.ISurfaceComposer` (asked for as
+        // "SurfaceFlingerAIDL"). Only the AIDL one starts its replies with a
+        // `Status` word; for the legacy one a status word shifts every field by
+        // four bytes, so `readInt64Vector` reads the status (0) as the element
+        // count and every reply looks empty.
+        let aidl = matches!(name_for_handle(handle).as_deref(), Some("SurfaceFlingerAIDL"));
+        if !aidl {
+            return false;
+        }
+        // `createConnection` and `createDisplayEventConnection` are legacy
+        // methods that also end in `reply.readStrongBinder()` with no status.
         return !matches!(
             code,
             ISC_CREATE_CONNECTION | ISC_CREATE_DISPLAY_EVENT_CONNECTION
@@ -980,6 +1014,22 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                 seed_probe_codes();
                 APP_THREAD_PROBE.store(true, Ordering::Relaxed);
             }
+        }
+    }
+    if is_surface_flinger(tr.target_handle)
+        && (tr.code == ISC_GET_PHYSICAL_DISPLAY_IDS
+            || tr.code == ISC_GET_PHYSICAL_DISPLAY_IDS_LEGACY
+            || tr.code == ISC_GET_PHYSICAL_DISPLAY_IDS_ALT)
+    {
+        // AIDL `long[] getPhysicalDisplayIds()`: `[int32 count][int64 id...]`.
+        // hwui's `EglManager::initialize` aborts with "Failed to acquire
+        // physical displays for WCG support!" on an empty array, so one id is
+        // enough. The code was found by tracing the last transaction before
+        // that abort (3, not the deprecated legacy tag 34).
+        parcel.extend_from_slice(&1i32.to_ne_bytes());
+        parcel.extend_from_slice(&0i64.to_ne_bytes());
+        if trace_enabled() {
+            diag("[binder]   -> getPhysicalDisplayIds = [0]\n");
         }
     }
     if tr.target_handle == 0 && (tr.code == ISM_GET_SERVICE || tr.code == ISM_CHECK_SERVICE) {
@@ -1071,7 +1121,7 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             }
         }
     }
-    if tr.target_handle == handle_for("SurfaceFlinger") && tr.code == ISC_CREATE_CONNECTION {
+    if is_surface_flinger(tr.target_handle) && tr.code == ISC_CREATE_CONNECTION {
         push_flat_handle(
             &mut parcel,
             &mut objects,
@@ -1094,7 +1144,7 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             diag("[binder]   -> createSurface handle + gbp\n");
         }
     }
-    if tr.target_handle == handle_for("SurfaceFlinger") && tr.code == ISC_CREATE_DISPLAY_EVENT_CONNECTION {
+    if is_surface_flinger(tr.target_handle) && tr.code == ISC_CREATE_DISPLAY_EVENT_CONNECTION {
         // No status word: the client's first read is `readStrongBinder()`.
         push_flat_handle(
             &mut parcel,

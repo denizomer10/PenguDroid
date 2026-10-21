@@ -3,7 +3,43 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
-## Bu oturum: Roblox artık Activity'yi resume ediyor
+## Bu oturum: WCG duvarı aşıldı, hwui EGL'ye geldi
+
+Belgelenen "`getPhysicalDisplayIds` boş dönüyor" durağının kökü **kod numarası
+değil, yanıt biçimiydi**:
+
+- `SurfaceFlinger` adı **iki ayrı arayüzü** gösteriyor: eski (hand-written)
+  `android.ui.ISurfaceComposer` (istemci "SurfaceFlinger" adıyla istiyor) ve
+  AIDL `android.gui.ISurfaceComposer` ("SurfaceFlingerAIDL"). `handle_for` her
+  ad için ayrı handle üretiyor, biz ise tek bir literal adla karşılaştırıyorduk.
+- Eski arayüzün yanıtlarında **status kelimesi yok**. Biz status yazdığımız için
+  istemcinin `readInt64Vector`'ü status'ü (0) eleman sayısı sanıyor, dizi boş
+  görünüyor ve hwui "Failed to acquire physical displays for WCG support!" ile
+  abort ediyordu.
+- Düzeltme: `is_surface_flinger()` iki adı da tanıyor; `reply_has_status()`
+  yalnızca AIDL handle'ında status yazıyor. `getPhysicalDisplayIds` kodu **3**
+  (`BpSurfaceComposer` içinde `mov $0x3,%esi` ile doğrulandı) ve yanıt
+  `[int32 count][int64 id...]`.
+
+Sonuç: WCG abort **kayboldu**, hwui EGL'yi başlatıyor
+(`OpenGLRenderer: Failed to initialize 101010-2 format` = zararsız WCG probu) ve
+NewPipe Activity'si **launch + resume** oluyor:
+
+```
+apphost: handleLaunchActivity returned an Activity
+apphost: calling handleResumeActivity
+FragmentManager: Added fragment to active set MainFragment
+```
+
+Şimdi kalan durak: feed yüklendikten sonra (SQLite sorgusundan hemen sonra)
+SIGSEGV. ART'nin kendi fault handler'ı bu ortamda döküm üretmiyor (Bionic
+`ucontext_t` bekliyor, glibc farklı düzen veriyor), bu yüzden
+`.toolchain/crashbt.c` yazıldı: `PENGUDROID_EXTRA_PRELOAD=<crashbt.so>` ile VM
+kurulduktan **sonra** dlopen edilip SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGABRT için
+glibc backtrace basıyor (alt sinyal yığını + `SYS_rt_sigaction` ile, çünkü
+shim'in `sigaction`'ı Bionic düzeni bekliyor).
+
+## Önceki oturum: Roblox Activity'yi resume ediyor
 
 Hedef Roblox (`/tmp/roblox/base.apk` + `split_config.x86_64.apk`). Zincirin
 tamamı çalışıyor:
