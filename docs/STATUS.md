@@ -3,7 +3,41 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
-## Bu oturum: display bilgisi verildi, hwui çizim yoluna girdi
+## Bu oturum: NewPipe hwui ile çiziyor (70+ sn stabil)
+
+Gralloc duvarı aşıldı. `art-test ... --bind-app` ile NewPipe **70 saniye
+boyunca canlı kalıyor**, `FATAL`/`SIGSEGV` yok, `Choreographer` kareleri işliyor
+ve hwui 1280×720 RGBA_8888 buffer'larını bizim ayırıcımızdan alıyor:
+
+```
+[ahb] allocated 1280x720 fmt=1 stride=1280 (3686400 bytes)   ×6
+```
+
+### Nasıl çözüldü
+
+`GraphicBufferMapper`/`GraphicBufferAllocator` kurucularındaki
+`LOG_ALWAYS_FATAL`'lar interpose edildi, sonra **`GraphicBufferAllocator::allocate`**
+shim'de uygulandı. Kritik ayrıntılar (hepsi gdb ile ölçüldü):
+
+1. `allocate` bir **üye fonksiyon**: `rdi` = `this`, sonra `rsi=w, rdx=h,
+   rcx=format, r8=layerCount, r9=usage`.
+2. Mangled isimdeki `Pjm` iki farklı şey: `outStride` bir **pointer** (`Pj`),
+   sonraki argüman ise **değer olarak `unsigned long`** (`m`). Ona pointer gibi
+   yazmak SIGSEGV veriyordu.
+3. `GraphicBufferMapper::getTransportSize` sembolü `16getTransportSize…PjS4_`
+   (uzunluk 16, `S4_`); yanlış yazım sessizce host'a düşüyordu.
+
+Buffer'lar memfd + klasik gralloc0 `native_handle` düzeniyle ayrılıyor
+(`data[0]=fd`, sonra stride/format/width/height/usage).
+
+### Kalan iş: sunum
+
+Pikseller bizim memfd buffer'larında; **Wayland'a sunum henüz yok** (daemon
+logunda pencere yok). Sıradaki adım: `IGraphicBufferProducer::queueBuffer`
+transaction'ını broker'da yakalayıp buffer'ı `zwp_linux_dmabuf_v1` ile
+compositor'a vermek (ya da memfd'i `wl_shm` ile sunmak).
+
+## Önceki oturum: display bilgisi verildi, hwui çizim yoluna girdi
 
 `ADisplay_acquirePhysicalDisplays`'ın istediği **üç** yanıt tamamlandı ve her
 biri ölçülerek doğrulandı:

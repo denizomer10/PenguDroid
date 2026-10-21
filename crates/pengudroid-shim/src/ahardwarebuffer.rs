@@ -141,6 +141,7 @@ pub struct NativeHandle {
 /// `[3]=height`, `[4..5]=usage`.
 #[no_mangle]
 pub unsafe extern "C" fn _ZN7android22GraphicBufferAllocator8allocateEjjijmPPK13native_handlePjmNSt3__112basic_stringIcNS6_11char_traitsIcEENS6_9allocatorIcEEEE(
+    _this: *mut c_void,
     width: u32,
     height: u32,
     format: i32,
@@ -148,7 +149,7 @@ pub unsafe extern "C" fn _ZN7android22GraphicBufferAllocator8allocateEjjijmPPK13
     usage: u64,
     out_handle: *mut *const NativeHandle,
     out_stride: *mut u32,
-    out_buffer_id: *mut u64,
+    _out_buffer_id: u64,
     _requestor: *mut c_void,
 ) -> i32 {
     // Thin wrapper: keeping the body in one place avoids the stack juggling that
@@ -161,7 +162,6 @@ pub unsafe extern "C" fn _ZN7android22GraphicBufferAllocator8allocateEjjijmPPK13
         usage,
         out_handle,
         out_stride,
-        out_buffer_id,
     )
 }
 
@@ -174,6 +174,7 @@ pub unsafe extern "C" fn _ZN7android22GraphicBufferAllocator8allocateEjjijmPPK13
 /// `bool` by value.
 #[no_mangle]
 pub unsafe extern "C" fn _ZN7android22GraphicBufferAllocator14allocateHelperEjjijmPPK13native_handlePjNSt3__112basic_stringIcNS6_11char_traitsIcEENS6_9allocatorIcEEEEb(
+    _this: *mut c_void,
     width: u32,
     height: u32,
     format: i32,
@@ -181,11 +182,11 @@ pub unsafe extern "C" fn _ZN7android22GraphicBufferAllocator14allocateHelperEjji
     usage: u64,
     out_handle: *mut *const NativeHandle,
     out_stride: *mut u32,
-    out_buffer_id: *mut u64,
+    _out_buffer_id: u64,
     _requestor: *mut c_void,
     _flag: u8,
 ) -> i32 {
-    allocate_buffer(width, height, format, layer_count, usage, out_handle, out_stride, out_buffer_id)
+    allocate_buffer(width, height, format, layer_count, usage, out_handle, out_stride)
 }
 
 /// Shared body of the two allocation entry points.
@@ -197,7 +198,6 @@ unsafe fn allocate_buffer(
     usage: u64,
     out_handle: *mut *const NativeHandle,
     out_stride: *mut u32,
-    out_buffer_id: *mut u64,
 ) -> i32 {
     if out_handle.is_null() {
         return -22;
@@ -236,13 +236,49 @@ unsafe fn allocate_buffer(
     if !out_stride.is_null() {
         *out_stride = stride;
     }
-    if !out_buffer_id.is_null() {
-        *out_buffer_id = 0;
-    }
     if std::env::var_os("PENGUDROID_TRACE_AHB").is_some() {
         eprintln!("[ahb] allocated {width}x{height} fmt={format} stride={stride} ({size} bytes)");
     }
     0
+}
+
+/// `android::GraphicBufferMapper::getTransportSize(handle, &numFds, &numInts)`.
+///
+/// `GraphicBuffer::initWithSize` asks the mapper how many fds and ints a handle
+/// carries so it can copy it. Our handles always carry one fd and six ints.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper16getTransportSizeEPK13native_handlePjS4_(
+    _this: *mut c_void,
+    handle: *const NativeHandle,
+    num_fds: *mut u32,
+    num_ints: *mut u32,
+) -> i32 {
+    if handle.is_null() {
+        return -22;
+    }
+    if !num_fds.is_null() {
+        *num_fds = (*handle).num_fds as u32;
+    }
+    if !num_ints.is_null() {
+        *num_ints = (*handle).num_ints as u32;
+    }
+    0
+}
+
+/// `android::GraphicBufferMapper::freeBuffer(handle)`.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper10freeBufferEPK13native_handle(
+    _this: *mut c_void,
+    handle: *const NativeHandle,
+) {
+    if handle.is_null() {
+        return;
+    }
+    let h = &*handle;
+    if h.num_fds > 0 && !h.data.is_empty() {
+        libc::close(h.data[0]);
+    }
+    drop(Box::from_raw(handle as *mut NativeHandle));
 }
 
 /// `AHardwareBuffer_allocate(desc, out)`.
