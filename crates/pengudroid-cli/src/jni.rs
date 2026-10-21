@@ -53,6 +53,17 @@ mod slot {
     pub const GET_OBJECT_CLASS: usize = 31;
     pub const GET_METHOD_ID: usize = 33;
     pub const CALL_OBJECT_METHOD_A: usize = 36;
+    pub const NEW_OBJECT_A: usize = 30;
+    pub const GET_FIELD_ID: usize = 94;
+    pub const GET_OBJECT_FIELD: usize = 95;
+    pub const SET_OBJECT_FIELD: usize = 104;
+    pub const SET_BOOLEAN_FIELD: usize = 105;
+    pub const SET_INT_FIELD: usize = 109;
+    pub const GET_STATIC_OBJECT_FIELD: usize = 145;
+    pub const GET_ARRAY_LENGTH: usize = 171;
+    pub const GET_OBJECT_ARRAY_ELEMENT: usize = 173;
+    pub const NEW_LONG_ARRAY: usize = 180;
+    pub const CALL_VOID_METHOD_A: usize = 63;
     pub const GET_STATIC_METHOD_ID: usize = 113;
     pub const CALL_STATIC_OBJECT_METHOD_A: usize = 116;
     pub const CALL_STATIC_INT_METHOD_A: usize = 131;
@@ -157,7 +168,115 @@ impl JniEnv {
         self.exception_check().then_some(v)
     }
 
-    /// Resolve a class through the *system* class loader.
+    /// `NewObjectA(clazz, method, args)`.
+    pub fn new_object(&self, class: JClass, ctor: JMethodId, args: &[JValue]) -> Option<JObject> {
+        let f: unsafe extern "C" fn(*mut c_void, JClass, JMethodId, *const JValue) -> JObject =
+            unsafe { self.func(slot::NEW_OBJECT_A) };
+        let v = unsafe { f(self.0, class, ctor, args.as_ptr()) };
+        self.exception_check().then_some(v)
+    }
+
+    /// `GetFieldID(clazz, name, sig)`.
+    pub fn field_id(&self, class: JClass, name: &str, sig: &str) -> Option<JFieldId> {
+        let cname = std::ffi::CString::new(name).ok()?;
+        let csig = std::ffi::CString::new(sig).ok()?;
+        let f: unsafe extern "C" fn(*mut c_void, JClass, *const i8, *const i8) -> JFieldId =
+            unsafe { self.func(slot::GET_FIELD_ID) };
+        let id = unsafe { f(self.0, class, cname.as_ptr(), csig.as_ptr()) };
+        if id.is_null() {
+            self.describe_exception();
+            return None;
+        }
+        Some(id)
+    }
+
+    /// `GetStaticObjectField(clazz, field)`.
+    pub fn static_object_field(&self, class: JClass, field: JFieldId) -> JObject {
+        let f: unsafe extern "C" fn(*mut c_void, JClass, JFieldId) -> JObject =
+            unsafe { self.func(slot::GET_STATIC_OBJECT_FIELD) };
+        unsafe { f(self.0, class, field) }
+    }
+
+    /// `GetObjectField(obj, field)`.
+    pub fn object_field(&self, obj: JObject, field: JFieldId) -> JObject {
+        let f: unsafe extern "C" fn(*mut c_void, JObject, JFieldId) -> JObject =
+            unsafe { self.func(slot::GET_OBJECT_FIELD) };
+        unsafe { f(self.0, obj, field) }
+    }
+
+    /// `SetObjectField(obj, field, value)`.
+    pub fn set_object_field(&self, obj: JObject, field: JFieldId, value: JObject) {
+        let f: unsafe extern "C" fn(*mut c_void, JObject, JFieldId, JObject) =
+            unsafe { self.func(slot::SET_OBJECT_FIELD) };
+        unsafe { f(self.0, obj, field, value) }
+    }
+
+    /// `SetIntField(obj, field, value)`.
+    pub fn set_int_field(&self, obj: JObject, field: JFieldId, value: i32) {
+        let f: unsafe extern "C" fn(*mut c_void, JObject, JFieldId, i32) =
+            unsafe { self.func(slot::SET_INT_FIELD) };
+        unsafe { f(self.0, obj, field, value) }
+    }
+
+    /// `SetBooleanField(obj, field, value)`.
+    pub fn set_boolean_field(&self, obj: JObject, field: JFieldId, value: bool) {
+        let f: unsafe extern "C" fn(*mut c_void, JObject, JFieldId, u8) =
+            unsafe { self.func(slot::SET_BOOLEAN_FIELD) };
+        unsafe { f(self.0, obj, field, value as u8) }
+    }
+
+    /// `CallVoidMethodA(obj, method, args)`.
+    pub fn call_void(&self, obj: JObject, method: JMethodId, args: &[JValue]) -> bool {
+        let f: unsafe extern "C" fn(*mut c_void, JObject, JMethodId, *const JValue) =
+            unsafe { self.func(slot::CALL_VOID_METHOD_A) };
+        unsafe { f(self.0, obj, method, args.as_ptr()) };
+        self.exception_check()
+    }
+
+    /// `GetArrayLength(array)`.
+    pub fn array_length(&self, array: JObject) -> i32 {
+        if array.is_null() {
+            return 0;
+        }
+        let f: unsafe extern "C" fn(*mut c_void, JObject) -> i32 =
+            unsafe { self.func(slot::GET_ARRAY_LENGTH) };
+        unsafe { f(self.0, array) }
+    }
+
+    /// `GetObjectArrayElement(array, index)`.
+    pub fn array_get(&self, array: JObject, index: i32) -> JObject {
+        if array.is_null() {
+            return std::ptr::null_mut();
+        }
+        let f: unsafe extern "C" fn(*mut c_void, JObject, i32) -> JObject =
+            unsafe { self.func(slot::GET_OBJECT_ARRAY_ELEMENT) };
+        unsafe { f(self.0, array, index) }
+    }
+
+    /// `NewObjectArray(len, elementClass, initial)`.
+    pub fn new_object_array(&self, len: i32, class: JClass, initial: JObject) -> Option<JObject> {
+        let f: unsafe extern "C" fn(*mut c_void, i32, JClass, JObject) -> JObject =
+            unsafe { self.func(slot::NEW_OBJECT_ARRAY) };
+        let v = unsafe { f(self.0, len, class, initial) };
+        self.exception_check().then_some(v)
+    }
+
+    /// `SetObjectArrayElement(array, index, value)`.
+    pub fn set_object_array_element(&self, array: JObject, index: i32, value: JObject) {
+        let f: unsafe extern "C" fn(*mut c_void, JObject, i32, JObject) =
+            unsafe { self.func(slot::SET_OBJECT_ARRAY_ELEMENT) };
+        unsafe { f(self.0, array, index, value) }
+    }
+
+    /// `NewLongArray(length)`.
+    pub fn new_long_array(&self, len: i32) -> Option<JObject> {
+        let f: unsafe extern "C" fn(*mut c_void, i32) -> JObject =
+            unsafe { self.func(slot::NEW_LONG_ARRAY) };
+        let v = unsafe { f(self.0, len) };
+        self.exception_check().then_some(v)
+    }
+
+    /// `Resolve a class through the *system* class loader.
     ///
     /// `FindClass` from a native thread only consults the boot class path, so
     /// application classes (anything in `-Djava.class.path`) have to be loaded

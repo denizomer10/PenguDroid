@@ -11,6 +11,7 @@
 //! ```
 
 mod apk;
+mod apphost;
 mod audio;
 mod bundle;
 mod client;

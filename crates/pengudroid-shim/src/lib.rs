@@ -65,6 +65,9 @@ mod zip;
 /// therefore copies at most `PROP_VALUE_MAX - 1` payload bytes.
 pub const PROP_VALUE_MAX: usize = 92;
 
+/// Bionic's `PROP_NAME_MAX`, again including the NUL.
+pub const PROP_NAME_MAX: usize = 32;
+
 /// `<android/log.h>` priorities, matching Bionic's numeric values.
 pub const ANDROID_LOG_UNKNOWN: c_int = 0;
 pub const ANDROID_LOG_DEFAULT: c_int = 1;
@@ -1002,7 +1005,7 @@ static SERIAL: AtomicU32 = AtomicU32::new(1);
 /// Android defaults below must be overridden through [`set_prop`].
 pub fn default_props() -> BTreeMap<String, String> {
     let mut props = BTreeMap::new();
-    let seed: [(&str, &str); 10] = [
+    let seed: [(&str, &str); 28] = [
         ("ro.build.version.sdk", "36"),
         ("ro.build.version.release", "16"),
         ("ro.build.version.codename", "REL"),
@@ -1013,6 +1016,28 @@ pub fn default_props() -> BTreeMap<String, String> {
         ("ro.kernel.qemu", "0"),
         ("ro.hardware", "pengudroid"),
         ("ro.build.characteristics", "default"),
+        // `Build.<clinit>` reads these. An empty ABI list makes it index an
+        // empty array and the whole framework fails to initialise, so they have
+        // to be present. Only x86_64 is claimed: that is what a guest library
+        // can actually run here without the ARM translator.
+        ("ro.product.cpu.abilist", "x86_64"),
+        ("ro.product.cpu.abilist64", "x86_64"),
+        ("ro.product.cpu.abilist32", "x86"),
+        ("ro.product.cpu.abi", "x86_64"),
+        ("ro.product.cpu.abi2", ""),
+        ("ro.product.name", "pengudroid"),
+        ("ro.product.device", "pengudroid"),
+        ("ro.product.brand", "PenguDroid"),
+        ("ro.product.board", "pengudroid"),
+        ("ro.product.first_api_level", "31"),
+        ("ro.build.id", "PENGUDROID"),
+        ("ro.build.display.id", "PenguDroid build"),
+        ("ro.build.type", "userdebug"),
+        ("ro.build.tags", "test-keys"),
+        ("ro.build.user", "pengudroid"),
+        ("ro.build.host", "pengudroid"),
+        ("ro.build.fingerprint", "PenguDroid/pengudroid/pengudroid:16/PENGUDROID/userdebug:user/release-keys"),
+        ("ro.sf.lcd_density", "420"),
     ];
     for (k, v) in seed {
         props.insert(k.to_string(), v.to_string());
@@ -1069,6 +1094,9 @@ pub unsafe extern "C" fn __system_property_get(name: *const c_char, value: *mut 
     }
     let name = cstr_lossy(name);
     let val = get_prop(&name).unwrap_or_default();
+    if std::env::var_os("PENGUDROID_TRACE_PROPS").is_some() {
+        eprintln!("[props] get({name}) -> {val:?}\n");
+    }
     if value.is_null() {
         return 0;
     }
@@ -1098,22 +1126,93 @@ pub unsafe extern "C" fn __system_property_set(
     0
 }
 
-/// `__system_property_find(name)` — the shim keeps no shared property area, so
-/// this always returns `NULL`. Callers should fall back to
-/// `__system_property_get`.
-#[no_mangle]
-pub unsafe extern "C" fn __system_property_find(_name: *const c_char) -> *const c_void {
-    std::ptr::null()
+/// A fake `prop_info` for the modern property API.
+///
+/// bionic's `__system_property_find` returns an opaque pointer that is only ever
+/// handed back to `__system_property_read_callback`/`__system_property_read`, so
+/// the shim can define its own layout. Java's `SystemProperties.get` uses this
+/// path (not the legacy `__system_property_get`), and an earlier stub that always
+/// returned `NULL` made every Java-side property read come back empty - which
+/// broke `Build.<clinit>` (`"".split(",")` is a zero-length array in Java).
+#[repr(C)]
+struct FakeProp {
+    magic: u64,
+    serial: u32,
+    _pad: u32,
+    name: std::ffi::CString,
+    value: std::ffi::CString,
 }
 
-/// `__system_property_read_callback(pi, cb, cookie)` — no-op, because
-/// `__system_property_find` never returns a property area to iterate.
+const FAKE_PROP_MAGIC: u64 = 0x5045_4e47_5550_5221; // "PENGUPR!"
+
+/// Fake property records, one per name, so repeated `find` calls return the same
+/// pointer (callers may compare them).
+static FAKE_PROPS: LazyLock<Mutex<BTreeMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+fn fake_prop_for(name: &str) -> *const c_void {
+    let mut map = FAKE_PROPS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ptr) = map.get(name) {
+        return *ptr as *const c_void;
+    }
+    let value = match props_lock().get(name) {
+        Some(v) => v.clone(),
+        None => return std::ptr::null(),
+    };
+    let Ok(cname) = std::ffi::CString::new(name) else {
+        return std::ptr::null();
+    };
+    let Ok(cvalue) = std::ffi::CString::new(value) else {
+        return std::ptr::null();
+    };
+    let node = Box::new(FakeProp {
+        magic: FAKE_PROP_MAGIC,
+        serial: SERIAL.load(Ordering::Relaxed),
+        _pad: 0,
+        name: cname,
+        value: cvalue,
+    });
+    let raw = Box::into_raw(node);
+    map.insert(name.to_string(), raw as usize);
+    raw as *const c_void
+}
+
+unsafe fn as_fake_prop<'a>(pi: *const c_void) -> Option<&'a FakeProp> {
+    if pi.is_null() {
+        return None;
+    }
+    let p = &*(pi as *const FakeProp);
+    (p.magic == FAKE_PROP_MAGIC).then_some(p)
+}
+
+/// `__system_property_find(name)` — a stable record for a known property.
+#[no_mangle]
+pub unsafe extern "C" fn __system_property_find(name: *const c_char) -> *const c_void {
+    if name.is_null() {
+        return std::ptr::null();
+    }
+    let name = CStr::from_ptr(name).to_string_lossy();
+    let found = fake_prop_for(&name);
+    if std::env::var_os("PENGUDROID_TRACE_PROPS").is_some() {
+        eprintln!(
+            "[props] find({name}) -> {}\n",
+            if found.is_null() { "NULL".to_string() } else { format!("{found:p}") }
+        );
+    }
+    found
+}
+
+/// `__system_property_read_callback(pi, cb, cookie)`.
 #[no_mangle]
 pub unsafe extern "C" fn __system_property_read_callback(
-    _pi: *const c_void,
-    _cb: Option<extern "C" fn(*mut c_void, *const c_char, *const c_char, u32)>,
-    _cookie: *mut c_void,
+    pi: *const c_void,
+    cb: Option<extern "C" fn(*mut c_void, *const c_char, *const c_char, u32)>,
+    cookie: *mut c_void,
 ) {
+    let (Some(prop), Some(cb)) = (as_fake_prop(pi), cb) else {
+        return;
+    };
+    cb(cookie, prop.name.as_ptr(), prop.value.as_ptr(), prop.serial);
 }
 
 // ---------------------------------------------------------------------------
@@ -1218,15 +1317,26 @@ pub unsafe extern "C" fn __system_property_wait(
 
 /// `__system_property_read(pi, name, value)`.
 ///
-/// Because [`__system_property_find`] never hands out a `prop_info`, there is
-/// nothing to read; we always return `-1`.
+/// Copies the record's name and value into the caller's buffers, which are
+/// `PROP_NAME_MAX`/`PROP_VALUE_MAX` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn __system_property_read(
-    _pi: *const c_void,
-    _name: *mut c_char,
-    _value: *mut c_char,
+    pi: *const c_void,
+    name: *mut c_char,
+    value: *mut c_char,
 ) -> c_int {
-    -1
+    let Some(prop) = as_fake_prop(pi) else {
+        return -1;
+    };
+    if !name.is_null() {
+        let n = prop.name.as_bytes_with_nul();
+        std::ptr::copy_nonoverlapping(n.as_ptr() as *const c_char, name, n.len().min(PROP_NAME_MAX));
+    }
+    if !value.is_null() {
+        let v = prop.value.as_bytes_with_nul();
+        std::ptr::copy_nonoverlapping(v.as_ptr() as *const c_char, value, v.len().min(PROP_VALUE_MAX));
+    }
+    prop.value.as_bytes().len() as c_int
 }
 
 /// `__system_property_foreach(callback, cookie)` — no-op.

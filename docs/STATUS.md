@@ -27,6 +27,38 @@ düzeltildi, hizasız tamponla test eklendi. Bu düzeltmeden sonra NewPipe
   # her APEX için etc/ javalib/ lib64/ alt ağaçlarını çıkar (ext4.py ile)
   ```
 
+## bindApplication — Java tarafından (bu tur)
+
+Parcel arkeolojisi bırakıldı. JNI erişim denetimini atladığı için
+`handleBindApplication` **doğrudan** çağrılıyor (`--bind-app`):
+
+1. `ActivityThread.currentActivityThread()` → `main`in kurduğu nesne;
+2. `new AppBindData()` + alanları `SetObjectField`/`SetIntField` ile doldurma;
+3. `handleBindApplication(AppBindData)` (private, JNI umursamıyor).
+
+Yol boyunca düzeltilen gerçek engeller:
+
+- **`__system_property_find` stub'ı.** NULL dönüyordu ve Java'nın
+  `SystemProperties.get`'i tam bu yolu kullanıyor → Java *tüm* özellikleri boş
+  görüyordu; `Build.<clinit>` `"".split(",")` yüzünden boş diziye `[0]`
+  uygulayıp ölüyordu. Sahte `prop_info` + `read_callback`/`read` eklendi.
+- **Eksik varsayılan özellikler**: `ro.product.cpu.abilist*`, `ro.build.*`,
+  `ro.product.*` (28 adet) shim'in deposuna eklendi.
+- **`AppBindData` alan adları sürüme göre farklı** (`--dump-class` ile
+  okundu): `restrictedBackupMode` ( `isRestrictedBackupMode` değil),
+  `coreSettings` yok, `disabledCompatChanges` `long[]` **null olamaz**.
+- **Eksik native grupları**: `Canvas.nSetCompatibilityVersion` libhwui'de →
+  `--register-natives libandroid_runtime.so,libhwui.so` (virgüllü liste).
+- **`locales is empty`**: `Configuration.setToDefaults()` locale bırakmıyor;
+  `setLocales(new LocaleList(new Locale("en","US")))` eklendi.
+- **`/system/fonts` sysroot'a çıkarılmamıştı** (208 dosya) → `Typeface`
+  varsayılan ailesi null kalıyordu.
+
+Şu an `handleBindApplication` **ActivityThread.java:6587**'ye kadar geliyor;
+orada `Typeface.create(sSystemFontMap.get("sans-serif"), style)` null dönüyor
+(`loadPreinstalledSystemFontMap`: "Preloading
+/system/fonts/RobotoStatic-Regular.ttf" loglanıyor, map'te aile yok).
+
 ## Binder sunucu tarafı — durum
 
 Hedef: `system_server`'ın yaptığı gibi uygulamaya *çağrı yapmak*

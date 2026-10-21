@@ -494,7 +494,7 @@ pub fn art_test(args: &[String]) -> i32 {
                     other,
                     "--main" | "--find-class" | "--classpath" | "--jni-lib" | "--register-natives"
                         | "--init-bridge" | "--native-bridge" | "--bridge-lib" | "--xmx"
-                        | "--bridge-selftest" | "--vm-option"
+                        | "--bridge-selftest" | "--vm-option" | "--dump-class"
                 ) {
                     if let Some(v) = it.next() {
                         passthrough.push(v.clone());
@@ -678,6 +678,9 @@ pub fn art_main(args: &[String]) -> i32 {
     let mut register_libs: Vec<String> = Vec::new();
     let mut init_bridge: Option<String> = None;
     let mut bridge_selftest: Option<String> = None;
+    let mut bind_app = false;
+    let mut dump_class: Option<String> = None;
+    let mut java_props = false;
     let mut xmx: String = "512m".to_string();
     let mut vm_extra: Vec<String> = Vec::new();
     let mut it = args.iter();
@@ -694,11 +697,21 @@ pub fn art_main(args: &[String]) -> i32 {
             }
             "--register-natives" => {
                 if let Some(v) = it.next() {
-                    register_libs.push(v.clone());
+                    // Comma-separated, because framework natives are split over
+                    // several libraries (`libandroid_runtime`, `libhwui`, ...).
+                    for part in v.split(',') {
+                        let part = part.trim();
+                        if !part.is_empty() {
+                            register_libs.push(part.to_string());
+                        }
+                    }
                 }
             }
             "--init-bridge" => init_bridge = it.next().cloned(),
             "--bridge-selftest" => bridge_selftest = it.next().cloned(),
+            "--bind-app" => bind_app = true,
+            "--dump-class" => dump_class = it.next().cloned(),
+            "--java-props" => java_props = true,
             "--xmx" => {
                 if let Some(v) = it.next() {
                     xmx = v.clone();
@@ -854,9 +867,20 @@ pub fn art_main(args: &[String]) -> i32 {
             if let Ok(name) = std::env::var("PENGUDROID_PROBE_SERVICE") {
                 probe_service(&env, &name);
             }
+            if let Some(name) = dump_class.as_deref() {
+                crate::apphost::dump_class(&env, name);
+                return 0;
+            }
+            if java_props {
+                crate::apphost::print_java_props(&env);
+                return 0;
+            }
             if let Some(class) = main_class {
                 if std::env::var_os("PENGUDROID_BINDER_POOL").is_some() {
                     start_binder_pool(libs.as_deref());
+                }
+                if bind_app {
+                    spawn_app_binder(vm, &classpath);
                 }
                 return run_main(&env, &class, &app_args);
             }
@@ -1473,6 +1497,59 @@ unsafe fn install_findclass_tracer(env: *mut c_void) {
     *slot = traced_find_class as *mut c_void;
     let _ = libc::mprotect(page as *mut c_void, 0x1000, libc::PROT_READ);
     println!("art: tracing JNI FindClass (PENGUDROID_TRACE_FINDCLASS)");
+}
+
+/// Bind an APK into the `ActivityThread` that `main` creates.
+///
+/// `ActivityThread.main` does not return (it enters `Looper.loop`), and the
+/// instance only exists once it has started, so the bind has to come from a
+/// second thread that attaches to the VM and then calls
+/// `handleBindApplication` from the host side.
+fn spawn_app_binder(vm: *mut c_void, classpath: &[String]) {
+    let Some(apk) = classpath.first().cloned() else {
+        eprintln!("apphost: --bind-app needs --classpath <apk>");
+        return;
+    };
+    let vm_addr = vm as usize;
+    std::thread::spawn(move || {
+        // Give ActivityThread.main time to construct the instance and attach.
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let Some(env) = crate::apphost::attach_current_thread(vm_addr as *mut c_void) else {
+            eprintln!("apphost: AttachCurrentThread failed");
+            return;
+        };
+        let Some(thread) = crate::apphost::current_activity_thread(&env) else {
+            eprintln!("apphost: ActivityThread.currentActivityThread() is null");
+            return;
+        };
+        let info = match crate::apk::read_apk(&apk) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("apphost: {e}");
+                return;
+            }
+        };
+        let package = if info.package.is_empty() {
+            "org.pengudroid.app".to_string()
+        } else {
+            info.package.clone()
+        };
+        let apk_path = std::path::PathBuf::from(&apk);
+        let data_dir = std::env::temp_dir().join(format!("pengudroid-data/{package}"));
+        let lib_dir = std::env::temp_dir().join(format!("pengudroid-libs/{package}"));
+        let _ = std::fs::create_dir_all(&data_dir);
+        let _ = std::fs::create_dir_all(&lib_dir);
+        let spec = crate::apphost::AppSpec {
+            package: &package,
+            apk: &apk_path,
+            data_dir: &data_dir,
+            native_lib_dir: &lib_dir,
+            target_sdk: info.target_sdk.map(|v| v as i32).unwrap_or(35),
+            min_sdk: info.min_sdk.map(|v| v as i32).unwrap_or(23),
+            uid: 10_123,
+        };
+        crate::apphost::bind_application(&env, thread, &spec);
+    });
 }
 
 /// Start libbinder's thread pool in this process.
