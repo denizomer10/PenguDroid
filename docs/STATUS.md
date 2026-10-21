@@ -72,6 +72,46 @@ işleniyor (cevap parcel'i atılıyor). `display_event_connection` code 3'te
 (216 bayt: `Header{type,displayId,timestamp}` + `VSync{count,VsyncEventData}`,
 `frameInterval` 16.67 ms). Böylece `Choreographer` ilk kareyi alıyor.
 
+### Grafik: hwui artık başlatılıyor (bu tur)
+
+`relayout` gerçek bir `SurfaceControl` döndürüyor ve hwui EGL'ye kadar geliyor.
+Zincir:
+
+```
+relayout → SurfaceControl parcel
+  [String8 name][i32 w][i32 h][i32 hasNative=1]
+  [client binder][handle binder][i32 layerId][u32 transformHint][u32 w][u32 h][u32 format]
+→ SurfaceControl::readFromParcel (SurfaceControl.cpp:226)
+→ Surface.copyFrom → getSurface() → generateSurfaceLocked()
+    mClient->createSurface("bbq-wrapper", ...)   ← ISurfaceComposerClient code 1
+    BLASTBufferQueue::make(...) → new BBQSurface(mProducer, ...)
+→ hwui: eglCreateWindowSurface → gleshim (offscreen FBO) → eglSwapBuffers → daemon → Wayland
+```
+
+Bu turda eklenenler:
+
+* `ISurfaceComposer.createConnection` (code 2) → `surface_composer_client`
+* `ISurfaceComposerClient.createSurface` (code 1) →
+  `[handle][gbp][layerId][transformHint][status]` — `callRemote` çıktı
+  parametrelerini **önce**, statüyü **sonra** okur
+* `relayout`'un `outSurfaceControl`'u artık dolu
+* `ActivityInfo.flags = 0x200` (`FLAG_HARDWARE_ACCELERATED`) — `Activity.attach`
+  bunu `Window.setWindowManager`'a geçiriyor; onsuz `ViewRootImpl` hiç
+  `ThreadedRenderer` yaratmıyor
+* `DisplayInfo.logicalDensityDpi = 420` — sıfırken `DisplayMetrics.density` 0
+  oluyor, `ThreadedRenderer.setLightCenter`'ın `zRatio`'su Infinity'ye dönüşüyor
+  ve ilk traversal "lightZ must be a finite positive" ile ölüyor
+* `pengudroid-gleshim`: `eglQueryString(EGL_EXTENSIONS)` artık
+  `EGL_KHR_swap_buffers_with_damage` bildiriyor ve
+  `eglSwapBuffersWithDamageKHR` gerçekten var (hwui bu uzantı olmadan abort ediyor)
+* `art-test` artık gleshim'i de `LD_PRELOAD` ediyor
+
+**Kalan durak:** `EglManager::initialize` içinde
+`Failed to acquire physical displays for WCG support!` — `getPhysicalDisplayIds`
+çağrısı boş dönüyor. Eski (hand-written) etiket 34, ama AIDL tarafı kendi
+numaralandırmasını kullanıyor; trace'te 2, 4, 8, 54 görülüyor. Sıradaki adım
+doğru transaction kodunu bulup `[count][int64...]` döndürmek.
+
 ### NewPipe: ÇALIŞIYOR (bu tur)
 
 `pengudroid art-test ... --classpath NewPipe_v0.29.1.apk` artık NewPipe'ı

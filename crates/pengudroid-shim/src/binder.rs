@@ -201,6 +201,27 @@ const ICP_CHECK_URI_PERMISSION: u32 = 28;
 const IBC_GET_CURSOR_WINDOW: u32 = 1;
 const IBC_CLOSE: u32 = 4;
 
+/// `ISurfaceComposer` transaction code for `createConnection`.
+///
+/// Like `createDisplayEventConnection` this is a hand-written interface, so the
+/// reply is a bare `strongBinder` with no status word.
+const ISC_CREATE_CONNECTION: u32 = 2;
+
+/// `ISurfaceComposerClient` transaction code for `createSurface`.
+///
+/// `ISurfaceComposerClient` is hand-written too, and `callRemote` reads the out
+/// parameters *first* and the status word *last*:
+/// `[handle][gbp][layerId][transformHint][status]`.
+const ISCC_CREATE_SURFACE: u32 = 1;
+
+/// `ISurfaceComposer` transaction code for `getPhysicalDisplayIds`.
+///
+/// hwui's `EglManager::initialize` aborts with "Failed to acquire physical
+/// displays for WCG support!" unless this returns at least one id. The legacy
+/// tag is 34; the AIDL-generated interface uses its own numbering.
+#[allow(dead_code)]
+const ISC_GET_PHYSICAL_DISPLAY_IDS: u32 = 34;
+
 /// `ISurfaceComposer` transaction code for `createDisplayEventConnection`.
 ///
 /// `ISurfaceComposer` is a hand-written binder interface (`libs/gui/
@@ -661,7 +682,23 @@ fn window_session_reply(code: u32, parcel: &mut Vec<u8>, objects: &mut Vec<u64>)
             parcel.extend_from_slice(&0u32.to_ne_bytes()); // result
             parcel.extend_from_slice(&0u32.to_ne_bytes()); // outFrames absent
             parcel.extend_from_slice(&0u32.to_ne_bytes()); // merged config absent
-            parcel.extend_from_slice(&0u32.to_ne_bytes()); // surface control absent
+            // `outSurfaceControl`: present, so `ViewRootImpl` has something to
+            // draw into. `SurfaceControl.readFromParcel` reads the Java-side
+            // header (name + size + presence) and then
+            // `SurfaceControl::readFromParcel`'s
+            // `[client][handle][layerId][transformHint][w][h][format]`.
+            parcel.extend_from_slice(&1u32.to_ne_bytes()); // present
+            push_string8(parcel, "pengudroid");
+            parcel.extend_from_slice(&1280i32.to_ne_bytes()); // width
+            parcel.extend_from_slice(&720i32.to_ne_bytes()); // height
+            parcel.extend_from_slice(&1i32.to_ne_bytes()); // hasNativeObject
+            push_flat_handle(parcel, objects, handle_for("surface_composer_client"));
+            push_flat_handle(parcel, objects, handle_for("surface_handle"));
+            parcel.extend_from_slice(&1i32.to_ne_bytes()); // layerId
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // transformHint
+            parcel.extend_from_slice(&1280u32.to_ne_bytes()); // width
+            parcel.extend_from_slice(&720u32.to_ne_bytes()); // height
+            parcel.extend_from_slice(&1u32.to_ne_bytes()); // format: RGBA_8888
             parcel.extend_from_slice(&0u32.to_ne_bytes()); // insets state absent
             let size = INSETS_SIZE.load(Ordering::Relaxed) as usize;
             parcel.extend_from_slice(&(size as u32).to_ne_bytes());
@@ -752,7 +789,6 @@ fn add_to_display_reply(parcel: &mut Vec<u8>, objects: &mut Vec<u64>) {
 }
 
 /// `Parcel::writeString8`: a byte count, the bytes, then padding to 4.
-#[allow(dead_code)]
 fn push_string8(parcel: &mut Vec<u8>, s: &str) {
     parcel.extend_from_slice(&(s.len() as u32).to_ne_bytes());
     parcel.extend_from_slice(s.as_bytes());
@@ -892,7 +928,14 @@ fn reply_has_status(handle: u32, code: u32) -> bool {
     if handle == handle_for("SurfaceFlinger") {
         // `createConnection` and `createDisplayEventConnection` both end in
         // `reply.readStrongBinder()` with no preceding status.
-        return !matches!(code, 2 | ISC_CREATE_DISPLAY_EVENT_CONNECTION);
+        return !matches!(
+            code,
+            ISC_CREATE_CONNECTION | ISC_CREATE_DISPLAY_EVENT_CONNECTION
+        );
+    }
+    if handle == handle_for("surface_composer_client") {
+        // `callRemote` reads the out parameters first and the status last.
+        return false;
     }
     true
 }
@@ -1023,6 +1066,29 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             if trace_enabled() {
                 diag(&format!("[binder]   -> PackageInfo ({} bytes)\n", cached.len()));
             }
+        }
+    }
+    if tr.target_handle == handle_for("SurfaceFlinger") && tr.code == ISC_CREATE_CONNECTION {
+        push_flat_handle(
+            &mut parcel,
+            &mut objects,
+            handle_for("surface_composer_client"),
+        );
+        if trace_enabled() {
+            diag("[binder]   -> surface_composer_client handle\n");
+        }
+    }
+    if tr.target_handle == handle_for("surface_composer_client")
+        && tr.code == ISCC_CREATE_SURFACE
+    {
+        // `[handle][gbp][layerId][transformHint][status]`.
+        push_flat_handle(&mut parcel, &mut objects, handle_for("surface_handle"));
+        push_flat_handle(&mut parcel, &mut objects, handle_for("graphic_buffer_producer"));
+        parcel.extend_from_slice(&1i32.to_ne_bytes()); // layerId
+        parcel.extend_from_slice(&0u32.to_ne_bytes()); // transformHint
+        parcel.extend_from_slice(&0i32.to_ne_bytes()); // status: NO_ERROR
+        if trace_enabled() {
+            diag("[binder]   -> createSurface handle + gbp\n");
         }
     }
     if tr.target_handle == handle_for("SurfaceFlinger") && tr.code == ISC_CREATE_DISPLAY_EVENT_CONNECTION {

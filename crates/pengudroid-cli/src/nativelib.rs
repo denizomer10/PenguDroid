@@ -76,7 +76,7 @@ fn symlink(link: &Path, target: &Path) -> std::io::Result<()> {
 
 /// Locate `libpengudroid_gleshim.so` (the Bionic libEGL/GLESv2 shim) next to
 /// this executable.
-fn find_gleshim() -> Option<PathBuf> {
+pub fn find_gleshim() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("PENGUDROID_GLESHIM") {
         let p = PathBuf::from(p);
         if p.exists() {

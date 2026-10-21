@@ -637,7 +637,15 @@ pub fn art_test(args: &[String]) -> i32 {
         }
         ld_path = format!("{}:{ld_path}", prepared.display());
     }
-    cmd.env("LD_PRELOAD", &shim)
+    // `libpengudroid_gleshim.so` implements Bionic's `libEGL`/`libGLESv2` on the
+    // host GPU and presents every `eglSwapBuffers` as a dma-buf. Without it
+    // hwui's EGL calls land on the sysroot's Bionic `libEGL`, which has no
+    // driver behind it, so nothing is ever drawn.
+    let preload = match crate::nativelib::find_gleshim() {
+        Some(g) => format!("{}:{}", shim.display(), g.display()),
+        None => shim.display().to_string(),
+    };
+    cmd.env("LD_PRELOAD", &preload)
         .env("LD_LIBRARY_PATH", &ld_path)
         .env("ANDROID_ROOT", &layout.android_root)
         .env("ANDROID_ART_ROOT", &layout.art_root)

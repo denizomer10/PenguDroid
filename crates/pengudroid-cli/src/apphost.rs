@@ -102,6 +102,11 @@ fn build_app_info(env: &JniEnv, spec: &AppSpec<'_>) -> Option<JObject> {
     set_int("targetSdkVersion", spec.target_sdk);
     set_int("minSdkVersion", spec.min_sdk);
     set_int("uid", spec.uid);
+    // `FLAG_HARDWARE_ACCELERATED` (0x10000000) is what makes `ViewRootImpl`
+    // create a `ThreadedRenderer`; without it the window is added but nothing is
+    // ever drawn. `FLAG_HAS_CODE` (0x4) and `FLAG_SUPPORTS_SCREEN_DENSITIES`
+    // (0x2000) are what a normal APK declares.
+    set_int("flags", 0x1000_0000 | 0x2000 | 0x4);
     // Read back the fields `LoadedApk` depends on: a silently failed write here
     // shows up much later as "No data directory found for package".
     if let Some(id) = env.field_id(class, "dataDir", "Ljava/lang/String;") {
@@ -1026,6 +1031,16 @@ fn launch_activity(
     if let Some(id) = env.field_id(ai_class, "exported", "Z") {
         env.set_boolean_field(activity_info, id, true);
     }
+    // `Activity.attach` passes `(info.flags & ActivityInfo.FLAG_HARDWARE_ACCELERATED)
+    // != 0` to `Window.setWindowManager`, and that is what puts
+    // `FLAG_HARDWARE_ACCELERATED` on the window attributes — without it
+    // `ViewRootImpl.enableHardwareAcceleration` never creates a renderer and
+    // nothing is drawn.
+    if let Some(id) = env.field_id(ai_class, "flags", "I") {
+        // `ActivityInfo.FLAG_HARDWARE_ACCELERATED` is 0x200 in this build
+        // (read out with `--dump-class`).
+        env.set_int_field(activity_info, id, 0x200);
+    }
     if let Some(theme) = spec.theme {
         if let Some(id) = env.field_id(ai_class, "theme", "I") {
             env.set_int_field(activity_info, id, theme as i32);
@@ -1536,6 +1551,11 @@ fn install_display_replies(env: &JniEnv) {
     }
     // `DisplayInfo` has no `densityDpi` field in this build; the density is
     // derived from the logical size and the display metrics.
+    // `Display.getRealMetrics()` reads `logicalDensityDpi`, and a zero there
+    // makes `DisplayMetrics.density` zero — which turns
+    // `ThreadedRenderer.setLightCenter`'s `zRatio` into Infinity and aborts the
+    // first traversal with "lightZ must be a finite positive".
+    set_int("logicalDensityDpi", 420);
     // Display.STATE_ON = 2, Display.TYPE_INTERNAL = 1, Surface.ROTATION_0 = 0.
     set_int("state", 2);
     set_int("committedState", 2);

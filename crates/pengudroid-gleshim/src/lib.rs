@@ -925,11 +925,47 @@ pub unsafe extern "C" fn eglGetError() -> c_int {
 
 #[no_mangle]
 pub unsafe extern "C" fn eglQueryString(dpy: EGLDisplay, name: c_int) -> *const c_char {
+    const EGL_EXTENSIONS: c_int = 0x3055;
     match host() {
         // SAFETY: forwarded verbatim.
-        Ok(host) => (host.query_string)(dpy, name),
+        Ok(host) => {
+            let raw = (host.query_string)(dpy, name);
+            if name != EGL_EXTENSIONS || raw.is_null() {
+                return raw;
+            }
+            // hwui hard-requires `EGL_KHR_swap_buffers_with_damage`
+            // (`EglManager::initialize` aborts without it), and a surfaceless
+            // Mesa display does not advertise it. The entry point below is a
+            // real implementation — it forwards to `eglSwapBuffers` — so
+            // advertising it is honest.
+            static EXTENSIONS: OnceLock<CString> = OnceLock::new();
+            let s = EXTENSIONS.get_or_init(|| {
+                let base = std::ffi::CStr::from_ptr(raw).to_string_lossy().into_owned();
+                if base.contains("EGL_KHR_swap_buffers_with_damage") {
+                    CString::new(base).unwrap_or_default()
+                } else {
+                    CString::new(format!("{base} EGL_KHR_swap_buffers_with_damage"))
+                        .unwrap_or_default()
+                }
+            });
+            s.as_ptr()
+        }
         Err(_) => std::ptr::null(),
     }
+}
+
+/// `eglSwapBuffersWithDamageKHR(dpy, surface, rects, n_rects)`.
+///
+/// The damage rectangles are a hint for the compositor; PenguDroid presents the
+/// whole surface, so this is `eglSwapBuffers` with the arguments dropped.
+#[no_mangle]
+pub unsafe extern "C" fn eglSwapBuffersWithDamageKHR(
+    dpy: EGLDisplay,
+    surface: EGLSurface,
+    _rects: *const c_int,
+    _n_rects: c_int,
+) -> u32 {
+    eglSwapBuffers(dpy, surface)
 }
 
 #[no_mangle]
