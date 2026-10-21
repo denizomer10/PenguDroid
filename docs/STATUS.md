@@ -156,18 +156,19 @@ Sırada:
      okuyucu doğrudan offset 0'dan `readNullableStrongBinder` yapıyor (durum
      sözcüğü eklenince libbinder "Attempt to read object from Parcel ... at
      offset 0 that is not in the object list" diyor).
-   - `DisplayEventConnection.stealReceiveChannel` (kod 1) çağrılıyor;
-     `BitTube::writeToParcel` **iki fd** yazıyor (önce receive, sonra send) ve
-     bunlar `BINDER_TYPE_FD` (`0x66642a85`) nesneleridir. **Ölçülen:** AIDL C++
-     yanıtın başına bir `Status` başlığı koyuyor ve **OK için bu 8 bayttır**
-     (`[exception][errorCode]`; mesaj yalnızca hata durumunda yazılıyor).
-     - başlık yok → `PERMISSION_DENIED` (`readFileDescriptor` `BAD_TYPE` = -1)
-     - 12 bayt başlık → `UNEXPECTED_NULL`
-     - **8 bayt başlık → `UNEXPECTED_NULL`** (fd'ler offset 8 ve 32'de)
-     Yani başlık 8 bayt, ama BitTube'un fd'leri hâlâ okunamıyor. Sıradaki adım:
-     `BitTube::readFromParcel`'ın hangi fd'de takıldığını görmek (ikinci fd mi,
-     yoksa `readObject`'in offset ilerlemesi mi). Deneme çalışmadığı için kod
-     geri alındı.
+   - `DisplayEventConnection.stealReceiveChannel` (kod 1) çağrılıyor. İstemci
+     tarafı (libgui disassembly'si) sırayla **`Status::readFromParcel`** ve
+     **`Parcel::readParcelable`** → `BitTube::readFromParcel` çağırıyor.
+     `Status::readFromParcel` OK için **4 bayt** okuyor (libbinder'da `je` ile
+     doğrulandı: `readInt32` + `test` + `je`). `BitTube::writeToParcel` **iki fd**
+     yazıyor (receive, send), `BINDER_TYPE_FD` (`0x66642a85`).
+     - başlık yok → `PERMISSION_DENIED` (`readFileDescriptor` → `BAD_TYPE` = -1)
+     - 4 bayt başlık + fd'ler [4, 28] → `PERMISSION_DENIED`
+     - 8/12 bayt başlık → `UNEXPECTED_NULL`
+     Yani başlık 4 bayt olmalı, ama fd nesneleri offset 4'te bulunamıyor.
+     Sıradaki adım: `Parcel::readObject`'in `findObject` yolunu (0x77ff0) ve
+     `mObjects`/`mObjectsSize`'ın `ipcSetDataReference`'tan doğru geldiğini
+     doğrulamak. Deneme çalışmadığı için kod geri alındı.
 
    Gereken: `ISurfaceComposerClient.createSurface` + `IGraphicBufferProducer`
    (`connect`/`dequeueBuffer`/`queueBuffer`/`requestBuffer`/`setBufferCount`/
