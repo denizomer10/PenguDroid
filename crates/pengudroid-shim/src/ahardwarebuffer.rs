@@ -151,6 +151,54 @@ pub unsafe extern "C" fn _ZN7android22GraphicBufferAllocator8allocateEjjijmPPK13
     out_buffer_id: *mut u64,
     _requestor: *mut c_void,
 ) -> i32 {
+    // Thin wrapper: keeping the body in one place avoids the stack juggling that
+    // clobbered the saved `out_handle` when this function had its own frame.
+    allocate_buffer(
+        width,
+        height,
+        format,
+        layer_count,
+        usage,
+        out_handle,
+        out_stride,
+        out_buffer_id,
+    )
+}
+
+/// `android::GraphicBufferAllocator::allocateHelper(w, h, format, layerCount,
+/// usage, outHandle, outStride, outBufferId, requestorName, flag)`.
+///
+/// `allocate` and `allocateRawHandle` both reach this through the PLT, so
+/// interposing it here is what actually replaces the gralloc allocator. The
+/// `std::string` is passed by invisible reference (a pointer) and the trailing
+/// `bool` by value.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android22GraphicBufferAllocator14allocateHelperEjjijmPPK13native_handlePjNSt3__112basic_stringIcNS6_11char_traitsIcEENS6_9allocatorIcEEEEb(
+    width: u32,
+    height: u32,
+    format: i32,
+    layer_count: u32,
+    usage: u64,
+    out_handle: *mut *const NativeHandle,
+    out_stride: *mut u32,
+    out_buffer_id: *mut u64,
+    _requestor: *mut c_void,
+    _flag: u8,
+) -> i32 {
+    allocate_buffer(width, height, format, layer_count, usage, out_handle, out_stride, out_buffer_id)
+}
+
+/// Shared body of the two allocation entry points.
+unsafe fn allocate_buffer(
+    width: u32,
+    height: u32,
+    format: i32,
+    layer_count: u32,
+    usage: u64,
+    out_handle: *mut *const NativeHandle,
+    out_stride: *mut u32,
+    out_buffer_id: *mut u64,
+) -> i32 {
     if out_handle.is_null() {
         return -22;
     }
@@ -173,7 +221,6 @@ pub unsafe extern "C" fn _ZN7android22GraphicBufferAllocator8allocateEjjijmPPK13
         version: std::mem::size_of::<NativeHandle>() as i32,
         num_fds: 1,
         num_ints: 6,
-        // `data` holds the fds first, then the ints.
         data: [
             fd,
             stride as i32,
@@ -185,8 +232,7 @@ pub unsafe extern "C" fn _ZN7android22GraphicBufferAllocator8allocateEjjijmPPK13
             0,
         ],
     });
-    let raw = Box::into_raw(handle);
-    *out_handle = raw;
+    *out_handle = Box::into_raw(handle);
     if !out_stride.is_null() {
         *out_stride = stride;
     }

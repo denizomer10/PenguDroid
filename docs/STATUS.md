@@ -90,10 +90,14 @@ interpose edildi; böylece iki `LOG_ALWAYS_FATAL` ("gralloc-mapper is missing",
 çağırıyor; `mAllocator` null olduğu için çöküyor. `allocate`'ı interpose etmek
 yetmiyor çünkü `allocate → allocateHelper` çağrısı PLT'den geçmiyor.
 
-**Sıradaki adım (net):** kurucuda `this+0x8`'e kendi `GrallocAllocator`
-nesnemizi yazmak ve vtable slot 0'ı (`allocate`) uygulamak. Çağrı sitesi
-söküldü: `rdi=nesne, rsi=descriptor, edx=count, ecx, r8, r9d` + yığın
-argümanları. Bu, çizim hattının kalan tek büyük parçası.
+**Sıradaki adım (net):** `GraphicBufferAllocator::allocate` artık shim'de interpose
+ediliyor ve **çağrılıyor** (çökme bizim `.so`'muzun içine taşındı), ama gövde
+henüz tamam değil: `allocate_buffer` içinde bir yerde SIGSEGV var. Çağrı
+sitesi söküldü: `rdi=nesne, rsi=descriptor, edx=count, ecx, r8, r9d` + yığın
+argümanları; `std::string` görünmez referansla (pointer) geçiyor.
+
+Not: `allocateHelper` PLT'den çağrılıyor gibi görünse de (0x501b0) pratikte
+libui kendi tanımına bağlanıyor; işe yarayan interpose `allocate` oldu.
 
 `eglQuerySurface` artık `EGL_SWAP_BEHAVIOR` (→ `EGL_BUFFER_DESTROYED`) ve
 `EGL_BUFFER_AGE_EXT` (→ 1) yanıtlıyor; "Unable to match the desired swap
