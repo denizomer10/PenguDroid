@@ -28,6 +28,30 @@ Videoyu *oynatmak* hâlâ mümkün değil: oynatıcı `MediaCodec` istiyor, bizd
 Ekran görüntüsü alınamayan oturumlarda girdiyi denemek için:
 `PENGUDROID_SYNTH_CLICK=400,400` (8 saniye sonra bir dokunuş enjekte eder).
 
+### Sıradaki durak: `MediaCodec` (video oynatma)
+
+Oynatıcı açılıyor ama kare üretemiyor. Zincir şu:
+
+1. `MediaCodecList` → `libmedia_jni` → `MediaCodecList::getInstance()` →
+   `Codec2InfoBuilder` → `Codec2Client::CreateFromService("default")`.
+2. Servis, swcodec APEX'indeki `android.hardware.media.c2@1.2-service`
+   (Bionic bir binary; host'ta çalıştıramıyoruz).
+3. Servis yoksa liste boş dönüyor ve ExoPlayer "no decoder" diyor.
+
+İki yol var:
+
+- **Doğru yol:** broker'a HIDL `ICodec2` servisini eklemek ve arkasında
+  `libcodec2_soft_avcdec.so`'yu (APEX'te var, `createCodec2Factory` ihraç
+  ediyor) süreç içinde yüklemek. HIDL parcel'ı, buffer queue'ları ve
+  `C2Component` yaşam döngüsü yazılmalı.
+- **Kısa yol:** boot class path'in *önüne* kendi `android.media.MediaCodec`
+  sınıfımızı koyup host'un libavcodec'ine bağlamak. Daha az kod ama
+  framework'ün geri kalanıyla (`MediaExtractor`, `MediaFormat`, surface
+  çıkışı) uyum riski yüksek.
+
+Ses tarafı da aynı şekilde eksik: `AudioTrack` → `AudioFlinger` yok, ama
+daemon'ın PipeWire ring'i hazır (`audio-test --via-daemon`).
+
 ```sh
 pengudroid daemon &
 PENGUDROID_ART_SYSROOT=.toolchain/sysroot \
