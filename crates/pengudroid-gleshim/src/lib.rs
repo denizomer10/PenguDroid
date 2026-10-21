@@ -1254,6 +1254,24 @@ pub unsafe extern "C" fn eglCreatePbufferSurface(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn eglSurfaceAttrib(
+    _dpy: EGLDisplay,
+    surface: EGLSurface,
+    attribute: c_int,
+    value: c_int,
+) -> u32 {
+    // hwui sets `EGL_SWAP_BEHAVIOR` to `EGL_BUFFER_DESTROYED` on every surface it
+    // creates and aborts when that fails. Our surfaces are offscreen FBOs, so the
+    // attribute has no meaning; accepting it (and answering the query) is what
+    // keeps the render thread alive.
+    if surface.is_null() {
+        return EGL_FALSE;
+    }
+    let _ = (attribute, value);
+    EGL_TRUE
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn eglQuerySurface(
     _dpy: EGLDisplay,
     surface: EGLSurface,

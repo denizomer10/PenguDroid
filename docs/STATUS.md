@@ -32,7 +32,7 @@ geliyor (`[u32][-1]["TSYS"]`).
 Sonuç: WCG abort **yok**, `DeviceInfo::updateDisplayInfo` çökmesi **yok**.
 Yeni durak: `OpenGLRenderer: Unreachable: unsupported pixel format: 0`.
 
-### Pixel format duvarı — ölçülenler
+### Pixel format duvarı — AŞILDI
 
 `DeviceInfo::updateDisplayInfo` (libhwui) şu zinciri çalıştırıyor:
 
@@ -44,16 +44,26 @@ ADisplay_acquirePhysicalDisplays
 ```
 
 `ADisplay_getPreferredWideColorFormat` yalnızca `ADisplay` nesnesinin
-`+0x0c` (dataspace) ve `+0x10` (format) alanlarını kopyalıyor. gdb'de `ADisplay`
-belleği **tamamen sıfır** çıktı, yani bu iki alan hiç doldurulmamış.
-`ADisplay_acquirePhysicalDisplays` bunları `getCompositionPreference`'ın
-çıktılarından alıyor (legacy code **27**, istemci 5 adet `readInt32` okuyor);
-bu çağrı artık `[status][dataspace][format=1][renderIntent][spare]` olarak
-yanıtlanıyor ve **ret=0** dönüyor, ama değerler `ADisplay`'e ulaşmıyor.
+`+0x0c` (dataspace) ve `+0x10` (format) alanlarını kopyalıyor. gdb ile ölçüldü:
+bu iki alan `getCompositionPreference`'ın (legacy code **27**, istemci 5 adet
+`readInt32` okuyor) **3.** ve **4.** yüklerinden geliyor. 4. yüke `1`
+(RGBA_8888) verilince assert **kayboldu**.
 
-Sıradaki adım: `-0x1a8`/`-0x1a4` yığın alanlarının `getCompositionPreference`
-çıktılarından mı yoksa `DynamicDisplayInfo`'dan mı geldiğini netleştirmek
-(objdump bu bölgede hizasız okuduğu için gdb ile tek adım izlemek gerekiyor).
+### Yeni durak: gralloc mapper
+
+```
+WARN  Gralloc2: mapper 2.x is not supported
+FATAL GraphicBufferMapper: gralloc-mapper is missing
+```
+
+hwui `AHardwareBuffer`/`GraphicBuffer` ayırmak için gralloc mapper'ı arıyor;
+shim'de yok. Sıradaki adım: `GraphicBufferMapper`'ın beklediği mapper'ı
+(`libgralloc` / `IMapper`) sağlamak ya da `AHardwareBuffer_allocate`'ı doğrudan
+kendi dma-buf ayırıcımıza bağlamak.
+
+Ayrıca `pengudroid-gleshim`'e **`eglSurfaceAttrib`** eklendi: hwui her yüzeyde
+`EGL_SWAP_BEHAVIOR = EGL_BUFFER_DESTROYED` ayarlıyor ve başarısız olunca abort
+ediyordu (`EGL_BAD_SURFACE`, çünkü sembol host EGL'ye düşüyordu).
 
 ## Önceki oturum: WCG duvarı aşıldı, hwui EGL'ye geldi
 

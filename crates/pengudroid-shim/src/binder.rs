@@ -1146,10 +1146,15 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         // hwui's `DeviceInfo::updateDisplayInfo` asserts "Unreachable: unsupported
         // pixel format" unless the format is 1 (RGBA_8888) or 0x16.
         parcel.extend_from_slice(&0i32.to_ne_bytes()); // status
-        parcel.extend_from_slice(&0i32.to_ne_bytes()); // dataspace (UNKNOWN)
-        parcel.extend_from_slice(&1i32.to_ne_bytes()); // format RGBA_8888
-        parcel.extend_from_slice(&0i32.to_ne_bytes()); // render intent
-        parcel.extend_from_slice(&0i32.to_ne_bytes()); // spare (client reads 5 ints)
+        // The client reads five int32s. `ADisplay_acquirePhysicalDisplays` copies
+        // the third payload into `ADisplay+0x0c` (dataspace) and the fourth into
+        // `ADisplay+0x10` (the pixel format that
+        // `ADisplay_getPreferredWideColorFormat` reports), so the fourth carries
+        // RGBA_8888.
+        parcel.extend_from_slice(&0i32.to_ne_bytes()); // 1st payload
+        parcel.extend_from_slice(&1i32.to_ne_bytes()); // 2nd payload
+        parcel.extend_from_slice(&0i32.to_ne_bytes()); // 3rd payload -> dataspace
+        parcel.extend_from_slice(&1i32.to_ne_bytes()); // 4th payload -> format RGBA_8888
         if trace_enabled() {
             diag("[binder]   -> getCompositionPreference (RGBA_8888)\n");
         }
