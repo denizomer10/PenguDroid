@@ -33,9 +33,20 @@ Buffer'lar memfd + klasik gralloc0 `native_handle` düzeniyle ayrılıyor
 ### Kalan iş: sunum
 
 Pikseller bizim memfd buffer'larında; **Wayland'a sunum henüz yok** (daemon
-logunda pencere yok). Sıradaki adım: `IGraphicBufferProducer::queueBuffer`
-transaction'ını broker'da yakalayıp buffer'ı `zwp_linux_dmabuf_v1` ile
-compositor'a vermek (ya da memfd'i `wl_shm` ile sunmak).
+logunda pencere yok). Ölçülenler:
+
+- `PENGUDROID_TRACE_GLESHIM=1` ile görüldü ki **`eglSwapBuffers` hiç
+  çağrılmıyor** — hwui kareyi bitirmiyor.
+- Broker'a `graphic_buffer_producer` handle'ında **hiç transaction gelmiyor**
+  (`queueBuffer` yok).
+- `BufferQueueProducer::allocateBuffers` 6 buffer ayırıyor (bizim memfd'ler),
+  yani BLASTBufferQueue'nin yerel producer'ı çalışıyor ama consumer'ı bizim
+  `gbp`'mize bağlanmıyor.
+
+Sıradaki adım: BLASTBufferQueue'nin consumer'ını bizim `gbp`'mize bağlayan yolu
+(`ISurfaceComposer`/`setConsumer` ya da `createSurface` yanıtındaki gbp'nin
+BQB tarafından kullanılması) çözmek; ardından `queueBuffer`'da gelen buffer'ı
+`zwp_linux_dmabuf_v1` (veya `wl_shm`) ile compositor'a vermek.
 
 ## Önceki oturum: display bilgisi verildi, hwui çizim yoluna girdi
 

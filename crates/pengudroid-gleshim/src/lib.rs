@@ -1311,6 +1311,13 @@ pub unsafe extern "C" fn eglQuerySurface(
 
 #[no_mangle]
 pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -> u32 {
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+        static SWAPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SWAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 5 || n % 60 == 0 {
+            eprintln!("[gleshim] eglSwapBuffers #{n} surface={surface:p}");
+        }
+    }
     if surface.is_null() {
         return EGL_FALSE;
     }
