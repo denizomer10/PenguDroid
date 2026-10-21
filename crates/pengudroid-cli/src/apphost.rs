@@ -1218,6 +1218,30 @@ fn force_visible(env: &JniEnv, record: JObject) {
         env.call_void(decor, invalidate, &[]);
         println!("apphost: decor view invalidated");
     }
+    // The traversal runs but never reaches `performDraw`, so drive it once more
+    // from here: `View.getViewRootImpl()` is @hide, and JNI ignores access
+    // modifiers, so the private `performTraversals()` can be called directly.
+    if let Some(get_root) = env.method_id(view_class, "getViewRootImpl", "()Landroid/view/ViewRootImpl;") {
+        match env.call_object(decor, get_root, &[]) {
+            Some(root) if !root.is_null() => {
+                if let Some(root_class) = env.find_class("android/view/ViewRootImpl") {
+                    match env.method_id(root_class, "performTraversals", "()V") {
+                        Some(traverse) => {
+                            if env.call_void(root, traverse, &[]) {
+                                println!("apphost: performTraversals() done");
+                            } else {
+                                eprintln!("apphost: performTraversals threw");
+                            }
+                        }
+                        None => eprintln!("apphost: no performTraversals"),
+                    }
+                }
+            }
+            _ => eprintln!("apphost: getViewRootImpl returned null"),
+        }
+    } else {
+        eprintln!("apphost: no View.getViewRootImpl");
+    }
 }
 
 /// Drive `onResume` and the window attach.

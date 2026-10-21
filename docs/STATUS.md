@@ -66,6 +66,12 @@ Sıradaki adım: `mAppVisible`'ı true yapan yolu bulmak (cihazda bunu
 `WindowManagerService`/`setAppVisibility` yapar) veya `ThreadedRenderer.draw`'ı
 doğrudan tetiklemek.
 
+Denenen ve **işe yaramayan**: `View.getViewRootImpl()` ile `ViewRootImpl`'i alıp
+`performTraversals()`'ı çağırmak — `getViewRootImpl()` **null** dönüyor (decor
+view o ViewRootImpl'e bağlı değil). Bir sonraki deneme
+`WindowManagerGlobal.getInstance().mRoots` üzerinden gerçek `ViewRootImpl`'e
+ulaşmak olmalı.
+
 ## Önceki oturum: display bilgisi verildi, hwui çizim yoluna girdi
 
 `ADisplay_acquirePhysicalDisplays`'ın istediği **üç** yanıt tamamlandı ve her
