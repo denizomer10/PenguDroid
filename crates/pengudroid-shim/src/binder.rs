@@ -280,7 +280,7 @@ unsafe fn hidl_service_manager_reply(
         // `IServiceManager::getTransport(fqName, name)` returns a `Transport`
         // enum, which HIDL serialises as a single byte (`readUint8`).
         3 => {
-            parcel.push(0); // Transport::HWBINDER
+            parcel.push(1); // Transport::HWBINDER (EMPTY is 0)
             if trace_enabled() {
                 diag("[binder]   -> hidl getTransport: hwbinder\n");
             }
