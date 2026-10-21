@@ -45,6 +45,41 @@ Hedef: `system_server`'ın yaptığı gibi uygulamaya *çağrı yapmak*
   (b) çağıran `read_size = 0` verirse enjekte edilen komut `ENOSPC` yolunda
   düşer — probe bekletiliyor.
 
+**Yeni: uygulamaya çağrı yapılabiliyor (bu turun kazanımı).**
+
+Gerçek sürücü, sıraya girmiş bir transaction'ı **reply'dan önce** teslim eder.
+libbinder'ın `waitForResponse`'u `BR_TRANSACTION`'ı `default:` dalında işler ve
+*sonra* beklediği `BR_REPLY`'ı okur. Bu yüzden transaction'ı reply'dan önce
+koymak, binder thread pool'u olmadan da uygulamaya çağrı indirir:
+
+```
+[binder] captured app thread weak=0x… cookie=0x…
+[binder] delivering code=0x1 to app node … (read_size=256, before 1 reply)
+[binder]   app reply (100 bytes) … "…er invocation to an incorrect interface"
+```
+
+`cmd=0x40406301` (**BC_REPLY**) gelmesi uygulamanın bizim transaction'ımızı
+*işlediğini* kanıtlar. `INTERFACE_TRANSACTION` (0x5f4e5446) ile
+`BC_REPLY data=68` dönüyor ve içinde `IApplicationThread` descriptor'ı var.
+
+Ölçülen ayrıntılar:
+- **AIDL kodu 1 geçerli bir metottur** (yanıt `enforceInterface` hatası veriyor).
+- Hata mesajı "…invocation to an incorrect **interface**" → parcel'ın başında
+  interface token'ı istiyor. `string16("android.app.IApplicationThread")`
+  eklendi; şu an hata aynı kaldığı için token biçimi/sırası hâlâ yanlış
+  (yanıt parcel'ının 12 baytlık bir ön-eki var, yani exception marshalling'i
+  çözülmeden ilerlemek zor).
+- Probe bir koşuda tek kod deniyor: uygulama ilk delivery'den sonra yeni
+  `read_size > 0` çağrısı yapmıyor (pool yok). Kodları `—PROBE_CODE=1,2,3`
+  listesiyle vermek mümkün ama her kod ayrı koşu istiyor.
+
+**Sıradaki en kısa yol:** parcel arkeolojisi yerine Java tarafını kullanmak:
+`ActivityThread.currentActivityThread()` → `getApplicationThread()` ile
+uygulamanın kendi `ApplicationThread` nesnesini alıp `bindApplication(...)`'ı
+**JNI ile doğrudan** çağırmak (parcel, kod numarası ve `enforceInterface`
+tamamen devre dışı kalır). Argümanların çoğu `null`, `ApplicationInfo` ise
+reflection ile doldurulacak.
+
 **Duvar: binder thread pool.** Uygulama süreci normalde thread pool'unu
 *zygote*'tan miras alır; biz zygote'tan fork etmediğimiz için hiçbir thread
 `read_size > 0` ile okuma yapmıyor ve `system_server` geri-çağrısı inecek yer

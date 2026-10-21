@@ -71,7 +71,36 @@ const BR_TRANSACTION: u32 = 0x8040_7202;
 /// the `binder` union member is the local object's address.
 const BINDER_TYPE_BINDER: u32 = 0x7362_2A85;
 
-/// The app's own `ApplicationThread` node, captured from `attachApplication`.
+/// Codes still to probe, in order. Seeded from
+/// `PENGUDROID_BINDER_PROBE_CODE` (a comma-separated list) when the app node is
+/// first captured, so one run can try many AIDL code numbers and compare the
+/// replies the app sends back.
+static PROBE_CODES: std::sync::LazyLock<std::sync::Mutex<std::collections::VecDeque<u32>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+
+fn next_probe_code() -> Option<u32> {
+    let mut q = PROBE_CODES.lock().unwrap_or_else(|e| e.into_inner());
+    q.pop_front()
+}
+
+fn seed_probe_codes() {
+    let Ok(raw) = std::env::var("PENGUDROID_BINDER_PROBE_CODE") else {
+        return;
+    };
+    let mut q = PROBE_CODES.lock().unwrap_or_else(|e| e.into_inner());
+    q.clear();
+    for part in raw.split(',') {
+        if let Ok(v) = part.trim().parse::<u32>() {
+            q.push_back(v);
+        }
+    }
+    // Default: `IBinder.INTERFACE_TRANSACTION`, which libbinder answers with the
+    // interface descriptor - proof that a call reached the app.
+    if q.is_empty() {
+        q.push_back(0x5f4e_5446);
+    }
+}
+
 ///
 /// libbinder flattens a local binder as `obj.binder = getWeakRefs()` and
 /// `obj.cookie = this` (the `BBinder*`). An incoming transaction has to carry
@@ -344,6 +373,7 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                 ));
             }
             if std::env::var_os("PENGUDROID_BINDER_PROBE").is_some() {
+                seed_probe_codes();
                 APP_THREAD_PROBE.store(true, Ordering::Relaxed);
             }
         }
@@ -416,6 +446,36 @@ unsafe fn incoming_transaction(target_weak: u64, cookie: u64, code: u32, parcel:
     push_u32(&mut out, BR_TRANSACTION);
     push_transaction(&mut out, &tr);
     Some(out)
+}
+
+/// Read `(data_ptr, data_size)` from the command at `off`, for `BC_REPLY`.
+unsafe fn tr_reply_data(buf: u64, off: u64) -> Option<(u64, u64)> {
+    let tr = transaction_at(buf, off);
+    Some((tr.data_ptr, tr.data_size))
+}
+
+/// Encode a `String16` the way `Parcel::writeString16` does: a `u32` char
+/// count, the UTF-16LE code units, a terminating NUL, padded to 4 bytes.
+pub(crate) fn string16(s: &str) -> Vec<u8> {
+    let units: Vec<u16> = s.encode_utf16().collect();
+    let mut out = Vec::with_capacity(4 + units.len() * 2 + 4);
+    out.extend_from_slice(&(units.len() as u32).to_ne_bytes());
+    for u in units {
+        out.extend_from_slice(&u.to_ne_bytes());
+    }
+    out.extend_from_slice(&0u16.to_ne_bytes());
+    while out.len() % 4 != 0 {
+        out.push(0);
+    }
+    out
+}
+
+/// AIDL interface descriptor of `IApplicationThread`.
+const IAPPLICATIONTHREAD: &str = "android.app.IApplicationThread";
+
+/// Body of a probe transaction: just the interface token.
+fn probe_parcel() -> Vec<u8> {
+    string16(IAPPLICATIONTHREAD)
 }
 
 /// Place a reply parcel in the guest's transfer area.
@@ -505,6 +565,26 @@ unsafe fn handle_write_read(wr: *mut WriteRead) -> c_int {
                 pending.push(make_reply(&tr, pid));
             }
         }
+        if cmd == BC_REPLY && trace_enabled() {
+            // The app answering a transaction we sent it: dump the parcel so the
+            // Java exception (if any) is readable.
+            let (ptr, size) = tr_reply_data(wr.write_buffer, off).unwrap_or((0, 0));
+            if ptr != 0 && size > 0 {
+                let n = (size as usize).min(120);
+                let bytes = std::slice::from_raw_parts(ptr as *const u8, n);
+                let mut hex = format!("[binder]   app reply ({size} bytes):");
+                for b in bytes {
+                    hex.push_str(&format!(" {b:02x}"));
+                }
+                hex.push('\n');
+                diag(&hex);
+                let text: String = bytes
+                    .iter()
+                    .map(|b| if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '.' })
+                    .collect();
+                diag(&format!("[binder]   app reply text: {text}\n"));
+            }
+        }
         off += size;
     }
     // The driver consumes the whole write buffer even for commands we do not
@@ -512,6 +592,38 @@ unsafe fn handle_write_read(wr: *mut WriteRead) -> c_int {
     wr.write_consumed = wr.write_size;
 
     let mut out: Vec<u8> = Vec::new();
+
+    // Deliver a queued transaction to the app's own binder node *before* the
+    // reply that this call is waiting for.
+    //
+    // That is what a real driver does when `system_server` calls back inside a
+    // transaction, and it is what makes this work without a binder thread pool:
+    // `IPCThreadState::waitForResponse` handles `BR_TRANSACTION` in its `default:`
+    // arm (dispatching it) and only then reads the `BR_REPLY` it was after. Put
+    // the transaction *after* the reply and it is silently dropped.
+    if APP_THREAD_PROBE.load(Ordering::Relaxed) {
+        let weak = APP_THREAD_WEAK.load(Ordering::Relaxed);
+        let cookie = APP_THREAD_COOKIE.load(Ordering::Relaxed);
+        if weak != 0 && wr.read_size > 0 {
+            // One code per read call; stop when the list is exhausted.
+            if let Some(code) = next_probe_code() {
+                if let Some(bytes) = unsafe { incoming_transaction(weak, cookie, code, &probe_parcel()) } {
+                    if bytes.len() as u64 <= wr.read_size {
+                        diag(&format!(
+                            "[binder] delivering code={code:#x} to app node weak={weak:#x} cookie={cookie:#x} (read_size={}, cmd_len={}, before {} reply/replies)\n",
+                            wr.read_size,
+                            bytes.len(),
+                            pending.len()
+                        ));
+                        out.extend_from_slice(&bytes);
+                    }
+                }
+            } else {
+                APP_THREAD_PROBE.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+
     for reply in &pending {
         push_u32(&mut out, BR_TRANSACTION_COMPLETE);
         push_u32(&mut out, BR_REPLY);
@@ -538,37 +650,6 @@ unsafe fn handle_write_read(wr: *mut WriteRead) -> c_int {
             }
             hex.push_str(&format!(" objects={:?} buf={:#x} offs={:#x}\n", reply.objects, tr.data_ptr, tr.offsets_ptr));
             diag(&hex);
-        }
-    }
-
-    // Deliver a probe transaction to the app's own binder node.
-    //
-    // It must NOT share a read buffer with a reply: libbinder's
-    // `waitForResponse` stops parsing as soon as it finds the BR_REPLY it was
-    // waiting for and drops whatever follows. The looper's blocking read
-    // (`read_size > 0`, no write commands) is the right place.
-    if pending.is_empty() && APP_THREAD_PROBE.load(Ordering::Relaxed) {
-        let weak = APP_THREAD_WEAK.load(Ordering::Relaxed);
-        let cookie = APP_THREAD_COOKIE.load(Ordering::Relaxed);
-        // `read_size == 0` means the caller only wanted to *write*; keep the
-        // probe pending so it goes out on the next real read instead of being
-        // dropped by the ENOSPC path below.
-        if weak != 0 && wr.read_size > 0 {
-            let code: u32 = std::env::var("PENGUDROID_BINDER_PROBE_CODE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(u32::MAX);
-            if let Some(bytes) = unsafe { incoming_transaction(weak, cookie, code, &0u32.to_ne_bytes()) } {
-                if bytes.len() as u64 <= wr.read_size {
-                    APP_THREAD_PROBE.store(false, Ordering::Relaxed);
-                    diag(&format!(
-                        "[binder] probing app node weak={weak:#x} cookie={cookie:#x} code={code:#x} read_size={} cmd_len={}\n",
-                        wr.read_size,
-                        bytes.len()
-                    ));
-                    out.extend_from_slice(&bytes);
-                }
-            }
         }
     }
 
