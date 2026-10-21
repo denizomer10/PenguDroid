@@ -278,10 +278,20 @@ unsafe fn hidl_service_manager_reply(
         // (`vec<hidl_string>`), not `InstanceDebugInfo` records.
         5 | 13 => {
             parcel.extend_from_slice(&0u32.to_ne_bytes()); // status: ok
-            // `hidl_vec<hidl_string>`: `size_t` count, then each element as a
-            // 40-byte struct followed by its inline bytes.
-            parcel.extend_from_slice(&1u64.to_ne_bytes());
-            push_hidl_string(parcel, "default");
+            // `hidl_vec<hidl_string>` is a 16-byte struct `{ptr, size}` whose
+            // size is read as a `u32` at offset 8, followed by the elements
+            // inline, 16 bytes each. Each element is a `hidl_string` whose
+            // bytes are read *in place* at the element's own offset, so short
+            // names live in the first eight bytes.
+            parcel.extend_from_slice(&0u64.to_ne_bytes()); // mData
+            parcel.extend_from_slice(&1u32.to_ne_bytes()); // mSize
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // padding
+            let name: &[u8] = b"default\0";
+            parcel.extend_from_slice(name);
+            for _ in name.len()..8 {
+                parcel.push(0);
+            }
+            parcel.extend_from_slice(&(name.len() as u64 - 1).to_ne_bytes());
             if trace_enabled() {
                 diag(&format!("[binder]   -> hidl listManifestByInterface (code {code}): [default]\n"));
             }

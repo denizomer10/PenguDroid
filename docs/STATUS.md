@@ -66,12 +66,27 @@ the manifest"), sonra `listByInterface` ile servis arıyor. Yapılacaklar:
    yanlış**.
 
    Ölçülen istek yerleşimi: parcel = `[interface token][40 baytlık hidl_string
-   struct][gömülü string verisi]`; her argüman iki 40 baytlık blok. Yanıt için
-   sıradaki adım: `BpHwServiceManager::_hidl_listManifestByInterface`'ın
-   (libhidlbase `0x93800`) `transact`'a verdiği **lambda**'yı disassemble edip
-   `hidl_vec` sayısının `u32` mi `size_t` mi okunduğunu ve elemanın tam
-   yerleşimini görmek. `writeToParcel(Status)`'ın OK için 4 bayt yazdığı
-   doğrulandı (`0x57050`), yani status alanı doğru.
+   struct][gömülü string verisi]`; her argüman iki 40 baytlık blok.
+
+   **Yanıt tarafı disassemble edildi** (`libhidlbase` `0x9a8f0`, `transact`'a
+   verilen lambda):
+
+   ```
+   readFromParcel(Status)                     → 4 bayt
+   readBuffer(0x10, &parentOffset, &ptr)      → 16 baytlık hidl_vec struct
+   size = *(u32*)(ptr + 8)                    ← sayaç u32, offset 8
+   readNullableEmbeddedBuffer(size * 16, 0, parentOffset, 0, &arr)
+   for i in 0..size:
+       readEmbeddedFromParcel(hidl_string, parcel, parentOffset, i * 16)
+   ```
+
+   Yani yanıt: `[status u32][16 baytlık vec struct {ptr, u32 size, pad}]
+   [elemanlar, her biri 16 bayt, satır içi]` ve her elemanın string verisi
+   `parentOffset + i*16` adresinden **yerinde** okunuyor. Bu yerleşimle de
+   istemci boş liste görüyor; sıradaki adım `readEmbeddedBuffer`'ın
+   (`0x56da0`'dan çağrılan) `parentOffset`'i nasıl yorumladığını okumak —
+   gömülü veri alanının struct'tan sonra mı yoksa struct'ın içinde mi
+   olduğunu bu belirleyecek.
 2. `get(...)` → `codec2` handle'ı (hazır).
 3. `ICodec2::listComponents` → `ComponentInfo` listesi.
 4. `ICodec2::createComponent` + `ICodec2Component` (`configure`, `start`,
