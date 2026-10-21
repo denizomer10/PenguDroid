@@ -152,36 +152,24 @@ fn is_hidl_request(tr: &TransactionData) -> bool {
     &data[8..12] != b"TSYS"
 }
 
-/// Write a `hidl_string` as `Parcel::writeBuffer` does: `[u32 len][bytes][NUL]`
-/// padded to four bytes.
-fn push_hidl_buffer_string(parcel: &mut Vec<u8>, s: &str) {
+/// Write a `hidl_string` the way libhidlbase does.
+///
+/// Measured from a live `getTransport` request: a string is a 40-byte struct
+/// `[u32 tag][u32 heap][u64 data][u32 size][20 bytes inline]` followed by the
+/// string bytes **inline in the parcel** (that is what `writeEmbeddedToParcel`
+/// does). The reader takes the size from the struct and then reads `size + 1`
+/// bytes in place, so the pointer field is irrelevant.
+fn push_hidl_string(parcel: &mut Vec<u8>, s: &str) {
+    const TAG: u32 = 0x7074_2a85;
+    parcel.extend_from_slice(&TAG.to_ne_bytes());
+    parcel.extend_from_slice(&1u32.to_ne_bytes()); // heap
+    parcel.extend_from_slice(&0u64.to_ne_bytes()); // data pointer: unused
     parcel.extend_from_slice(&(s.len() as u32).to_ne_bytes());
+    parcel.extend_from_slice(&[0u8; 20]);
     parcel.extend_from_slice(s.as_bytes());
     parcel.push(0);
     while parcel.len() % 4 != 0 {
         parcel.push(0);
-    }
-}
-
-/// Write a `hidl_string` the way libhidlbase does.
-///
-/// Measured from a live `getTransport` request: a string is **two** 40-byte
-/// blocks, `[u32 tag][u32 heap][u64 data][u32 size][20 bytes inline]`. The
-/// first block carries the inline copy, the second the heap one, and the reader
-/// follows `data`. Because the broker runs inside the guest process, a pointer
-/// into our own memory is valid for the client.
-fn push_hidl_string(parcel: &mut Vec<u8>, s: &str) {
-    const TAG: u32 = 0x7074_2a85;
-    // Leaked on purpose: the client dereferences this pointer after the reply
-    // has been handed over. The number of HIDL strings we emit is tiny.
-    let bytes: &'static [u8] = Box::leak(s.as_bytes().to_vec().into_boxed_slice());
-    let ptr = bytes.as_ptr() as u64;
-    for (heap, size) in [(0u32, 16u32), (1u32, s.len() as u32)] {
-        parcel.extend_from_slice(&TAG.to_ne_bytes());
-        parcel.extend_from_slice(&heap.to_ne_bytes());
-        parcel.extend_from_slice(&ptr.to_ne_bytes());
-        parcel.extend_from_slice(&size.to_ne_bytes());
-        parcel.extend_from_slice(&[0u8; 20]);
     }
 }
 
@@ -290,10 +278,10 @@ unsafe fn hidl_service_manager_reply(
         // (`vec<hidl_string>`), not `InstanceDebugInfo` records.
         5 | 13 => {
             parcel.extend_from_slice(&0u32.to_ne_bytes()); // status: ok
-            // `hidl_vec<hidl_string>`: the count is a `size_t` and each element
-            // is a `writeBuffer` string (`[u32 len][bytes][NUL]`, padded).
+            // `hidl_vec<hidl_string>`: `size_t` count, then each element as a
+            // 40-byte struct followed by its inline bytes.
             parcel.extend_from_slice(&1u64.to_ne_bytes());
-            push_hidl_buffer_string(parcel, "default");
+            push_hidl_string(parcel, "default");
             if trace_enabled() {
                 diag(&format!("[binder]   -> hidl listManifestByInterface (code {code}): [default]\n"));
             }

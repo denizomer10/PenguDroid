@@ -61,13 +61,17 @@ the manifest"), sonra `listByInterface` ile servis arıyor. Yapılacaklar:
 1. `listManifestByInterface("android.hardware.media.c2@1.0::IComponentStore")`
    → `["default"]`. Çağrı **kod 5** olarak geliyor (`Codec2Client::GetServiceNames`
    `IServiceManager1_2` üzerinden yapıyor) ve yanıt `vec<hidl_string>`
-   (instance adları). Şu an `[status][u64 count][buffer string]` yazılıyor ama
-   istemci hâlâ boş liste görüyor — **yanıtın yerleşimi hâlâ yanlış**.
+   (instance adları). Şu an `[status u32][count u64][40 baytlık struct + gömülü
+   string]` yazılıyor; istemci hâlâ boş liste görüyor — **yanıtın yerleşimi hâlâ
+   yanlış**.
+
    Ölçülen istek yerleşimi: parcel = `[interface token][40 baytlık hidl_string
    struct][gömülü string verisi]`; her argüman iki 40 baytlık blok. Yanıt için
-   doğru kodlama `libhidlbase`'in `BnHwServiceManager` tarafındaki yazma
-   sırasından çıkarılmalı (ya da `hidl_vec`'in `size_t` mi `u32` mi olduğu
-   doğrulanmalı).
+   sıradaki adım: `BpHwServiceManager::_hidl_listManifestByInterface`'ın
+   (libhidlbase `0x93800`) `transact`'a verdiği **lambda**'yı disassemble edip
+   `hidl_vec` sayısının `u32` mi `size_t` mi okunduğunu ve elemanın tam
+   yerleşimini görmek. `writeToParcel(Status)`'ın OK için 4 bayt yazdığı
+   doğrulandı (`0x57050`), yani status alanı doğru.
 2. `get(...)` → `codec2` handle'ı (hazır).
 3. `ICodec2::listComponents` → `ComponentInfo` listesi.
 4. `ICodec2::createComponent` + `ICodec2Component` (`configure`, `start`,
