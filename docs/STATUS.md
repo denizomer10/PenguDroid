@@ -3,6 +3,30 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
+## Bugün eklenen (bu oturum)
+
+- **`sysroot` eksikti, ART değil.** NewPipe'ın `NoClassDefFoundError`'ı geri
+geldi çünkü `.toolchain/sysroot`'ta `apex -> system/apex` bağlantısı yoktu
+  (`tools/art/sysroot-relink.py` ile kuruldu) ve imajdaki 25 APEX'in yalnızca
+  15'i çıkarılmıştı. Eksik APEX'lerin `etc`/`javalib`/`lib64` alt ağaçları
+  çıkarılınca boot classpath **13 → 31 jar** oldu; `android.app.StatsManager` ve
+  `android.os.StatsDimensionsValue` (`framework-statsd.jar`, statsd APEX'inin
+  *bootclasspath* parçası) çözülür oldu. **Ders:** bir APEX'in `javalib/`ini
+  atlamak, `SystemServiceRegistry`'yi ve dolayısıyla `ActivityThread.main`'i
+  sessizce `NoClassDefFoundError`'a düşürüyor.
+- **binder: hizasız `TransactionData` okuması.** `handle_write_read` struct'ı
+  `*const TransactionData` üzerinden okuyordu; komut akışı 4 bayt hizalı olduğu
+  için adres `…234` gibi bitiyor ve Rust "misaligned pointer dereference" ile
+  **süreci abort ediyordu**. `transaction_at()` + `read_unaligned` ile
+düzeltildi, hizasız tamponla test eklendi. Bu düzeltmeden sonra NewPipe
+  `ActivityThread.main` → `Looper.loop()` yolunda **45 sn canlı kalıyor**
+  (exit 124), yani belgelenen "binder sınırı" durumu geri geldi.
+- Boot classpath'i eksiksiz kurmanın yolu (yerel, tek seferlik):
+  ```sh
+  python3 tools/art/sysroot-relink.py .toolchain/sysroot
+  # her APEX için etc/ javalib/ lib64/ alt ağaçlarını çıkar (ext4.py ile)
+  ```
+
 ## Bugün çalışan şeyler
 
 | Ne | Komut | Kanıt |
@@ -178,13 +202,15 @@ tek gerçekçi "oyun açılsın" yolu VM/container, ki bu projenin önermesinin 
   (ptrace aracı gibi).
 
 ## Bu oturumun son commit'leri
+`31967a4` binder: transaction'ları yanıtla; ActivityThread.main Looper.loop()'a ulaşıyor ·
+`968a57c` shim: /dev/binder'ı süreç-içi aygıt olarak sun ·
 `0a82e39` ARM bridge sinyal handler'ları + bulgular · `bfb3675` bundle desteği ·
 `02e6c1a` çevirici çalıştırma dokümanı · `cd41f2e` ART JNI_OK + sinyal ABI +
 launcher.
 
 ## Yeni makinede ilk adımlar
 1. `cargo build --workspace` (sistemde Rust yoksa `.toolchain` yeniden kurulmalı).
-2. `cargo test --workspace` → 160 test.
+2. `cargo test --workspace` → 167 test.
 3. `.toolchain/sysroot` yoksa yukarıdaki `debugfs` + `sysroot-relink.py` komutları.
 4. ART'ı doğrula:
    ```sh

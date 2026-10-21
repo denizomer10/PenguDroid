@@ -372,6 +372,21 @@ unsafe fn place_reply(reply: &Reply) -> Option<(u64, u64)> {
     Some(((base + off) as u64, offsets_addr))
 }
 
+/// Read a `TransactionData` from a binder command stream.
+///
+/// Binder writes a 4-byte command code followed by the struct, so the struct is
+/// only 4-byte aligned even though it contains `u64` fields. A plain pointer
+/// dereference is undefined behaviour and Rust's `debug_assertions` abort on it
+/// ("misaligned pointer dereference"), which killed the guest the first time a
+/// real transaction arrived.
+///
+/// # Safety
+/// `buf + off` must point to at least `size_of::<TransactionData>()` readable
+/// bytes within the write buffer.
+unsafe fn transaction_at(buf: u64, off: u64) -> TransactionData {
+    std::ptr::read_unaligned((buf + off) as *const TransactionData)
+}
+
 /// Emulate `BINDER_WRITE_READ`.
 ///
 /// Consumes the queued commands and, for every synchronous transaction,
@@ -394,7 +409,11 @@ unsafe fn handle_write_read(wr: *mut WriteRead) -> c_int {
             break;
         }
         if cmd == BC_TRANSACTION {
-            let tr = *((wr.write_buffer + off) as *const TransactionData);
+            // The command stream is only 4-byte aligned (a `u32` command code
+            // followed by the struct), so this must not be read through a
+            // `*const TransactionData` — Rust's alignment check aborts. Copy
+            // the bytes out and reinterpret them with `read_unaligned`.
+            let tr = transaction_at(wr.write_buffer, off);
             if tr.flags & TF_ONE_WAY == 0 {
                 pending.push(make_reply(&tr, pid));
             }
@@ -497,7 +516,7 @@ unsafe fn trace_write_read(wr: *const WriteRead) {
             if off + std::mem::size_of::<TransactionData>() as u64 > wr.write_size {
                 break;
             }
-            let tr = *((wr.write_buffer + off) as *const TransactionData);
+            let tr = transaction_at(wr.write_buffer, off);
             line = format!(
                 "[binder]   cmd={:#x} target={} code={} flags={:#x} data={} offsets={}\n",
                 cmd, tr.target_handle, tr.code, tr.flags, tr.data_size, tr.offsets_size
@@ -690,5 +709,35 @@ mod tests {
         let b = handle_for("activity");
         assert_eq!(a, b);
         assert!(a >= 1);
+    }
+
+    #[test]
+    fn parses_a_misaligned_transaction() {
+        // Binder puts the struct right after a 4-byte command code, so every
+        // u64 field lands on a 4-byte boundary. Reading it through a typed
+        // pointer aborted the process the first time a real transaction came in.
+        let mut buf = vec![0u8; 4 + std::mem::size_of::<TransactionData>() + 4];
+        let data = TransactionData {
+            target_handle: 0,
+            _pad0: 0,
+            cookie: 0,
+            code: 0x5f61_6374,
+            flags: 0,
+            sender_pid: 1,
+            sender_euid: 2,
+            data_size: 8,
+            offsets_size: 0,
+            data_ptr: 0,
+            offsets_ptr: 0,
+        };
+        unsafe {
+            std::ptr::write_unaligned(buf.as_mut_ptr().add(4) as *mut TransactionData, data);
+        }
+        let base = buf.as_ptr() as u64;
+        // Start at 4: the command code occupies the first word.
+        let parsed = unsafe { transaction_at(base, 4) };
+        assert_eq!(parsed.code, 0x5f61_6374);
+        assert_eq!(parsed.data_size, 8);
+        assert_eq!(parsed.sender_pid, 1);
     }
 }
