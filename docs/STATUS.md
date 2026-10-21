@@ -67,14 +67,17 @@ FATAL GraphicBufferMapper: gralloc-mapper is missing
 
 Mapper'lar **HIDL** (`android.hardware.graphics.mapper@2.0/3.0/4.0`), yani
 `hwservicemanager` üzerinden aranıyor; bizim broker yalnızca normal servis
-yöneticisini taklit ediyor. Sıradaki adım iki seçenekli:
+yöneticisini taklit ediyor.
 
-1. `GraphicBufferMapper::getInstance()`'ı shim'de interpose edip kendi
-dma-buf/memfd tabanlı mapper'ımızı döndürmek (`allocate`, `lock`, `unlock`,
-   `importBuffer`, `getTransportSize` …), ya da
-2. `AHardwareBuffer_allocate`'ı doğrudan kendi ayırıcımıza bağlamak.
-
-İkisi de "host GPU + dma-buf" çizgisine uygun; (1) daha az yüzey değiştiriyor.
+Bu turda `crates/pengudroid-shim/src/ahardwarebuffer.rs` eklendi: hwui'nin
+kullandığı beş giriş noktası (`allocate`, `describe`, `acquire`, `release`,
+`to_ANativeWindowBuffer`) memfd tabanlı bir `AHardwareBuffer` ile
+uygulanıyor. **Ancak ölçüm şunu gösterdi:** `AHardwareBuffer_allocate` hiç
+çağrılmıyor (`PENGUDROID_TRACE_AHB=1` ile doğrulandı); mapper **libgui/libui
+içinden** isteniyor (hwui bu sembolü import etmiyor). Yani sıradaki adım
+`GraphicBufferMapper::getInstance()`'ı interpose edip kendi mapper nesnemizi
+döndürmek — bu, `GrallocMapper` vtable'ının (`allocate`, `lock`, `unlock`,
+`importBuffer`, `getTransportSize`) uygulanmasını gerektiriyor.
 
 `eglQuerySurface` artık `EGL_SWAP_BEHAVIOR` (→ `EGL_BUFFER_DESTROYED`) ve
 `EGL_BUFFER_AGE_EXT` (→ 1) yanıtlıyor; "Unable to match the desired swap
