@@ -158,15 +158,16 @@ Sırada:
      offset 0 that is not in the object list" diyor).
    - `DisplayEventConnection.stealReceiveChannel` (kod 1) çağrılıyor;
      `BitTube::writeToParcel` **iki fd** yazıyor (önce receive, sonra send) ve
-     bunlar `BINDER_TYPE_FD` (`0x66642a85`) nesneleridir. Broker bir socketpair
-     açıp iki ucu yazdığında **bizim ioctl `rc=0` dönüyor** (trace: `-> 72 bytes,
-     rc=0`) ama AIDL katmanı yine de
-     `Status(-129, EX_TRANSACTION_FAILED): 'PERMISSION_DENIED'` veriyor — yani
-     `transact()` `-EPERM` döndürüyor. Durum sözcüklü ve sözcüksüz iki parcel
-     şekli de aynı sonucu verdi. Sıradaki adım: `waitForResponse`'un hangi dalda
-     `-EPERM` ürettiğini bulmak (reply `TransactionData`'sının alanları mı,
-     `ipcSetDataReference` doğrulaması mı, yoksa `mIn.errorCheck()` mi).
-     Deneme çalışmadığı için kod geri alındı.
+     bunlar `BINDER_TYPE_FD` (`0x66642a85`) nesneleridir. **Ölçülen:** AIDL C++
+     yanıtın başına bir `Status` başlığı koyuyor ve **OK için bu 8 bayttır**
+     (`[exception][errorCode]`; mesaj yalnızca hata durumunda yazılıyor).
+     - başlık yok → `PERMISSION_DENIED` (`readFileDescriptor` `BAD_TYPE` = -1)
+     - 12 bayt başlık → `UNEXPECTED_NULL`
+     - **8 bayt başlık → `UNEXPECTED_NULL`** (fd'ler offset 8 ve 32'de)
+     Yani başlık 8 bayt, ama BitTube'un fd'leri hâlâ okunamıyor. Sıradaki adım:
+     `BitTube::readFromParcel`'ın hangi fd'de takıldığını görmek (ikinci fd mi,
+     yoksa `readObject`'in offset ilerlemesi mi). Deneme çalışmadığı için kod
+     geri alındı.
 
    Gereken: `ISurfaceComposerClient.createSurface` + `IGraphicBufferProducer`
    (`connect`/`dequeueBuffer`/`queueBuffer`/`requestBuffer`/`setBufferCount`/
