@@ -49,15 +49,25 @@ shim'in `sigaction`'ı Bionic düzeni bekliyor).
 ```
 
 `ADisplay_acquirePhysicalDisplays` (libnativedisplay) her id için
-`getPhysicalDisplayToken` **ve** `getStaticDisplayInfo` çağırıyor; ikincisi
-`ComposerService` (**legacy** `android.ui.ISurfaceComposer`) üzerinden gidiyor ve
-biz o handle'da yalnızca boş yanıt veriyoruz → `ui::StaticDisplayInfo` okunamıyor
-→ display atlanıyor → dizi boş → çökme. Sıradaki adım: legacy
-`getStaticDisplayInfo` için gerçek `StaticDisplayInfo` parcel'ı
-(`connected`, `density`, `secure`, …) döndürmek.
+`getPhysicalDisplayToken` **ve** `getStaticDisplayInfo` çağırıyor. Ölçülenler:
+
+- `SurfaceComposerClient::getPhysicalDisplayIds()` **1 eleman** döndürüyor
+  (gdb ile vektörün begin/end'i okundu), yani id tarafı sağlam.
+- `getPhysicalDisplayToken` (AIDL code 5) artık `[status][strongBinder]`
+  döndürüyor.
+- `SurfaceComposerClient::getStaticDisplayInfo` çağrılıyor ve **hata (1)**
+  döndürüyor → display atlanıyor → dizi boş → çökme.
+
+`ui::StaticDisplayInfo::unflatten` düzeni söküldü: `[4B connected][4B density]
+[1B secure][DeviceProductInfo flattened][4B]`. `DeviceProductInfo`'nun kendi
+flattened boyutu en az 12 bayt (`getFlattenedSize` = 8 + string + 4 + …), yani
+blob 25+ bayt. Sıradaki adım: legacy `getStaticDisplayInfo` kodunu (legacy
+handle'da binder token taşıyan kodlar **3** ve **8**) ve `DeviceProductInfo`
+blob'unu doğru üretmek.
 
 Bu turda ayrıca `getPhysicalDisplayToken` (AIDL code 5) `[status][strongBinder]`
-olarak yanıtlanıyor.
+olarak yanıtlanıyor ve legacy isteklerde binder token taşıyan kodlar trace'te
+loglanıyor.
 
 ## Önceki oturum: Roblox Activity'yi resume ediyor
 

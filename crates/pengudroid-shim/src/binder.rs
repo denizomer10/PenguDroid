@@ -235,6 +235,9 @@ const ISC_GET_PHYSICAL_DISPLAY_IDS_LEGACY: u32 = 54;
 #[allow(dead_code)]
 const ISC_GET_PHYSICAL_DISPLAY_IDS_ALT: u32 = 5;
 
+/// Legacy `android.ui.ISurfaceComposer.getStaticDisplayInfo`.
+const ISC_LEGACY_GET_STATIC_DISPLAY_INFO: u32 = 8;
+
 /// `ISurfaceComposer.getPhysicalDisplayToken(long id)` (AIDL).
 const ISC_GET_PHYSICAL_DISPLAY_TOKEN: u32 = 5;
 
@@ -1020,9 +1023,21 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             }
         }
     }
-    if is_surface_flinger(tr.target_handle)
-        && (tr.code == ISC_GET_PHYSICAL_DISPLAY_IDS || tr.code == ISC_GET_PHYSICAL_DISPLAY_IDS_LEGACY)
-    {
+    if trace_enabled() && is_surface_flinger(tr.target_handle) && tr.data_size > 0 && tr.data_ptr != 0 {
+        // `getStaticDisplayInfo`/`getDisplayConfigs` write a strong binder token
+        // first; logging which legacy codes carry one identifies them.
+        let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
+        let has_binder = data
+            .windows(4)
+            .any(|w| u32::from_ne_bytes([w[0], w[1], w[2], w[3]]) == BINDER_TYPE_HANDLE);
+        if has_binder {
+            diag(&format!(
+                "[binder]   legacy code={} carries a binder token\n",
+                tr.code
+            ));
+        }
+    }
+    if is_surface_flinger(tr.target_handle) && tr.code == ISC_GET_PHYSICAL_DISPLAY_IDS {
         // AIDL `long[] getPhysicalDisplayIds()`: `[int32 count][int64 id...]`.
         // hwui's `EglManager::initialize` aborts with "Failed to acquire
         // physical displays for WCG support!" on an empty array, so one id is
