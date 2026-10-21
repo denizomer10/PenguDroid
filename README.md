@@ -36,8 +36,12 @@ $ ps -eo pid,comm,args | grep pengudroid
 
 > **Where we are right now:** `docs/STATUS.md` is the up-to-date handoff note
 > (what runs, what does not, and the exact failure point of each attempt).
-> Last verified: NewPipe 0.29.1 and Beach Buggy Racing 2 both stop at
-> `ActivityThread.main`; x86_64 NativeActivity games run on the GPU.
+> Last verified: **NewPipe 0.29.1 launches, draws and presents on screen** —
+> `pengudroid launch NewPipe_v0.29.1.apk` opens a Wayland window with the live
+> feed, rendered by hwui on the host GPU at 60 fps. x86_64 NativeActivity games
+> run on the GPU too. Beach Buggy Racing 2 still stops at the ARM translator.
+>
+> ![NewPipe running under PenguDroid](docs/screenshots/newpipe.png)
 
 ## Status: what actually works vs. what is stubbed
 
@@ -85,7 +89,11 @@ milestone. Nothing below is overstated.
 | Service registry + `phone`/`media.camera`/AMS/PMS/SurfaceFlinger stubs | **Stub** | correctly-named interfaces, minimal replies |
 | Audio: PipeWire | **Working** | the daemon owns a shared ring and drains it into `pw-cat` (or `aplay`); `audio-test [--via-daemon]` streams PCM |
 | Telephony (`ITelephony`) | **Working (no-SIM model)** | real AIDL transaction codes and `Parcel`-marshalled replies for the methods apps reach through `TelephonyManager`; `pengudroid telephony` transacts and decodes them |
-| **Running real DEX bytecode (ART)** | **Working (VM + DEX)** | `JNI_CreateJavaVM` now returns `JNI_OK` against an extracted LineageOS 20 (Android 13) tree: ART's whole startup path completes and Java code executes. Classes from a real APK's `classes.dex` load and link through the system class loader. Launching an *Activity* still needs the Android system services, which do not exist here — see `docs/LIMITATIONS.md` §2 |
+| **Running real DEX bytecode (ART)** | **Working (VM + DEX)** | `JNI_CreateJavaVM` now returns `JNI_OK` against an extracted LineageOS 20 (Android 13) tree: ART's whole startup path completes and Java code executes. Classes from a real APK's `classes.dex` load and link through the system class loader |
+| **Activity lifecycle driven from the host** | **Working** | with `--bind-app` the host plays `system_server`'s part: it builds `AppBindData` over JNI, calls `handleBindApplication`, then `handleLaunchActivity`/`handleResumeActivity` for the manifest's launcher activity. No `system_server`, no `AppBindData` parcel |
+| **hwui drawing** | **Working** | `ViewRootImpl.performTraversals` reaches `performDraw`, `ThreadedRenderer` renders the real view hierarchy into the shim's FBO, and `eglSwapBuffers` runs every frame |
+| **Presenting an app's frames on Wayland** | **Working** | the gleshim exports the FBO as a dma-buf, the daemon imports it through `zwp_linux_dmabuf_v1` and commits it; NewPipe's live feed is on screen at ~60 fps |
+| **Window geometry from the window manager** | **Working** | the `IWindowSession.relayout` reply carries a real `ClientWindowFrames` (1280×720), so `ViewRootImpl.mWidth/mHeight` are non-zero and the dirty rect is not empty |
 | Android packed relocations (`APS2` / `ANDROID_RELA` / `ANDROID_RELR`) | **Working** | `de-bionic` expands them into standard `RELA`/`RELR` (new `PT_LOAD` + retagged dynamic entries); without this a modern Android `.so` loads with *no* relocations applied |
 | Android linker API (`android_dlopen_ext`, namespaces, `__loader_*`) | **Working** | translated to glibc's flat namespace by the shim; `libdl_android.so` / `ld-android.so` resolve to the shim |
 | **Loading `libart.so` (the Android runtime)** | **Working** | the ART APEX closure (`libart`, `libartbase`, `libdexfile`, `libc++`, `libnativebridge`, `libunwindstack`, ...) `dlopen`s |
@@ -98,7 +106,7 @@ milestone. Nothing below is overstated.
 | **`AndroidRuntime::setArgv0` without `app_process`** | **Working** | interposed because `getRuntime()` is null when ART is hosted directly; the call would otherwise null-deref during `ActivityThread.main` |
 | **In-process `/dev/binder` device** | **Working (service lookups)** | `memfd`-backed device answering `BINDER_VERSION` (8), `SET_MAX_THREADS`, `SET_CONTEXT_MGR`, `THREAD_EXIT`; `BINDER_WRITE_READ` parses transactions and replies with `flat_binder_object` handles (including the stability field libbinder requires). `ServiceManager.getService` returns a real proxy and `attachApplication` is accepted |
 | **ARM→x86_64 translation (Intel NDK translation)** | **Partial** | the emulator's `libndk_translation.so` loads and initialises (`Initialized NDK translation (aarch64)`), the guest linker resolves the ARM64 runtime and `ExecuteGuest` starts running the real ARM64 `app_process64`; it then dies in the translator's lazy code-translation fault handler. See `docs/LIMITATIONS.md` §2.1 |
-| `pengudroid launch` (Proton-style prefixes) | **Working** | per-app prefix (`~/.local/share/pengudroid/prefixes/<pkg>`) with `files`/`cache`/`code_cache`/`shared_prefs` and `pengudroid.env` overrides; picks `native` or `art` from the APK |
+| `pengudroid launch` (Proton-style prefixes) | **Working** | per-app prefix (`~/.local/share/pengudroid/prefixes/<pkg>`) with `files`/`cache`/`code_cache`/`shared_prefs` and `pengudroid.env` overrides; picks `native` or `art` from the APK. The `art` backend now runs the full bind + launch flow, so `pengudroid launch <apk>` opens a window |
 | **Play bundles** (`.apkm`, `.xapk`, `.apks`) | **Working** | `pengudroid extract` unpacks base + splits + OBB (with `--abi` filtering); `info`, `doctor` and `launch` read the bundle directly, including native libraries that live in the ABI split rather than in `base.apk` |
 | **Real Bionic/EGL in a guest** | **Not started** | needs the Android userspace `.so`s loaded in-process |
 

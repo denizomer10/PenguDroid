@@ -3,7 +3,71 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
-## Bu oturum: NewPipe hwui ile çiziyor (70+ sn stabil)
+## Bu oturum: NewPipe ekranda — çizim ve sunum çalışıyor
+
+**`pengudroid launch NewPipe_v0.29.1.apk` bir Wayland penceresi açıyor ve
+NewPipe'ın canlı akışını gerçek verilerle çiziyor.** Kareler hwui tarafından
+host GPU'da üretiliyor, dma-buf olarak ihraç ediliyor, daemon onu
+`zwp_linux_dmabuf_v1` ile içe alıp commit ediyor. Ölçüm: 20 saniyede ~250 kare,
+`FATAL`/`SIGSEGV` yok.
+
+![NewPipe](screenshots/newpipe.png)
+
+```sh
+pengudroid daemon &
+PENGUDROID_ART_SYSROOT=.toolchain/sysroot \
+  pengudroid launch NewPipe_v0.29.1.apk
+```
+
+### Neydi tıkanıklık: `relayout` yanıtında pencere çerçevesi yoktu
+
+Üç ayrı hata üst üste biniyordu. Sırayla:
+
+1. **`IWindowSession.relayout` yanıtı `outFrames`'i "yok" olarak yazıyordu.**
+   `ViewRootImpl.mTmpFrames` önceden ayrılmış 0×0 değerinde kalıyordu, yani
+   `mWidth`/`mHeight` sıfırdı. `performDraw` **çağrılıyordu** ama `draw()`
+   içindeki `dirty` dikdörtgeni boş olduğu için hwui'ye hiç inmiyordu.
+   Çözüm: gerçek bir `ClientWindowFrames` yazmak. LineageOS 20'nin
+   `readFromParcel`'ı `[frame][displayFrame][parentFrame][attachedFrame][bool]
+   [float]` sırasını okuyor (AOSP 13.0.0_r1'de `attachedFrame`/`compatScale`
+   yok — sürüm farkı burada ısırıyor).
+2. **`eglSetDamageRegionKHR` shim'de yoktu.** hwui her swap öncesi çağırıyor ve
+   başarısız olunca `LOG_ALWAYS_FATAL` ile ölüyordu. Eklendi; ayrıca
+   `eglGetProcAddress` artık kendi uyguladığımız giriş noktalarını host'tan önce
+   döndürüyor.
+3. **hwui varsayılan framebuffer'a (id 0) çiziyor.** Surfaceless bir host
+   context'te FBO 0 hiçbir yere gitmiyor. `glBindFramebuffer` interpose edildi:
+   `0` bağlanınca o anki yüzeyin FBO'su bağlanıyor. Piksellerin görünmesini
+   sağlayan asıl değişiklik bu.
+
+Ek olarak `relayoutWindow`'un `mSurfaceControl.isValid()` false olduğunda
+`destroySurface()` çağırıp bizim geçerli `mSurface`'ımızı da geçersiz kıldığı
+görüldü; `mSurfaceControl` de framework'ün kendi `SurfaceControl.Builder`'ı ile
+kuruluyor ve `mForceDisableBLAST` açılıyor (BLAST yolu gerçek bir consumer
+istiyor).
+
+### Yeni teşhis araçları
+
+- `PENGUDROID_TRACE_DRAW=1` — ana thread `Looper.loop()` içindeyken ayrı bir host
+  thread'i `ViewRootImpl` alanlarını yokluyor: `mAttachInfo.mDrawingTime`,
+  `mDirty`, `mIsDrawing`, `mWidth/mHeight`, `mSurface.isValid()`.
+  `mDrawingTime` sıfırdan farklıysa `draw()` gerçekten çalışmıştır.
+- `PENGUDROID_DUMP_FRAME=/tmp/f.ppm` — 200/201/400. kareleri `glReadPixels` ile
+  okuyup PPM yazar. Ekran görüntüsü alınamayan oturumlarda çizimin kanıtı budur.
+- `PENGUDROID_TRACE_GLESHIM=1` artık `eglSurfaceAttrib`, `ANativeWindow` boyutu
+  ve `eglCreateWindowSurface` sonucunu da yazıyor.
+
+### Bilinen sınırlar (bu oturumda değişmedi)
+
+- `-Xint` zorunlu: JIT `nterp_op_invoke_virtual` içinde çöküyor.
+- Yüzey boyutu 1280×720 (yatay) sabit; `ANativeWindow_getWidth/Height` shim'den
+  geliyor, ekran modu da 1280×720.
+- Video oynatma (`MediaCodec`) ve ses (`AudioTrack`) hâlâ yok; akış listesi
+  çiziliyor, video açılmıyor.
+- Beach Buggy Racing 2 / Genshin Impact: ARM çevirici guest kodu
+  çalıştıramıyor (`docs/LIMITATIONS.md` §2.1).
+
+## Önceki oturum: NewPipe hwui ile çiziyor (70+ sn stabil)
 
 Gralloc duvarı aşıldı. `art-test ... --bind-app` ile NewPipe **70 saniye
 boyunca canlı kalıyor**, `FATAL`/`SIGSEGV` yok, `Choreographer` kareleri işliyor

@@ -58,6 +58,9 @@ mod slot {
     pub const NEW_OBJECT_A: usize = 30;
     pub const GET_FIELD_ID: usize = 94;
     pub const GET_OBJECT_FIELD: usize = 95;
+    pub const GET_BOOLEAN_FIELD: usize = 96;
+    pub const GET_INT_FIELD: usize = 100;
+    pub const GET_LONG_FIELD: usize = 101;
     pub const SET_OBJECT_FIELD: usize = 104;
     pub const SET_BOOLEAN_FIELD: usize = 105;
     pub const SET_INT_FIELD: usize = 109;
@@ -85,6 +88,7 @@ mod slot {
     pub const GET_BYTE_ARRAY_ELEMENTS: usize = 184;
     pub const RELEASE_BYTE_ARRAY_ELEMENTS: usize = 192;
     pub const SET_OBJECT_ARRAY_ELEMENT: usize = 174;
+    pub const GET_JAVA_VM: usize = 219;
 }
 
 /// A `JNIEnv*` wrapper.
@@ -225,6 +229,36 @@ impl JniEnv {
         let f: unsafe extern "C" fn(*mut c_void, JObject, JFieldId) -> JObject =
             unsafe { self.func(slot::GET_OBJECT_FIELD) };
         unsafe { f(self.0, obj, field) }
+    }
+
+    /// `GetBooleanField(obj, field)`.
+    pub fn boolean_field(&self, obj: JObject, field: JFieldId) -> bool {
+        let f: unsafe extern "C" fn(*mut c_void, JObject, JFieldId) -> u8 =
+            unsafe { self.func(slot::GET_BOOLEAN_FIELD) };
+        unsafe { f(self.0, obj, field) != 0 }
+    }
+
+    /// `GetIntField(obj, field)`.
+    pub fn int_field(&self, obj: JObject, field: JFieldId) -> i32 {
+        let f: unsafe extern "C" fn(*mut c_void, JObject, JFieldId) -> i32 =
+            unsafe { self.func(slot::GET_INT_FIELD) };
+        unsafe { f(self.0, obj, field) }
+    }
+
+    /// `GetLongField(obj, field)`.
+    pub fn long_field(&self, obj: JObject, field: JFieldId) -> i64 {
+        let f: unsafe extern "C" fn(*mut c_void, JObject, JFieldId) -> i64 =
+            unsafe { self.func(slot::GET_LONG_FIELD) };
+        unsafe { f(self.0, obj, field) }
+    }
+
+    /// `GetJavaVM()`.
+    pub fn get_java_vm(&self) -> Option<*mut c_void> {
+        let f: unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> i32 =
+            unsafe { self.func(slot::GET_JAVA_VM) };
+        let mut vm: *mut c_void = std::ptr::null_mut();
+        let rc = unsafe { f(self.0, &mut vm) };
+        (rc == 0 && !vm.is_null()).then_some(vm)
     }
 
     /// `SetObjectField(obj, field, value)`.

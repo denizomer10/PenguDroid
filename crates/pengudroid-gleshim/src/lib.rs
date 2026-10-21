@@ -124,6 +124,7 @@ type GlClear = unsafe extern "C" fn(u32);
 type GlClearColor = unsafe extern "C" fn(f32, f32, f32, f32);
 type GlFinish = unsafe extern "C" fn();
 type GlFlush = unsafe extern "C" fn();
+type GlReadPixels = unsafe extern "C" fn(i32, i32, i32, i32, u32, u32, *mut c_void);
 
 // ---------------------------------------------------------------------------
 // Host table
@@ -168,6 +169,7 @@ struct Host {
     gl_clear_color: Option<GlClearColor>,
     gl_finish: Option<GlFinish>,
     gl_flush: Option<GlFlush>,
+    gl_read_pixels: Option<GlReadPixels>,
 }
 
 impl Host {
@@ -252,6 +254,7 @@ impl Host {
             gl_clear_color: gl_proc("glClearColor").and_then(cast_fn),
             gl_finish: gl_proc("glFinish").and_then(cast_fn),
             gl_flush: gl_proc("glFlush").and_then(cast_fn),
+            gl_read_pixels: gl_proc("glReadPixels").and_then(cast_fn),
         })
     }
 }
@@ -968,6 +971,24 @@ pub unsafe extern "C" fn eglSwapBuffersWithDamageKHR(
     eglSwapBuffers(dpy, surface)
 }
 
+/// `eglSetDamageRegionKHR(dpy, surface, rects, n_rects)`.
+///
+/// hwui calls this before every swap when partial updates are on and aborts
+/// (`LOG_ALWAYS_FATAL`) when it fails. Our surfaces are offscreen FBOs, so the
+/// damage region is only a hint; accepting it is enough.
+#[no_mangle]
+pub unsafe extern "C" fn eglSetDamageRegionKHR(
+    _dpy: EGLDisplay,
+    surface: EGLSurface,
+    _rects: *const c_int,
+    _n_rects: c_int,
+) -> u32 {
+    if surface.is_null() {
+        return EGL_FALSE;
+    }
+    EGL_TRUE
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn eglChooseConfig(
     dpy: EGLDisplay,
@@ -1158,6 +1179,25 @@ pub unsafe extern "C" fn eglGetProcAddress(name: *const c_char) -> *mut c_void {
     if name.is_null() {
         return std::ptr::null_mut();
     }
+    // Answer for the entry points this shim implements itself. hwui resolves
+    // `eglSetDamageRegionKHR`/`eglSwapBuffersWithDamageKHR` through here, and
+    // the host's copies reject our offscreen surfaces with `EGL_BAD_DISPLAY`.
+    let requested = std::ffi::CStr::from_ptr(name).to_bytes();
+    let ours: &[(&[u8], *mut c_void)] = &[
+        (b"eglSetDamageRegionKHR", eglSetDamageRegionKHR as *mut c_void),
+        (b"eglSwapBuffersWithDamageKHR", eglSwapBuffersWithDamageKHR as *mut c_void),
+        (b"eglSurfaceAttrib", eglSurfaceAttrib as *mut c_void),
+        (b"eglQuerySurface", eglQuerySurface as *mut c_void),
+        (b"eglCreateWindowSurface", eglCreateWindowSurface as *mut c_void),
+        (b"eglDestroySurface", eglDestroySurface as *mut c_void),
+        (b"eglSwapBuffers", eglSwapBuffers as *mut c_void),
+        (b"glBindFramebuffer", glBindFramebuffer as *mut c_void),
+    ];
+    for (symbol, ptr) in ours {
+        if requested == *symbol {
+            return *ptr;
+        }
+    }
     let host = match host() {
         Ok(host) => host,
         Err(_) => return std::ptr::null_mut(),
@@ -1179,6 +1219,36 @@ pub unsafe extern "C" fn eglGetProcAddress(name: *const c_char) -> *mut c_void {
     std::ptr::null_mut()
 }
 
+/// Ask an `ANativeWindow` for its buffer dimensions.
+///
+/// `ANativeWindow_getWidth`/`getHeight` live in Bionic's `libandroid.so`, which
+/// the app has already loaded by the time hwui creates a surface. They are
+/// resolved lazily so a process without `libandroid.so` still works.
+unsafe fn window_size(window: *mut c_void) -> (u32, u32) {
+    if window.is_null() {
+        return (0, 0);
+    }
+    type GetDim = unsafe extern "C" fn(*mut c_void) -> i32;
+    let mut resolve = |name: &[u8]| -> Option<GetDim> {
+        let sym = libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr() as *const c_char);
+        if sym.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<*mut c_void, GetDim>(sym))
+        }
+    };
+    let w = resolve(b"ANativeWindow_getWidth\0").map(|f| f(window)).unwrap_or(0);
+    let h = resolve(b"ANativeWindow_getHeight\0").map(|f| f(window)).unwrap_or(0);
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+        eprintln!("[gleshim] ANativeWindow reports {w}x{h}");
+    }
+    if w > 0 && h > 0 {
+        (w as u32, h as u32)
+    } else {
+        (0, 0)
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn eglCreateWindowSurface(
     _dpy: EGLDisplay,
@@ -1189,11 +1259,19 @@ pub unsafe extern "C" fn eglCreateWindowSurface(
     if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
         eprintln!("[gleshim] eglCreateWindowSurface window={native_window:p}");
     }
-    // Bionic hands us an `ANativeWindow*`, which we deliberately ignore: there
-    // is no host window, only the FBO that `eglSwapBuffers` exports.
-    let _ = native_window;
-    let w = env_dim("PENGUDROID_SURFACE_W", 720);
-    let h = env_dim("PENGUDROID_SURFACE_H", 1280);
+    // Bionic hands us an `ANativeWindow*`. There is no host window, only the
+    // FBO that `eglSwapBuffers` exports, but the window still knows the size the
+    // framework laid the surface out at — and hwui renders at that size. Using
+    // the window's dimensions keeps the FBO, the viewport and the presented
+    // buffer in agreement; the env vars are only a fallback.
+    let (mut w, mut h) = window_size(native_window);
+    if w == 0 || h == 0 {
+        w = env_dim("PENGUDROID_SURFACE_W", 1280);
+        h = env_dim("PENGUDROID_SURFACE_H", 720);
+    }
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+        eprintln!("[gleshim] eglCreateWindowSurface -> {w}x{h}");
+    }
     let rec = Box::new(SurfaceRec {
         w,
         h,
@@ -1270,6 +1348,9 @@ pub unsafe extern "C" fn eglSurfaceAttrib(
     if surface.is_null() {
         return EGL_FALSE;
     }
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+        eprintln!("[gleshim] eglSurfaceAttrib surface={surface:p} attr=0x{attribute:x} value=0x{value:x}");
+    }
     let _ = (attribute, value);
     EGL_TRUE
 }
@@ -1336,13 +1417,16 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
         log_once(format_args!("eglSwapBuffers: {e}"));
         return EGL_FALSE;
     }
-    if let Err(e) = ensure_fbo(surface, host) {
+    // Bind this surface's FBO: `ensure_fbo` alone leaves whatever the last
+    // `eglMakeCurrent` bound, and two windows share one render thread.
+    if let Err(e) = bind_surface_fbo(surface, host) {
         log_once(format_args!("eglSwapBuffers: {e}"));
         return EGL_FALSE;
     }
     if let Some(finish) = host.gl_finish {
         finish();
     }
+    dump_frame_once(surface, host);
 
     let exported = match export_surface_dmabuf(surface) {
         Ok(exported) => exported,
@@ -1372,6 +1456,54 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
             log_once(format_args!("eglSwapBuffers: {e}"));
             EGL_FALSE
         }
+    }
+}
+
+/// `PENGUDROID_DUMP_FRAME=/path/frame.ppm`: write the first few frames to disk.
+///
+/// The compositor cannot be screenshotted from a sandboxed session, so this is
+/// how the render output is inspected: the FBO is read back with
+/// `glReadPixels` and written as a binary PPM (no image crate needed).
+unsafe fn dump_frame_once(surface: EGLSurface, host: &Host) {
+    let Some(path) = std::env::var_os("PENGUDROID_DUMP_FRAME") else {
+        return;
+    };
+    static DUMPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // Skip the first frames: the first traversal draws the window background
+    // before the app has laid anything out.
+    let n = DUMPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !(n == 200 || n == 201 || n == 400) {
+        return;
+    }
+    let Some(read_pixels) = host.gl_read_pixels else {
+        return;
+    };
+    let rec = &*(surface as *const SurfaceRec);
+    let (w, h) = (rec.w as usize, rec.h as usize);
+    let mut rgba = vec![0u8; w * h * 4];
+    read_pixels(
+        0,
+        0,
+        w as i32,
+        h as i32,
+        0x1908, // GL_RGBA
+        0x1401, // GL_UNSIGNED_BYTE
+        rgba.as_mut_ptr() as *mut c_void,
+    );
+    let mut ppm = Vec::with_capacity(w * h * 3 + 32);
+    ppm.extend_from_slice(format!("P6\n{w} {h}\n255\n").as_bytes());
+    // GL's origin is bottom-left; PPM's is top-left.
+    for y in (0..h).rev() {
+        for x in 0..w {
+            let i = (y * w + x) * 4;
+            ppm.extend_from_slice(&rgba[i..i + 3]);
+        }
+    }
+    let path = std::path::PathBuf::from(path);
+    let path = path.with_extension(format!("frame{n}.ppm"));
+    match std::fs::write(&path, &ppm) {
+        Ok(()) => eprintln!("[gleshim] wrote {} ({w}x{h})", path.display()),
+        Err(e) => eprintln!("[gleshim] cannot write {}: {e}", path.display()),
     }
 }
 
@@ -1440,6 +1572,34 @@ pub unsafe extern "C" fn glGetString(name: u32) -> *const u8 {
         Some(f) => f(name),
         None => std::ptr::null(),
     }
+}
+
+/// `glBindFramebuffer(target, framebuffer)`.
+///
+/// hwui's Skia backend renders into the *default* framebuffer (id 0) and binds
+/// it explicitly before every flush. A surfaceless host context has no default
+/// framebuffer, so binding 0 is redirected to the current surface's FBO — that
+/// is what makes the app's pixels land somewhere we can export.
+#[no_mangle]
+pub unsafe extern "C" fn glBindFramebuffer(target: u32, framebuffer: u32) {
+    let Ok(host) = host() else {
+        return;
+    };
+    let Some(bind) = host.gl_bind_framebuffer else {
+        return;
+    };
+    if framebuffer == 0 {
+        let surface = {
+            let st = lock_state();
+            st.current_surface as EGLSurface
+        };
+        if !surface.is_null() && ensure_fbo(surface, host).is_ok() {
+            let rec = &*(surface as *const SurfaceRec);
+            bind(target, rec.fbo);
+            return;
+        }
+    }
+    bind(target, framebuffer);
 }
 
 // ---------------------------------------------------------------------------

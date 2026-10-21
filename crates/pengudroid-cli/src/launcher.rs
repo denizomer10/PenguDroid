@@ -337,23 +337,37 @@ pub fn launch(args: &[String]) -> i32 {
                 .arg(&app_path)
                 // The framework's JNI natives live in libandroid_runtime.so and
                 // are registered by calling every exported `register_*` entry
-                // point, which is what app_process does.
+                // point, which is what app_process does. libhwui.so registers the
+                // renderer's natives (`ThreadedRenderer`, `RenderNode`), without
+                // which hardware drawing cannot start.
                 .arg("--register-natives")
-                .arg("libandroid_runtime.so");
+                .arg("libandroid_runtime.so,libhwui.so");
             let main = component.clone().unwrap_or_else(|| {
                 // An Activity has no `main(String[])`; the closest honest entry
                 // point is the app_process one, `ActivityThread.main`, which is
                 // what a device's zygote calls for every app.
                 "android.app.ActivityThread".to_string()
             });
-            if info.main_activity_name().is_some() && component.is_none() {
+            // With `--bind-app` the host plays the part `system_server` plays on
+            // a device: it calls `handleBindApplication` and then
+            // `handleLaunchActivity` for the manifest's launcher activity. That
+            // is the only path that reaches `ViewRootImpl.performTraversals` and
+            // therefore the only one that draws.
+            let activity = info.main_activity_name().map(|s| s.to_string());
+            if let Some(activity) = &activity {
+                cmd.arg("--bind-app");
+                cmd.env("PENGUDROID_LAUNCH_ACTIVITY", activity);
+                println!("  activity: {activity}");
+            } else {
                 println!(
-                    "  note    : launching via ActivityThread.main; starting {} needs \
-                     system_server (see docs/LIMITATIONS.md \u{a7}2)",
-                    info.main_activity_name().unwrap_or("the activity")
+                    "  note    : no launcher activity in the manifest; starting via \
+                     ActivityThread.main"
                 );
             }
             cmd.arg("--main").arg(main);
+            // The JIT crashes in `nterp_op_invoke_virtual` on this framework
+            // build, so the interpreter is the only working execution mode.
+            cmd.arg("--vm-option").arg("-Xint");
             if !app_args.is_empty() {
                 cmd.arg("--").args(&app_args);
             }

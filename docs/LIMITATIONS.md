@@ -84,17 +84,23 @@ The path there was ABI translation, not environment emulation:
   the function dereferences `this->mArgv0` and segfaults. The shim interposes
   the symbol (reached through the PLT) and sets the thread name only.
 
-**What remains — and why it is not a small patch.** An *Activity* cannot start,
-because starting one means `system_server` calls back into the app with
-`bindApplication`, and there is no `system_server`: no package manager, no window
-manager, no SurfaceFlinger. The app process itself now does everything a real
-one does up to that point: `ActivityThread.main` completes `attach()` (a real
-`IActivityManager.attachApplication` transaction against the shim's binder
-broker) and settles into `Looper.loop()`, waiting to be bound. Closing the gap
-means implementing the Android system services — the thing Waydroid gets by
-booting a real system image inside a container. PenguDroid deliberately does not
-boot a container; it runs apps as host processes. Those two goals meet at the
-system-service boundary.
+**What remains — and why it is not a small patch.** An *Activity* used to be
+unreachable, because starting one means `system_server` calls back into the app
+with `bindApplication`, and there is no `system_server`: no package manager, no
+window manager, no SurfaceFlinger. PenguDroid now closes that gap from the other
+side: with `--bind-app` the *host* plays `system_server`'s part over JNI — it
+builds `AppBindData`, calls `handleBindApplication`, then
+`handleLaunchActivity`/`handleResumeActivity` for the manifest's launcher
+activity, fakes the window session's `relayout`/`setInsets` replies, and lets
+`ViewRootImpl` drive its own traversal. NewPipe 0.29.1 goes all the way through
+`performDraw` and presents on Wayland.
+
+What that does **not** give you is a real system: there is still no package
+manager (installed packages are synthesised per launch), no `ActivityManager`
+lifecycle (no `onPause`/`onStop`/task switching), no input dispatch, no
+`SurfaceFlinger` (the app's frames are exported straight to the compositor), and
+no `MediaCodec`/`AudioFlinger`. Apps that only need to draw a view hierarchy
+work; apps that need the platform's services do not.
 
 ### 2.1 ARM translation (Intel's NDK translation / Houdini lineage)
 
@@ -343,7 +349,16 @@ An app's own EGL calls now do reach the GPU: `crates/pengudroid-gleshim` is a
 Bionic-compatible `libEGL` (plus a small `libGLESv2`) that binds the host's
 EGL/GLES, renders the app's drawing into an FBO, and exports each
 `eglSwapBuffers` as a dma-buf presented by the daemon. `fixtures/egl-app` swaps
-five frames through it.
+five frames through it, and NewPipe's whole UI goes through the same path.
+
+Two details make hwui work through that shim, and both are easy to miss:
+
+* hwui renders into the **default framebuffer** (id 0), which in a surfaceless
+  context is nothing. `glBindFramebuffer` is interposed so that binding 0 binds
+  the current surface's FBO instead.
+* hwui calls `eglSetDamageRegionKHR` before every swap and `LOG_ALWAYS_FATAL`s
+  when it fails, so the shim has to answer it (and `eglGetProcAddress` has to
+  return the shim's own entry points rather than the host's).
 
 **Vulkan works.** Android's `libvulkan.so` is a loader, and Vulkan's ABI is
 identical on Android and Linux, so the compat directory maps the Bionic soname
@@ -444,11 +459,12 @@ hanging forever, so a wedged guest cannot freeze its peers.
    `zwp_linux_dmabuf_v1` import in the daemon, zero-copy frames from
    `pengudroid run`, and `pengudroid-gleshim` — a Bionic `libEGL` that renders an
    app's own EGL/GL calls and swaps them to Wayland (`fixtures/egl-app`).
-5. ~~Load the ART runtime and execute `JNI_CreateJavaVM`.~~ **Partial**: the whole
-   ART closure `dlopen`s and `JNI_CreateJavaVM` executes into ART's runtime setup
-   (packed relocations, the linker API, CFI/fdsan/fortify/`_ctype_` and the
-   system-library chain are all handled). Returning a live `JavaVM` remains open
-   — see §2.
+5. ~~Load the ART runtime and execute `JNI_CreateJavaVM`.~~ **Done**: the whole
+   ART closure `dlopen`s, `JNI_CreateJavaVM` returns `JNI_OK`, framework natives
+   register, an APK's DEX loads, and the host drives `handleBindApplication` +
+   `handleLaunchActivity` so a real Activity draws and presents (§2).
+   **Still open**: the JIT (only `-Xint` works) and the platform services
+   (`ActivityManager` lifecycle, input, `MediaCodec`).
 6. ~~Wire the PipeWire audio pump.~~ **Done**: the daemon owns a shared ring and
    drains it into `pw-cat` (`audio-test --via-daemon`); silence by default,
    `--tone` audible. ~~OpenSL ES buffer-queue player~~ **Done**: `Enqueue` →
@@ -465,3 +481,7 @@ hanging forever, so a wedged guest cannot freeze its peers.
 10. ~~Vulkan.~~ **Done**: the Bionic soname maps to the host loader;
     `fixtures/native-vulkan` enumerates the GPU and creates a device.
 11. `AHardwareBuffer`/`gralloc` on dma-buf, then hardware composition.
+12. `MediaCodec` (codec2) + `AudioTrack`/`AudioFlinger`, so video plays.
+13. Input dispatch (touch/key) from the Wayland seat into the app's window.
+14. Guest ARM code execution, so arm64-only apps (Beach Buggy Racing 2,
+    Genshin Impact) can run at all — see §2.1.

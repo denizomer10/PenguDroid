@@ -935,6 +935,7 @@ pub fn prepare_main_thread(env: &JniEnv) -> bool {
 
 /// Enter the main `Looper`. Never returns for a GUI app.
 pub fn loop_forever(env: &JniEnv) {
+    spawn_draw_monitor(env);
     let Some(looper_class) = env.find_class("android/os/Looper") else {
         return;
     };
@@ -944,6 +945,131 @@ pub fn loop_forever(env: &JniEnv) {
     println!("apphost: entering Looper.loop()");
     let _ = env.call_static_void(looper_class, loop_fn, &[]);
     eprintln!("apphost: Looper.loop() returned");
+}
+
+/// Poll the first `ViewRootImpl` from a host thread and print what the draw
+/// path is doing.
+///
+/// The main thread is inside `Looper.loop()` by the time this runs, so the only
+/// way to observe `performDraw` from the outside is to read the fields it
+/// mutates. `mAttachInfo.mDrawingTime` is written by `ViewRootImpl.draw()`, so a
+/// non-zero value proves the draw path was entered.
+fn spawn_draw_monitor(env: &JniEnv) {
+    if std::env::var_os("PENGUDROID_TRACE_DRAW").is_none() {
+        return;
+    }
+    let Some(vm) = env.get_java_vm() else {
+        eprintln!("apphost: draw monitor: no JavaVM");
+        return;
+    };
+    let vm_addr = vm as usize;
+    std::thread::spawn(move || {
+        let vm = vm_addr as *mut c_void;
+        let Some(env) = attach_current_thread(vm) else {
+            eprintln!("apphost: draw monitor: attach failed");
+            return;
+        };
+        let Some(wmg_class) = env.find_class("android/view/WindowManagerGlobal") else {
+            return;
+        };
+        let Some(root_class) = env.find_class("android/view/ViewRootImpl") else {
+            return;
+        };
+        let Some(attach_class) = env.find_class("android/view/View$AttachInfo") else {
+            return;
+        };
+        let Some(rect_class) = env.find_class("android/graphics/Rect") else {
+            return;
+        };
+        let Some(surface_class) = env.find_class("android/view/Surface") else {
+            return;
+        };
+        let (Some(get_instance), Some(roots_field)) = (
+            env.static_method_id(wmg_class, "getInstance", "()Landroid/view/WindowManagerGlobal;"),
+            env.field_id(wmg_class, "mRoots", "Ljava/util/ArrayList;"),
+        ) else {
+            return;
+        };
+        let Some(list_class) = env.find_class("java/util/ArrayList") else {
+            return;
+        };
+        let (Some(size_m), Some(get_m)) = (
+            env.method_id(list_class, "size", "()I"),
+            env.method_id(list_class, "get", "(I)Ljava/lang/Object;"),
+        ) else {
+            return;
+        };
+        let attach_field = env.field_id(root_class, "mAttachInfo", "Landroid/view/View$AttachInfo;");
+        let drawing_time = env.field_id(attach_class, "mDrawingTime", "J");
+        let dirty_field = env.field_id(root_class, "mDirty", "Landroid/graphics/Rect;");
+        let is_drawing = env.field_id(root_class, "mIsDrawing", "Z");
+        let first_field = env.field_id(root_class, "mFirst", "Z");
+        let width_field = env.field_id(root_class, "mWidth", "I");
+        let height_field = env.field_id(root_class, "mHeight", "I");
+        let surface_field = env.field_id(root_class, "mSurface", "Landroid/view/Surface;");
+        let renderer_field = env.field_id(attach_class, "mThreadedRenderer", "Landroid/view/ThreadedRenderer;");
+        let is_valid = env.method_id(surface_class, "isValid", "()Z");
+        let left = env.field_id(rect_class, "left", "I");
+        let top = env.field_id(rect_class, "top", "I");
+        let right = env.field_id(rect_class, "right", "I");
+        let bottom = env.field_id(rect_class, "bottom", "I");
+        let mut last = String::new();
+        for tick in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else {
+                continue;
+            };
+            let roots = env.object_field(wmg, roots_field);
+            if roots.is_null() {
+                continue;
+            }
+            let count = env.call_int(roots, size_m, &[]).unwrap_or(0);
+            if count == 0 {
+                continue;
+            }
+            let Some(root) = env.call_object(roots, get_m, &[JValue { i: 0 }]) else {
+                continue;
+            };
+            if root.is_null() {
+                continue;
+            }
+            let attach = attach_field.map(|f| env.object_field(root, f)).unwrap_or(std::ptr::null_mut());
+            let time = match (drawing_time, attach.is_null()) {
+                (Some(f), false) => env.long_field(attach, f),
+                _ => -1,
+            };
+            let dirty = dirty_field.map(|f| env.object_field(root, f)).unwrap_or(std::ptr::null_mut());
+            let dirty_str = if dirty.is_null() {
+                "null".to_string()
+            } else {
+                format!(
+                    "[{},{},{},{}]",
+                    left.map(|f| env.int_field(dirty, f)).unwrap_or(0),
+                    top.map(|f| env.int_field(dirty, f)).unwrap_or(0),
+                    right.map(|f| env.int_field(dirty, f)).unwrap_or(0),
+                    bottom.map(|f| env.int_field(dirty, f)).unwrap_or(0),
+                )
+            };
+            let surface = surface_field.map(|f| env.object_field(root, f)).unwrap_or(std::ptr::null_mut());
+            let valid = match (is_valid, surface.is_null()) {
+                (Some(m), false) => env.call_boolean(surface, m, &[]).unwrap_or(false),
+                _ => false,
+            };
+            let renderer = renderer_field.map(|f| env.object_field(attach, f)).unwrap_or(std::ptr::null_mut());
+            let line = format!(
+                "tick={tick} drawingTime={time} dirty={dirty_str} isDrawing={:?} first={:?} w={:?} h={:?} surfaceValid={valid} renderer={}",
+                is_drawing.map(|f| env.boolean_field(root, f)),
+                first_field.map(|f| env.boolean_field(root, f)),
+                width_field.map(|f| env.int_field(root, f)),
+                height_field.map(|f| env.int_field(root, f)),
+                class_name_of(&env, renderer).unwrap_or_else(|| "null".into()),
+            );
+            if line != last {
+                println!("apphost: draw monitor {line}");
+                last = line;
+            }
+        }
+    });
 }
 
 /// Give the calling thread a `Looper` if it has none.
@@ -1163,6 +1289,154 @@ fn launch_activity(
     }
 }
 
+/// `Object.getClass().getName()` for diagnostics.
+fn class_name_of(env: &JniEnv, obj: JObject) -> Option<String> {
+    if obj.is_null() {
+        return None;
+    }
+    let obj_class = env.find_class("java/lang/Object")?;
+    let get_class = env.method_id(obj_class, "getClass", "()Ljava/lang/Class;")?;
+    let cls = env.call_object(obj, get_class, &[])?;
+    let class_class = env.find_class("java/lang/Class")?;
+    let get_name = env.method_id(class_class, "getName", "()Ljava/lang/String;")?;
+    env.call_object(cls, get_name, &[])
+        .and_then(|n| env.get_string(n))
+}
+
+/// Print the flags `performTraversals` consults before it decides to draw.
+///
+/// `performDraw` is skipped when `cancelDraw` is true, and `cancelDraw` is
+/// `mAttachInfo.mTreeObserver.dispatchOnPreDraw() || !isViewVisible`. This says
+/// which of the two fired and who the pre-draw listeners are.
+fn dump_draw_state(env: &JniEnv, root: JObject, index: usize) {
+    let Some(root_class) = env.find_class("android/view/ViewRootImpl") else {
+        return;
+    };
+    let boolean = |name: &str| -> Option<bool> {
+        let f = env.field_id(root_class, name, "Z")?;
+        Some(env.boolean_field(root, f))
+    };
+    let int = |name: &str| -> Option<i32> {
+        let f = env.field_id(root_class, name, "I")?;
+        Some(env.int_field(root, f))
+    };
+    println!(
+        "apphost: root {index} flags first={:?} added={:?} stopped={:?} inTraversal={:?} appVisible={:?} reportNextDraw={:?} w={:?} h={:?} viewVisibility={:?}",
+        boolean("mFirst"),
+        boolean("mAdded"),
+        boolean("mStopped"),
+        boolean("mIsInTraversal"),
+        boolean("mAppVisible"),
+        boolean("mReportNextDraw"),
+        int("mWidth"),
+        int("mHeight"),
+        int("mViewVisibility"),
+    );
+    let Some(attach_field) = env.field_id(root_class, "mAttachInfo", "Landroid/view/View$AttachInfo;") else {
+        return;
+    };
+    let attach = env.object_field(root, attach_field);
+    if attach.is_null() {
+        println!("apphost: root {index} mAttachInfo is null");
+        return;
+    }
+    let Some(attach_class) = env.find_class("android/view/View$AttachInfo") else {
+        return;
+    };
+    if let Some(f) = env.field_id(attach_class, "mThreadedRenderer", "Landroid/view/ThreadedRenderer;") {
+        let renderer = env.object_field(attach, f);
+        println!(
+            "apphost: root {index} mThreadedRenderer = {}",
+            class_name_of(env, renderer).unwrap_or_else(|| "null".into())
+        );
+        if !renderer.is_null() {
+            // `isEnabled` is declared on the superclass; `GetMethodID` searches
+            // the hierarchy, so asking the concrete class works.
+            if let Some(renderer_class) = env.find_class("android/view/ThreadedRenderer") {
+                if let Some(is_enabled) = env.method_id(renderer_class, "isEnabled", "()Z") {
+                    println!(
+                        "apphost: root {index} mThreadedRenderer.isEnabled() = {:?}",
+                        env.call_boolean(renderer, is_enabled, &[])
+                    );
+                }
+            }
+        }
+    }
+    if let Some(f) = env.field_id(attach_class, "mWindowVisibility", "I") {
+        println!(
+            "apphost: root {index} mWindowVisibility = {}",
+            env.int_field(attach, f)
+        );
+    }
+    if let Some(f) = env.field_id(attach_class, "mDisplayState", "I") {
+        println!(
+            "apphost: root {index} mDisplayState = {} (0=UNKNOWN 1=OFF 2=ON)",
+            env.int_field(attach, f)
+        );
+    }
+    if let Some(display_field) = env.field_id(root_class, "mDisplay", "Landroid/view/Display;") {
+        let display = env.object_field(root, display_field);
+        if !display.is_null() {
+            if let Some(display_class) = env.find_class("android/view/Display") {
+                if let Some(get_state) = env.method_id(display_class, "getState", "()I") {
+                    println!(
+                        "apphost: root {index} mDisplay.getState() = {:?}",
+                        env.call_int(display, get_state, &[])
+                    );
+                }
+            }
+        }
+    }
+    let Some(obs_field) = env.field_id(attach_class, "mTreeObserver", "Landroid/view/ViewTreeObserver;") else {
+        return;
+    };
+    let observer = env.object_field(attach, obs_field);
+    if observer.is_null() {
+        println!("apphost: root {index} mTreeObserver is null");
+        return;
+    }
+    let Some(obs_class) = env.find_class("android/view/ViewTreeObserver") else {
+        return;
+    };
+    for (field_name, label) in [
+        ("mOnPreDrawListeners", "preDraw"),
+        ("mOnGlobalLayoutListeners", "globalLayout"),
+    ] {
+        let Some(f) = env.field_id(obs_class, field_name, "Landroid/view/ViewTreeObserver$CopyOnWriteArray;") else {
+            continue;
+        };
+        let array = env.object_field(observer, f);
+        if array.is_null() {
+            println!("apphost: root {index} {label} listeners = null");
+            continue;
+        }
+        let Some(array_class) = env.find_class("android/view/ViewTreeObserver$CopyOnWriteArray") else {
+            continue;
+        };
+        let Some(data_field) = env.field_id(array_class, "mData", "[Ljava/lang/Object;") else {
+            continue;
+        };
+        let data = env.object_field(array, data_field);
+        if data.is_null() {
+            println!("apphost: root {index} {label} listeners = empty");
+            continue;
+        }
+        let len = env.array_length(data);
+        let mut names = Vec::new();
+        for i in 0..len {
+            let item = env.array_get(data, i);
+            if item.is_null() {
+                continue;
+            }
+            names.push(class_name_of(env, item).unwrap_or_else(|| "?".into()));
+        }
+        println!(
+            "apphost: root {index} {label} listeners ({len}) = {}",
+            if names.is_empty() { "-".to_string() } else { names.join(", ") }
+        );
+    }
+}
+
 /// Attach the decor view and ask for a traversal.
 ///
 /// Without this the window is created but `ViewRootImpl` never reaches
@@ -1277,6 +1551,23 @@ fn force_visible(env: &JniEnv, record: JObject) {
             println!("apphost: root {index} mSurfaceControl.isValid() = {valid}");
             if !valid {
                 if let Some(built) = build_surface_control(env) {
+                    // `relayoutWindow` ends with
+                    // `if (mSurfaceControl.isValid()) { ... } else { destroySurface(); }`,
+                    // so fixing only `mSurface` is not enough: the next traversal
+                    // releases it again. The control has to be valid too.
+                    if let Some(sc_field) =
+                        env.field_id(root_class, "mSurfaceControl", "Landroid/view/SurfaceControl;")
+                    {
+                        env.set_object_field(root, sc_field, built);
+                        println!("apphost: root {index} mSurfaceControl := built");
+                    }
+                    // With BLAST enabled `relayoutWindow` builds a `BLASTBufferQueue`
+                    // (which needs a real consumer); disabling it makes the same
+                    // method take the plain `mSurface.copyFrom(mSurfaceControl)` path.
+                    if let Some(blast_field) = env.field_id(root_class, "mForceDisableBLAST", "Z") {
+                        env.set_boolean_field(root, blast_field, true);
+                        println!("apphost: root {index} mForceDisableBLAST := true");
+                    }
                     if let Some(surface_field) =
                         env.field_id(root_class, "mSurface", "Landroid/view/Surface;")
                     {
@@ -1306,6 +1597,7 @@ fn force_visible(env: &JniEnv, record: JObject) {
                 }
             }
         }
+        dump_draw_state(env, root, index as usize);
         // `performTraversals` must run inside a Choreographer frame callback:
         // calling it directly makes `Choreographer.getFrameTimeNanos()` throw
         // "must only be called as part of a callback while a frame is in

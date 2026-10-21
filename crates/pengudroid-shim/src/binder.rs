@@ -700,12 +700,28 @@ fn window_session_reply(code: u32, parcel: &mut Vec<u8>, objects: &mut Vec<u64>)
         }
         IWS_RELAYOUT => {
             // `[result][outFrames][outMergedConfiguration][outSurfaceControl]
-            //  [insetsState][activeControls][bundle]`. Every parcelable is
-            // written as absent so `ViewRootImpl` keeps the objects it
-            // pre-allocated; the array still has to match `InsetsState.SIZE`
-            // exactly, and the bundle is a null `Bundle` (-1).
+            //  [insetsState][activeControls][bundle]`.
+            //
+            // `outFrames` used to be written as absent, which left
+            // `ViewRootImpl.mTmpFrames` at its pre-allocated 0x0 and made
+            // `mWidth`/`mHeight` zero. `draw()` then ran with an empty dirty
+            // rect and never called into hwui. LineageOS 20's
+            // `ClientWindowFrames.readFromParcel` is
+            // `[frame][displayFrame][parentFrame][attachedFrame][bool][float]`,
+            // each `Rect` being four int32s, and the AIDL out-parameter is a
+            // presence word followed by that payload.
             parcel.extend_from_slice(&0u32.to_ne_bytes()); // result
-            parcel.extend_from_slice(&0u32.to_ne_bytes()); // outFrames absent
+            parcel.extend_from_slice(&1u32.to_ne_bytes()); // outFrames present
+            for _ in 0..3 {
+                // frame, displayFrame, parentFrame
+                parcel.extend_from_slice(&0i32.to_ne_bytes()); // left
+                parcel.extend_from_slice(&0i32.to_ne_bytes()); // top
+                parcel.extend_from_slice(&1280i32.to_ne_bytes()); // right
+                parcel.extend_from_slice(&720i32.to_ne_bytes()); // bottom
+            }
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // attachedFrame absent
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // parentClippedByDisplayCutout
+            parcel.extend_from_slice(&1.0f32.to_ne_bytes()); // compatScale
             parcel.extend_from_slice(&0u32.to_ne_bytes()); // merged config absent
             // `outSurfaceControl`: present, so `ViewRootImpl` has something to
             // draw into. `SurfaceControl.readFromParcel` reads the Java-side
