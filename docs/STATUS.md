@@ -139,14 +139,25 @@ Test APK'sı `SimAppDialog` (`HTMLViewer` bir `WebView` istiyor, WebView
 sağlayıcısı yok).
 
 Sırada:
-1. **`onResume`**: `handleLaunchActivity` yalnızca `onCreate`'i çalıştırıyor;
-   normalde `TransactionExecutor` ardından `handleResumeActivity` çağırıyor.
-2. **Pencere**: `SurfaceComposerClient`/`SurfaceFlinger` yerine kendi
-   EGL/dmabuf sunumumuz; HWUI EGL üzerinden çiziyor. `window` servisine gelen
-   kodlar (5, 41, 69) bu yolun başlangıcı.
-3. `IApplicationThread.scheduleLaunchActivity` (ActivityClientRecord parcel'ı)
+1. **Pencere / SurfaceFlinger** — şu anki duvar. `handleResumeActivity` çağrılıyor ve
+   `onResume` sonrası `WindowManager.addView` yoluna giriyor:
+   ```
+   [window] code=4                      addToDisplayAsUser
+   [SurfaceFlinger] code=2, code=4      createConnection / createDisplayEventConnection
+   WARN DisplayEventDispatcher: Failed to initialize display event receiver, status=-19
+   (SIGSEGV)
+   ```
+   `DisplayEventReceiver`'ın native tarafı SurfaceFlinger bağlantısı olmadan
+   çöküyor. Denenen ve **yetmeyen**: `createConnection`/
+   `createDisplayEventConnection` çağrılarına handle döndürmek (parcel şekli
+   yanlış çıktı: "Attempt to read object from Parcel at offset 0 that is not in
+   the object list"). Doğru yol, `ISurfaceComposer` + `ISurfaceComposerClient` +
+   `IGraphicBufferProducer`'ın **kendi EGL/dmabuf sunumumuza** bağlanan bir
+   uygulamasını yazmak — yani SurfaceFlinger'ı taklit etmek değil, onun yerine
+   geçmek. Bu, projenin asıl iddiasının kalbi ve ayrı bir iş kalemi.
+2. `IApplicationThread.scheduleLaunchActivity` (ActivityClientRecord parcel'ı)
    — şu an JNI ile doğrudan çağırıyoruz.
-4. `IPackageManager`'in geri kalanı (`getPackagesForUid`, `checkPermission`, ...)
+3. `IPackageManager`'in geri kalanı (`getPackagesForUid`, `checkPermission`, ...)
    ve `IActivityManager`'in temel metotları.
 
 ## Binder sunucu tarafı — durum

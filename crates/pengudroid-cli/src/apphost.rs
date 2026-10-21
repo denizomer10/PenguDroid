@@ -672,12 +672,47 @@ fn launch_activity(
         }
         Some(_) => {
             println!("apphost: handleLaunchActivity returned an Activity");
+            resume_activity(env, thread_class, thread, record);
             true
         }
         None => {
             eprintln!("apphost: handleLaunchActivity threw");
             false
         }
+    }
+}
+
+/// Drive `onResume` and the window attach.
+///
+/// `handleLaunchActivity` only runs `onCreate`; on a device `TransactionExecutor`
+/// follows it with `handleResumeActivity`, which calls `onResume` and then
+/// `WindowManager.addView` — the first step into the window/SurfaceFlinger path.
+fn resume_activity(env: &JniEnv, thread_class: JClass, thread: JObject, record: JObject) {
+    let Some(handle) = env.method_id(
+        thread_class,
+        "handleResumeActivity",
+        "(Landroid/app/ActivityThread$ActivityClientRecord;ZZZLjava/lang/String;)V",
+    ) else {
+        eprintln!("apphost: ActivityThread.handleResumeActivity not found");
+        return;
+    };
+    let reason = env.new_string("pengudroid");
+    println!("apphost: calling handleResumeActivity");
+    let ok = env.call_void(
+        thread,
+        handle,
+        &[
+            JValue { l: record },
+            JValue { z: 0 },
+            JValue { z: 0 },
+            JValue { z: 0 },
+            JValue { l: reason },
+        ],
+    );
+    if ok {
+        println!("apphost: handleResumeActivity returned");
+    } else {
+        eprintln!("apphost: handleResumeActivity threw");
     }
 }
 
