@@ -50,6 +50,22 @@ Sıradaki adım: BLASTBufferQueue'nin consumer'ını bizim `gbp`'mize bağlayan 
 BQB tarafından kullanılması) çözmek; ardından `queueBuffer`'da gelen buffer'ı
 `zwp_linux_dmabuf_v1` (veya `wl_shm`) ile compositor'a vermek.
 
+### Çizim neden hiç başlamıyor (bu turun ölçümü)
+
+- Render thread **başlıyor** (`RenderThread::threadLoop` hit) ama
+  `CanvasContext::draw` ve `RenderProxy::syncAndDrawFrame` **hiç çağrılmıyor**.
+- `handleResumeActivity` normal dönüyor, `Looper.loop()`'a giriliyor;
+  `ViewRootImpl.performTraversals` çalışıyor (measure/layout görülüyor,
+  `relayout` 8 kez çağrılıyor) ama **`performDraw`'a hiç gelinmiyor**.
+- Süreç **%1.5 CPU, state S** — yani uygulama boşta bekliyor, kilitli değil.
+- `Activity.makeVisible()` + `decorView.invalidate()` açıkça çağrıldı (apphost),
+  yine swap yok. Yani `ViewRootImpl.isViewVisible()` false kalıyor
+  (muhtemelen `mAppVisible`).
+
+Sıradaki adım: `mAppVisible`'ı true yapan yolu bulmak (cihazda bunu
+`WindowManagerService`/`setAppVisibility` yapar) veya `ThreadedRenderer.draw`'ı
+doğrudan tetiklemek.
+
 ## Önceki oturum: display bilgisi verildi, hwui çizim yoluna girdi
 
 `ADisplay_acquirePhysicalDisplays`'ın istediği **üç** yanıt tamamlandı ve her

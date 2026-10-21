@@ -1150,12 +1150,73 @@ fn launch_activity(
         Some(_) => {
             println!("apphost: handleLaunchActivity returned an Activity");
             resume_activity(env, thread_class, thread, record);
+            // `handleResumeActivity` calls `makeVisible()` only when it decides the
+            // activity will be visible; drive it explicitly so the decor view is
+            // attached and the first traversal reaches `performDraw`.
+            force_visible(env, record);
             true
         }
         None => {
             eprintln!("apphost: handleLaunchActivity threw");
             false
         }
+    }
+}
+
+/// Attach the decor view and ask for a traversal.
+///
+/// Without this the window is created but `ViewRootImpl` never reaches
+/// `performDraw`: `isViewVisible()` stays false, so hwui is initialised (it
+/// creates its EGL surface) and then never draws a frame.
+fn force_visible(env: &JniEnv, record: JObject) {
+    let Some(record_class) = env.find_class("android/app/ActivityThread$ActivityClientRecord") else {
+        return;
+    };
+    let Some(activity_field) = env.field_id(record_class, "activity", "Landroid/app/Activity;") else {
+        return;
+    };
+    let activity = env.object_field(record, activity_field);
+    if activity.is_null() {
+        return;
+    }
+    let Some(activity_class) = env.find_class("android/app/Activity") else {
+        return;
+    };
+    if let Some(make_visible) = env.method_id(activity_class, "makeVisible", "()V") {
+        if !env.call_void(activity, make_visible, &[]) {
+            eprintln!("apphost: Activity.makeVisible threw");
+            return;
+        }
+        println!("apphost: Activity.makeVisible() done");
+    }
+    // `getWindow().getDecorView().invalidate()` schedules a traversal.
+    let Some(get_window) = env.method_id(activity_class, "getWindow", "()Landroid/view/Window;") else {
+        return;
+    };
+    let Some(window) = env.call_object(activity, get_window, &[]) else {
+        return;
+    };
+    if window.is_null() {
+        return;
+    }
+    let Some(window_class) = env.find_class("android/view/Window") else {
+        return;
+    };
+    let Some(get_decor) = env.method_id(window_class, "getDecorView", "()Landroid/view/View;") else {
+        return;
+    };
+    let Some(decor) = env.call_object(window, get_decor, &[]) else {
+        return;
+    };
+    if decor.is_null() {
+        return;
+    }
+    let Some(view_class) = env.find_class("android/view/View") else {
+        return;
+    };
+    if let Some(invalidate) = env.method_id(view_class, "invalidate", "()V") {
+        env.call_void(decor, invalidate, &[]);
+        println!("apphost: decor view invalidated");
     }
 }
 
