@@ -154,6 +154,12 @@ const IAM_GET_CONTENT_PROVIDER: u32 = 23;
 /// `IUserManager` transaction code for `isUserUnlocked(int)`.
 const IUM_IS_USER_UNLOCKED: u32 = 79;
 
+/// `IUserManager` transaction code for `isUserUnlockingOrUnlocked(int)`.
+///
+/// `ContextImpl.getSharedPreferences` refuses credential-encrypted storage
+/// until this reports true, which is what NewPipe hits on `onCreate`.
+const IUM_IS_USER_UNLOCKING_OR_UNLOCKED: u32 = 71;
+
 /// A serialized `ProviderInfo` for the `settings` provider.
 static PROVIDER_INFO: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
@@ -501,9 +507,12 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             }
         }
     }
-    if tr.target_handle == handle_for("user") && tr.code == IUM_IS_USER_UNLOCKED {
+    if tr.target_handle == handle_for("user")
+        && (tr.code == IUM_IS_USER_UNLOCKED || tr.code == IUM_IS_USER_UNLOCKING_OR_UNLOCKED)
+    {
         // Without this the framework logs "Failed to find provider info for
-        // settings (user not unlocked)" and refuses the provider lookup.
+        // settings (user not unlocked)" and refuses the provider lookup, and
+        // `getSharedPreferences` throws for credential-encrypted storage.
         parcel.extend_from_slice(&1u32.to_ne_bytes());
     }
     if tr.target_handle == handle_for("display") && tr.code == IDM_GET_DISPLAY_INFO {

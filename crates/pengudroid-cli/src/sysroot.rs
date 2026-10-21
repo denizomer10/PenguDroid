@@ -897,27 +897,13 @@ pub fn art_main(args: &[String]) -> i32 {
                     start_binder_pool(libs.as_deref());
                 }
                 if bind_app {
-                    // Run the app's `main` on a helper thread and bind from
-                    // *this* thread. `ActivityThread.main` never returns (it
-                    // enters `Looper.loop`), so the bind has to come from
-                    // somewhere else; doing it here rather than on a spawned
-                    // thread matters because ART's fault handler can dump a
-                    // Java stack for the thread that created the VM, and a
-                    // fault on an attached thread only produces a bare signal.
-                    let vm_addr = vm as usize;
-                    let class = class.clone();
-                    let args = app_args.clone();
-                    let helper = std::thread::spawn(move || {
-                        match crate::apphost::attach_current_thread(vm_addr as *mut c_void) {
-                            Some(env) => run_main(&env, &class, &args),
-                            None => {
-                                eprintln!("apphost: AttachCurrentThread failed");
-                                1
-                            }
-                        }
-                    });
+                    // The Activity has to be created on the thread that owns the
+                    // main Looper (androidx enforces it), so set the main thread
+                    // up here and bind from it instead of calling
+                    // `ActivityThread.main`, which would block in Looper.loop().
+                    crate::apphost::prepare_main_thread(&env);
                     bind_application_now(&env, &classpath);
-                    let _ = helper.join();
+                    crate::apphost::loop_forever(&env);
                     return 0;
                 }
                 return run_main(&env, &class, &app_args);

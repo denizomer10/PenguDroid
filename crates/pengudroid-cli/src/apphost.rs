@@ -114,6 +114,19 @@ fn new_configuration(env: &JniEnv) -> Option<JObject> {
             env.call_void(config, m, &[JValue { l: loc }]);
         }
     }
+    // `setToDefaults()` leaves `densityDpi` at DPI_UNDEFINED (0), which makes
+    // `DisplayMetrics.scaledDensity` zero -- and then every `sp` dimension
+    // resolves to 0px (NewPipe's auto-size text sizes hit exactly that).
+    let set_int = |field: &str, value: i32| {
+        if let Some(id) = env.field_id(class, field, "I") {
+            env.set_int_field(config, id, value);
+        }
+    };
+    set_int("densityDpi", 420);
+    // 1280x720 at 420 dpi, in dp.
+    set_int("screenWidthDp", 487);
+    set_int("screenHeightDp", 274);
+    set_int("smallestScreenWidthDp", 274);
     Some(config)
 }
 
@@ -506,6 +519,7 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         if std::env::var_os("PENGUDROID_DUMP_HOLDER").is_some() {
             install_provider_replies(env, app_info, spec.package);
         }
+        report_display_metrics(env);
         install_display_replies(env);
         if let Ok(name) = std::env::var("PENGUDROID_LAUNCH_ACTIVITY") {
             launch_activity(env, thread, data, spec, &name);
@@ -514,6 +528,105 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         eprintln!("apphost: handleBindApplication threw");
     }
     ok
+}
+
+/// Print the display metrics the app sees.
+///
+/// `sp` dimensions resolve through `scaledDensity`; if that is zero every
+/// `sp` value becomes 0px, which is what breaks NewPipe's auto-size text.
+fn report_display_metrics(env: &JniEnv) {
+    let Some(res_class) = env.find_class("android/content/res/Resources") else {
+        return;
+    };
+    let Some(get_system) = env.static_method_id(res_class, "getSystem", "()Landroid/content/res/Resources;") else {
+        return;
+    };
+    let Some(res) = env.call_static_object(res_class, get_system, &[]) else {
+        return;
+    };
+    let Some(get_metrics) = env.method_id(res_class, "getDisplayMetrics", "()Landroid/util/DisplayMetrics;") else {
+        return;
+    };
+    let Some(metrics) = env.call_object(res, get_metrics, &[]) else {
+        return;
+    };
+    let Some(metrics_class) = env.find_class("android/util/DisplayMetrics") else {
+        return;
+    };
+    let get_float: unsafe extern "C" fn(*mut c_void, JObject, JFieldId) -> f32 = unsafe {
+        let table = *(env.0 as *const *const *const c_void);
+        std::mem::transmute(*table.add(117)) // GetFloatField
+    };
+    let get_int: unsafe extern "C" fn(*mut c_void, JObject, JFieldId) -> i32 = unsafe {
+        let table = *(env.0 as *const *const *const c_void);
+        std::mem::transmute(*table.add(100)) // GetIntField
+    };
+    for field in ["density", "scaledDensity"] {
+        if let Some(id) = env.field_id(metrics_class, field, "F") {
+            println!("apphost: DisplayMetrics.{field} = {}", unsafe { get_float(env.0, metrics, id) });
+        }
+    }
+    if let Some(id) = env.field_id(metrics_class, "densityDpi", "I") {
+        println!("apphost: DisplayMetrics.densityDpi = {}", unsafe { get_int(env.0, metrics, id) });
+    }
+}
+
+/// Set up the main thread the way `ActivityThread.main` does, without entering
+/// the loop.
+///
+/// An `Activity` must be created on the thread that owns the *main* `Looper`:
+/// androidx's `LifecycleRegistry` enforces it (`addObserver must be called on
+/// the main thread`), and so does a lot of framework code. `ActivityThread.main`
+/// would give us that thread but then block in `Looper.loop()`, so the pieces
+/// are done here instead and the caller enters the loop afterwards.
+pub fn prepare_main_thread(env: &JniEnv) -> bool {
+    let Some(looper_class) = env.find_class("android/os/Looper") else {
+        return false;
+    };
+    let Some(prepare) = env.static_method_id(looper_class, "prepareMainLooper", "()V") else {
+        eprintln!("apphost: Looper.prepareMainLooper missing");
+        return false;
+    };
+    if !env.call_static_void(looper_class, prepare, &[]) {
+        eprintln!("apphost: Looper.prepareMainLooper threw");
+        return false;
+    }
+    println!("apphost: prepared the main Looper");
+
+    let Some(thread_class) = env.find_class("android/app/ActivityThread") else {
+        return false;
+    };
+    let Some(ctor) = env.method_id(thread_class, "<init>", "()V") else {
+        eprintln!("apphost: ActivityThread() missing");
+        return false;
+    };
+    let Some(thread) = env.new_object(thread_class, ctor, &[]) else {
+        eprintln!("apphost: new ActivityThread() threw");
+        return false;
+    };
+    let Some(attach) = env.method_id(thread_class, "attach", "(ZJ)V") else {
+        eprintln!("apphost: ActivityThread.attach missing");
+        return false;
+    };
+    if !env.call_void(thread, attach, &[JValue { z: 0 }, JValue { j: 0 }]) {
+        eprintln!("apphost: ActivityThread.attach threw");
+        return false;
+    }
+    println!("apphost: ActivityThread attached on the main thread");
+    true
+}
+
+/// Enter the main `Looper`. Never returns for a GUI app.
+pub fn loop_forever(env: &JniEnv) {
+    let Some(looper_class) = env.find_class("android/os/Looper") else {
+        return;
+    };
+    let Some(loop_fn) = env.static_method_id(looper_class, "loop", "()V") else {
+        return;
+    };
+    println!("apphost: entering Looper.loop()");
+    let _ = env.call_static_void(looper_class, loop_fn, &[]);
+    eprintln!("apphost: Looper.loop() returned");
 }
 
 /// Give the calling thread a `Looper` if it has none.
@@ -1114,6 +1227,23 @@ fn install_provider_replies(env: &JniEnv, app_info: JObject, package: &str) {
         install_reply(&data, "__pengudroid_binder_set_provider_info");
     }
     if let Some((_, bundle)) = new_instance(env, "android/os/Bundle") {
+        // `Settings.NameValueCache.getStringsForPrefix` casts
+        // `Bundle.getSerializable("value")` to a `HashMap` and iterates it, so
+        // an empty bundle NPEs inside `DeviceConfig`. Put an empty map there;
+        // `getString("value")` still returns null (it swallows the cast).
+        if let Some((_, map)) = new_instance(env, "java/util/HashMap") {
+            let Some(bundle_class) = env.find_class("android/os/Bundle") else {
+                return;
+            };
+            if let Some(put) = env.method_id(
+                bundle_class,
+                "putSerializable",
+                "(Ljava/lang/String;Ljava/io/Serializable;)V",
+            ) {
+                let key = env.new_string("value");
+                env.call_void(bundle, put, &[JValue { l: key }, JValue { l: map }]);
+            }
+        }
         if let Some(data) = marshal_object(env, bundle, "android/os/Bundle") {
             install_reply(&data, "__pengudroid_binder_set_empty_bundle");
         }
