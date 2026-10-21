@@ -64,6 +64,10 @@ pub struct Daemon {
     /// Threads that finish a `RunApk` child so the daemon never keeps zombies
     /// and can report the exit status.
     pub(crate) spawned: Mutex<Vec<SpawnedRun>>,
+    /// Connections that asked for input on a surface, keyed by surface id.
+    /// The sender is the peer's inbox, so input travels the same path as
+    /// forwarded guest calls.
+    input_sinks: Mutex<std::collections::HashMap<u32, Sender<Message>>>,
 }
 
 pub(crate) struct SpawnedRun {
@@ -121,6 +125,7 @@ impl Daemon {
             socket_path,
             cli_path: find_cli_binary(),
             spawned: Mutex::new(Vec::new()),
+            input_sinks: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -162,6 +167,7 @@ impl Daemon {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     self.reap_children();
                     self.reap_surfaces();
+                    self.pump_input();
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 Err(e) => {
@@ -210,6 +216,29 @@ impl Daemon {
                     // SAFETY: plain `kill(2)` on a pid recorded by the guest.
                     unsafe { libc::kill(p.pid, libc::SIGTERM) };
                 }
+            }
+        }
+    }
+
+    /// Forward compositor input to the connections that subscribed for it.
+    ///
+    /// Called from the accept loop, which is also what drives the Wayland
+    /// event queue, so a pointer event reaches the guest within one poll.
+    pub fn pump_input(&self) {
+        let events = {
+            let mut guard = self.graphics.lock().unwrap();
+            match guard.as_mut() {
+                Some(gfx) => gfx.poll_input(),
+                None => return,
+            }
+        };
+        if events.is_empty() {
+            return;
+        }
+        let sinks = self.input_sinks.lock().unwrap();
+        for (surface_id, event) in events {
+            if let Some(tx) = sinks.get(&surface_id) {
+                let _ = tx.send(Message::InputEvent { surface_id, event });
             }
         }
     }
@@ -396,6 +425,18 @@ fn handle(
     match msg {
         Message::Ping => (Some(Message::Pong), vec![], false),
         Message::Hello { .. } | Message::Welcome { .. } => (None, vec![], false),
+
+        Message::SubscribeInput { surface_id } => {
+            daemon
+                .input_sinks
+                .lock()
+                .unwrap()
+                .insert(surface_id, inbox.clone());
+            crate::info!("pid {} subscribed to input on surface {surface_id}", peer.pid);
+            (Some(Message::Ack), vec![], false)
+        }
+        // Guests never send these; ignore rather than error.
+        Message::InputEvent { .. } => (None, vec![], false),
 
         Message::GetProp { name } => {
             let props = daemon.props.lock().unwrap();

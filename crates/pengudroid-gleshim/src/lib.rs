@@ -771,6 +771,7 @@ fn ensure_surface_id(st: &mut State, w: u32, h: u32) -> Result<u32, String> {
     match reply {
         Message::SurfaceCreated { surface_id, .. } => {
             st.surface_id = Some(surface_id);
+            subscribe_input(surface_id);
             Ok(surface_id)
         }
         Message::Error { code, message } => Err(format!(
@@ -778,6 +779,99 @@ fn ensure_surface_id(st: &mut State, w: u32, h: u32) -> Result<u32, String> {
         )),
         other => Err(format!("unexpected CreateSurface reply: {other:?}")),
     }
+}
+
+/// Input events forwarded by the daemon, waiting for the host to pick them up.
+static INPUT_QUEUE: Mutex<Vec<(u32, pengudroid_proto::InputKind)>> = Mutex::new(Vec::new());
+
+/// Subscribe to the compositor's input for `surface_id` on a second connection.
+///
+/// The present connection is strictly request/reply, so unsolicited input would
+/// desynchronise it; a dedicated connection keeps the two streams apart. The
+/// reader thread only ever appends to [`INPUT_QUEUE`].
+fn subscribe_input(surface_id: u32) {
+    std::thread::spawn(move || {
+        let conn = match Connection::connect(&default_socket_path()) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[pengudroid-gleshim] input: cannot connect: {e}");
+                return;
+            }
+        };
+        let hello = Message::Hello {
+            version: PROTO_VERSION,
+            role: Role::Guest,
+            pid: std::process::id() as i32,
+        };
+        if conn.send_message(&hello, &[]).is_err() {
+            return;
+        }
+        if conn.recv_message().is_err() {
+            return;
+        }
+        if conn
+            .send_message(&Message::SubscribeInput { surface_id }, &[])
+            .is_err()
+        {
+            return;
+        }
+        if conn.recv_message().is_err() {
+            return;
+        }
+        loop {
+            match conn.recv_message() {
+                Ok((Message::InputEvent { surface_id, event }, fds)) => {
+                    close_fds(&fds);
+                    let mut q = INPUT_QUEUE.lock().unwrap();
+                    if q.len() < 256 {
+                        q.push((surface_id, event));
+                    }
+                }
+                Ok((_, fds)) => close_fds(&fds),
+                Err(_) => return,
+            }
+        }
+    });
+}
+
+/// Pop one queued input event into `out`.
+///
+/// Layout (all little-endian, 16 bytes): `[u32 surface_id][u32 kind]
+/// [f32 a][f32 b]`, where `kind` is the protocol's `InputKind` tag and `a`/`b`
+/// carry the coordinates (or the button/keycode and the pressed flag).
+///
+/// Returns 1 when an event was written, 0 when the queue is empty.
+#[no_mangle]
+pub unsafe extern "C" fn pengudroid_input_poll(out: *mut u8) -> i32 {
+    if out.is_null() {
+        return 0;
+    }
+    let event = {
+        let mut q = INPUT_QUEUE.lock().unwrap();
+        if q.is_empty() {
+            return 0;
+        }
+        q.remove(0)
+    };
+    let (surface_id, kind) = event;
+    let (tag, a, b) = match kind {
+        pengudroid_proto::InputKind::PointerEnter { x, y } => (1u32, x, y),
+        pengudroid_proto::InputKind::PointerLeave => (2, 0.0, 0.0),
+        pengudroid_proto::InputKind::PointerMotion { x, y } => (3, x, y),
+        pengudroid_proto::InputKind::PointerButton { button, pressed } => {
+            (4, button as f32, if pressed { 1.0 } else { 0.0 })
+        }
+        pengudroid_proto::InputKind::PointerAxis { axis, value } => (5, axis as f32, value),
+        pengudroid_proto::InputKind::Key { keycode, pressed } => {
+            (6, keycode as f32, if pressed { 1.0 } else { 0.0 })
+        }
+    };
+    let buf = std::slice::from_raw_parts_mut(out, 16);
+    buf[0..4].copy_from_slice(&surface_id.to_le_bytes());
+    buf[4..8].copy_from_slice(&tag.to_le_bytes());
+    buf[8..12].copy_from_slice(&a.to_le_bytes());
+    buf[12..16].copy_from_slice(&b.to_le_bytes());
+    1
 }
 
 /// Send one `PresentDmabuf` and wait for exactly one reply.

@@ -936,6 +936,7 @@ pub fn prepare_main_thread(env: &JniEnv) -> bool {
 /// Enter the main `Looper`. Never returns for a GUI app.
 pub fn loop_forever(env: &JniEnv) {
     spawn_draw_monitor(env);
+    spawn_input_pump(env);
     let Some(looper_class) = env.find_class("android/os/Looper") else {
         return;
     };
@@ -945,6 +946,175 @@ pub fn loop_forever(env: &JniEnv) {
     println!("apphost: entering Looper.loop()");
     let _ = env.call_static_void(looper_class, loop_fn, &[]);
     eprintln!("apphost: Looper.loop() returned");
+}
+
+/// Forward compositor input into the app's window.
+///
+/// The gleshim subscribes to the daemon's seat and queues events; this thread
+/// drains that queue and turns each one into a `MotionEvent` delivered through
+/// `ViewRootImpl.dispatchInputEvent`, which is the same entry point the input
+/// channel uses on a device.
+fn spawn_input_pump(env: &JniEnv) {
+    let Some(vm) = env.get_java_vm() else {
+        return;
+    };
+    let vm_addr = vm as usize;
+    std::thread::spawn(move || {
+        let vm = vm_addr as *mut c_void;
+        // The gleshim is in `LD_PRELOAD`, so its poller is in the global scope.
+        let sym = unsafe {
+            libc::dlsym(
+                libc::RTLD_DEFAULT,
+                b"pengudroid_input_poll\0".as_ptr() as *const libc::c_char,
+            )
+        };
+        if sym.is_null() {
+            eprintln!("apphost: input pump: pengudroid_input_poll not found");
+            return;
+        }
+        type Poll = unsafe extern "C" fn(*mut u8) -> i32;
+        let poll: Poll = unsafe { std::mem::transmute(sym) };
+        let Some(env) = attach_current_thread(vm) else {
+            return;
+        };
+        let Some(wmg_class) = env.find_class("android/view/WindowManagerGlobal") else {
+            return;
+        };
+        let Some(root_class) = env.find_class("android/view/ViewRootImpl") else {
+            return;
+        };
+        let Some(motion_class) = env.find_class("android/view/MotionEvent") else {
+            return;
+        };
+        let Some(clock_class) = env.find_class("android/os/SystemClock") else {
+            return;
+        };
+        let (Some(get_instance), Some(roots_field)) = (
+            env.static_method_id(wmg_class, "getInstance", "()Landroid/view/WindowManagerGlobal;"),
+            env.field_id(wmg_class, "mRoots", "Ljava/util/ArrayList;"),
+        ) else {
+            return;
+        };
+        let Some(list_class) = env.find_class("java/util/ArrayList") else {
+            return;
+        };
+        let (Some(size_m), Some(get_m)) = (
+            env.method_id(list_class, "size", "()I"),
+            env.method_id(list_class, "get", "(I)Ljava/lang/Object;"),
+        ) else {
+            return;
+        };
+        let Some(obtain) = env.static_method_id(
+            motion_class,
+            "obtain",
+            "(JJIFFI)Landroid/view/MotionEvent;",
+        ) else {
+            eprintln!("apphost: input pump: MotionEvent.obtain not found");
+            return;
+        };
+        let Some(uptime) = env.static_method_id(clock_class, "uptimeMillis", "()J") else {
+            return;
+        };
+        let Some(dispatch) = env.method_id(root_class, "dispatchInputEvent", "(Landroid/view/InputEvent;)V")
+        else {
+            eprintln!("apphost: input pump: dispatchInputEvent not found");
+            return;
+        };
+
+        const ACTION_DOWN: i32 = 0;
+        const ACTION_UP: i32 = 1;
+        const ACTION_MOVE: i32 = 2;
+        const ACTION_HOVER_MOVE: i32 = 7;
+
+        let mut down_time = 0i64;
+        let mut pressed = false;
+        let mut last = (0.0f32, 0.0f32);
+        let mut buf = [0u8; 16];
+
+        // Deliver one motion event to every window root. Each root recycles the
+        // event it is handed, so a fresh instance is obtained per root.
+        let inject = |action: i32, x: f32, y: f32, down_time: i64| {
+            let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else {
+                return;
+            };
+            let roots = env.object_field(wmg, roots_field);
+            if roots.is_null() {
+                return;
+            }
+            let count = env.call_int(roots, size_m, &[]).unwrap_or(0);
+            for i in 0..count {
+                let Some(root) = env.call_object(roots, get_m, &[JValue { i }]) else {
+                    continue;
+                };
+                if root.is_null() {
+                    continue;
+                }
+                let now = env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
+                let Some(event) = env.call_static_object(
+                    motion_class,
+                    obtain,
+                    &[
+                        JValue { j: down_time },
+                        JValue { j: now },
+                        JValue { i: action },
+                        JValue { f: x },
+                        JValue { f: y },
+                        JValue { i: 0 },
+                    ],
+                ) else {
+                    continue;
+                };
+                if event.is_null() {
+                    continue;
+                }
+                env.call_void(root, dispatch, &[JValue { l: event }]);
+            }
+        };
+
+        // `PENGUDROID_SYNTH_CLICK=x,y` injects one tap after the UI settles.
+        // There is no way to click a window from a sandboxed session, so this is
+        // how the input path is exercised end to end.
+        if let Ok(spec) = std::env::var("PENGUDROID_SYNTH_CLICK") {
+            let mut parts = spec.split(',').filter_map(|p| p.trim().parse::<f32>().ok());
+            if let (Some(x), Some(y)) = (parts.next(), parts.next()) {
+                std::thread::sleep(std::time::Duration::from_secs(8));
+                let now = env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
+                inject(ACTION_DOWN, x, y, now);
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                inject(ACTION_UP, x, y, now);
+                println!("apphost: synthetic click at {x},{y} injected");
+            }
+        }
+
+        loop {
+            if unsafe { poll(buf.as_mut_ptr()) } == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(8));
+                continue;
+            }
+            let tag = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+            let a = f32::from_le_bytes(buf[8..12].try_into().unwrap());
+            let b = f32::from_le_bytes(buf[12..16].try_into().unwrap());
+            let (action, x, y) = match tag {
+                1 | 3 => {
+                    last = (a, b);
+                    (if pressed { ACTION_MOVE } else { ACTION_HOVER_MOVE }, a, b)
+                }
+                // BTN_LEFT (0x110) only; other buttons are ignored.
+                4 if a as u32 == 0x110 => {
+                    if b != 0.0 {
+                        pressed = true;
+                        down_time = env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
+                        (ACTION_DOWN, last.0, last.1)
+                    } else {
+                        pressed = false;
+                        (ACTION_UP, last.0, last.1)
+                    }
+                }
+                _ => continue,
+            };
+            inject(action, x, y, down_time);
+        }
+    });
 }
 
 /// Poll the first `ViewRootImpl` from a host thread and print what the draw

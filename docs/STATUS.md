@@ -13,6 +13,21 @@ host GPU'da üretiliyor, dma-buf olarak ihraç ediliyor, daemon onu
 
 ![NewPipe](screenshots/newpipe.png)
 
+### Girdi (input) da çalışıyor
+
+Daemon `wl_seat`'i bağlıyor, pointer/keyboard olaylarını yüzeyin sahibine
+iletiyor; apphost bunları `MotionEvent`'e çevirip
+`ViewRootImpl.dispatchInputEvent` ile uygulamaya veriyor. Bir tıklama NewPipe'ın
+video sayfasını açıyor:
+
+![NewPipe video sayfası](screenshots/newpipe-video.png)
+
+Videoyu *oynatmak* hâlâ mümkün değil: oynatıcı `MediaCodec` istiyor, bizde
+`codec2` servisi yok (bkz. aşağıdaki sınırlar).
+
+Ekran görüntüsü alınamayan oturumlarda girdiyi denemek için:
+`PENGUDROID_SYNTH_CLICK=400,400` (8 saniye sonra bir dokunuş enjekte eder).
+
 ```sh
 pengudroid daemon &
 PENGUDROID_ART_SYSROOT=.toolchain/sysroot \
@@ -62,8 +77,10 @@ istiyor).
 - `-Xint` zorunlu: JIT `nterp_op_invoke_virtual` içinde çöküyor.
 - Yüzey boyutu 1280×720 (yatay) sabit; `ANativeWindow_getWidth/Height` shim'den
   geliyor, ekran modu da 1280×720.
-- Video oynatma (`MediaCodec`) ve ses (`AudioTrack`) hâlâ yok; akış listesi
-  çiziliyor, video açılmıyor.
+- **Video oynatma yok**: `MediaCodec`/`codec2` servisi yok, `MediaCodecList`
+  boş dönüyor. Ses (`AudioTrack`/`AudioFlinger`) de yok.
+- Klavye olayları Linux keycode'u olarak geliyor; Android keycode eşlemesi
+  henüz yok (pointer çalışıyor).
 - Beach Buggy Racing 2 / Genshin Impact: ARM çevirici guest kodu
   çalıştıramıyor (`docs/LIMITATIONS.md` §2.1).
 

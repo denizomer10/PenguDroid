@@ -47,7 +47,8 @@ mod imp {
     use pengudroid_proto::abi;
     use wayland_client::globals::{registry_queue_init, GlobalListContents};
     use wayland_client::protocol::{
-        wl_buffer, wl_callback, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_surface,
+        wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat,
+        wl_shm, wl_shm_pool, wl_surface,
     };
     use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
     use wayland_protocols::wp::linux_dmabuf::zv1::client::{
@@ -116,12 +117,35 @@ mod imp {
         toplevels: HashMap<u32, xdg_toplevel::XdgToplevel>,
         /// Ids of surfaces the compositor asked us to close.
         pub close_requests: Vec<u32>,
+        /// The seat, once the compositor advertises one.
+        pub seat: Option<wl_seat::WlSeat>,
+        pub pointer: Option<wl_pointer::WlPointer>,
+        pub keyboard: Option<wl_keyboard::WlKeyboard>,
+        /// Surface under the pointer, and the last position in surface pixels.
+        pointer_focus: Option<u32>,
+        pointer_pos: (f64, f64),
+        /// Input waiting to be forwarded to the guest that owns the surface.
+        pub input: Vec<(u32, pengudroid_proto::InputKind)>,
     }
 
     impl State {
         fn alloc_id(&mut self) -> u32 {
             self.next_id += 1;
             self.next_id
+        }
+
+        /// Which broker surface a `wl_surface` belongs to.
+        fn surface_id_of(&self, s: &wl_surface::WlSurface) -> Option<u32> {
+            self.surfaces
+                .iter()
+                .find(|(_, v)| v.wl_surface.id() == s.id())
+                .map(|(id, _)| *id)
+        }
+
+        fn push_input(&mut self, event: pengudroid_proto::InputKind) {
+            if let Some(id) = self.pointer_focus {
+                self.input.push((id, event));
+            }
         }
 
         /// Build the `wl_shm` buffer for a pending surface once the compositor
@@ -249,6 +273,9 @@ mod imp {
             state.wm_base = globals.bind(&qh, 1..=6, ()).ok();
             // v3 adds format modifiers, which we need to import GPU buffers.
             state.dmabuf = globals.bind(&qh, 3..=4, ()).ok();
+            // Input: the seat gives us pointer and keyboard events, which are
+            // forwarded to whichever guest owns the surface under the cursor.
+            state.seat = globals.bind(&qh, 1..=7, ()).ok();
             if queue.roundtrip(&mut state).is_err() {
                 crate::warn!("Wayland roundtrip failed");
                 return None;
@@ -264,6 +291,18 @@ mod imp {
             }
             crate::info!("Wayland graphics broker ready");
             Some(Graphics { conn, queue, state })
+        }
+
+        /// Dispatch pending compositor events and return the input they carried.
+        ///
+        /// Called from the daemon's accept loop; the events are then pushed to
+        /// the connection that subscribed for the surface.
+        pub fn poll_input(&mut self) -> Vec<(u32, pengudroid_proto::InputKind)> {
+            // A blocking read would stall the daemon, so only drain what is
+            // already queued.
+            let _ = self.queue.dispatch_pending(&mut self.state);
+            let _ = self.conn.flush();
+            std::mem::take(&mut self.state.input)
         }
 
         /// Create a toplevel-backed surface `width`×`height` with `title`.
@@ -630,6 +669,102 @@ mod imp {
     ignore_events!(wl_surface::WlSurface, ());
     ignore_events!(wl_callback::WlCallback, ());
 
+    impl Dispatch<wl_seat::WlSeat, ()> for State {
+        fn event(
+            state: &mut Self,
+            seat: &wl_seat::WlSeat,
+            event: wl_seat::Event,
+            _: &(),
+            _: &Connection,
+            qh: &QueueHandle<Self>,
+        ) {
+            if let wl_seat::Event::Capabilities { capabilities } = event {
+                use wayland_client::protocol::wl_seat::Capability;
+                use wayland_client::WEnum;
+                let has = |c: Capability| matches!(capabilities, WEnum::Value(v) if v.contains(c));
+                if has(Capability::Pointer) && state.pointer.is_none() {
+                    state.pointer = Some(seat.get_pointer(qh, ()));
+                    crate::info!("seat: pointer available");
+                }
+                if has(Capability::Keyboard) && state.keyboard.is_none() {
+                    state.keyboard = Some(seat.get_keyboard(qh, ()));
+                    crate::info!("seat: keyboard available");
+                }
+            }
+        }
+    }
+
+    impl Dispatch<wl_pointer::WlPointer, ()> for State {
+        fn event(
+            state: &mut Self,
+            _: &wl_pointer::WlPointer,
+            event: wl_pointer::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            use pengudroid_proto::InputKind;
+            match event {
+                wl_pointer::Event::Enter { surface, surface_x, surface_y, .. } => {
+                    state.pointer_focus = state.surface_id_of(&surface);
+                    state.pointer_pos = (surface_x, surface_y);
+                    state.push_input(InputKind::PointerEnter {
+                        x: surface_x as f32,
+                        y: surface_y as f32,
+                    });
+                }
+                wl_pointer::Event::Leave { .. } => {
+                    state.push_input(InputKind::PointerLeave);
+                    state.pointer_focus = None;
+                }
+                wl_pointer::Event::Motion { surface_x, surface_y, .. } => {
+                    state.pointer_pos = (surface_x, surface_y);
+                    state.push_input(InputKind::PointerMotion {
+                        x: surface_x as f32,
+                        y: surface_y as f32,
+                    });
+                }
+                wl_pointer::Event::Button { button, state: button_state, .. } => {
+                    use wayland_client::protocol::wl_pointer::ButtonState;
+                    use wayland_client::WEnum;
+                    state.push_input(InputKind::PointerButton {
+                        button,
+                        pressed: matches!(button_state, WEnum::Value(ButtonState::Pressed)),
+                    });
+                }
+                wl_pointer::Event::Axis { axis, value, .. } => {
+                    use wayland_client::protocol::wl_pointer::Axis;
+                    use wayland_client::WEnum;
+                    state.push_input(InputKind::PointerAxis {
+                        axis: if matches!(axis, WEnum::Value(Axis::VerticalScroll)) { 0 } else { 1 },
+                        value: value as f32,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
+        fn event(
+            state: &mut Self,
+            _: &wl_keyboard::WlKeyboard,
+            event: wl_keyboard::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let wl_keyboard::Event::Key { key, state: key_state, .. } = event {
+                use wayland_client::protocol::wl_keyboard::KeyState;
+                use wayland_client::WEnum;
+                state.push_input(pengudroid_proto::InputKind::Key {
+                    keycode: key,
+                    pressed: matches!(key_state, WEnum::Value(KeyState::Pressed)),
+                });
+            }
+        }
+    }
+
     impl Dispatch<xdg_wm_base::XdgWmBase, ()> for State {
         fn event(
             _: &mut Self,
@@ -711,6 +846,9 @@ mod imp {
             false
         }
         pub fn poll(&mut self) {}
+        pub fn poll_input(&mut self) -> Vec<(u32, pengudroid_proto::InputKind)> {
+            Vec::new()
+        }
         pub fn close_requests(&mut self) -> Vec<u32> {
             Vec::new()
         }

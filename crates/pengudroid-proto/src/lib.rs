@@ -88,6 +88,9 @@ pub enum MsgKind {
     AudioRing = 85,
     AudioWrite = 86,
 
+    SubscribeInput = 87,
+    InputEvent = 88,
+
     Ack = 80,
 
     Shutdown = 90,
@@ -133,6 +136,8 @@ impl MsgKind {
             84 => GetAudioRing,
             85 => AudioRing,
             86 => AudioWrite,
+            87 => SubscribeInput,
+            88 => InputEvent,
             80 => Ack,
             90 => Shutdown,
             91 => Goodbye,
@@ -177,8 +182,38 @@ pub struct ProcInfo {
     pub surface_id: u32,
 }
 
+/// A pointer or keyboard event forwarded from the compositor.
+///
+/// Coordinates are in surface pixels, with the origin at the top-left, which is
+/// what `MotionEvent` expects.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InputKind {
+    PointerEnter { x: f32, y: f32 },
+    PointerLeave,
+    PointerMotion { x: f32, y: f32 },
+    /// `button` is a Linux `BTN_*` code (0x110 = left, 0x111 = right).
+    PointerButton { button: u32, pressed: bool },
+    /// `axis` is 0 for vertical, 1 for horizontal.
+    PointerAxis { axis: u8, value: f32 },
+    /// `keycode` is a Linux input keycode (`KEY_*`).
+    Key { keycode: u32, pressed: bool },
+}
+
+impl InputKind {
+    fn tag(&self) -> u8 {
+        match self {
+            InputKind::PointerEnter { .. } => 1,
+            InputKind::PointerLeave => 2,
+            InputKind::PointerMotion { .. } => 3,
+            InputKind::PointerButton { .. } => 4,
+            InputKind::PointerAxis { .. } => 5,
+            InputKind::Key { .. } => 6,
+        }
+    }
+}
+
 /// Every control-plane message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Message {
     Hello { version: u16, role: Role, pid: i32 },
     Welcome { version: u16, pid: i32 },
@@ -258,6 +293,12 @@ pub enum Message {
     /// still alive.
     RunStatus { pid: i32, running: bool, exit_code: i32, signal: i32 },
 
+    /// Ask the daemon to forward input for a surface on this connection.
+    /// The connection then only receives `InputEvent` messages.
+    SubscribeInput { surface_id: u32 },
+    /// Pointer/keyboard input for a surface the receiver subscribed to.
+    InputEvent { surface_id: u32, event: InputKind },
+
     /// Generic acknowledgement for fire-and-forget requests.
     Ack,
 
@@ -304,6 +345,8 @@ impl Message {
             GetAudioRing => MsgKind::GetAudioRing,
             AudioRing { .. } => MsgKind::AudioRing,
             AudioWrite { .. } => MsgKind::AudioWrite,
+            SubscribeInput { .. } => MsgKind::SubscribeInput,
+            InputEvent { .. } => MsgKind::InputEvent,
             Ack => MsgKind::Ack,
             Shutdown => MsgKind::Shutdown,
             Goodbye => MsgKind::Goodbye,
@@ -469,6 +512,31 @@ impl Message {
                 e.u32(*offset);
                 e.u32(*len);
             }
+            SubscribeInput { surface_id } => e.u32(*surface_id),
+            InputEvent { surface_id, event } => {
+                e.u32(*surface_id);
+                e.u8(event.tag());
+                match event {
+                    InputKind::PointerEnter { x, y }
+                    | InputKind::PointerMotion { x, y } => {
+                        e.f32(*x);
+                        e.f32(*y);
+                    }
+                    InputKind::PointerLeave => {}
+                    InputKind::PointerButton { button, pressed } => {
+                        e.u32(*button);
+                        e.u8(if *pressed { 1 } else { 0 });
+                    }
+                    InputKind::PointerAxis { axis, value } => {
+                        e.u8(*axis);
+                        e.f32(*value);
+                    }
+                    InputKind::Key { keycode, pressed } => {
+                        e.u32(*keycode);
+                        e.u8(if *pressed { 1 } else { 0 });
+                    }
+                }
+            }
         }
         e.into_frame()
     }
@@ -600,6 +668,20 @@ impl Message {
                 size: d.u32()?,
             },
             K::AudioWrite => AudioWrite { offset: d.u32()?, len: d.u32()? },
+            K::SubscribeInput => SubscribeInput { surface_id: d.u32()? },
+            K::InputEvent => {
+                let surface_id = d.u32()?;
+                let event = match d.u8()? {
+                    1 => InputKind::PointerEnter { x: d.f32()?, y: d.f32()? },
+                    2 => InputKind::PointerLeave,
+                    3 => InputKind::PointerMotion { x: d.f32()?, y: d.f32()? },
+                    4 => InputKind::PointerButton { button: d.u32()?, pressed: d.u8()? != 0 },
+                    5 => InputKind::PointerAxis { axis: d.u8()?, value: d.f32()? },
+                    6 => InputKind::Key { keycode: d.u32()?, pressed: d.u8()? != 0 },
+                    other => return Err(ProtoError::BadKind(other)),
+                };
+                InputEvent { surface_id, event }
+            }
         })
     }
 }
@@ -631,6 +713,9 @@ impl Encoder {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
     pub fn i32(&mut self, v: i32) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+    pub fn f32(&mut self, v: f32) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
     pub fn bytes(&mut self, b: &[u8]) {
@@ -690,6 +775,9 @@ impl<'a> Decoder<'a> {
     }
     pub fn i32(&mut self) -> Result<i32, ProtoError> {
         Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    pub fn f32(&mut self) -> Result<f32, ProtoError> {
+        Ok(f32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
     pub fn bytes(&mut self) -> Result<Vec<u8>, ProtoError> {
         let n = self.u32()? as usize;
