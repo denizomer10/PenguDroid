@@ -94,12 +94,33 @@ bu 4 bayt eksik olunca okuyucu kayıyor ve 7.6 GB'lık bir tahsis deniyordu.
 ### Sıradaki adım
 
 Uygulama bağlandı ama **Activity başlamadı**: `system_server`'ın
-`scheduleLaunchActivity` çağrısı yok. Sırada:
-1. `IApplicationThread.scheduleLaunchActivity` (ActivityClientRecord parcel'ı)
+`scheduleLaunchActivity` çağrısı yok. İlk ölçülen engel **uygulama sınıf
+yükleyicisi**:
+
+```
+apphost: LoadedApk.mIncludeCode = 0
+java.lang.ClassNotFoundException: Didn't find class
+  "com.android.htmlviewer.HTMLViewerActivity" on path: DexPathList[[]]
+```
+
+`LoadedApk.createOrUpdateClassLoaderLocked` `mIncludeCode == false` görünce
+**boş** bir dex yolu ile yükleyici kuruyor (`DexPathList[[]]`), yani APK'nın
+kendi sınıfları erişilemez. `mApplicationInfo.sourceDir` doğru
+(`.toolchain/.../HTMLViewer.apk`), `mIncludeCode` yanlış. `handleBindApplication`
+`getPackageInfoNoCheck(..., includeCode=true)` çağırıyor gibi görünüyor, yani
+bu sürümün dex'i farklı davranıyor olabilir; ölçüm için
+`PENGUDROID_PROBE_APP_CLASS=<sınıf>` eklendi (bind sonrası `LoadedApk`'ın
+`mIncludeCode`/`sourceDir` değerlerini ve `loadClass` sonucunu yazar).
+
+Sırada:
+1. `mIncludeCode` neden false — dex'teki `getPackageInfoNoCheck`
+   imzalarını `--dump-class` ile doğrula; gerekirse `LoadedApk.mClassLoader`'ı
+   APK yoluna sahip bir `PathClassLoader` ile doğrudan ata.
+2. `IApplicationThread.scheduleLaunchActivity` (ActivityClientRecord parcel'ı)
    → `onCreate/onStart/onResume`.
-2. Pencere yolu: `SurfaceFlinger`/`SurfaceComposerClient` yerine kendi
+3. Pencere yolu: `SurfaceFlinger`/`SurfaceComposerClient` yerine kendi
    EGL/dmabuf sunumumuz; HWUI EGL üzerinden çiziyor.
-3. `IPackageManager`'in geri kalanı (`getPackagesForUid`, `checkPermission`, ...)
+4. `IPackageManager`'in geri kalanı (`getPackagesForUid`, `checkPermission`, ...)
    ve `IActivityManager`'in temel metotları.
 
 ## Binder sunucu tarafı — durum

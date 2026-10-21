@@ -18,7 +18,7 @@
 use std::ffi::c_void;
 use std::path::Path;
 
-use crate::jni::{JClass, JMethodId, JObject, JValue, JniEnv};
+use crate::jni::{JClass, JFieldId, JMethodId, JObject, JValue, JniEnv};
 
 /// Everything `handleBindApplication` needs to know about the app.
 pub struct AppSpec<'a> {
@@ -496,10 +496,93 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
     let ok = env.call_void(thread, handle, &[JValue { l: data }]);
     if ok {
         println!("apphost: handleBindApplication returned normally");
+        if let Ok(name) = std::env::var("PENGUDROID_PROBE_APP_CLASS") {
+            probe_app_class(env, data, &name);
+        }
     } else {
         eprintln!("apphost: handleBindApplication threw");
     }
     ok
+}
+
+/// Resolve a class through the app's own `LoadedApk` class loader.
+///
+/// This is the loader `Instrumentation.newActivity` will use, so it is the
+/// first thing a launch needs: if the APK's dex is not on its path, no Activity
+/// can be instantiated no matter what the binder side does.
+fn probe_app_class(env: &JniEnv, data: JObject, name: &str) {
+    let Some(bind_class) = env.find_class("android/app/ActivityThread$AppBindData") else {
+        return;
+    };
+    let Some(field) = env.field_id(bind_class, "info", "Landroid/app/LoadedApk;") else {
+        eprintln!("apphost: AppBindData.info not found");
+        return;
+    };
+    let loaded_apk = env.object_field(data, field);
+    if loaded_apk.is_null() {
+        eprintln!("apphost: AppBindData.info is null after the bind");
+        return;
+    }
+    let Some(apk_class) = env.find_class("android/app/LoadedApk") else {
+        return;
+    };
+    // Report what the loader was built from: an empty dex path means
+    // `sourceDir` was null when `createOrUpdateClassLoaderLocked` ran.
+    if let Some(id) = env.field_id(apk_class, "mIncludeCode", "Z") {
+        let f: unsafe extern "C" fn(*mut c_void, JObject, JFieldId) -> u8 = unsafe {
+            let table = *(env.0 as *const *const *const c_void);
+            std::mem::transmute(*table.add(96)) // GetBooleanField
+        };
+        println!("apphost: LoadedApk.mIncludeCode = {}", unsafe { f(env.0, loaded_apk, id) });
+    }
+    if let Some(id) = env.field_id(
+        apk_class,
+        "mApplicationInfo",
+        "Landroid/content/pm/ApplicationInfo;",
+    ) {
+        let ai = env.object_field(loaded_apk, id);
+        if !ai.is_null() {
+            if let Some(sid) = env.field_id(
+                env.find_class("android/content/pm/ApplicationInfo").unwrap_or(std::ptr::null_mut()),
+                "sourceDir",
+                "Ljava/lang/String;",
+            ) {
+                let s = env.object_field(ai, sid);
+                println!("apphost: LoadedApk.mApplicationInfo.sourceDir = {:?}", env.get_string(s));
+            }
+        }
+    }
+    let Some(get_loader) = env.method_id(apk_class, "getClassLoader", "()Ljava/lang/ClassLoader;") else {
+        eprintln!("apphost: LoadedApk.getClassLoader missing");
+        return;
+    };
+    let Some(loader) = env.call_object(loaded_apk, get_loader, &[]) else {
+        eprintln!("apphost: LoadedApk.getClassLoader threw");
+        return;
+    };
+    if loader.is_null() {
+        eprintln!("apphost: LoadedApk.getClassLoader returned null");
+        return;
+    }
+    let Some(loader_class) = env.find_class("java/lang/ClassLoader") else {
+        return;
+    };
+    let Some(load) = env.method_id(
+        loader_class,
+        "loadClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+    ) else {
+        return;
+    };
+    let arg = env.new_string(name);
+    match env.call_object(loader, load, &[JValue { l: arg }]) {
+        Some(cls) if cls.is_null() => eprintln!("apphost: app class loader returned null for {name}"),
+        Some(_) => println!("apphost: app class loader resolved {name}"),
+        None => {
+            eprintln!("apphost: app class loader could not load {name}");
+            env.describe_exception();
+        }
+    }
 }
 
 /// Serialize `obj` with the framework's own `writeToParcel`.

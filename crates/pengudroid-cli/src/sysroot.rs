@@ -1595,7 +1595,11 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) {
         native_lib_dir: &lib_dir,
         target_sdk: info.target_sdk.map(|v| v as i32).unwrap_or(35),
         min_sdk: info.min_sdk.map(|v| v as i32).unwrap_or(23),
-        uid: 10_123,
+        // Must belong to user 0: `ActivityThread.getPackageInfo` skips its
+        // `LoadedApk` cache when `UserHandle.getUserId(uid) != myUserId()`, and
+        // a cache miss rebuilds the package info with `mIncludeCode == false`
+        // (empty dex path, so the APK's classes are unreachable).
+        uid: 10_000,
     };
     crate::apphost::bind_application(env, thread, &spec);
 }
