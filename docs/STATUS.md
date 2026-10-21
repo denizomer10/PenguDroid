@@ -78,10 +78,23 @@ gelmiyordu.
 while a frame is in progress` atıyor; doğru giriş noktası `scheduleTraversals()`.
 
 **Kalan durak:** `scheduleTraversals()` her iki root için de dönüyor, vsync
-saati 1424 olay gönderiyor (`dropped=0`), ama `RenderProxy::syncAndDrawFrame`
-hâlâ çağrılmıyor — yani Choreographer'ın vsync'i *tüketmesi* gerekiyor. Sıradaki
-adım: `BitTube`'nun alıcı ucu ile bizim gönderdiğimiz olayların eşleştiğini
-(`stealReceiveChannel` fd'leri) doğrulamak.
+saati 1424 olay gönderiyor (`dropped=0`), traversal'lar **çalışıyor** (relayout
+çağrıları bizim schedule'dan *sonra*), ama `RenderProxy::syncAndDrawFrame`
+hâlâ çağrılmıyor.
+
+Bu turda ayrıca ölçüldü ve düzeltildi:
+
+- `ViewRootImpl.mSurfaceControl.isValid()` **false** idi (relayout yanıtındaki
+  SurfaceControl parcel'ı bu sürümde ayrıştırılmıyor). Çözüm: SurfaceControl'ü
+  framework'ün **kendi** `SurfaceControl.Builder`'ı ile kurmak (bu yol
+  `SurfaceComposerClient.createSurface`'a gider ve broker onu yanıtlar) ve
+  `mSurface.copyFrom(built)` ile bağlamak → `mSurface.isValid() = true`.
+- `mView.getVisibility() = 0` (VISIBLE) doğrulandı.
+
+Yani çizim koşullarının üçü de (visible view, `mAppVisible`, geçerli surface)
+sağlanıyor; `performDraw`'ı engelleyen şey artık uygulamanın kendi
+`OnPreDrawListener`'ları (feed verisi hazır olana kadar iptal ediyor) gibi
+görünüyor.
 
 ## Önceki oturum: display bilgisi verildi, hwui çizim yoluna girdi
 

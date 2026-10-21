@@ -1246,6 +1246,66 @@ fn force_visible(env: &JniEnv, record: JObject) {
         if let Some(f) = env.field_id(root_class, "mAppVisible", "Z") {
             env.set_boolean_field(root, f, true);
         }
+        // `isViewVisible()` also needs the root view to be VISIBLE.
+        if let Some(view_field) = env.field_id(root_class, "mView", "Landroid/view/View;") {
+            let view = env.object_field(root, view_field);
+            if !view.is_null() {
+                if let Some(view_class) = env.find_class("android/view/View") {
+                    if let Some(get_vis) = env.method_id(view_class, "getVisibility", "()I") {
+                        let vis = env.call_int(view, get_vis, &[]).unwrap_or(-1);
+                        println!("apphost: root {index} mView.getVisibility() = {vis} (0 = VISIBLE)");
+                    }
+                }
+            }
+        }
+        // `performDraw` also requires a valid surface. The SurfaceControl we
+        // hand back from `relayout` does not survive `SurfaceControl.readFromParcel`
+        // (the parcel layout is version specific), so build one through the
+        // framework's own builder - that path goes through
+        // `SurfaceComposerClient.createSurface`, which the broker answers - and
+        // copy it into `mSurface`.
+        if let Some(sc_field) = env.field_id(root_class, "mSurfaceControl", "Landroid/view/SurfaceControl;") {
+            let sc = env.object_field(root, sc_field);
+            let valid = if sc.is_null() {
+                false
+            } else {
+                env.find_class("android/view/SurfaceControl")
+                    .and_then(|c| env.method_id(c, "isValid", "()Z"))
+                    .and_then(|m| env.call_boolean(sc, m, &[]))
+                    .unwrap_or(false)
+            };
+            println!("apphost: root {index} mSurfaceControl.isValid() = {valid}");
+            if !valid {
+                if let Some(built) = build_surface_control(env) {
+                    if let Some(surface_field) =
+                        env.field_id(root_class, "mSurface", "Landroid/view/Surface;")
+                    {
+                        let surface = env.object_field(root, surface_field);
+                        if !surface.is_null() {
+                            if let Some(surface_class) = env.find_class("android/view/Surface") {
+                                if let Some(copy_from) = env.method_id(
+                                    surface_class,
+                                    "copyFrom",
+                                    "(Landroid/view/SurfaceControl;)V",
+                                ) {
+                                    if env.call_void(surface, copy_from, &[JValue { l: built }]) {
+                                        println!("apphost: root {index} mSurface.copyFrom(built) done");
+                                        if let Some(is_valid) =
+                                            env.method_id(surface_class, "isValid", "()Z")
+                                        {
+                                            let ok = env.call_boolean(surface, is_valid, &[]);
+                                            println!("apphost: root {index} mSurface.isValid() = {ok:?}");
+                                        }
+                                    } else {
+                                        eprintln!("apphost: root {index} mSurface.copyFrom threw");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // `performTraversals` must run inside a Choreographer frame callback:
         // calling it directly makes `Choreographer.getFrameTimeNanos()` throw
         // "must only be called as part of a callback while a frame is in
@@ -1257,6 +1317,45 @@ fn force_visible(env: &JniEnv, record: JObject) {
             eprintln!("apphost: scheduleTraversals threw for root {index}");
         }
     }
+}
+
+/// Build a `SurfaceControl` through the framework's own builder.
+///
+/// `SurfaceControl.Builder.build()` calls
+/// `SurfaceComposerClient.createSurface`, which the broker answers with a real
+/// handle, so the resulting object is valid even though the one we hand back
+/// from `relayout` is not.
+fn build_surface_control(env: &JniEnv) -> Option<JObject> {
+    let builder_class = env.find_class("android/view/SurfaceControl$Builder")?;
+    let ctor = env.method_id(builder_class, "<init>", "()V")?;
+    let builder = env.new_object(builder_class, ctor, &[])?;
+    let name = env.new_string("pengudroid");
+    if let Some(set_name) = env.method_id(
+        builder_class,
+        "setName",
+        "(Ljava/lang/String;)Landroid/view/SurfaceControl$Builder;",
+    ) {
+        env.call_object(builder, set_name, &[JValue { l: name }]);
+    }
+    if let Some(set_size) = env.method_id(
+        builder_class,
+        "setBufferSize",
+        "(II)Landroid/view/SurfaceControl$Builder;",
+    ) {
+        env.call_object(
+            builder,
+            set_size,
+            &[JValue { i: 1280 }, JValue { i: 720 }],
+        );
+    }
+    let build = env.method_id(builder_class, "build", "()Landroid/view/SurfaceControl;")?;
+    let sc = env.call_object(builder, build, &[])?;
+    if sc.is_null() {
+        eprintln!("apphost: SurfaceControl.Builder.build returned null");
+        return None;
+    }
+    println!("apphost: built a SurfaceControl via SurfaceControl.Builder");
+    Some(sc)
 }
 
 /// Drive `onResume` and the window attach.

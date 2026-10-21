@@ -713,6 +713,7 @@ fn window_session_reply(code: u32, parcel: &mut Vec<u8>, objects: &mut Vec<u64>)
             // `SurfaceControl::readFromParcel`'s
             // `[client][handle][layerId][transformHint][w][h][format]`.
             parcel.extend_from_slice(&1u32.to_ne_bytes()); // present
+            // `SurfaceControl.readFromParcel` starts with `readString8`.
             push_string8(parcel, "pengudroid");
             parcel.extend_from_slice(&1280i32.to_ne_bytes()); // width
             parcel.extend_from_slice(&720i32.to_ne_bytes()); // height
@@ -922,10 +923,18 @@ fn vsync_channel() -> Option<(RawFd, RawFd)> {
         }
         return None;
     }
-    VSYNC_SEND_FDS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(ours);
+    // The client is handed both ends and closes them when the `BitTube` dies, so
+    // the broker keeps its own duplicates. Both are kept and both are written:
+    // which end `BitTube::readFromParcel` treats as the receive side is not
+    // documented, and writing to the wrong one silently stalls the frame clock.
+    let ours0 = unsafe { libc::dup(fds[0]) };
+    {
+        let mut fds_lock = VSYNC_SEND_FDS.lock().unwrap_or_else(|e| e.into_inner());
+        fds_lock.push(ours);
+        if ours0 >= 0 {
+            fds_lock.push(ours0);
+        }
+    }
     Some((fds[0], fds[1]))
 }
 
