@@ -235,6 +235,9 @@ const ISC_GET_PHYSICAL_DISPLAY_IDS_LEGACY: u32 = 54;
 #[allow(dead_code)]
 const ISC_GET_PHYSICAL_DISPLAY_IDS_ALT: u32 = 5;
 
+/// Legacy `android.ui.ISurfaceComposer.getDynamicDisplayInfo`.
+const ISC_GET_DYNAMIC_DISPLAY_INFO: u32 = 55;
+
 /// Legacy `android.ui.ISurfaceComposer.getStaticDisplayInfo`.
 const ISC_LEGACY_GET_STATIC_DISPLAY_INFO: u32 = 8;
 
@@ -949,6 +952,107 @@ fn is_surface_flinger(handle: u32) -> bool {
     )
 }
 
+/// Decode the AIDL interface token of a request parcel.
+///
+/// libbinder prefixes the token with a 12-byte header (`[u32][i32 -1]["TSYS"]`)
+/// before the `String16`, so the string does not start at offset 0.
+fn first_string16(data: &[u8]) -> Option<String> {
+    for start in [12usize, 0] {
+        if data.len() < start + 8 {
+            continue;
+        }
+        let len = u32::from_ne_bytes([
+            data[start],
+            data[start + 1],
+            data[start + 2],
+            data[start + 3],
+        ]) as usize;
+        if len == 0 || len > 512 || start + 4 + len * 2 > data.len() {
+            continue;
+        }
+        let text = decode_utf16le(&data[start + 4..start + 4 + len * 2]);
+        if text.chars().all(|c| c.is_ascii_graphic() || c == '.' || c == '/') {
+            return Some(text);
+        }
+    }
+    None
+}
+
+/// Whether a request was addressed to the legacy `android.ui.ISurfaceComposer`.
+///
+/// The same handle and the same code number can belong to either interface: the
+/// AIDL proxy writes `android.gui.ISurfaceComposer` as its token and the legacy
+/// one writes `android.ui.ISurfaceComposer`. Only the token tells them apart,
+/// and only the AIDL replies start with a `Status` word.
+fn is_legacy_surface_composer(data: &[u8]) -> bool {
+    matches!(first_string16(data).as_deref(), Some(t) if t.contains("android.ui.ISurfaceComposer"))
+}
+
+/// Build a flattened `ui::DynamicDisplayInfo` by asking libui to serialise a
+/// zeroed instance.
+///
+/// Hand-writing the blob is error-prone (it is a chain of nested vectors and
+/// optionals), but the library exports both `getFlattenedSize` and `flatten`, so
+/// a zeroed instance round-trips into a blob that `unflatten` accepts.
+fn dynamic_display_info_blob() -> Option<Vec<u8>> {
+    let handle = unsafe { libc::dlopen(c"libui.so".as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+    if handle.is_null() {
+        return None;
+    }
+    let size_fn = unsafe {
+        libc::dlsym(
+            handle,
+            c"_ZNK7android2ui18DynamicDisplayInfo16getFlattenedSizeEv".as_ptr(),
+        )
+    };
+    let flatten_fn = unsafe {
+        libc::dlsym(handle, c"_ZNK7android2ui18DynamicDisplayInfo7flattenEPvm".as_ptr())
+    };
+    if size_fn.is_null() || flatten_fn.is_null() {
+        return None;
+    }
+    // Generous, zeroed storage for the struct itself.
+    let mut instance = vec![0u8; 1024];
+    // `ADisplay_acquirePhysicalDisplays` rejects a display whose
+    // `supportedDisplayModes` vector is empty (-ENODEV), so give it one mode.
+    // `sizeof(ui::DisplayMode)` is 0x38 (from `vector::__push_back_slow_path`).
+    let mut mode = vec![0u8; 0x38];
+    mode[0..4].copy_from_slice(&1u32.to_ne_bytes()); // id
+    mode[4..12].copy_from_slice(&16_666_666u64.to_ne_bytes()); // vsync period (ns)
+    mode[0x0c..0x10].copy_from_slice(&1280u32.to_ne_bytes()); // width
+    mode[0x10..0x14].copy_from_slice(&720u32.to_ne_bytes()); // height
+    mode[0x14..0x18].copy_from_slice(&60.0f32.to_ne_bytes()); // refresh rate
+    let mode_addr = mode.as_ptr() as u64;
+    instance[0..8].copy_from_slice(&mode_addr.to_ne_bytes());
+    instance[8..16].copy_from_slice(&(mode_addr + 0x38).to_ne_bytes());
+    instance[16..24].copy_from_slice(&(mode_addr + 0x38).to_ne_bytes());
+    // `activeDisplayModeId` sits at offset 0x18 in the struct.
+    instance[0x18..0x1c].copy_from_slice(&1u32.to_ne_bytes());
+    // `supportedColorModes` is the vector at offset 0x20; an empty one leaves
+    // hwui with pixel format 0 ("Unreachable: unsupported pixel format: 0").
+    // `ui::ColorMode::SRGB` is 1.
+    let mut color_mode = vec![0u8; 4];
+    color_mode[0..4].copy_from_slice(&1i32.to_ne_bytes());
+    let cm_addr = color_mode.as_ptr() as u64;
+    instance[0x20..0x28].copy_from_slice(&cm_addr.to_ne_bytes());
+    instance[0x28..0x30].copy_from_slice(&(cm_addr + 4).to_ne_bytes());
+    instance[0x30..0x38].copy_from_slice(&(cm_addr + 4).to_ne_bytes());
+    type SizeFn = unsafe extern "C" fn(*const u8) -> usize;
+    type FlattenFn = unsafe extern "C" fn(*const u8, *mut u8, usize) -> i32;
+    let size_of: SizeFn = unsafe { std::mem::transmute(size_fn) };
+    let flatten: FlattenFn = unsafe { std::mem::transmute(flatten_fn) };
+    let size = unsafe { size_of(instance.as_ptr()) };
+    if size == 0 || size > 4096 {
+        return None;
+    }
+    let mut blob = vec![0u8; size];
+    let rc = unsafe { flatten(instance.as_ptr(), blob.as_mut_ptr(), size) };
+    if rc != 0 {
+        return None;
+    }
+    Some(blob)
+}
+
 /// Whether a reply starts with an AIDL `Status` word.
 ///
 /// Almost every interface here is AIDL, whose generated proxy reads the status
@@ -1024,29 +1128,77 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         }
     }
     if trace_enabled() && is_surface_flinger(tr.target_handle) && tr.data_size > 0 && tr.data_ptr != 0 {
-        // `getStaticDisplayInfo`/`getDisplayConfigs` write a strong binder token
-        // first; logging which legacy codes carry one identifies them.
         let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
+        let token = first_string16(data).unwrap_or_else(|| "?".into());
         let has_binder = data
             .windows(4)
             .any(|w| u32::from_ne_bytes([w[0], w[1], w[2], w[3]]) == BINDER_TYPE_HANDLE);
-        if has_binder {
-            diag(&format!(
-                "[binder]   legacy code={} carries a binder token\n",
-                tr.code
-            ));
+        diag(&format!(
+            "[binder]   SF code={} token={token} binder={has_binder}\n",
+            tr.code
+        ));
+    }
+    if is_surface_flinger(tr.target_handle) && tr.code == ISC_GET_DYNAMIC_DISPLAY_INFO {
+        // Legacy `getDynamicDisplayInfo`: `[int32 status][int32 size][blob]`.
+        // `ADisplay_acquirePhysicalDisplays` returns -ENODATA when this fails,
+        // which leaves hwui with no display at all.
+        match dynamic_display_info_blob() {
+            Some(blob) => {
+                parcel.extend_from_slice(&0i32.to_ne_bytes());
+                parcel.extend_from_slice(&(blob.len() as i32).to_ne_bytes());
+                parcel.extend_from_slice(&blob);
+                if trace_enabled() {
+                    diag(&format!("[binder]   -> getDynamicDisplayInfo ({} bytes)\n", blob.len()));
+                }
+            }
+            None => {
+                diag("[binder]   getDynamicDisplayInfo: libui flatten unavailable\n");
+            }
         }
     }
     if is_surface_flinger(tr.target_handle) && tr.code == ISC_GET_PHYSICAL_DISPLAY_IDS {
-        // AIDL `long[] getPhysicalDisplayIds()`: `[int32 count][int64 id...]`.
-        // hwui's `EglManager::initialize` aborts with "Failed to acquire
-        // physical displays for WCG support!" on an empty array, so one id is
-        // enough. The code was found by tracing the last transaction before
-        // that abort (3, not the deprecated legacy tag 34).
-        parcel.extend_from_slice(&1i32.to_ne_bytes());
-        parcel.extend_from_slice(&0i64.to_ne_bytes());
-        if trace_enabled() {
-            diag("[binder]   -> getPhysicalDisplayIds = [0]\n");
+        let legacy = tr.data_size > 0
+            && tr.data_ptr != 0
+            && is_legacy_surface_composer(std::slice::from_raw_parts(
+                tr.data_ptr as *const u8,
+                tr.data_size as usize,
+            ));
+        if legacy {
+            // Legacy `android.ui.ISurfaceComposer.getStaticDisplayInfo`:
+            // `[int32 status][flattened ui::StaticDisplayInfo]`. The flattened
+            // form, read out of `StaticDisplayInfo::unflatten` and
+            // `DeviceProductInfo::unflatten`, is
+            //   [4B connected][4B density][1B secure]
+            //   [u64 nameLen][name][u32 year][u64 modelLen][model][u64][u32]
+            //   [4B]
+            // `ADisplay_acquirePhysicalDisplays` drops a display whose static
+            // info cannot be read, and hwui then indexes `displays[0]` of an
+            // empty array.
+            parcel.extend_from_slice(&0i32.to_ne_bytes()); // status
+            // The client reads `status`, then the flattened *size*, then the blob
+            // (`readInt32`, `readInt32`, `readInplace(size)`, `unflatten`).
+            let mut blob: Vec<u8> = Vec::new();
+            blob.extend_from_slice(&1i32.to_ne_bytes()); // connected
+            blob.extend_from_slice(&420.0f32.to_ne_bytes()); // density
+            blob.push(0); // secure
+            blob.extend_from_slice(&0u64.to_ne_bytes()); // product name length
+            blob.extend_from_slice(&0u32.to_ne_bytes()); // manufacture year
+            blob.extend_from_slice(&0u64.to_ne_bytes()); // model length
+            blob.extend_from_slice(&0u64.to_ne_bytes());
+            blob.extend_from_slice(&0u32.to_ne_bytes());
+            blob.extend_from_slice(&0u32.to_ne_bytes()); // trailing field
+            parcel.extend_from_slice(&(blob.len() as i32).to_ne_bytes());
+            parcel.extend_from_slice(&blob);
+            if trace_enabled() {
+                diag("[binder]   -> legacy getStaticDisplayInfo (connected, 420 dpi)\n");
+            }
+        } else {
+            // AIDL `long[] getPhysicalDisplayIds()`: `[int32 count][int64 id...]`.
+            parcel.extend_from_slice(&1i32.to_ne_bytes());
+            parcel.extend_from_slice(&0i64.to_ne_bytes());
+            if trace_enabled() {
+                diag("[binder]   -> getPhysicalDisplayIds = [0]\n");
+            }
         }
     }
     if is_surface_flinger(tr.target_handle) && tr.code == ISC_GET_PHYSICAL_DISPLAY_TOKEN {

@@ -3,7 +3,39 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
-## Bu oturum: WCG duvarı aşıldı, hwui EGL'ye geldi
+## Bu oturum: display bilgisi verildi, hwui çizim yoluna girdi
+
+`ADisplay_acquirePhysicalDisplays`'ın istediği **üç** yanıt tamamlandı ve her
+biri ölçülerek doğrulandı:
+
+1. **`getPhysicalDisplayIds`** (AIDL code 3) → `[count][int64...]`.
+2. **`getStaticDisplayInfo`** (legacy code 3) → `[status][size][blob]`. Blob,
+   `ui::StaticDisplayInfo::unflatten` + `DeviceProductInfo::unflatten`
+   disassembly'sinden çıkarıldı: `[4B connected][4B density][1B secure]`
+   `[u64 nameLen][u32 year][u64 modelLen][u64][u32][4B]`. **Kritik ayrıntı:**
+   istemci `status`'ten sonra bir **boyut** alanı okuyor (`readInt32`,
+   `readInt32`, `readInplace(size)`, `unflatten`); boyut yazmadan `unflatten`
+   `-ENOMEM` veriyordu.
+3. **`getDynamicDisplayInfo`** (legacy code 55) → aynı `[status][size][blob]`
+   biçimi. Blob elle yazılmadı: libui'nin **kendi** `flatten`'i sıfırlanmış bir
+   `ui::DynamicDisplayInfo` üzerinde çağrılıyor (`getFlattenedSize` +
+   `flatten`, ikisi de ihraç edilmiş). `supportedDisplayModes` vektörü boş
+   olamıyor (`-ENODEV`), bu yüzden 0x38 baytlık bir `ui::DisplayMode`
+   (`id=1`, 1280×720, 60 Hz) vektöre bağlanıyor.
+
+Ayrıca **handle/kod çakışması** çözüldü: aynı handle ve aynı kod numarası iki
+farklı arayüze ait olabiliyor. Ayrım artık istek parcel'ındaki **interface
+token**'a göre yapılıyor (`android.ui.ISurfaceComposer` = legacy,
+`android.gui.ISurfaceComposer` = AIDL); token 12 baytlık bir ön-ekten sonra
+geliyor (`[u32][-1]["TSYS"]`).
+
+Sonuç: WCG abort **yok**, `DeviceInfo::updateDisplayInfo` çökmesi **yok**.
+Yeni durak: `OpenGLRenderer: Unreachable: unsupported pixel format: 0` —
+display'in renk formatı hâlâ 0. Sıradaki adım: `DynamicDisplayInfo`'nun
+`activeColorMode`/`supportedColorModes` alanlarını (veya `DisplayMode`'un
+pixel-format alanını) doğru doldurmak.
+
+## Önceki oturum: WCG duvarı aşıldı, hwui EGL'ye geldi
 
 Belgelenen "`getPhysicalDisplayIds` boş dönüyor" durağının kökü **kod numarası
 değil, yanıt biçimiydi**:
