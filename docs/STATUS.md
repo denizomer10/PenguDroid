@@ -63,6 +63,15 @@ motor çizemiyor.
    proxy `readTypedArray(T[], Creator)` kullanıyor ve uzunluk eşleşmezse
    "bad array lengths" atıyor.
 
+### Vsync (bu turda eklendi)
+
+`requestNextVsync` **oneway** bir çağrı; broker oneway işlemlerde `make_reply`'i
+hiç çalıştırmıyordu, yani yan etki kayboluyordu. Artık oneway çağrılar da
+işleniyor (cevap parcel'i atılıyor). `display_event_connection` code 3'te
+`BitTube`'un send ucuna bir `DisplayEventReceiver::Event` yazılıyor
+(216 bayt: `Header{type,displayId,timestamp}` + `VSync{count,VsyncEventData}`,
+`frameInterval` 16.67 ms). Böylece `Choreographer` ilk kareyi alıyor.
+
 ### Sıradaki adım (grafik)
 
 `IWindowSession.relayout` (code 5) gerçek bir `SurfaceControl` döndürmeli.

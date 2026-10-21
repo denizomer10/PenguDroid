@@ -253,6 +253,22 @@ static INSETS_SIZE: AtomicU32 = AtomicU32::new(0);
 static INPUT_SERVER_FDS: std::sync::LazyLock<std::sync::Mutex<Vec<RawFd>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
+/// `IDisplayEventConnection` transaction code for `setVsyncRate`.
+const IDEC_SET_VSYNC_RATE: u32 = 2;
+
+/// `IDisplayEventConnection` transaction code for `requestNextVsync` (oneway).
+const IDEC_REQUEST_NEXT_VSYNC: u32 = 3;
+
+/// Size of one `DisplayEventReceiver::Event` on this ABI.
+///
+/// `Header` is `{u32 type; u64 displayId; i64 timestamp}` (24 bytes, both
+/// 64-bit fields 8-aligned), and the union's largest member is `VSync`:
+/// `{u32 count; VsyncEventData}` where `VsyncEventData` is
+/// `{i64 frameInterval; u32 preferredFrameTimelineIndex; FrameTimeline[7]}`
+/// with `FrameTimeline` = three `i64`s — 192 bytes. 24 + 192 = 216.
+const DISPLAY_EVENT_SIZE: usize = 216;
+const DISPLAY_EVENT_VSYNC: u32 = 0x0000_0001;
+
 /// A serialized `ProviderInfo` for the `settings` provider.
 static PROVIDER_INFO: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
@@ -710,6 +726,45 @@ fn input_channel_pair() -> Option<(RawFd, RawFd)> {
     Some((fds[0], fds[1]))
 }
 
+/// Deliver one vsync event on every open `BitTube`.
+///
+/// The client's `DisplayEventReceiver::getEvents` does a `recv` on the socket
+/// and divides the byte count by `sizeof(Event)`, so each `send` has to be
+/// exactly one whole event.
+fn send_vsync() {
+    let mut event = [0u8; DISPLAY_EVENT_SIZE];
+    event[0..4].copy_from_slice(&DISPLAY_EVENT_VSYNC.to_ne_bytes());
+    // `displayId` stays 0 (the default display).
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `ts` is a valid `timespec` for `clock_gettime` to fill.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    let now = (ts.tv_sec as i64) * 1_000_000_000 + ts.tv_nsec as i64;
+    event[16..24].copy_from_slice(&now.to_ne_bytes());
+    // `vsync.count` is the frame number; a monotonically increasing counter is
+    // what `Choreographer` expects.
+    static FRAME: AtomicU32 = AtomicU32::new(0);
+    let frame = FRAME.fetch_add(1, Ordering::Relaxed);
+    event[24..28].copy_from_slice(&frame.to_ne_bytes());
+    // `frameInterval` = 16.67 ms (60 Hz), the only timeline entry.
+    event[32..40].copy_from_slice(&16_666_666i64.to_ne_bytes());
+
+    let fds = VSYNC_SEND_FDS.lock().unwrap_or_else(|e| e.into_inner());
+    for fd in fds.iter() {
+        // SAFETY: `event` is a valid buffer and `fd` is a socket we own.
+        unsafe {
+            libc::send(
+                *fd,
+                event.as_ptr() as *const c_void,
+                event.len(),
+                libc::MSG_NOSIGNAL,
+            );
+        }
+    }
+    if trace_enabled() {
+        unsafe { diag(&format!("[binder]   -> vsync frame {frame}\n")) };
+    }
+}
+
 /// Create the socket pair behind a `BitTube`.
 ///
 /// `BitTube` is an `AF_UNIX` `SOCK_SEQPACKET` pair; the client keeps the receive
@@ -923,6 +978,15 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         if tr.code != IDEC_STEAL_RECEIVE_CHANNEL {
             parcel.extend_from_slice(&0u32.to_ne_bytes());
         }
+        if tr.code == IDEC_REQUEST_NEXT_VSYNC {
+            // `ViewRootImpl` schedules its first traversal from a vsync, so
+            // without this the window is added but never laid out and
+            // `relayout` is never called.
+            send_vsync();
+        }
+        if tr.code == IDEC_SET_VSYNC_RATE {
+            send_vsync();
+        }
     }
     if tr.target_handle == handle_for("window") && tr.code == IWM_OPEN_SESSION {
         // `IWindowManager.openSession` returns the `IWindowSession` the client
@@ -1134,6 +1198,10 @@ unsafe fn handle_write_read(wr: *mut WriteRead) -> c_int {
             if tr.flags & TF_ONE_WAY == 0 {
                 pending.push(Some(make_reply(&tr, pid)));
             } else {
+                // A oneway call still has to run: `requestNextVsync` is oneway
+                // and its whole point is the side effect (delivering a pulse).
+                // The caller never reads a reply, so the parcel is discarded.
+                let _ = make_reply(&tr, pid);
                 pending.push(None);
             }
         }
