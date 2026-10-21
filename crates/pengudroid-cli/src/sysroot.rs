@@ -1574,6 +1574,28 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) {
     ] {
         let _ = std::fs::create_dir_all(&dir);
     }
+    // `System.loadLibrary` resolves through `ApplicationInfo.nativeLibraryDir`,
+    // so the APK's own `lib/<abi>/*.so` have to exist on disk there. Without
+    // this every `native*` method is an UnsatisfiedLinkError (Roblox's
+    // ActivitySplash dies on its first one).
+    let mut extracted = 0usize;
+    for apk in classpath {
+        let Ok(libs) = crate::apk::native_libs(apk) else { continue };
+        for lib in libs.iter().filter(|l| l.abi == "x86_64") {
+            let dest = lib_dir.join(&lib.file);
+            if dest.exists() {
+                continue;
+            }
+            if let Ok(bytes) = crate::apk::extract_named(apk, &lib.entry) {
+                if std::fs::write(&dest, bytes).is_ok() {
+                    extracted += 1;
+                }
+            }
+        }
+    }
+    if extracted > 0 {
+        println!("apphost: extracted {extracted} x86_64 native libraries");
+    }
     let spec = crate::apphost::AppSpec {
         package: &package,
         apk: &apk_path,

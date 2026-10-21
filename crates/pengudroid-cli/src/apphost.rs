@@ -509,7 +509,7 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
     let ok = env.call_void(thread, handle, &[JValue { l: data }]);
     if ok {
         println!("apphost: handleBindApplication returned normally");
-        install_app_class_loader(env, data, spec.apk);
+        install_app_class_loader(env, data, spec.apk, spec.native_lib_dir);
         if let Some(compat) = compat {
             report_include_code(env, thread, app_info, compat, data);
         }
@@ -842,7 +842,7 @@ fn resume_activity(env: &JniEnv, thread_class: JClass, thread: JObject, record: 
 /// Activity can be instantiated. `LoadedApk.getClassLoader()` returns
 /// `mClassLoader` when it is non-null, so installing one built from the APK is
 /// enough for `performLaunchActivity`.
-fn install_app_class_loader(env: &JniEnv, data: JObject, apk: &Path) -> bool {
+fn install_app_class_loader(env: &JniEnv, data: JObject, apk: &Path, native_lib_dir: &Path) -> bool {
     let Some(bind_class) = env.find_class("android/app/ActivityThread$AppBindData") else {
         return false;
     };
@@ -864,9 +864,9 @@ fn install_app_class_loader(env: &JniEnv, data: JObject, apk: &Path) -> bool {
     let Some(ctor) = env.method_id(
         pcl_class,
         "<init>",
-        "(Ljava/lang/String;Ljava/lang/ClassLoader;)V",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/ClassLoader;)V",
     ) else {
-        eprintln!("apphost: PathClassLoader(String, ClassLoader) missing");
+        eprintln!("apphost: PathClassLoader(String, String, ClassLoader) missing");
         return false;
     };
     let Some(cl_class) = env.find_class("java/lang/ClassLoader") else {
@@ -883,8 +883,16 @@ fn install_app_class_loader(env: &JniEnv, data: JObject, apk: &Path) -> bool {
         return false;
     };
     let path = env.new_string(&apk.display().to_string());
-    let Some(loader) = env.new_object(pcl_class, ctor, &[JValue { l: path }, JValue { l: parent }])
-    else {
+    // The library search path matters: `System.loadLibrary` resolves through
+    // the class loader's native library directories, and the two-argument
+    // constructor leaves them at the system defaults, so the app's own
+    // `lib/<abi>/*.so` would never be found.
+    let lib_path = env.new_string(&native_lib_dir.display().to_string());
+    let Some(loader) = env.new_object(
+        pcl_class,
+        ctor,
+        &[JValue { l: path }, JValue { l: lib_path }, JValue { l: parent }],
+    ) else {
         eprintln!("apphost: PathClassLoader construction threw");
         return false;
     };
