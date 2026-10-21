@@ -871,6 +871,10 @@ pub fn art_main(args: &[String]) -> i32 {
                 crate::apphost::dump_class(&env, name);
                 return 0;
             }
+            if std::env::var_os("PENGUDROID_FONTMAP").is_some() {
+                crate::apphost::font_map_size(&env);
+                return 0;
+            }
             if java_props {
                 crate::apphost::print_java_props(&env);
                 return 0;

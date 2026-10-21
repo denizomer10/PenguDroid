@@ -103,6 +103,117 @@ fn locale_list(env: &JniEnv) -> Option<JObject> {
     env.new_object(list_class, list_ctor, &[JValue { l: array }])
 }
 
+/// Give `Typeface` a system font map.
+///
+/// `Typeface.loadPreinstalledSystemFontMap()` builds the map from
+/// `/system/etc/fonts.xml` through the native `FontConfig`. That path yields an
+/// empty map here, so `setSystemFontMap` dereferences
+/// `sSystemFontMap.get("sans-serif")` == null. Seeding the one family the
+/// framework demands is enough to get through `handleBindApplication`; the real
+/// fix is making the native font config parse.
+pub fn seed_font_map(env: &JniEnv) -> bool {
+    let Some(tf_class) = env.find_class("android/graphics/Typeface") else {
+        eprintln!("apphost: Typeface class not found for the font map seed");
+        return false;
+    };
+    // `createFromFile` was removed in this release; `Typeface.Builder` replaces
+    // it. `Builder(File)` + `build()` is the public way to load a font file.
+    let Some((file_class, file)) = new_instance(env, "java/io/File") else {
+        return false;
+    };
+    let Some(file_ctor) = env.method_id(file_class, "<init>", "(Ljava/lang/String;)V") else {
+        return false;
+    };
+    let path = env.new_string("/system/fonts/Roboto-Regular.ttf");
+    let Some(file) = env.new_object(file_class, file_ctor, &[JValue { l: path }]) else {
+        return false;
+    };
+    let _ = file;
+    let Some(builder_class) = env.find_class("android/graphics/Typeface$Builder") else {
+        return false;
+    };
+    let Some(ctor) = env.method_id(builder_class, "<init>", "(Ljava/io/File;)V") else {
+        eprintln!("apphost: Typeface$Builder(File) missing");
+        return false;
+    };
+    let Some(builder) = env.new_object(builder_class, ctor, &[JValue { l: file }]) else {
+        eprintln!("apphost: Typeface$Builder threw");
+        return false;
+    };
+    let Some(build) = env.method_id(builder_class, "build", "()Landroid/graphics/Typeface;") else {
+        return false;
+    };
+    let Some(typeface) = env.call_object(builder, build, &[]) else {
+        eprintln!("apphost: Typeface$Builder.build threw");
+        return false;
+    };
+    if typeface.is_null() {
+        eprintln!("apphost: Typeface$Builder.build returned null");
+        return false;
+    }
+    let Some((map_class, map)) = new_instance(env, "java/util/HashMap") else {
+        return false;
+    };
+    let Some(put) = env.method_id(
+        map_class,
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    ) else {
+        return false;
+    };
+    for family in ["sans-serif", "sans-serif-medium", "sans-serif-bold"] {
+        let key = env.new_string(family);
+        env.call_object(map, put, &[JValue { l: key }, JValue { l: typeface }]);
+    }
+    let Some(set_map) = env.static_method_id(
+        tf_class,
+        "setSystemFontMap",
+        "(Ljava/util/Map;)V",
+    ) else {
+        eprintln!("apphost: Typeface.setSystemFontMap missing");
+        return false;
+    };
+    let ok = env.call_static_void(tf_class, set_map, &[JValue { l: map }]);
+    if ok {
+        println!("apphost: seeded the system font map");
+    } else {
+        eprintln!("apphost: Typeface.setSystemFontMap threw");
+    }
+    ok
+}
+
+/// Print how many families `Typeface`'s system font map holds.
+pub fn font_map_size(env: &JniEnv) {
+    let Some(tf) = env.find_class("android/graphics/Typeface") else {
+        eprintln!("--fontmap: no Typeface");
+        return;
+    };
+    let Some(get) = env.static_method_id(tf, "getSystemFontMap", "()Ljava/util/Map;") else {
+        eprintln!("--fontmap: no Typeface.getSystemFontMap");
+        return;
+    };
+    let Some(map) = env.call_static_object(tf, get, &[]) else {
+        eprintln!("--fontmap: getSystemFontMap threw");
+        return;
+    };
+    let Some(map_class) = env.find_class("java/util/Map") else { return };
+    let Some(size) = env.method_id(map_class, "size", "()I") else { return };
+    let n = env.call_static_object(map, size, &[]);
+    let _ = n;
+    let f: unsafe extern "C" fn(*mut c_void, JObject, JMethodId, *const JValue) -> i32 =
+        unsafe { self::call_int_method(env) };
+    let count = unsafe { f(env.0, map, size, std::ptr::null()) };
+    println!("--fontmap: {count} families");
+}
+
+fn call_int_method(env: &JniEnv) -> unsafe extern "C" fn(*mut c_void, JObject, JMethodId, *const JValue) -> i32 {
+    // JNINativeInterface slot 49 = CallIntMethodA.
+    unsafe {
+        let table = *(env.0 as *const *const *const c_void);
+        std::mem::transmute(*table.add(49))
+    }
+}
+
 /// Bind the app into `thread`, the object returned by
 /// `ActivityThread.currentActivityThread()`.
 pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bool {
@@ -115,6 +226,7 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         eprintln!("apphost: cannot build ApplicationInfo");
         return false;
     };
+    seed_font_map(env);
     let Some(config) = new_configuration(env) else {
         eprintln!("apphost: cannot build Configuration");
         return false;

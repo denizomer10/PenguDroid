@@ -54,10 +54,27 @@ Yol boyunca düzeltilen gerçek engeller:
 - **`/system/fonts` sysroot'a çıkarılmamıştı** (208 dosya) → `Typeface`
   varsayılan ailesi null kalıyordu.
 
-Şu an `handleBindApplication` **ActivityThread.java:6587**'ye kadar geliyor;
-orada `Typeface.create(sSystemFontMap.get("sans-serif"), style)` null dönüyor
-(`loadPreinstalledSystemFontMap`: "Preloading
-/system/fonts/RobotoStatic-Regular.ttf" loglanıyor, map'te aile yok).
+Şu an `handleBindApplication` **ActivityThread.java:6587**'ye kadar geliyor. Oradaki
+engel **grafik yığını**:
+
+```
+Typeface.loadPreinstalledSystemFontMap → setSystemFontMap → Typeface.create(null,0)
+  NPE: Attempt to read from field 'int android.graphics.Typeface.mStyle' on a null object
+Typeface$Builder(File(/system/fonts/Roboto-Regular.ttf)).build()
+  NPE: ... 'long android.graphics.Typeface.native_instance' on a null object
+--fontmap: 0 families
+```
+
+Yani `android.graphics.Typeface`'ın **native** tarafı hiç `Typeface` üretemiyor:
+minikin'in font koleksiyonu boş. Ölçülenler: `/system/fonts` 208 dosya (doğru
+imajdan), `/system/etc/fonts.xml` var ve `sans-serif` ailesini tanımlıyor,
+`libhwui.so` dlopen oluyor ve `register_android_graphics_classes` çağrılıyor
+(2/2 grup), `libminikin`/`libexpat`/`libharfbuzz_ng` yerinde. Buna rağmen
+`Typeface.getSystemFontMap()` **0 aile** döndürüyor ve `nativeCreate*` null.
+
+Bu, sadece font değil **HWUI/EGL** tarafının da (pencere çizimi) önündeki duvar:
+Activity başlasa bile çizmek için SurfaceFlinger yerine kendi EGL/dmabuf
+sunumumuz + çalışan bir minikin/Skia gerekir.
 
 ## Binder sunucu tarafı — durum
 
