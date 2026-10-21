@@ -75,6 +75,8 @@ mod slot {
     pub const GET_STRING_UTF_CHARS: usize = 169;
     pub const RELEASE_STRING_UTF_CHARS: usize = 170;
     pub const NEW_OBJECT_ARRAY: usize = 172;
+    pub const GET_BYTE_ARRAY_ELEMENTS: usize = 184;
+    pub const RELEASE_BYTE_ARRAY_ELEMENTS: usize = 192;
     pub const SET_OBJECT_ARRAY_ELEMENT: usize = 174;
 }
 
@@ -274,6 +276,30 @@ impl JniEnv {
             unsafe { self.func(slot::NEW_LONG_ARRAY) };
         let v = unsafe { f(self.0, len) };
         self.exception_check().then_some(v)
+    }
+
+    /// Copy a `byte[]` out of the VM.
+    pub fn byte_array_copy(&self, array: JObject) -> Option<Vec<u8>> {
+        if array.is_null() {
+            return None;
+        }
+        let len = self.array_length(array);
+        if len <= 0 {
+            return Some(Vec::new());
+        }
+        let get: unsafe extern "C" fn(*mut c_void, JObject, *mut u8) -> *mut u8 =
+            unsafe { self.func(slot::GET_BYTE_ARRAY_ELEMENTS) };
+        let release: unsafe extern "C" fn(*mut c_void, JObject, *mut u8, i32) =
+            unsafe { self.func(slot::RELEASE_BYTE_ARRAY_ELEMENTS) };
+        let ptr = unsafe { get(self.0, array, std::ptr::null_mut()) };
+        if ptr.is_null() {
+            self.describe_exception();
+            return None;
+        }
+        let out = unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec();
+        // JNI_ABORT (2): the array is not modified, so do not copy back.
+        unsafe { release(self.0, array, ptr, 2) };
+        Some(out)
     }
 
     /// `Resolve a class through the *system* class loader.

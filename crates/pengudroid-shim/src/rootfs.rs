@@ -197,6 +197,54 @@ pub unsafe extern "C" fn fstatat(
     }
 }
 
+// Bionic code calls the 64-bit variants (`stat64`, `lstat64`, `fstat64`,
+// `fstatat64`) rather than the plain names; libcore's `File.isFile()` and
+// `File.exists()` go through `stat64`. Without these the call falls through to
+// glibc's own `stat64`, which never sees the virtual-root rewrite, so every
+// `/system/...` path looks absent and `FontListParser` rejects every font.
+
+/// `stat64(path, buf)`.
+#[no_mangle]
+pub unsafe extern "C" fn stat64(path: *const c_char, buf: *mut c_void) -> c_int {
+    match next::<StatFn>(b"stat64\0") {
+        Some(f) => with_path(path, |p| f(p, buf)),
+        None => -1,
+    }
+}
+
+/// `lstat64(path, buf)`.
+#[no_mangle]
+pub unsafe extern "C" fn lstat64(path: *const c_char, buf: *mut c_void) -> c_int {
+    match next::<StatFn>(b"lstat64\0") {
+        Some(f) => with_path(path, |p| f(p, buf)),
+        None => -1,
+    }
+}
+
+/// `fstatat64(dirfd, path, buf, flags)`.
+#[no_mangle]
+pub unsafe extern "C" fn fstatat64(
+    dirfd: c_int,
+    path: *const c_char,
+    buf: *mut c_void,
+    flags: c_int,
+) -> c_int {
+    match next::<StatAtFn>(b"fstatat64\0") {
+        Some(f) => with_path(path, |p| f(dirfd, p, buf, flags)),
+        None => -1,
+    }
+}
+
+/// `fstat64(fd, buf)` — no path, so nothing to rewrite; defined so the symbol
+/// resolves through the shim like its siblings.
+#[no_mangle]
+pub unsafe extern "C" fn fstat64(fd: c_int, buf: *mut c_void) -> c_int {
+    match next::<unsafe extern "C" fn(c_int, *mut c_void) -> c_int>(b"fstat64\0") {
+        Some(f) => f(fd, buf),
+        None => -1,
+    }
+}
+
 /// `access(path, mode)`.
 #[no_mangle]
 pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {

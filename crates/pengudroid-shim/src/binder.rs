@@ -125,6 +125,33 @@ static NEXT_HANDLE: AtomicU32 = AtomicU32::new(1);
 const ISM_GET_SERVICE: u32 = 1;
 const ISM_CHECK_SERVICE: u32 = 2;
 
+/// `android.content.pm.IPackageManager` transaction code for `getPackageInfo`.
+///
+/// Read off a live transaction (`PENGUDROID_TRACE_BINDER=1`): the app asks the
+/// `package` service with code 3 and the package name as the only argument.
+const IPM_GET_PACKAGE_INFO: u32 = 3;
+
+/// `IPackageManager` transaction code for `getApplicationInfo`.
+///
+/// Also read off a live transaction: code 9, arguments
+/// `(String packageName, int flags, int userId)`.
+const IPM_GET_APPLICATION_INFO: u32 = 9;
+
+/// A `PackageInfo` reply serialized by the host with the framework's own
+/// `PackageInfo.writeToParcel`.
+///
+/// `LoadedApk.initializeJavaContextClassLoader()` asks `IPackageManager` for the
+/// app's `PackageInfo` and refuses to continue when it is null. There is no
+/// package manager here, so the host builds the answer from the
+/// `ApplicationInfo` it already has; using the framework's writer keeps the
+/// parcel layout exactly right instead of hand-rolling a version-specific one.
+static PACKAGE_INFO: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// A serialized `ApplicationInfo`, for `IPackageManager.getApplicationInfo`.
+static APPLICATION_INFO: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
 /// `flat_binder_object.type` for a handle that belongs to another process.
 ///
 /// `B_PACK_CHARS('s', 'h', '*', <low byte>)`; the low byte is the value the
@@ -348,6 +375,12 @@ fn push_flat_handle(parcel: &mut Vec<u8>, objects: &mut Vec<u64>, handle: u32) {
     parcel.extend_from_slice(&BINDER_STABILITY_SYSTEM.to_ne_bytes());
 }
 
+/// Reverse lookup of a handle, for diagnostics.
+fn name_for_handle(handle: u32) -> Option<String> {
+    let map = SERVICE_HANDLES.lock().unwrap_or_else(|e| e.into_inner());
+    map.iter().find(|(_, h)| **h == handle).map(|(n, _)| n.clone())
+}
+
 /// Build the reply parcel for a transaction.
 ///
 /// Every reply starts with the AIDL status word (`0` = no exception); a
@@ -357,6 +390,13 @@ fn push_flat_handle(parcel: &mut Vec<u8>, objects: &mut Vec<u64>, handle: u32) {
 unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
     let mut parcel = Vec::new();
     let mut objects = Vec::new();
+    if trace_enabled() {
+        let name = name_for_handle(tr.target_handle).unwrap_or_else(|| "?".to_string());
+        diag(&format!(
+            "[binder]   dispatch target={} ({name}) code={}\n",
+            tr.target_handle, tr.code
+        ));
+    }
     parcel.extend_from_slice(&0u32.to_ne_bytes());
     // Any transaction that carries a local binder object is a client handing us
     // a node it wants called back on. `attachApplication` is the one that
@@ -386,6 +426,30 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                     diag(&format!("[binder]   -> {name} (handle {})\n", handle_for(&name)));
                 }
                 push_flat_handle(&mut parcel, &mut objects, handle_for(&name));
+            }
+        }
+    }
+    if tr.target_handle == handle_for("package") && tr.code == IPM_GET_PACKAGE_INFO {
+        let cached = PACKAGE_INFO.lock().unwrap_or_else(|e| e.into_inner());
+        if !cached.is_empty() {
+            // `IPackageManager$Stub$Proxy.getPackageInfo` reads the result with
+            // `Parcel.readTypedObject`, which first reads a presence int and
+            // only then hands the parcel to `PackageInfo.CREATOR`. Without the
+            // `1` the reader starts four bytes late and misreads every field.
+            parcel.extend_from_slice(&1u32.to_ne_bytes());
+            parcel.extend_from_slice(&cached);
+            if trace_enabled() {
+                diag(&format!("[binder]   -> PackageInfo ({} bytes)\n", cached.len()));
+            }
+        }
+    }
+    if tr.target_handle == handle_for("package") && tr.code == IPM_GET_APPLICATION_INFO {
+        let cached = APPLICATION_INFO.lock().unwrap_or_else(|e| e.into_inner());
+        if !cached.is_empty() {
+            parcel.extend_from_slice(&1u32.to_ne_bytes());
+            parcel.extend_from_slice(&cached);
+            if trace_enabled() {
+                diag(&format!("[binder]   -> ApplicationInfo ({} bytes)\n", cached.len()));
             }
         }
     }
@@ -802,6 +866,38 @@ pub unsafe extern "C" fn __pengudroid_binder_mapping(
     if !addr.is_null() {
         record_mapping(fd, addr as usize, len);
     }
+}
+
+/// `void __pengudroid_binder_set_package_info(const uint8_t *bytes, size_t len)`
+///
+/// Installs the serialized `PackageInfo` the broker answers
+/// `IPackageManager.getPackageInfo` with.
+///
+/// # Safety
+/// `ptr` must point to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_package_info(ptr: *const u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
+    *PACKAGE_INFO.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
+}
+
+/// `void __pengudroid_binder_set_application_info(const uint8_t *bytes, size_t len)`
+///
+/// Installs the serialized `ApplicationInfo` the broker answers
+/// `IPackageManager.getApplicationInfo` with.
+///
+/// # Safety
+/// `ptr` must point to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_application_info(ptr: *const u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
+    *APPLICATION_INFO.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
 }
 
 /// `int __pengudroid_binder_mmap_prot(int fd, int prot)`

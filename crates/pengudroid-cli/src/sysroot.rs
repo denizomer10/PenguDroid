@@ -876,6 +876,14 @@ pub fn art_main(args: &[String]) -> i32 {
                 crate::apphost::dump_class(&env, name);
                 return 0;
             }
+            if let Ok(mode) = std::env::var("PENGUDROID_FONTDEBUG") {
+                if mode == "2" {
+                    crate::apphost::font_parse_debug(&env);
+                } else {
+                    crate::apphost::font_debug(&env);
+                }
+                return 0;
+            }
             if std::env::var_os("PENGUDROID_FONTMAP").is_some() {
                 crate::apphost::font_map_size(&env);
                 return 0;
@@ -889,7 +897,28 @@ pub fn art_main(args: &[String]) -> i32 {
                     start_binder_pool(libs.as_deref());
                 }
                 if bind_app {
-                    spawn_app_binder(vm, &classpath);
+                    // Run the app's `main` on a helper thread and bind from
+                    // *this* thread. `ActivityThread.main` never returns (it
+                    // enters `Looper.loop`), so the bind has to come from
+                    // somewhere else; doing it here rather than on a spawned
+                    // thread matters because ART's fault handler can dump a
+                    // Java stack for the thread that created the VM, and a
+                    // fault on an attached thread only produces a bare signal.
+                    let vm_addr = vm as usize;
+                    let class = class.clone();
+                    let args = app_args.clone();
+                    let helper = std::thread::spawn(move || {
+                        match crate::apphost::attach_current_thread(vm_addr as *mut c_void) {
+                            Some(env) => run_main(&env, &class, &args),
+                            None => {
+                                eprintln!("apphost: AttachCurrentThread failed");
+                                1
+                            }
+                        }
+                    });
+                    bind_application_now(&env, &classpath);
+                    let _ = helper.join();
+                    return 0;
                 }
                 return run_main(&env, &class, &app_args);
             }
@@ -1510,55 +1539,65 @@ unsafe fn install_findclass_tracer(env: *mut c_void) {
 
 /// Bind an APK into the `ActivityThread` that `main` creates.
 ///
-/// `ActivityThread.main` does not return (it enters `Looper.loop`), and the
-/// instance only exists once it has started, so the bind has to come from a
-/// second thread that attaches to the VM and then calls
-/// `handleBindApplication` from the host side.
-fn spawn_app_binder(vm: *mut c_void, classpath: &[String]) {
+/// Runs on the calling thread (the one that created the VM). `ActivityThread`
+/// only exists once `main` has started on the helper thread, so this polls for
+/// the instance before binding.
+fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) {
     let Some(apk) = classpath.first().cloned() else {
         eprintln!("apphost: --bind-app needs --classpath <apk>");
         return;
     };
-    let vm_addr = vm as usize;
-    std::thread::spawn(move || {
-        // Give ActivityThread.main time to construct the instance and attach.
-        std::thread::sleep(std::time::Duration::from_millis(1500));
-        let Some(env) = crate::apphost::attach_current_thread(vm_addr as *mut c_void) else {
-            eprintln!("apphost: AttachCurrentThread failed");
-            return;
-        };
-        let Some(thread) = crate::apphost::current_activity_thread(&env) else {
-            eprintln!("apphost: ActivityThread.currentActivityThread() is null");
-            return;
-        };
-        let info = match crate::apk::read_apk(&apk) {
-            Ok(i) => i,
-            Err(e) => {
-                eprintln!("apphost: {e}");
-                return;
+    let mut thread = std::ptr::null_mut();
+    for _ in 0..300 {
+        if let Some(t) = crate::apphost::current_activity_thread(env) {
+            if !t.is_null() {
+                thread = t;
+                break;
             }
-        };
-        let package = if info.package.is_empty() {
-            "org.pengudroid.app".to_string()
-        } else {
-            info.package.clone()
-        };
-        let apk_path = std::path::PathBuf::from(&apk);
-        let data_dir = std::env::temp_dir().join(format!("pengudroid-data/{package}"));
-        let lib_dir = std::env::temp_dir().join(format!("pengudroid-libs/{package}"));
-        let _ = std::fs::create_dir_all(&data_dir);
-        let _ = std::fs::create_dir_all(&lib_dir);
-        let spec = crate::apphost::AppSpec {
-            package: &package,
-            apk: &apk_path,
-            data_dir: &data_dir,
-            native_lib_dir: &lib_dir,
-            target_sdk: info.target_sdk.map(|v| v as i32).unwrap_or(35),
-            min_sdk: info.min_sdk.map(|v| v as i32).unwrap_or(23),
-            uid: 10_123,
-        };
-        crate::apphost::bind_application(&env, thread, &spec);
-    });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if thread.is_null() {
+        eprintln!("apphost: ActivityThread.currentActivityThread() is null");
+        return;
+    }
+    let info = match crate::apk::read_apk(&apk) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("apphost: {e}");
+            return;
+        }
+    };
+    let package = if info.package.is_empty() {
+        "org.pengudroid.app".to_string()
+    } else {
+        info.package.clone()
+    };
+    let apk_path = std::path::PathBuf::from(&apk);
+    let data_dir = std::env::temp_dir().join(format!("pengudroid-data/{package}"));
+    let lib_dir = std::env::temp_dir().join(format!("pengudroid-libs/{package}"));
+    // `handleBindApplication` creates `code_cache` under the data directory and
+    // logs "Data directory doesn't exist" (plus a stack trace) when the parent
+    // is missing, so lay the tree out the way the framework expects.
+    for dir in [
+        data_dir.clone(),
+        data_dir.join("device_protected"),
+        data_dir.join("device_protected/code_cache"),
+        data_dir.join("code_cache"),
+        lib_dir.clone(),
+    ] {
+        let _ = std::fs::create_dir_all(&dir);
+    }
+    let spec = crate::apphost::AppSpec {
+        package: &package,
+        apk: &apk_path,
+        data_dir: &data_dir,
+        native_lib_dir: &lib_dir,
+        target_sdk: info.target_sdk.map(|v| v as i32).unwrap_or(35),
+        min_sdk: info.min_sdk.map(|v| v as i32).unwrap_or(23),
+        uid: 10_123,
+    };
+    crate::apphost::bind_application(env, thread, &spec);
 }
 
 /// Start libbinder's thread pool in this process.

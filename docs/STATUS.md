@@ -27,65 +27,80 @@ düzeltildi, hizasız tamponla test eklendi. Bu düzeltmeden sonra NewPipe
   # her APEX için etc/ javalib/ lib64/ alt ağaçlarını çıkar (ext4.py ile)
   ```
 
-## bindApplication — Java tarafından (bu tur)
+## bindApplication — ÇALIŞIYOR (bu tur)
 
-Parcel arkeolojisi bırakıldı. JNI erişim denetimini atladığı için
-`handleBindApplication` **doğrudan** çağrılıyor (`--bind-app`):
+`handleBindApplication` **baştan sona tamamlanıyor** (`apphost: handleBindApplication
+returned normally`), hem varsayılan JIT/nterp ile hem `-Xint` ile. Uygulama
+bağlanıyor: `GraphicsEnvironment`, `NetworkSecurityConfig`, `LoadedApk`,
+`Application` nesnesi, veri dizinleri.
 
-1. `ActivityThread.currentActivityThread()` → `main`in kurduğu nesne;
-2. `new AppBindData()` + alanları `SetObjectField`/`SetIntField` ile doldurma;
-3. `handleBindApplication(AppBindData)` (private, JNI umursamıyor).
+### Grafik duvarı aslında bir `stat64` hatasıydı
 
-Yol boyunca düzeltilen gerçek engeller:
+Dokümanda "minikin font koleksiyonu boş, native `Typeface` üretilemiyor" diye
+kayıtlı duvarın kökü **font değil, shim**di:
 
-- **`__system_property_find` stub'ı.** NULL dönüyordu ve Java'nın
-  `SystemProperties.get`'i tam bu yolu kullanıyor → Java *tüm* özellikleri boş
-  görüyordu; `Build.<clinit>` `"".split(",")` yüzünden boş diziye `[0]`
-  uygulayıp ölüyordu. Sahte `prop_info` + `read_callback`/`read` eklendi.
-- **Eksik varsayılan özellikler**: `ro.product.cpu.abilist*`, `ro.build.*`,
-  `ro.product.*` (28 adet) shim'in deposuna eklendi.
-- **`AppBindData` alan adları sürüme göre farklı** (`--dump-class` ile
-  okundu): `restrictedBackupMode` ( `isRestrictedBackupMode` değil),
-  `coreSettings` yok, `disabledCompatChanges` `long[]` **null olamaz**.
-- **Eksik native grupları**: `Canvas.nSetCompatibilityVersion` libhwui'de →
-  `--register-natives libandroid_runtime.so,libhwui.so` (virgüllü liste).
-- **`locales is empty`**: `Configuration.setToDefaults()` locale bırakmıyor;
-  `setLocales(new LocaleList(new Locale("en","US")))` eklendi.
-- **`/system/fonts` sysroot'a çıkarılmamıştı** (208 dosya) → `Typeface`
-  varsayılan ailesi null kalıyordu.
+- libcore'un `File.isFile()`/`exists()` yolu `stat64`/`lstat64` çağırıyor
+  (libopenjdk'nın import listesinde `stat64@LIBC`). Shim yalnızca `stat`,
+  `lstat`, `fstatat` interpose ediyordu; `stat64` glibc'ye düşüyor ve **sanal
+  kök eşlemesini hiç görmüyordu**. Sonuç: `/system/fonts/*` her sorguda "yok".
+- `FontListParser.readFont` `file.isFile()` false olunca fontu atıyor → her
+  aile boş → `FontConfig` 0 aile → `SystemFonts.buildSystemFallback` boş →
+  `Typeface.setSystemFontMap` boş harita → `Typeface.create(null, 0)` NPE.
+- Düzeltme: `stat64`, `lstat64`, `fstat64`, `fstatat64` shim'e eklendi.
+  Ölçüm: `--fontmap` **0 → 33 aile**; `FontListParser` 158 aile / 367 font
+  okuyor; `Font.Builder.build()` zaten çalışıyordu.
 
-Şu an `handleBindApplication` **ActivityThread.java:6587**'ye kadar geliyor. Oradaki
-engel **grafik yığını**:
+`seed_font_map` (elle font haritası kurma) artık gereksiz ve zararlıydı
+(`Typeface.DEFAULT` henüz null olduğu için kendisi NPE veriyordu) — kaldırıldı.
 
-```
-Typeface.loadPreinstalledSystemFontMap → setSystemFontMap → Typeface.create(null,0)
-  NPE: Attempt to read from field 'int android.graphics.Typeface.mStyle' on a null object
-Typeface$Builder(File(/system/fonts/Roboto-Regular.ttf)).build()
-  NPE: ... 'long android.graphics.Typeface.native_instance' on a null object
---fontmap: 0 families
-```
+### Sırayla çözülen diğer engeller
 
-Yani `android.graphics.Typeface`'ın **native** tarafı hiç `Typeface` üretemiyor:
-minikin'in font koleksiyonu boş. `--fontmap` ile daha kesin ölçüm (teşhis artık
-`loadPreinstalledSystemFontMap()`'ı kendisi tetikliyor):
+1. **`Build$VERSION.<clinit>`** `ArrayIndexOutOfBoundsException: length=0`:
+   `getStringList` boş özellikte **sıfır uzunluklu** dizi döndürüyor ve
+   `ALL_CODENAMES[0]` patlıyor. `ro.build.version.all_codenames` (ve
+   `known_codenames`, `release_or_codename`, `preview_sdk*`, `security_patch`,
+   `ro.boot.*`, `ro.soc.*`, ...) shim'in deposuna eklendi (28 → 45).
+2. **`mCoreSettings` null**: normalde AMS `updateCoreSettings` ile gönderir;
+   bizde boş bir `Bundle` atanıyor. (Bu olmadan nterp *null-check yapmadan*
+   alan okuduğu için süreç segfault ediyordu — `-Xint` ile aynı yer temiz bir
+   NPE veriyordu. **İpucu: çökme yerini bulmak için `--vm-option -Xint`.**)
+3. **`deviceProtectedDataDir`/`credentialProtectedDataDir`**: `setupGraphicsSupport`
+   `createDeviceProtectedStorageContext().getCodeCacheDir()` üzerinden bu
+   alanları okuyor; null olunca "No data directory found for package".
+4. **`IPackageManager.getPackageInfo`** (transaction **kodu 3**):
+   `LoadedApk.initializeJavaContextClassLoader` null sonuçta "is package not
+   installed?" fırlatıyor.
+5. **`IPackageManager.getApplicationInfo`** (transaction **kodu 9**):
+   `handleBindApplication` `info.metaData` okuyor, null'da NPE.
 
-```
-Typeface: Preloading /system/fonts/Roboto-Regular.ttf      <- fonts.xml okundu, TTF açıldı
-Typeface: Preloading /system/fonts/RobotoStatic-Regular.ttf
-NPE ... Typeface.create(null, 0)                            <- ama aile üretilemedi
---fontmap: loadPreinstalledSystemFontMap threw / 0 families
-```
+4 ve 5 için parcel **elle yazılmıyor**: host, framework'ün kendi
+`PackageInfo.writeToParcel`/`ApplicationInfo.writeToParcel`'ını çağırıp
+`Parcel.marshall()` ile baytları alıyor ve shim'e aktarıyor
+(`__pengudroid_binder_set_package_info` / `..._set_application_info`). Böylece
+düzen sürüme özgü tahminlere kalmıyor. Yanıt parcel'ı
+`[status=0][presence=1][nesne]` — `readTypedObject` önce varlık int'ini okuyor;
+bu 4 bayt eksik olunca okuyucu kayıyor ve 7.6 GB'lık bir tahsis deniyordu.
 
-Yani XML ayrıştırma ve dosya erişimi **çalışıyor**; eksik olan, native
-`Typeface` üretimi (minikin/Skia). Ölçülen ve sağlam olanlar: `/system/fonts` 208
-dosya (framework ile aynı imajdan), `fonts.xml`'de `sans-serif`, `libhwui`
-dlopen + `register_android_graphics_classes` (2/2), `libminikin`/`libexpat`/
-`libharfbuzz_ng`/`libft2` yerinde, `ANDROID_ROOT` artık **mutlak** yol,
-`/product` + `/system_ext` `fonts_customization.xml` stub'ları eklendi.
+### Teşhis iyileştirmeleri
 
-Bu, sadece font değil **HWUI/EGL** tarafının da (pencere çizimi) önündeki duvar:
-Activity başlasa bile çizmek için SurfaceFlinger yerine kendi EGL/dmabuf
-sunumumuz + çalışan bir minikin/Skia gerekir.
+- `handleBindApplication` artık **ana thread'de** çağrılıyor; `ActivityThread.main`
+  bir yardımcı thread'de koşuyor. Böylece çökmeler VM'i kuran thread'de oluyor.
+- `PENGUDROID_TRACE_BINDER=1` artık hedef handle'ın **servis adını** da yazıyor
+  (`dispatch target=1 (package) code=9`), yani transaction kodları doğrudan
+  okunabiliyor.
+- `PENGUDROID_FONTDEBUG=1|2`: font zincirini (config aileleri, fallback,
+  `Font.Builder.build`, `XmlPullParser` olay akışı, `File.isFile`) adım adım ölçer.
+
+### Sıradaki adım
+
+Uygulama bağlandı ama **Activity başlamadı**: `system_server`'ın
+`scheduleLaunchActivity` çağrısı yok. Sırada:
+1. `IApplicationThread.scheduleLaunchActivity` (ActivityClientRecord parcel'ı)
+   → `onCreate/onStart/onResume`.
+2. Pencere yolu: `SurfaceFlinger`/`SurfaceComposerClient` yerine kendi
+   EGL/dmabuf sunumumuz; HWUI EGL üzerinden çiziyor.
+3. `IPackageManager`'in geri kalanı (`getPackagesForUid`, `checkPermission`, ...)
+   ve `IActivityManager`'in temel metotları.
 
 ## Binder sunucu tarafı — durum
 
@@ -170,15 +185,23 @@ kalındığı sürece bu katmanların sırayla yazılması gerekiyor.
 | Gerçek APK DEX'i yükleniyor | `art-test ... --classpath app.apk --find-class <C>` | sınıf *system class loader*'dan çözülüyor |
 | Framework native'leri (150 grup) | `art-test ... --register-natives libandroid_runtime.so` | `registered 150 of 150` |
 | ActivityThread.main çağrılıyor | `art-test ... --main android.app.ActivityThread` | "invoking ... main" |
+| **Uygulama bağlanıyor (`handleBindApplication`)** | `art-test ... --classpath app.apk --bind-app --main android.app.ActivityThread` | `apphost: handleBindApplication returned normally`; `Application`, `LoadedApk`, `GraphicsEnvironment`, `NetworkSecurityConfig` kuruluyor |
+| Sistem font haritası | `PENGUDROID_FONTMAP=1 art-test ...` | `--fontmap: 33 families` (fonts.xml'den 158 aile / 367 font) |
 | Bundle açma | `pengudroid extract app.apkm --dest D --abi arm64-v8a` | base + split + OBB yazılıyor |
 | Bundle analizi | `pengudroid info/doctor app.apkm` | split'lerdeki 37 kütüphane, ABI listesi, DEX sınıf sayısı |
 | x86_64 NativeActivity oyunu | `pengudroid native --lib fixtures/native-game/libmain.so` | 1280×720, ~56 fps (RTX 3080) |
 
-Testler: **153 geçiyor** (`cargo test --workspace`).
+Testler: **167 geçiyor** (`cargo test --workspace`).
 
 ## Çalışmayanlar ve tam olarak nerede durduğu
 
-### NewPipe 0.29.1 (`org.schabi.newpipe`) — AÇILMIYOR (ilerleme var)
+### NewPipe 0.29.1 (`org.schabi.newpipe`) — AÇILMIYOR (Activity başlamıyor)
+
+**Güncel durum:** ART açılıyor, `ActivityThread.main` çalışıyor ve
+`handleBindApplication` **tamamlanıyor** (yukarıdaki bölüm). Eksik olan tek şey
+`system_server`'ın `scheduleLaunchActivity` çağrısı: uygulama bağlı ama hiçbir
+Activity başlamadığı için pencere açılmıyor. Aşağısı bu noktaya gelene kadarki
+kayıt.
 
 Bu oturumda `NoClassDefFoundError` zinciri çözüldü. `ActivityThread.main`
 artık çalışıyor ve **binder'a bağlanma noktasına** kadar geliyor:

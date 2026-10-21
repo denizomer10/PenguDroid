@@ -1005,15 +1005,31 @@ static SERIAL: AtomicU32 = AtomicU32::new(1);
 /// Android defaults below must be overridden through [`set_prop`].
 pub fn default_props() -> BTreeMap<String, String> {
     let mut props = BTreeMap::new();
-    let seed: [(&str, &str); 28] = [
+    let seed: &[(&str, &str)] = &[
         ("ro.build.version.sdk", "36"),
         ("ro.build.version.release", "16"),
+        ("ro.build.version.release_or_codename", "16"),
+        ("ro.build.version.release_or_preview_display", "16"),
         ("ro.build.version.codename", "REL"),
+        // `Build.VERSION.ACTIVE_CODENAMES` indexes `ALL_CODENAMES[0]` and
+        // `getStringList` returns a *zero-length* array when the property is
+        // empty, so a missing `all_codenames` aborts `Build$VERSION.<clinit>`
+        // with ArrayIndexOutOfBoundsException and takes the whole framework
+        // down with it.
+        ("ro.build.version.all_codenames", "REL"),
+        ("ro.build.version.known_codenames", "REL"),
+        ("ro.build.version.incremental", "eng.pengudroid"),
+        ("ro.build.version.preview_sdk", "0"),
+        ("ro.build.version.preview_sdk_fingerprint", "REL"),
+        ("ro.build.version.security_patch", "2026-01-01"),
+        ("ro.build.version.base_os", ""),
+        ("ro.build.version.min_supported_target_sdk", "23"),
         ("ro.product.model", "PenguDroid"),
         ("ro.product.manufacturer", "PenguDroid"),
         ("ro.debuggable", "1"),
         ("ro.secure", "0"),
         ("ro.kernel.qemu", "0"),
+        ("ro.boot.qemu", "0"),
         ("ro.hardware", "pengudroid"),
         ("ro.build.characteristics", "default"),
         // `Build.<clinit>` reads these. An empty ABI list makes it index an
@@ -1036,7 +1052,16 @@ pub fn default_props() -> BTreeMap<String, String> {
         ("ro.build.tags", "test-keys"),
         ("ro.build.user", "pengudroid"),
         ("ro.build.host", "pengudroid"),
+        ("ro.build.date.utc", "0"),
         ("ro.build.fingerprint", "PenguDroid/pengudroid/pengudroid:16/PENGUDROID/userdebug:user/release-keys"),
+        ("ro.system.build.fingerprint", "PenguDroid/pengudroid/pengudroid:16/PENGUDROID/userdebug:user/release-keys"),
+        ("ro.bootloader", "unknown"),
+        ("ro.boot.hardware.sku", "unknown"),
+        ("ro.boot.product.hardware.sku", "unknown"),
+        ("ro.hw_timeout_multiplier", "1"),
+        ("ro.treble.enabled", "false"),
+        ("ro.soc.manufacturer", "PenguDroid"),
+        ("ro.soc.model", "PenguDroid"),
         ("ro.sf.lcd_density", "420"),
     ];
     for (k, v) in seed {

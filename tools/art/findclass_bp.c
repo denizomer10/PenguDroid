@@ -141,6 +141,10 @@ int main(int argc, char **argv) {
         return 1;
     }
     fprintf(stderr, "[bp] tracing pid %d for %s+0x%lx\n", pid, argv[2], sym);
+    /* Follow every thread: the interesting work happens on threads the guest
+     * spawns (the ART helper binds the app from a second thread), and a crash
+     * there is invisible to a single-thread tracer. */
+    ptrace(PTRACE_SETOPTIONS, pid, NULL, (void *)(long)PTRACE_O_TRACECLONE);
 
     unsigned long bp = 0;
     long orig = 0;
@@ -148,12 +152,6 @@ int main(int argc, char **argv) {
 
     /* Run syscall-by-syscall until libart.so is mapped, then set the breakpoint. */
     while (1) {
-        if (!armed) {
-            static unsigned long probes;
-            if ((++probes & 0x3ff) == 0) {
-                fprintf(stderr, "[bp] probing maps (%lu stops)\n", probes);
-            }
-        }
         if (!armed && map_base(pid, &bp) == 0) {
             bp += sym;
             errno = 0;
@@ -162,25 +160,31 @@ int main(int argc, char **argv) {
                 long patched = (orig & ~0xffL) | 0xcc;
                 if (ptrace(PTRACE_POKETEXT, pid, (void *)bp, (void *)patched) == 0) {
                     armed = 1;
-                    errno = 0;
-                    long at_base = ptrace(PTRACE_PEEKTEXT, pid, (void *)(bp - sym), NULL);
-                    errno = 0;
-                    long at_text = ptrace(PTRACE_PEEKTEXT, pid, (void *)(bp - sym + 0x35ff00), NULL);
-                    fprintf(stderr,
-                            "[bp] libart base+0x%lx armed (word=%#lx base=%#lx text=%#lx)\n",
-                            sym, (unsigned long)orig, (unsigned long)at_base,
-                            (unsigned long)at_text);
+                    fprintf(stderr, "[bp] libart base+0x%lx armed (word=%#lx)\n",
+                            sym, (unsigned long)orig);
                 }
             }
         }
 
-        if (WIFEXITED(status) || WIFSIGNALED(status)) break;
+        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            if (WIFSIGNALED(status)) {
+                fprintf(stderr, "[bp] pid %d died from signal %d\n", pid, WTERMSIG(status));
+            }
+            break;
+        }
 
         int sig = WSTOPSIG(status);
+        int event = status >> 16;
         struct user_regs_struct regs;
-        if (armed && sig == SIGTRAP
-            && ptrace(PTRACE_GETREGS, pid, NULL, &regs) == 0
-            && (unsigned long)regs.rip == bp + 1) {
+
+        if (event == PTRACE_EVENT_CLONE) {
+            unsigned long new_tid = 0;
+            ptrace(PTRACE_GETEVENTMSG, pid, NULL, &new_tid);
+            fprintf(stderr, "[bp] new thread %lu\n", new_tid);
+            ptrace(PTRACE_CONT, pid, NULL, NULL);
+        } else if (armed && sig == SIGTRAP
+                   && ptrace(PTRACE_GETREGS, pid, NULL, &regs) == 0
+                   && (unsigned long)regs.rip == bp + 1) {
             char desc[256];
             const char *which = getenv("BP_REG");
             unsigned long arg = regs.rsi;
@@ -197,7 +201,7 @@ int main(int argc, char **argv) {
             regs.rip = bp;
             ptrace(PTRACE_SETREGS, pid, NULL, &regs);
             ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL);
-            waitpid(pid, &status, 0);
+            waitpid(pid, &status, __WALL);
             ptrace(PTRACE_POKETEXT, pid, (void *)bp, (void *)((orig & ~0xffL) | 0xcc));
             ptrace(PTRACE_CONT, pid, NULL, NULL);
         } else {
@@ -205,8 +209,8 @@ int main(int argc, char **argv) {
             if (sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGFPE || sig == SIGABRT) {
                 struct user_regs_struct r;
                 if (ptrace(PTRACE_GETREGS, pid, NULL, &r) == 0) {
-                    fprintf(stderr, "[crash] signal %d rip=%#llx rsp=%#llx rdi=%#llx rsi=%#llx rdx=%#llx\n",
-                            sig, (unsigned long long)r.rip, (unsigned long long)r.rsp,
+                    fprintf(stderr, "[crash] tid %d signal %d rip=%#llx rsp=%#llx rdi=%#llx rsi=%#llx rdx=%#llx\n",
+                            pid, sig, (unsigned long long)r.rip, (unsigned long long)r.rsp,
                             (unsigned long long)r.rdi, (unsigned long long)r.rsi,
                             (unsigned long long)r.rdx);
                     /* Dump stack words that look like return addresses. */
@@ -228,7 +232,9 @@ int main(int argc, char **argv) {
                 ptrace(PTRACE_CONT, pid, NULL, deliver ? (void *)(long)deliver : NULL);
             }
         }
-        if (waitpid(pid, &status, 0) < 0) break;
+        /* __WALL: report stops from every traced thread, not just the leader. */
+        pid = waitpid(-1, &status, __WALL);
+        if (pid < 0) break;
     }
     return 0;
 }
