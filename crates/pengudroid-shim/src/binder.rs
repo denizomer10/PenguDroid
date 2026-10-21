@@ -192,6 +192,35 @@ fn leak_cstr(s: &str) -> (u64, u64) {
     (boxed.as_ptr() as u64, len)
 }
 
+/// Read the `index`-th `hidl_string` argument of a HIDL request.
+///
+/// The parcel is `[interface token][40-byte object][40-byte data]...`, two
+/// objects per argument; the odd one carries the bytes at `buffer`/`length`.
+unsafe fn hidl_arg_string(tr: &TransactionData, index: usize) -> Option<String> {
+    if tr.data_size == 0 || tr.data_ptr == 0 {
+        return None;
+    }
+    let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
+    let mut off = 0usize;
+    while off < data.len() && data[off] != 0 {
+        off += 1;
+    }
+    off = (off + 1 + 3) & !3;
+    let obj = off + index * 80 + 40;
+    if obj + 40 > data.len() {
+        return None;
+    }
+    let block = &data[obj..obj + 40];
+    let ptr = u64::from_ne_bytes(block[8..16].try_into().ok()?) as usize;
+    let len = u64::from_ne_bytes(block[16..24].try_into().ok()?) as usize;
+    if ptr == 0 || len == 0 || len > 512 {
+        return None;
+    }
+    let bytes = std::slice::from_raw_parts(ptr as *const u8, len);
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(len);
+    Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
+}
+
 /// Write a `hidl_string` the way libhidlbase does.
 ///
 /// Measured from a live `getTransport` request: a string is a 40-byte struct
@@ -299,16 +328,9 @@ unsafe fn hidl_service_manager_reply(
         }
         // `IServiceManager::get(fqName, name)`.
         1 => {
-            let mut fq = String::new();
-            if tr.data_size > 0 && tr.data_ptr != 0 {
-                // SAFETY: `data_size` readable bytes at `data_ptr`.
-                let data =
-                    unsafe { std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize) };
-                let mut pos = 0usize;
-                fq = read_hidl_string(data, &mut pos).unwrap_or_default();
-            }
+            let fq = hidl_arg_string(tr, 0).unwrap_or_default();
             // `make_reply` already wrote the status word for this handle.
-            let handle = if fq.contains("ICodec2") {
+            let handle = if fq.contains("media.c2") || fq.contains("ICodec2") {
                 handle_for("codec2")
             } else {
                 handle_for(fq.as_str())
