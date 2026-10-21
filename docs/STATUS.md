@@ -27,34 +27,45 @@ düzeltildi, hizasız tamponla test eklendi. Bu düzeltmeden sonra NewPipe
   # her APEX için etc/ javalib/ lib64/ alt ağaçlarını çıkar (ext4.py ile)
   ```
 
-## Binder sunucu tarafı — bu turda eklenenler
+## Binder sunucu tarafı — durum
 
 Hedef: `system_server`'ın yaptığı gibi uygulamaya *çağrı yapmak*
 (`bindApplication`, `scheduleLaunchActivity`).
 
+**Yapılanlar**
+
 - **Uygulama düğümü yakalanıyor.** `attachApplication` parcel'inde
-  `BINDER_TYPE_BINDER` (`0x73622a85`) nesnesi aranıp iki alanı saklanıyor:
-  libbinder yerel bir binder'ı `obj.binder = getWeakRefs()`,
-  `obj.cookie = BBinder*` olarak düzleştirir. Gelen bir transaction'da
-  `target.ptr` = weakref, `cookie` = BBinder olmak zorunda; ikisi de loglanıyor:
-  ```
-  [binder] captured app thread weak=0x… cookie=0x… (object at offset 76, target handle 1)
-  ```
+  `BINDER_TYPE_BINDER` (`0x73622a85`) aranıp iki alan saklanıyor: libbinder yerel
+  bir binder'ı `obj.binder = getWeakRefs()`, `obj.cookie = BBinder*` olarak
+  düzleştirir; gelen transaction'da `target.ptr` = weakref, `cookie` = BBinder.
 - **Gelen transaction üretimi** (`incoming_transaction`): `BR_TRANSACTION` +
   `binder_transaction_data`, parcel aynı transfer alanına yazılıyor.
-- **İki tuzak ölçüldü:** (a) probe `BR_REPLY` ile *aynı* okuma tamponuna
-  konulmamalı — libbinder'ın `waitForResponse`'u reply'ı bulunca kalan komutları
-  atıyor; (b) uygulama `read_size = 0` ile çağrı yaptığında enjekte edilen
-  komut `ENOSPC` yolunda düşüyor, bu yüzden probe bekletiliyor.
-- **Açık kalan:** yakalamadan sonra uygulama `read_size > 0` ile yeni bir
-  `BINDER_WRITE_READ` yapmıyor (muhtemelen `poll` üzerinde bekliyor), bu yüzden
-  probe iletilemiyor. Sıradaki adım: cihaz `poll`'da okunabilir göründüğünde
-  kuyruğu boşaltmak ve/veya `BR_TRANSACTION`'ı bir sonraki yazma çağrısının
-  okuma yarısına eklemek.
-- Ardından gerekenler: `BIND_APPLICATION` AIDL kod numarası + `AppBindData`
-  parcel'ı (`ApplicationInfo`, provider listesi, Configuration, ...), sonra
-  `scheduleLaunchActivity` ve son olarak pencere/Surface zinciri
-  (SurfaceFlinger yerine kendi EGL/dmabuf sunumumuz).
+- Ölçülen iki tuzak: (a) transaction `BR_REPLY` ile *aynı* okuma tamponunda
+  olmamalı (libbinder `waitForResponse` reply'ı bulunca kalanı atıyor);
+  (b) çağıran `read_size = 0` verirse enjekte edilen komut `ENOSPC` yolunda
+  düşer — probe bekletiliyor.
+
+**Duvar: binder thread pool.** Uygulama süreci normalde thread pool'unu
+*zygote*'tan miras alır; biz zygote'tan fork etmediğimiz için hiçbir thread
+`read_size > 0` ile okuma yapmıyor ve `system_server` geri-çağrısı inecek yer
+bulamıyor. `ProcessState::self()` + `startThreadPool()` çağrısı
+(`PENGUDROID_BINDER_POOL=1`) **`ProcessState::init` içinde SIGSEGV** veriyor:
+hata libbinder'ın kendi *kod* segmentine store (`r15` text içinde), yani init'in
+beklediği nesne/C++ runtime durumu host tarafından sağlanamıyor. Uygulamanın
+*kendi* binder kullanımı çalıştığı için doğru yol, pool'u `ProcessState`'i
+oluşturan aynı bağlamdan (bir JNI girişinden) başlatmak.
+
+**Sonrasında gerekenler (küçükten büyüğe)**
+1. `BIND_APPLICATION` AIDL kod numarası + `AppBindData` parcel'ı
+   (`ApplicationInfo`, provider listesi, `Configuration`, `CompatibilityInfo`).
+2. `scheduleLaunchActivity` (ActivityClientRecord) → `onCreate/onStart/onResume`.
+3. Pencere yolu: `SurfaceFlinger`/`SurfaceComposerClient` yerine kendi
+   EGL/dmabuf sunumumuz; `HWUI` EGL üzerinden çiziyor.
+4. Video için `MediaCodec` (codec2/OMX) + `AudioFlinger`/`AudioTrack`.
+
+Not: 3 ve 4, Waydroid'in gerçek Android userspace'i boot ederek çözdüğü
+katmanlar. Bu depo "uygulamaları host süreci olarak çalıştır" diyor; o çizgide
+kalındığı sürece bu katmanların sırayla yazılması gerekiyor.
 
 ## Bugün çalışan şeyler
 

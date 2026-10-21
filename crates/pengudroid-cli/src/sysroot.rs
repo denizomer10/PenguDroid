@@ -855,6 +855,9 @@ pub fn art_main(args: &[String]) -> i32 {
                 probe_service(&env, &name);
             }
             if let Some(class) = main_class {
+                if std::env::var_os("PENGUDROID_BINDER_POOL").is_some() {
+                    start_binder_pool(libs.as_deref());
+                }
                 return run_main(&env, &class, &app_args);
             }
             if let Some(class) = probe_class {
@@ -1470,6 +1473,55 @@ unsafe fn install_findclass_tracer(env: *mut c_void) {
     *slot = traced_find_class as *mut c_void;
     let _ = libc::mprotect(page as *mut c_void, 0x1000, libc::PROT_READ);
     println!("art: tracing JNI FindClass (PENGUDROID_TRACE_FINDCLASS)");
+}
+
+/// Start libbinder's thread pool in this process.
+///
+/// A real app process inherits its binder threads from zygote: the pool is
+/// started before the fork, so `system_server`'s callbacks (`bindApplication`,
+/// `scheduleLaunchActivity`) have a thread to arrive on. We do not fork from a
+/// zygote, so nothing is reading the binder device and an app would sit in
+/// `Looper.loop()` forever.
+///
+/// KNOWN BROKEN (hence `PENGUDROID_BINDER_POOL`): calling `ProcessState::self()`
+/// from here SIGSEGVs inside `ProcessState::init` — the fault is a store into
+/// libbinder's own text mapping (`r15` points into the code segment), which
+/// suggests the object layout/C++ runtime state init expects is not what a
+/// glibc-hosted call provides. The app's *own* binder use works, so the fix has
+/// to reach the pool from the same context that creates `ProcessState` (a JNI
+/// entry point) rather than from the host side.
+fn start_binder_pool(libs: Option<&Path>) {
+    // Open by *soname* on purpose: glibc keys loaded objects by the name they
+    // were resolved with, so dlopening an absolute path here can map a second
+    // copy of libbinder.so. That copy would have its own ProcessState singleton,
+    // and initialising it re-enters `ProcessState::init` on a half-built object
+    // (observed as a SIGSEGV inside init).
+    let _ = libs;
+    let handle = unsafe { libc::dlopen(c"libbinder.so".as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+    if handle.is_null() {
+        diag(&format!("art: dlopen(libbinder.so) failed: {}", dlerror()));
+        return;
+    }
+    diag(&format!("art: libbinder.so handle {handle:p}"));
+    let self_fn = unsafe { libc::dlsym(handle, c"_ZN7android12ProcessState4selfEv".as_ptr()) };
+    let start_fn = unsafe {
+        libc::dlsym(handle, c"_ZN7android12ProcessState15startThreadPoolEv".as_ptr())
+    };
+    if self_fn.is_null() || start_fn.is_null() {
+        diag("art: libbinder has no ProcessState::self/startThreadPool");
+        return;
+    }
+    type SelfFn = unsafe extern "C" fn() -> *mut c_void;
+    type StartFn = unsafe extern "C" fn(*mut c_void);
+    let get_self: SelfFn = unsafe { std::mem::transmute(self_fn) };
+    let start: StartFn = unsafe { std::mem::transmute(start_fn) };
+    let state = unsafe { get_self() };
+    if state.is_null() {
+        diag("art: ProcessState::self() returned null");
+        return;
+    }
+    unsafe { start(state) };
+    diag(&format!("art: binder thread pool started (ProcessState {state:p})"));
 }
 
 /// Run `<class>.main(String[])` on a live VM.
