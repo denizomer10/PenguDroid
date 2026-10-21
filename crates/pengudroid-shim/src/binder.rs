@@ -333,10 +333,14 @@ unsafe fn hidl_service_manager_reply(
             arr.extend_from_slice(&data_ptr.to_ne_bytes()); // mData
             arr.extend_from_slice(&(data_len - 1).to_ne_bytes()); // mSize
             let arr: &'static [u8] = Box::leak(arr.into_boxed_slice());
+            // `readNullableEmbeddedBuffer(size, 0, parentOffset, 0, &arr)` verifies
+            // `parent == 0` and `parentOffset == <the vec's handle>`.
             let arr_idx =
-                push_buffer_object(parcel, objects, 0, arr.as_ptr() as u64, 16, vec_idx, 0);
+                push_buffer_object(parcel, objects, 0, arr.as_ptr() as u64, 16, 0, vec_idx);
 
-            push_buffer_object(parcel, objects, 1, data_ptr, data_len, arr_idx, 0);
+            // `readEmbeddedFromParcel` verifies `parent == 0` and
+            // `parentOffset == <the array's handle>`.
+            push_buffer_object(parcel, objects, 1, data_ptr, data_len, 0, arr_idx);
             if trace_enabled() {
                 diag(&format!("[binder]   -> hidl listManifestByInterface (code {code}): [default]\n"));
             }
