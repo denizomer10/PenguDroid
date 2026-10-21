@@ -72,6 +72,33 @@ işleniyor (cevap parcel'i atılıyor). `display_event_connection` code 3'te
 (216 bayt: `Header{type,displayId,timestamp}` + `VSync{count,VsyncEventData}`,
 `frameInterval` 16.67 ms). Böylece `Choreographer` ilk kareyi alıyor.
 
+### Şu anki tam durak noktası (SIGSEGV)
+
+```
+rbx.JNIRobloxSettings: Setting default app policy file: content/guac/...GlobalDist.json
+→ SIGSEGV, libroblox.so + 0x224e4af
+```
+
+Çağrı zinciri (elle söküldü):
+
+```
+AppConfiguration::updateConfigurationDefaults(type, default)   @ 0x224e3c6
+  log "[FLog::AppConfiguration] ... type = %u, default = %s"    (seviye yüzünden atlanıyor)
+  singleton getter                                             @ 0x224242a  (std::call_once, null değil)
+  lookup(r15, key)                                             @ 0x224e632
+      → bulunamayınca çıktıya 16 sıfır yazıyor (0x224eaee)
+  mov (%rax),%rcx        ← rax = null, çökme
+```
+
+Yani **AppConfiguration haritası boş**: `updateConfigurationDefaults` aradığı anahtarı
+bulamıyor. `getStreamFromPath` bir *telemetri anahtarı* (map key), dosya yolu değil —
+assets'i `app_assets/` ve `<data>/content/` altına elle çıkarmak çökmeyi
+değiştirmiyor, yani sorun dosya erişimi değil.
+
+Sıradaki adım: `0x224e632`'nin hangi anahtarı aradığını ve `AppConfiguration`'ın
+nereden dolduğunu bulmak. `-Xcheck:jni` temiz geçiyor, yani JNI kötüye
+kullanımı değil.
+
 ### Sıradaki adım (grafik)
 
 `IWindowSession.relayout` (code 5) gerçek bir `SurfaceControl` döndürmeli.

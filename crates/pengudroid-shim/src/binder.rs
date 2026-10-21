@@ -751,18 +751,42 @@ fn send_vsync() {
     let fds = VSYNC_SEND_FDS.lock().unwrap_or_else(|e| e.into_inner());
     for fd in fds.iter() {
         // SAFETY: `event` is a valid buffer and `fd` is a socket we own.
+        // `MSG_DONTWAIT` keeps a client that stopped reading from blocking the
+        // frame clock; a full socket just drops the pulse.
         unsafe {
             libc::send(
                 *fd,
                 event.as_ptr() as *const c_void,
                 event.len(),
-                libc::MSG_NOSIGNAL,
+                libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
             );
         }
     }
     if trace_enabled() {
         unsafe { diag(&format!("[binder]   -> vsync frame {frame}\n")) };
     }
+}
+
+/// Start the 60 Hz frame clock, once per process.
+///
+/// A real compositor emits vsync continuously; the app's `Choreographer` only
+/// asks for the *next* pulse, so answering just that one request leaves the
+/// frame loop stalled as soon as a traversal is skipped. A steady clock is also
+/// what Roblox's engine expects once it starts drawing.
+fn start_frame_clock() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        std::thread::spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_micros(16_666));
+            if !VSYNC_SEND_FDS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+            {
+                send_vsync();
+            }
+        });
+    });
 }
 
 /// Create the socket pair behind a `BitTube`.
@@ -958,6 +982,7 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             Some((recv, send)) => {
                 push_flat_fd(&mut parcel, &mut objects, recv);
                 push_flat_fd(&mut parcel, &mut objects, send);
+                start_frame_clock();
                 if trace_enabled() {
                     diag(&format!("[binder]   -> BitTube fds {recv},{send}\n"));
                 }
