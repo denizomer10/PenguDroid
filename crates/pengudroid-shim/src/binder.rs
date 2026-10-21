@@ -17,7 +17,7 @@
 
 use std::ffi::CStr;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use libc::{c_int, c_ulong, c_void};
 
@@ -62,6 +62,24 @@ const BC_ACQUIRE_DONE: u32 = 0x4010_6309;
 /// Binder commands that appear on the read side.
 const BR_TRANSACTION_COMPLETE: u32 = 0x0000_7206;
 const BR_REPLY: u32 = 0x8040_7203;
+const BR_TRANSACTION: u32 = 0x8040_7202;
+
+/// `flat_binder_object.type` for a reference to a binder *in this process*.
+///
+/// `B_PACK_CHARS('s', 'b', '*', 0x85)`. A client that passes its own binder
+/// (the app handing `ApplicationThread` to the service manager) sends this, and
+/// the `binder` union member is the local object's address.
+const BINDER_TYPE_BINDER: u32 = 0x7362_2A85;
+
+/// The app's own `ApplicationThread` node, captured from `attachApplication`.
+///
+/// libbinder flattens a local binder as `obj.binder = getWeakRefs()` and
+/// `obj.cookie = this` (the `BBinder*`). An incoming transaction has to carry
+/// both: `target.ptr` is the weakref type and `cookie` is the object.
+static APP_THREAD_WEAK: AtomicU64 = AtomicU64::new(0);
+static APP_THREAD_COOKIE: AtomicU64 = AtomicU64::new(0);
+/// Set when a probe transaction should be delivered to `APP_THREAD_NODE`.
+static APP_THREAD_PROBE: AtomicBool = AtomicBool::new(false);
 
 /// Transaction flag: no reply is expected.
 const TF_ONE_WAY: u32 = 0x1;
@@ -311,6 +329,25 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
     let mut parcel = Vec::new();
     let mut objects = Vec::new();
     parcel.extend_from_slice(&0u32.to_ne_bytes());
+    // Any transaction that carries a local binder object is a client handing us
+    // a node it wants called back on. `attachApplication` is the one that
+    // matters: its object is the app's `ApplicationThread`.
+    if tr.data_size > 0 && tr.data_ptr != 0 {
+        let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
+        if let Some((weak, cookie, at)) = find_local_binder(data) {
+            let previous = APP_THREAD_WEAK.swap(weak, Ordering::Relaxed);
+            APP_THREAD_COOKIE.store(cookie, Ordering::Relaxed);
+            if previous != weak {
+                diag(&format!(
+                    "[binder] captured app thread weak={weak:#x} cookie={cookie:#x} (object at offset {at}, target handle {})\n",
+                    tr.target_handle
+                ));
+            }
+            if std::env::var_os("PENGUDROID_BINDER_PROBE").is_some() {
+                APP_THREAD_PROBE.store(true, Ordering::Relaxed);
+            }
+        }
+    }
     if tr.target_handle == 0 && (tr.code == ISM_GET_SERVICE || tr.code == ISM_CHECK_SERVICE) {
         if tr.data_size > 0 && tr.data_ptr != 0 {
             let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
@@ -329,6 +366,56 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         parcel.push(0);
     }
     Reply { parcel, objects }
+}
+
+/// Find a `flat_binder_object` describing a binder that lives in this process.
+///
+/// The parcel layout libbinder writes is `[u32 type][u32 flags][u64 binder or
+/// handle][u64 cookie]`, followed by the stability word for handle objects.
+/// Returns the object's address and its offset in the parcel.
+fn find_local_binder(data: &[u8]) -> Option<(u64, u64, usize)> {
+    let mut at = 0usize;
+    while at + 32 <= data.len() {
+        let ty = u32::from_ne_bytes(data[at..at + 4].try_into().ok()?);
+        if ty == BINDER_TYPE_BINDER {
+            let weak = u64::from_ne_bytes(data[at + 8..at + 16].try_into().ok()?);
+            let cookie = u64::from_ne_bytes(data[at + 16..at + 24].try_into().ok()?);
+            if weak != 0 && cookie != 0 {
+                return Some((weak, cookie, at));
+            }
+        }
+        at += 4;
+    }
+    None
+}
+
+/// Build an incoming `BR_TRANSACTION` command addressed to the app's binder node.
+///
+/// `code` is the AIDL transaction the caller wants to invoke and `parcel` its
+/// body. Returns the command bytes and the object-offset table.
+unsafe fn incoming_transaction(target_weak: u64, cookie: u64, code: u32, parcel: &[u8]) -> Option<Vec<u8>> {
+    let reply = Reply {
+        parcel: parcel.to_vec(),
+        objects: Vec::new(),
+    };
+    let (addr, offsets_addr) = place_reply(&reply)?;
+    let tr = TransactionData {
+        target_handle: target_weak as u32,
+        _pad0: (target_weak >> 32) as u32,
+        cookie,
+        code,
+        flags: 0,
+        sender_pid: libc::getpid(),
+        sender_euid: 0,
+        data_size: parcel.len() as u64,
+        offsets_size: 0,
+        data_ptr: addr,
+        offsets_ptr: offsets_addr,
+    };
+    let mut out = Vec::new();
+    push_u32(&mut out, BR_TRANSACTION);
+    push_transaction(&mut out, &tr);
+    Some(out)
 }
 
 /// Place a reply parcel in the guest's transfer area.
@@ -451,6 +538,37 @@ unsafe fn handle_write_read(wr: *mut WriteRead) -> c_int {
             }
             hex.push_str(&format!(" objects={:?} buf={:#x} offs={:#x}\n", reply.objects, tr.data_ptr, tr.offsets_ptr));
             diag(&hex);
+        }
+    }
+
+    // Deliver a probe transaction to the app's own binder node.
+    //
+    // It must NOT share a read buffer with a reply: libbinder's
+    // `waitForResponse` stops parsing as soon as it finds the BR_REPLY it was
+    // waiting for and drops whatever follows. The looper's blocking read
+    // (`read_size > 0`, no write commands) is the right place.
+    if pending.is_empty() && APP_THREAD_PROBE.load(Ordering::Relaxed) {
+        let weak = APP_THREAD_WEAK.load(Ordering::Relaxed);
+        let cookie = APP_THREAD_COOKIE.load(Ordering::Relaxed);
+        // `read_size == 0` means the caller only wanted to *write*; keep the
+        // probe pending so it goes out on the next real read instead of being
+        // dropped by the ENOSPC path below.
+        if weak != 0 && wr.read_size > 0 {
+            let code: u32 = std::env::var("PENGUDROID_BINDER_PROBE_CODE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(u32::MAX);
+            if let Some(bytes) = unsafe { incoming_transaction(weak, cookie, code, &0u32.to_ne_bytes()) } {
+                if bytes.len() as u64 <= wr.read_size {
+                    APP_THREAD_PROBE.store(false, Ordering::Relaxed);
+                    diag(&format!(
+                        "[binder] probing app node weak={weak:#x} cookie={cookie:#x} code={code:#x} read_size={} cmd_len={}\n",
+                        wr.read_size,
+                        bytes.len()
+                    ));
+                    out.extend_from_slice(&bytes);
+                }
+            }
         }
     }
 

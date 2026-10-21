@@ -27,6 +27,35 @@ düzeltildi, hizasız tamponla test eklendi. Bu düzeltmeden sonra NewPipe
   # her APEX için etc/ javalib/ lib64/ alt ağaçlarını çıkar (ext4.py ile)
   ```
 
+## Binder sunucu tarafı — bu turda eklenenler
+
+Hedef: `system_server`'ın yaptığı gibi uygulamaya *çağrı yapmak*
+(`bindApplication`, `scheduleLaunchActivity`).
+
+- **Uygulama düğümü yakalanıyor.** `attachApplication` parcel'inde
+  `BINDER_TYPE_BINDER` (`0x73622a85`) nesnesi aranıp iki alanı saklanıyor:
+  libbinder yerel bir binder'ı `obj.binder = getWeakRefs()`,
+  `obj.cookie = BBinder*` olarak düzleştirir. Gelen bir transaction'da
+  `target.ptr` = weakref, `cookie` = BBinder olmak zorunda; ikisi de loglanıyor:
+  ```
+  [binder] captured app thread weak=0x… cookie=0x… (object at offset 76, target handle 1)
+  ```
+- **Gelen transaction üretimi** (`incoming_transaction`): `BR_TRANSACTION` +
+  `binder_transaction_data`, parcel aynı transfer alanına yazılıyor.
+- **İki tuzak ölçüldü:** (a) probe `BR_REPLY` ile *aynı* okuma tamponuna
+  konulmamalı — libbinder'ın `waitForResponse`'u reply'ı bulunca kalan komutları
+  atıyor; (b) uygulama `read_size = 0` ile çağrı yaptığında enjekte edilen
+  komut `ENOSPC` yolunda düşüyor, bu yüzden probe bekletiliyor.
+- **Açık kalan:** yakalamadan sonra uygulama `read_size > 0` ile yeni bir
+  `BINDER_WRITE_READ` yapmıyor (muhtemelen `poll` üzerinde bekliyor), bu yüzden
+  probe iletilemiyor. Sıradaki adım: cihaz `poll`'da okunabilir göründüğünde
+  kuyruğu boşaltmak ve/veya `BR_TRANSACTION`'ı bir sonraki yazma çağrısının
+  okuma yarısına eklemek.
+- Ardından gerekenler: `BIND_APPLICATION` AIDL kod numarası + `AppBindData`
+  parcel'ı (`ApplicationInfo`, provider listesi, Configuration, ...), sonra
+  `scheduleLaunchActivity` ve son olarak pencere/Surface zinciri
+  (SurfaceFlinger yerine kendi EGL/dmabuf sunumumuz).
+
 ## Bugün çalışan şeyler
 
 | Ne | Komut | Kanıt |
