@@ -57,9 +57,28 @@ FATAL GraphicBufferMapper: gralloc-mapper is missing
 ```
 
 hwui `AHardwareBuffer`/`GraphicBuffer` ayırmak için gralloc mapper'ı arıyor;
-shim'de yok. Sıradaki adım: `GraphicBufferMapper`'ın beklediği mapper'ı
-(`libgralloc` / `IMapper`) sağlamak ya da `AHardwareBuffer_allocate`'ı doğrudan
-kendi dma-buf ayırıcımıza bağlamak.
+shim'de yok. Ölçülen zincir:
+
+```
+HidlServiceManagement: getService: defaultServiceManager() is null
+Gralloc4/3/2: mapper N.x is not supported
+FATAL GraphicBufferMapper: gralloc-mapper is missing
+```
+
+Mapper'lar **HIDL** (`android.hardware.graphics.mapper@2.0/3.0/4.0`), yani
+`hwservicemanager` üzerinden aranıyor; bizim broker yalnızca normal servis
+yöneticisini taklit ediyor. Sıradaki adım iki seçenekli:
+
+1. `GraphicBufferMapper::getInstance()`'ı shim'de interpose edip kendi
+dma-buf/memfd tabanlı mapper'ımızı döndürmek (`allocate`, `lock`, `unlock`,
+   `importBuffer`, `getTransportSize` …), ya da
+2. `AHardwareBuffer_allocate`'ı doğrudan kendi ayırıcımıza bağlamak.
+
+İkisi de "host GPU + dma-buf" çizgisine uygun; (1) daha az yüzey değiştiriyor.
+
+`eglQuerySurface` artık `EGL_SWAP_BEHAVIOR` (→ `EGL_BUFFER_DESTROYED`) ve
+`EGL_BUFFER_AGE_EXT` (→ 1) yanıtlıyor; "Unable to match the desired swap
+behavior" uyarısı bu sayede kalktı.
 
 Ayrıca `pengudroid-gleshim`'e **`eglSurfaceAttrib`** eklendi: hwui her yüzeyde
 `EGL_SWAP_BEHAVIOR = EGL_BUFFER_DESTROYED` ayarlıyor ve başarısız olunca abort

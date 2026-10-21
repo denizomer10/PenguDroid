@@ -1292,6 +1292,19 @@ pub unsafe extern "C" fn eglQuerySurface(
             *value = rec.h as c_int; // EGL_HEIGHT
             EGL_TRUE
         }
+        // EGL_SWAP_BEHAVIOR -> EGL_BUFFER_DESTROYED. hwui queries this right
+        // after setting it; answering EGL_FALSE makes it log "Unable to match
+        // the desired swap behavior" and fall back to allocating its own
+        // GraphicBuffers, which needs a gralloc mapper we do not have.
+        0x3093 => {
+            *value = 0x3095; // EGL_BUFFER_DESTROYED
+            EGL_TRUE
+        }
+        // EGL_BUFFER_AGE_EXT: a single-buffered offscreen FBO is always fresh.
+        0x313D => {
+            *value = 1;
+            EGL_TRUE
+        }
         _ => EGL_FALSE,
     }
 }
