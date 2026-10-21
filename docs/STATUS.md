@@ -114,32 +114,33 @@ doğrudan çağrılıyor (parcel/binder turu atlanıyor). Yol boyunca çözülen
   thread'inde Looper yoksa "Can't create handler inside thread ... that has not
   called Looper.prepare()". Launch öncesi `Looper.prepare()` çağrılıyor.
 
-Şu an durduğu yer: **Activity'nin `onCreate`'i çalışıyor** ve pencere/erişilebilirlik
-katmanında bekliyor.
-
-Ölçülen ilerleme (test APK'sı `SimAppDialog`, çünkü `HTMLViewer` bir `WebView`
-istiyor ve WebView sağlayıcısı yok):
+Şu an durduğu yer: **Activity başarıyla başlatılıyor.**
 
 ```
 apphost: calling handleLaunchActivity for com.android.simappdialog.InstallCarrierAppActivity
-[pengudroid:log] ERROR HidlServiceManagement: getService: defaultServiceManager() is null
-[pengudroid:log] DEBUG CompatibilityChangeReporter: Compat change id reported: 171228096 ...
-(süreç canlı kalıyor; ana thread binder okuma döngüsünde bekliyor)
+apphost: handleLaunchActivity returned an Activity
 ```
 
-Buraya gelmek için **display** de taklit edildi: `ContextImpl.getDisplayNoVerify()`
-→ `ResourcesManager.getAdjustedDisplay` → `DisplayManagerGlobal.getCompatibleDisplay`
-→ `IDisplayManager.getDisplayInfo` (transaction **kodu 1**). Boş yanıtta
-`getDisplayInfo` null dönüyor ve `Activity.setContentView` `Display.getDisplayId()`
-üzerinde NPE veriyordu. Broker artık framework'ün kendi `DisplayInfo.writeToParcel`'ı
+Buradaki kilit hata **oneway transaction**'lardı: libbinder `TF_ONE_WAY`
+çağrılarda bile `waitForResponse(nullptr, nullptr)` ile
+**`BR_TRANSACTION_COMPLETE`** bekliyor (ama `BR_REPLY` beklemiyor). Broker
+oneway'e hiçbir şey üretmediği için çağıran `talkWithDriver` içinde sonsuz
+okuma döngüsüne giriyordu (ana thread `hrtimer_nanosleep`'te, %1.7 CPU).
+Düzeltme: oneway için yalnızca `BR_TRANSACTION_COMPLETE` üretiliyor.
+
+Buraya gelmek için ayrıca **display** taklit edildi:
+`ContextImpl.getDisplayNoVerify()` → `ResourcesManager.getAdjustedDisplay` →
+`DisplayManagerGlobal.getCompatibleDisplay` → `IDisplayManager.getDisplayInfo`
+(transaction **kodu 1**). Broker, framework'ün kendi `DisplayInfo.writeToParcel`'ı
 ile üretilmiş bir `DisplayInfo` döndürüyor (1280×720, `STATE_ON`, `TYPE_INTERNAL`,
 `ROTATION_0`). Not: bu sürümde `DisplayInfo.densityDpi` alanı **yok**.
 
+Test APK'sı `SimAppDialog` (`HTMLViewer` bir `WebView` istiyor, WebView
+sağlayıcısı yok).
+
 Sırada:
-1. **Ana thread neden binder okuma döngüsünde?** Son transaction'lar
-   `accessibility` (kod 3/20/26/27). Ya bir çağrı yanıt bekliyor ya da bir looper
-   okuması başlatılmış. `/proc/<pid>/task/*/wchan` `hrtimer_nanosleep` gösteriyor
-   (shim'in 20 ms'lik looper uykusu).
+1. **`onResume`**: `handleLaunchActivity` yalnızca `onCreate`'i çalıştırıyor;
+   normalde `TransactionExecutor` ardından `handleResumeActivity` çağırıyor.
 2. **Pencere**: `SurfaceComposerClient`/`SurfaceFlinger` yerine kendi
    EGL/dmabuf sunumumuz; HWUI EGL üzerinden çiziyor. `window` servisine gelen
    kodlar (5, 41, 69) bu yolun başlangıcı.

@@ -1140,6 +1140,45 @@ mod tests {
         assert!(a >= 1);
     }
 
+    /// A one-way transaction must still be acknowledged.
+    ///
+    /// libbinder calls `waitForResponse(nullptr, nullptr)` for `TF_ONE_WAY` and
+    /// finishes on `BR_TRANSACTION_COMPLETE`; emitting nothing leaves it looping
+    /// in `talkWithDriver` forever.
+    #[test]
+    fn one_way_transactions_get_only_a_completion() {
+        let mut write = Vec::new();
+        write.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        let tr = TransactionData {
+            flags: TF_ONE_WAY,
+            ..TransactionData::default()
+        };
+        // SAFETY: `TransactionData` is plain old data.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                &tr as *const TransactionData as *const u8,
+                std::mem::size_of::<TransactionData>(),
+            )
+        };
+        write.extend_from_slice(bytes);
+
+        let mut read = vec![0u8; 256];
+        let mut wr = WriteRead {
+            write_size: write.len() as u64,
+            write_buffer: write.as_ptr() as u64,
+            read_size: read.len() as u64,
+            read_buffer: read.as_mut_ptr() as u64,
+            ..WriteRead::default()
+        };
+        // SAFETY: both buffers outlive the call and are sized as declared.
+        let rc = unsafe { handle_write_read(&mut wr) };
+        assert_eq!(rc, 0);
+        assert_eq!(wr.write_consumed, write.len() as u64);
+        assert_eq!(wr.read_consumed, 4, "only the completion command");
+        let cmd = u32::from_ne_bytes(read[0..4].try_into().unwrap());
+        assert_eq!(cmd, BR_TRANSACTION_COMPLETE);
+    }
+
     #[test]
     fn parses_a_misaligned_transaction() {
         // Binder puts the struct right after a 4-byte command code, so every
