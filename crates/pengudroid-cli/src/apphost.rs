@@ -1189,58 +1189,73 @@ fn force_visible(env: &JniEnv, record: JObject) {
         }
         println!("apphost: Activity.makeVisible() done");
     }
-    // `getWindow().getDecorView().invalidate()` schedules a traversal.
-    let Some(get_window) = env.method_id(activity_class, "getWindow", "()Landroid/view/Window;") else {
+
+    // Reach the real `ViewRootImpl` through
+    // `WindowManagerGlobal.getInstance().mRoots` (both @hide/private; JNI ignores
+    // access modifiers). `View.getViewRootImpl()` is null for this decor view.
+    let Some(wmg_class) = env.find_class("android/view/WindowManagerGlobal") else {
         return;
     };
-    let Some(window) = env.call_object(activity, get_window, &[]) else {
+    let Some(get_instance) = env.static_method_id(
+        wmg_class,
+        "getInstance",
+        "()Landroid/view/WindowManagerGlobal;",
+    ) else {
         return;
     };
-    if window.is_null() {
+    let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else {
+        return;
+    };
+    if wmg.is_null() {
         return;
     }
-    let Some(window_class) = env.find_class("android/view/Window") else {
+    let Some(roots_field) = env.field_id(wmg_class, "mRoots", "Ljava/util/ArrayList;") else {
         return;
     };
-    let Some(get_decor) = env.method_id(window_class, "getDecorView", "()Landroid/view/View;") else {
-        return;
-    };
-    let Some(decor) = env.call_object(window, get_decor, &[]) else {
-        return;
-    };
-    if decor.is_null() {
+    let roots = env.object_field(wmg, roots_field);
+    if roots.is_null() {
         return;
     }
-    let Some(view_class) = env.find_class("android/view/View") else {
+    let Some(list_class) = env.find_class("java/util/ArrayList") else {
         return;
     };
-    if let Some(invalidate) = env.method_id(view_class, "invalidate", "()V") {
-        env.call_void(decor, invalidate, &[]);
-        println!("apphost: decor view invalidated");
-    }
-    // The traversal runs but never reaches `performDraw`, so drive it once more
-    // from here: `View.getViewRootImpl()` is @hide, and JNI ignores access
-    // modifiers, so the private `performTraversals()` can be called directly.
-    if let Some(get_root) = env.method_id(view_class, "getViewRootImpl", "()Landroid/view/ViewRootImpl;") {
-        match env.call_object(decor, get_root, &[]) {
-            Some(root) if !root.is_null() => {
-                if let Some(root_class) = env.find_class("android/view/ViewRootImpl") {
-                    match env.method_id(root_class, "performTraversals", "()V") {
-                        Some(traverse) => {
-                            if env.call_void(root, traverse, &[]) {
-                                println!("apphost: performTraversals() done");
-                            } else {
-                                eprintln!("apphost: performTraversals threw");
-                            }
-                        }
-                        None => eprintln!("apphost: no performTraversals"),
-                    }
-                }
-            }
-            _ => eprintln!("apphost: getViewRootImpl returned null"),
+    let Some(size_m) = env.method_id(list_class, "size", "()I") else {
+        return;
+    };
+    let Some(get_m) = env.method_id(list_class, "get", "(I)Ljava/lang/Object;") else {
+        return;
+    };
+    let count = env.call_int(roots, size_m, &[]).unwrap_or(0);
+    println!("apphost: WindowManagerGlobal.mRoots size = {count}");
+    let Some(root_class) = env.find_class("android/view/ViewRootImpl") else {
+        return;
+    };
+    let Some(schedule) = env.method_id(root_class, "scheduleTraversals", "()V") else {
+        return;
+    };
+    for index in 0..count {
+        let Some(root) = env.call_object(roots, get_m, &[JValue { i: index }]) else {
+            continue;
+        };
+        if root.is_null() {
+            continue;
         }
-    } else {
-        eprintln!("apphost: no View.getViewRootImpl");
+        // `isViewVisible()` is false while `mAppVisible` is false, and
+        // `performTraversals` then skips `performDraw` entirely. On a device the
+        // window manager flips this; here the field is set directly.
+        if let Some(f) = env.field_id(root_class, "mAppVisible", "Z") {
+            env.set_boolean_field(root, f, true);
+        }
+        // `performTraversals` must run inside a Choreographer frame callback:
+        // calling it directly makes `Choreographer.getFrameTimeNanos()` throw
+        // "must only be called as part of a callback while a frame is in
+        // progress". `scheduleTraversals()` posts the framework's own
+        // TraversalRunnable, which is the correct entry point.
+        if env.call_void(root, schedule, &[]) {
+            println!("apphost: scheduleTraversals() done for root {index}");
+        } else {
+            eprintln!("apphost: scheduleTraversals threw for root {index}");
+        }
     }
 }
 

@@ -66,11 +66,22 @@ Sıradaki adım: `mAppVisible`'ı true yapan yolu bulmak (cihazda bunu
 `WindowManagerService`/`setAppVisibility` yapar) veya `ThreadedRenderer.draw`'ı
 doğrudan tetiklemek.
 
-Denenen ve **işe yaramayan**: `View.getViewRootImpl()` ile `ViewRootImpl`'i alıp
-`performTraversals()`'ı çağırmak — `getViewRootImpl()` **null** dönüyor (decor
-view o ViewRootImpl'e bağlı değil). Bir sonraki deneme
-`WindowManagerGlobal.getInstance().mRoots` üzerinden gerçek `ViewRootImpl`'e
-ulaşmak olmalı.
+Denenen ve **işe yarayan kısım**: `WindowManagerGlobal.getInstance().mRoots`
+üzerinden gerçek `ViewRootImpl`'e ulaşılıyor (2 root var), `mAppVisible` alanı
+`true` yapılıyor ve `scheduleTraversals()` çağrılıyor. Bu olmadan
+`isViewVisible()` false kalıyor ve `performTraversals` `performDraw`'a hiç
+gelmiyordu.
+
+**Önemli bulgu:** `performTraversals()`'ı **doğrudan** çağırmak
+`Choreographer.getFrameTimeNanos()` üzerinden
+`IllegalStateException: This method must only be called as part of a callback
+while a frame is in progress` atıyor; doğru giriş noktası `scheduleTraversals()`.
+
+**Kalan durak:** `scheduleTraversals()` her iki root için de dönüyor, vsync
+saati 1424 olay gönderiyor (`dropped=0`), ama `RenderProxy::syncAndDrawFrame`
+hâlâ çağrılmıyor — yani Choreographer'ın vsync'i *tüketmesi* gerekiyor. Sıradaki
+adım: `BitTube`'nun alıcı ucu ile bizim gönderdiğimiz olayların eşleştiğini
+(`stealReceiveChannel` fd'leri) doğrulamak.
 
 ## Önceki oturum: display bilgisi verildi, hwui çizim yoluna girdi
 
