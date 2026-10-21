@@ -321,25 +321,24 @@ unsafe fn hidl_service_manager_reply(
             // `hidl_vec<hidl_string>`: a 16-byte vec struct, a 16-byte element
             // array, and the string bytes — each one a `binder_buffer_object`
             // recorded in the offsets array.
-            let mut vec = Vec::with_capacity(16);
-            vec.extend_from_slice(&0u64.to_ne_bytes()); // mData (unused)
-            vec.extend_from_slice(&1u32.to_ne_bytes()); // mSize
-            vec.extend_from_slice(&0u32.to_ne_bytes()); // padding
-            let vec: &'static [u8] = Box::leak(vec.into_boxed_slice());
-            let vec_idx = push_buffer_object(parcel, objects, 0, vec.as_ptr() as u64, 16, 0, 0);
-
+            // `verifyBufferObject` requires `flags == nullable` (always 1 here)
+            // and an exact `length`, and it checks that the parent's buffer
+            // holds the child's pointer at `parentOffset`.
             let (data_ptr, data_len) = leak_cstr("default");
             let mut arr = Vec::with_capacity(16);
             arr.extend_from_slice(&data_ptr.to_ne_bytes()); // mData
             arr.extend_from_slice(&(data_len - 1).to_ne_bytes()); // mSize
             let arr: &'static [u8] = Box::leak(arr.into_boxed_slice());
-            // `readNullableEmbeddedBuffer(size, 0, parentOffset, 0, &arr)` verifies
-            // `parent == 0` and `parentOffset == <the vec's handle>`.
-            let arr_idx =
-                push_buffer_object(parcel, objects, 0, arr.as_ptr() as u64, 16, 0, vec_idx);
 
-            // `readEmbeddedFromParcel` verifies `parent == 0` and
-            // `parentOffset == <the array's handle>`.
+            let mut vec = Vec::with_capacity(16);
+            vec.extend_from_slice(&(arr.as_ptr() as u64).to_ne_bytes()); // mData
+            vec.extend_from_slice(&1u32.to_ne_bytes()); // mSize
+            vec.extend_from_slice(&0u32.to_ne_bytes()); // padding
+            let vec: &'static [u8] = Box::leak(vec.into_boxed_slice());
+
+            let vec_idx = push_buffer_object(parcel, objects, 1, vec.as_ptr() as u64, 16, 0, 0);
+            let arr_idx =
+                push_buffer_object(parcel, objects, 1, arr.as_ptr() as u64, 16, 0, vec_idx);
             push_buffer_object(parcel, objects, 1, data_ptr, data_len, 0, arr_idx);
             if trace_enabled() {
                 diag(&format!("[binder]   -> hidl listManifestByInterface (code {code}): [default]\n"));
