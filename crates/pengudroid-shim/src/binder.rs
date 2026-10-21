@@ -217,10 +217,13 @@ const ISCC_CREATE_SURFACE: u32 = 1;
 /// `ISurfaceComposer` transaction code for `getPhysicalDisplayIds`.
 ///
 /// hwui's `EglManager::initialize` aborts with "Failed to acquire physical
-/// displays for WCG support!" unless this returns at least one id. The legacy
-/// tag is 34; the AIDL-generated interface uses its own numbering.
+/// displays for WCG support!" unless this returns at least one id. The method
+/// is AIDL-generated (the legacy tag 34 is deprecated). The trace shows a
+/// no-argument transaction on the `SurfaceFlinger` handle at code 54, but
+/// answering it with a `long[]` did not clear the abort, so the code still has
+/// to be pinned down.
 #[allow(dead_code)]
-const ISC_GET_PHYSICAL_DISPLAY_IDS: u32 = 34;
+const ISC_GET_PHYSICAL_DISPLAY_IDS: u32 = 54;
 
 /// `ISurfaceComposer` transaction code for `createDisplayEventConnection`.
 ///
