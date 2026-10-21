@@ -278,10 +278,9 @@ unsafe fn hidl_service_manager_reply(
             // `make_reply` already wrote the status word for this handle.
         }
         // `IServiceManager::getTransport(fqName, name)` returns a `Transport`
-        // enum; without it `getService` cannot decide how to reach the service
-        // and reports it as inaccessible.
+        // enum, which HIDL serialises as a single byte (`readUint8`).
         3 => {
-            parcel.extend_from_slice(&0u32.to_ne_bytes()); // Transport::HWBINDER
+            parcel.push(0); // Transport::HWBINDER
             if trace_enabled() {
                 diag("[binder]   -> hidl getTransport: hwbinder\n");
             }
