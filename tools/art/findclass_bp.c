@@ -141,6 +141,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     fprintf(stderr, "[bp] tracing pid %d for %s+0x%lx\n", pid, argv[2], sym);
+    const pid_t main_pid = pid;
     /* Follow every thread: the interesting work happens on threads the guest
      * spawns (the ART helper binds the app from a second thread), and a crash
      * there is invisible to a single-thread tracer. */
@@ -150,9 +151,11 @@ int main(int argc, char **argv) {
     long orig = 0;
     int armed = 0;
 
-    /* Run syscall-by-syscall until libart.so is mapped, then set the breakpoint. */
+    /* Run syscall-by-syscall until libart.so is mapped, then set the breakpoint.
+     * With `sym == 0` this is a plain crash tracer: no breakpoint, no syscall
+     * stepping, so the guest runs at close to full speed. */
     while (1) {
-        if (!armed && map_base(pid, &bp) == 0) {
+        if (sym != 0 && !armed && map_base(pid, &bp) == 0) {
             bp += sym;
             errno = 0;
             orig = ptrace(PTRACE_PEEKTEXT, pid, (void *)bp, NULL);
@@ -170,7 +173,12 @@ int main(int argc, char **argv) {
             if (WIFSIGNALED(status)) {
                 fprintf(stderr, "[bp] pid %d died from signal %d\n", pid, WTERMSIG(status));
             }
-            break;
+            /* Other threads exit all the time; only the main process ending
+             * means the run is over. */
+            if (pid == main_pid) break;
+            pid = waitpid(-1, &status, __WALL);
+            if (pid < 0) break;
+            continue;
         }
 
         int sig = WSTOPSIG(status);
@@ -227,7 +235,11 @@ int main(int argc, char **argv) {
                 }
             }
             if (!armed) {
-                ptrace(PTRACE_SYSCALL, pid, NULL, deliver ? (void *)(long)deliver : NULL);
+                if (sym == 0) {
+                    ptrace(PTRACE_CONT, pid, NULL, deliver ? (void *)(long)deliver : NULL);
+                } else {
+                    ptrace(PTRACE_SYSCALL, pid, NULL, deliver ? (void *)(long)deliver : NULL);
+                }
             } else {
                 ptrace(PTRACE_CONT, pid, NULL, deliver ? (void *)(long)deliver : NULL);
             }

@@ -144,17 +144,20 @@ Sırada:
    ```
    [window] code=4                      addToDisplayAsUser
    [SurfaceFlinger] code=2, code=4      createConnection / createDisplayEventConnection
-   WARN DisplayEventDispatcher: Failed to initialize display event receiver, status=-19
-   (SIGSEGV)
+   java.lang.RuntimeException: Failed to initialize display event receiver.  status=-19
    ```
-   `DisplayEventReceiver`'ın native tarafı SurfaceFlinger bağlantısı olmadan
-   çöküyor. Denenen ve **yetmeyen**: `createConnection`/
-   `createDisplayEventConnection` çağrılarına handle döndürmek (parcel şekli
-   yanlış çıktı: "Attempt to read object from Parcel at offset 0 that is not in
-   the object list"). Doğru yol, `ISurfaceComposer` + `ISurfaceComposerClient` +
-   `IGraphicBufferProducer`'ın **kendi EGL/dmabuf sunumumuza** bağlanan bir
-   uygulamasını yazmak — yani SurfaceFlinger'ı taklit etmek değil, onun yerine
-   geçmek. Bu, projenin asıl iddiasının kalbi ve ayrı bir iş kalemi.
+   `Choreographer` → `DisplayEventReceiver.nativeInit` → `SurfaceFlinger`
+   `createDisplayEventConnection` boş yanıt alıyor, `DisplayEventDispatcher`
+   `ENODEV` dönüyor ve `DisplayEventReceiver` kurucusu istisna atıyor.
+   Gereken: `ISurfaceComposer.createDisplayEventConnection` → bir
+   `DisplayEventConnection` handle'ı, sonra `stealReceiveChannel` → parcel içinde
+   `BINDER_TYPE_FD` olarak bir BitTube fd'i. Ardından
+   `ISurfaceComposerClient.createSurface` + `IGraphicBufferProducer`
+   (`connect`/`dequeueBuffer`/`queueBuffer`/`requestBuffer`/`setBufferCount`/
+   `query`) ve bu buffer'ları **kendi EGL/dmabuf sunumumuza** bağlamak.
+   Denenen ve **yetmeyen**: `createConnection`/`createDisplayEventConnection`
+   çağrılarına düz handle döndürmek (parcel şekli yanlış: "Attempt to read
+   object from Parcel at offset 0 that is not in the object list").
 2. `IApplicationThread.scheduleLaunchActivity` (ActivityClientRecord parcel'ı)
    — şu an JNI ile doğrudan çağırıyoruz.
 3. `IPackageManager`'in geri kalanı (`getPackagesForUid`, `checkPermission`, ...)

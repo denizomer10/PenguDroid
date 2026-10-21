@@ -2697,6 +2697,56 @@ pub unsafe extern "C" fn __cxa_demangle(
 // `AndroidRuntime` entry points
 // ---------------------------------------------------------------------------
 
+/// `AndroidRuntime::getJavaVM()`
+///
+/// The real implementation returns `gCurRuntime->mJavaVM`, and `gCurRuntime` is
+/// installed by `app_process`, which PenguDroid deliberately does not run. Ask
+/// the VM itself instead of dereferencing null.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android14AndroidRuntime9getJavaVMEv() -> *mut c_void {
+    created_java_vm()
+}
+
+/// `AndroidRuntime::getJNIEnv()`
+///
+/// Same story: the real one goes through `getJavaVM()`. Several framework
+/// natives call it from destructors (e.g. `NativeDisplayEventReceiver`), where
+/// there is no `JNIEnv` argument to fall back on.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android14AndroidRuntime9getJNIEnvEv() -> *mut c_void {
+    let vm = created_java_vm();
+    if vm.is_null() {
+        return std::ptr::null_mut();
+    }
+    // `JavaVM` is a pointer to a table: 0-2 reserved, 3 DestroyJavaVM,
+    // 4 AttachCurrentThread, 5 DetachCurrentThread, 6 GetEnv.
+    let table = *(vm as *const *const *mut c_void);
+    if table.is_null() {
+        return std::ptr::null_mut();
+    }
+    let get_env: unsafe extern "C" fn(*mut c_void, *mut *mut c_void, i32) -> i32 =
+        std::mem::transmute(*table.add(6));
+    let mut env: *mut c_void = std::ptr::null_mut();
+    if get_env(vm, &mut env, 0x0001_0004) != 0 {
+        return std::ptr::null_mut();
+    }
+    env
+}
+
+/// The process's `JavaVM`, via the JNI invocation API.
+unsafe fn created_java_vm() -> *mut c_void {
+    type GetCreatedJavaVMs = unsafe extern "C" fn(*mut *mut c_void, i32, *mut i32) -> i32;
+    let Some(get_vms) = dlsym_next::<GetCreatedJavaVMs>(b"JNI_GetCreatedJavaVMs\0") else {
+        return std::ptr::null_mut();
+    };
+    let mut vm: *mut c_void = std::ptr::null_mut();
+    let mut count: i32 = 0;
+    if get_vms(&mut vm, 1, &mut count) != 0 || count == 0 {
+        return std::ptr::null_mut();
+    }
+    vm
+}
+
 /// `AndroidRuntime::setArgv0(proc_name, set_proc_name)`
 ///
 /// On a device, `app_process` constructs an `AndroidRuntime` and publishes it
