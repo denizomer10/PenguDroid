@@ -52,6 +52,7 @@ use libc::{c_char, c_int, c_void};
 
 mod android_native;
 mod binder;
+mod netdb;
 mod pathshim;
 mod rootfs;
 mod vlog;
@@ -593,17 +594,18 @@ pub unsafe extern "C" fn android_create_namespace(
 /// Bionic's per-network DNS entry points.
 ///
 /// The host has one network namespace, so the `netid`/`mark` arguments are
-/// ignored and the calls go straight to glibc's resolver.
+/// ignored. The result list is converted into Bionic's `struct addrinfo`
+/// layout — see [`netdb`] for why that matters.
 #[no_mangle]
 pub unsafe extern "C" fn android_getaddrinfofornet(
     hostname: *const c_char,
     servname: *const c_char,
-    hints: *const libc::addrinfo,
+    hints: *const netdb::BionicAddrinfo,
     _netid: u32,
     _mark: u32,
-    res: *mut *mut libc::addrinfo,
+    res: *mut *mut netdb::BionicAddrinfo,
 ) -> c_int {
-    libc::getaddrinfo(hostname, servname, hints, res)
+    netdb::resolve(hostname, servname, hints, res)
 }
 
 /// `android_getaddrinfofornetwork(hostname, servname, hints, network, res)`.
@@ -611,11 +613,11 @@ pub unsafe extern "C" fn android_getaddrinfofornet(
 pub unsafe extern "C" fn android_getaddrinfofornetwork(
     hostname: *const c_char,
     servname: *const c_char,
-    hints: *const libc::addrinfo,
+    hints: *const netdb::BionicAddrinfo,
     _network: *mut c_void,
-    res: *mut *mut libc::addrinfo,
+    res: *mut *mut netdb::BionicAddrinfo,
 ) -> c_int {
-    libc::getaddrinfo(hostname, servname, hints, res)
+    netdb::resolve(hostname, servname, hints, res)
 }
 
 /// `android_getaddrinfo(hostname, servname, hints, res)`.
@@ -623,16 +625,45 @@ pub unsafe extern "C" fn android_getaddrinfofornetwork(
 pub unsafe extern "C" fn android_getaddrinfo(
     hostname: *const c_char,
     servname: *const c_char,
-    hints: *const libc::addrinfo,
-    res: *mut *mut libc::addrinfo,
+    hints: *const netdb::BionicAddrinfo,
+    res: *mut *mut netdb::BionicAddrinfo,
 ) -> c_int {
-    libc::getaddrinfo(hostname, servname, hints, res)
+    netdb::resolve(hostname, servname, hints, res)
 }
 
 /// `android_freeaddrinfo(res)`.
 #[no_mangle]
-pub unsafe extern "C" fn android_freeaddrinfo(res: *mut libc::addrinfo) {
-    libc::freeaddrinfo(res)
+pub unsafe extern "C" fn android_freeaddrinfo(res: *mut netdb::BionicAddrinfo) {
+    netdb::free_bionic_addrinfo(res)
+}
+
+/// `getaddrinfo` — Bionic's ABI, not glibc's.
+///
+/// Android code compiled against Bionic headers reads `ai_addr` at offset
+/// `0x20`; glibc's own `getaddrinfo` writes it at `0x18`. Every guest `.so`
+/// that resolves names therefore has to see the Bionic layout, so the shim
+/// interposes the symbol and converts. Host code that needs the glibc layout
+/// must call `libc::getaddrinfo` through `dlsym(RTLD_NEXT, ...)`.
+#[no_mangle]
+pub unsafe extern "C" fn getaddrinfo(
+    hostname: *const c_char,
+    servname: *const c_char,
+    hints: *const netdb::BionicAddrinfo,
+    res: *mut *mut netdb::BionicAddrinfo,
+) -> c_int {
+    netdb::resolve(hostname, servname, hints, res)
+}
+
+/// `freeaddrinfo` — releases a list built by the shim's `getaddrinfo`.
+#[no_mangle]
+pub unsafe extern "C" fn freeaddrinfo(res: *mut netdb::BionicAddrinfo) {
+    netdb::free_bionic_addrinfo(res)
+}
+
+/// `gai_strerror` — Bionic's wording and numbering.
+#[no_mangle]
+pub unsafe extern "C" fn gai_strerror(code: c_int) -> *const c_char {
+    netdb::gai_strerror_text(code).as_ptr()
 }
 
 /// `__b64_ntop(src, srclen, target, targsize)` — Bionic's base64 encoder.
@@ -987,8 +1018,53 @@ pub unsafe extern "C" fn __loader_dl_iterate_phdr(
 // ---------------------------------------------------------------------------
 
 /// Process-local property store, keyed by name. Seeded on first use by
-/// [`default_props`].
-static PROPS: LazyLock<Mutex<BTreeMap<String, String>>> = LazyLock::new(|| Mutex::new(default_props()));
+/// [`seeded_props`].
+static PROPS: LazyLock<Mutex<BTreeMap<String, String>>> = LazyLock::new(|| Mutex::new(seeded_props()));
+
+/// The property store's initial contents: [`default_props`] overlaid with what
+/// the sysroot's own `build.prop` says.
+///
+/// The API level has to describe the **framework that is actually loaded**, not
+/// the one we would like to have. Advertising API 36 while running an Android 13
+/// `framework.jar` makes apps take their API-34+ code paths and die on
+/// `NoSuchMethodError` (Roblox calls `JobScheduler.forNamespace`, added in 34).
+/// Reading `ro.build.version.*` out of the sysroot keeps the two in step, so
+/// upgrading the sysroot upgrades the reported level with no code change.
+fn seeded_props() -> BTreeMap<String, String> {
+    let mut props = default_props();
+    let Some(root) = std::env::var_os("PENGUDROID_ROOT") else {
+        return props;
+    };
+    let path = std::path::Path::new(&root).join("system/build.prop");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return props;
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        // Only the version identity is taken from the sysroot; everything else
+        // (product name, ABI list, ...) stays PenguDroid's own.
+        if matches!(
+            key,
+            "ro.build.version.sdk"
+                | "ro.build.version.release"
+                | "ro.build.version.release_or_codename"
+                | "ro.build.version.release_or_preview_display"
+                | "ro.build.version.codename"
+                | "ro.build.version.incremental"
+                | "ro.build.version.security_patch"
+                | "ro.build.version.preview_sdk"
+        ) {
+            props.insert(key.to_string(), value.trim().to_string());
+        }
+    }
+    props
+}
 
 /// Mutation counter for the property store, mirroring Bionic's per-area serial.
 ///
@@ -1396,19 +1472,15 @@ pub unsafe extern "C" fn __system_property_foreach(
 /// overflow and aborts.
 #[no_mangle]
 pub unsafe extern "C" fn __strlen_chk(s: *const c_char, slen: usize) -> usize {
-    // A null pointer can never satisfy a bounded length query.
+    // Bionic: `ret = strlen(s); if (ret >= s_len) fatal; return ret;`
     if s.is_null() {
         libc::abort();
     }
-    let bytes = s as *const u8;
-    let mut i = 0usize;
-    while i <= slen {
-        if *bytes.add(i) == 0 {
-            return i;
-        }
-        i += 1;
+    let ret = libc::strlen(s);
+    if ret >= slen {
+        libc::abort();
     }
-    libc::abort();
+    ret
 }
 
 /// `__strchr_chk(s, c, slen)` — bounded `strchr`.
@@ -1418,13 +1490,18 @@ pub unsafe extern "C" fn __strlen_chk(s: *const c_char, slen: usize) -> usize {
 /// address is returned, otherwise `NULL`.
 #[no_mangle]
 pub unsafe extern "C" fn __strchr_chk(s: *const c_char, c: c_int, slen: usize) -> *mut c_char {
+    // Bionic walks at most `s_len` bytes and fails on the byte *after* the
+    // last one it may read, so a NUL at exactly `s_len - 1` is still fine.
     if s.is_null() {
         libc::abort();
     }
     let bytes = s as *const u8;
     let needle = c as u8;
     let mut i = 0usize;
-    while i <= slen {
+    loop {
+        if i == slen {
+            libc::abort();
+        }
         let b = *bytes.add(i);
         // Ordering matters: when `c == 0` this returns the NUL's address.
         if b == needle {
@@ -1435,7 +1512,6 @@ pub unsafe extern "C" fn __strchr_chk(s: *const c_char, c: c_int, slen: usize) -
         }
         i += 1;
     }
-    libc::abort();
 }
 
 /// `__strrchr_chk(s, c, slen)` — bounded `strrchr`.
@@ -1451,7 +1527,10 @@ pub unsafe extern "C" fn __strrchr_chk(s: *const c_char, c: c_int, slen: usize) 
     let needle = c as u8;
     let mut found: *mut c_char = std::ptr::null_mut();
     let mut i = 0usize;
-    while i <= slen {
+    loop {
+        if i == slen {
+            libc::abort();
+        }
         let b = *bytes.add(i);
         if b == needle {
             found = bytes.add(i) as *mut c_char;
@@ -1461,7 +1540,6 @@ pub unsafe extern "C" fn __strrchr_chk(s: *const c_char, c: c_int, slen: usize) 
         }
         i += 1;
     }
-    libc::abort();
 }
 
 /// `__memchr_chk(s, c, n, slen)` — bounded `memchr`.
@@ -1505,10 +1583,36 @@ pub unsafe extern "C" fn __strncpy_chk2(
     dst_len: usize,
     src_len: usize,
 ) -> *mut c_char {
-    if n > dst_len || n > src_len {
+    // Bionic does *not* reject `n > src_len`: `strncpy` stops at the source's
+    // NUL, so copying a 1-byte string into a 4 KiB buffer is legal. It only
+    // fails when the copy would actually read past the end of `src`, which is
+    // why the check has to happen inside the loop. Rejecting `n > src_len`
+    // outright (glibc's rule) aborts libroblox, which does exactly that.
+    if n > dst_len {
         libc::abort();
     }
-    libc::strncpy(dst, src, n)
+    if n != 0 {
+        let mut i = 0usize;
+        loop {
+            if i >= src_len {
+                libc::abort();
+            }
+            let c = *src.add(i);
+            *dst.add(i) = c;
+            i += 1;
+            if c == 0 {
+                while i < n {
+                    *dst.add(i) = 0;
+                    i += 1;
+                }
+                break;
+            }
+            if i == n {
+                break;
+            }
+        }
+    }
+    dst
 }
 
 /// `stpncpy` is not exposed by the `libc` crate; implement it directly.
@@ -1579,10 +1683,33 @@ pub unsafe extern "C" fn __stpncpy_chk2(
     dst_len: usize,
     src_len: usize,
 ) -> *mut c_char {
-    if n > dst_len || n > src_len {
+    // Same read-past-the-end rule as `__strncpy_chk2`; Bionic returns `dst`
+    // here rather than `stpncpy`'s end pointer.
+    if n > dst_len {
         libc::abort();
     }
-    stpncpy_impl(dst, src, n)
+    if n != 0 {
+        let mut i = 0usize;
+        loop {
+            if i >= src_len {
+                libc::abort();
+            }
+            let c = *src.add(i);
+            *dst.add(i) = c;
+            i += 1;
+            if c == 0 {
+                while i < n {
+                    *dst.add(i) = 0;
+                    i += 1;
+                }
+                break;
+            }
+            if i == n {
+                break;
+            }
+        }
+    }
+    dst
 }
 
 #[no_mangle]
@@ -1592,11 +1719,31 @@ pub unsafe extern "C" fn __strncat_chk(
     n: usize,
     dst_len: usize,
 ) -> *mut c_char {
-    let cur = libc::strlen(dst);
-    if cur.saturating_add(n) >= dst_len {
-        libc::abort();
+    // Bionic copies at most `n` bytes and stops at the source's NUL; it only
+    // fails when the destination actually runs out of room.
+    if n == 0 {
+        return dst;
     }
-    libc::strncat(dst, src, n)
+    let cur = __strlen_chk(dst, dst_len);
+    let mut d = dst.add(cur);
+    let mut room = dst_len - cur;
+    let mut s = src;
+    let mut left = n;
+    while *s != 0 {
+        *d = *s;
+        d = d.add(1);
+        s = s.add(1);
+        left -= 1;
+        room -= 1;
+        if room == 0 {
+            libc::abort();
+        }
+        if left == 0 {
+            break;
+        }
+    }
+    *d = 0;
+    dst
 }
 
 #[no_mangle]
@@ -5001,10 +5148,11 @@ mod tests {
         let s = CString::new("hello").unwrap();
         // Plenty of headroom: the length is reported directly.
         assert_eq!(unsafe { __strlen_chk(s.as_ptr(), 16) }, 5);
-        // `slen` exactly equal to the length still finds the NUL.
-        assert_eq!(unsafe { __strlen_chk(s.as_ptr(), 5) }, 5);
+        // Bionic fails when `strlen(s) >= s_len`, so the bound has to be at
+        // least one more than the length (the NUL has to fit).
+        assert_eq!(unsafe { __strlen_chk(s.as_ptr(), 6) }, 5);
 
-        // NOTE: the abort path (no NUL within `slen`) is intentionally not
+        // NOTE: the abort path (`slen` <= the length) is intentionally not
         // exercised here — `libc::abort()` would tear down the test runner.
     }
 

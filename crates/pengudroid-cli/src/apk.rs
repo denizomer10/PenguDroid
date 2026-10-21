@@ -19,6 +19,8 @@ pub struct Component {
     pub exported: bool,
     /// True if this component handles the MAIN/LAUNCHER intent.
     pub is_launcher: bool,
+    /// `android:theme` as a resource id, when the manifest names one.
+    pub theme: Option<u32>,
 }
 
 /// Everything PenguDroid extracts from a manifest.
@@ -33,6 +35,8 @@ pub struct ApkInfo {
     pub label: Option<String>,
     /// `android:name` of `<application>` (custom Application subclass).
     pub application_class: Option<String>,
+    /// `android:theme` of `<application>` as a resource id.
+    pub application_theme: Option<u32>,
     pub activities: Vec<Component>,
     pub services: Vec<Component>,
     pub receivers: Vec<Component>,
@@ -272,6 +276,8 @@ const RES_XML_END_ELEMENT_TYPE: u16 = 0x0103;
 
 // Attribute value typed kinds.
 const TYPE_STRING: u8 = 0x03;
+/// `Res_value::TYPE_REFERENCE` — the value is a resource id.
+const TYPE_REFERENCE: u8 = 0x01;
 const TYPE_INT_DEC: u8 = 0x10;
 const TYPE_INT_HEX: u8 = 0x11;
 const TYPE_INT_BOOLEAN: u8 = 0x12;
@@ -381,6 +387,19 @@ fn attr_int(pool: &[String], attrs: &[Attr], want: &str) -> Option<u32> {
         None => return None,
     };
     parse_sdk_number(&as_str)
+}
+
+/// Read an attribute's value as a resource reference (typed `0x01`).
+///
+/// `android:theme` is always a reference to a style in the APK's resources, so
+/// the raw `typed_data` is the resource id the framework expects.
+fn attr_ref(attrs: &[Attr], want: &str) -> Option<u32> {
+    let a = attrs.iter().find(|a| a.name == want)?;
+    if a.typed_type == TYPE_REFERENCE {
+        Some(a.typed_data)
+    } else {
+        None
+    }
 }
 
 /// Read an attribute's value as a boolean (typed `0x12`, or any non-zero int).
@@ -511,6 +530,7 @@ pub fn parse_axml(data: &[u8]) -> Result<ApkInfo, String> {
                         // A label that is a resource reference is not resolvable
                         // here, so only inline strings are kept.
                         info.label = attr_str(&pool, &attrs, "label");
+                        info.application_theme = attr_ref(&attrs, "theme");
                         if let Some(n) = attr_str(&pool, &attrs, "name") {
                             info.application_class = Some(info.resolve(&n));
                         }
@@ -530,6 +550,7 @@ pub fn parse_axml(data: &[u8]) -> Result<ApkInfo, String> {
                             name: resolved.clone(),
                             exported: explicit.unwrap_or(false),
                             is_launcher: false,
+                            theme: attr_ref(&attrs, "theme"),
                         };
                         let idx = match kind {
                             CompKind::Activity => {

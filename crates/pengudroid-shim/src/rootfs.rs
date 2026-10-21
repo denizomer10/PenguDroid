@@ -127,10 +127,27 @@ unsafe fn with_path<R>(path: *const c_char, f: impl FnOnce(*const c_char) -> R) 
         return f(path);
     }
     let bytes = CStr::from_ptr(path).to_bytes();
-    match map_bytes(bytes).and_then(|m| CString::new(m).ok()) {
+    let mapped = map_bytes(bytes).and_then(|m| CString::new(m).ok());
+    if trace_enabled() {
+        match &mapped {
+            Some(m) => eprintln!(
+                "[rootfs] {} -> {}",
+                String::from_utf8_lossy(bytes),
+                String::from_utf8_lossy(m.as_bytes())
+            ),
+            None => eprintln!("[rootfs] {} (host path)", String::from_utf8_lossy(bytes)),
+        }
+    }
+    match mapped {
         Some(mapped) => f(mapped.as_ptr()),
         None => f(path),
     }
+}
+
+/// Whether `PENGUDROID_TRACE_ROOTFS` asks for a log of every path rewrite.
+fn trace_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PENGUDROID_TRACE_ROOTFS").is_some())
 }
 
 /// `RTLD_NEXT` — search after this object.

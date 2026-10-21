@@ -33,8 +33,10 @@ static int map_base(pid_t pid, unsigned long *base) {
     char line[512];
     int found = 0;
     int have_exec = 0;
+    const char *want = getenv("BP_LIB");
+    if (!want || !*want) want = "libart.so";
     while (fgets(line, sizeof(line), f)) {
-        if (!strstr(line, "libart.so")) continue;
+        if (!strstr(line, want)) continue;
         unsigned long start, end, off;
         char perms[8];
         if (sscanf(line, "%lx-%lx %7s %lx", &start, &end, perms, &off) != 4) continue;
@@ -163,7 +165,8 @@ int main(int argc, char **argv) {
                 long patched = (orig & ~0xffL) | 0xcc;
                 if (ptrace(PTRACE_POKETEXT, pid, (void *)bp, (void *)patched) == 0) {
                     armed = 1;
-                    fprintf(stderr, "[bp] libart base+0x%lx armed (word=%#lx)\n",
+                    fprintf(stderr, "[bp] %s base+0x%lx armed (word=%#lx)\n",
+                            getenv("BP_LIB") ? getenv("BP_LIB") : "libart.so",
                             sym, (unsigned long)orig);
                 }
             }
@@ -202,8 +205,48 @@ int main(int argc, char **argv) {
             else if (which && strcmp(which, "r14") == 0) arg = regs.r14;
             else if (which && strcmp(which, "r15") == 0) arg = regs.r15;
             else if (which && strcmp(which, "rbx") == 0) arg = regs.rbx;
+            else if (which && strcmp(which, "r8") == 0) arg = regs.r8;
+            else if (which && strcmp(which, "r9") == 0) arg = regs.r9;
             read_child(pid, arg, desc, sizeof(desc));
             fprintf(stderr, "[findclass] %s\n", desc);
+            if (getenv("BP_CALLER")) {
+                /* The breakpoint fires before the prologue pushes anything, so
+                 * the return address is the word at rsp. */
+                errno = 0;
+                long ra = ptrace(PTRACE_PEEKDATA, pid, (void *)(unsigned long)regs.rsp, NULL);
+                fprintf(stderr, "[bp] hit tid %d rip=%#llx rdi=%#llx rsi=%#llx rdx=%#llx rcx=%#llx r8=%#llx r9=%#llx ra=%#lx\n",
+                        pid, (unsigned long long)regs.rip, (unsigned long long)regs.rdi,
+                        (unsigned long long)regs.rsi, (unsigned long long)regs.rdx,
+                        (unsigned long long)regs.rcx, (unsigned long long)regs.r8,
+                        (unsigned long long)regs.r9, (unsigned long)ra);
+                if (!errno) print_mapping(pid, (unsigned long)ra);
+                const char *dump = getenv("BP_DUMP");
+                if (dump && *dump) {
+                    /* BP_DUMP=<reg>:<bytes> — hex-dump memory at a register. */
+                    char reg[16] = {0};
+                    unsigned long n = 0;
+                    if (sscanf(dump, "%15[^:]:%lu", reg, &n) == 2) {
+                        unsigned long a = 0;
+                        if (!strcmp(reg, "r12")) a = regs.r12;
+                        else if (!strcmp(reg, "rsi")) a = regs.rsi;
+                        else if (!strcmp(reg, "rdi")) a = regs.rdi;
+                        else if (!strcmp(reg, "rbx")) a = regs.rbx;
+                        else if (!strcmp(reg, "r13")) a = regs.r13;
+                        else if (!strcmp(reg, "r14")) a = regs.r14;
+                        else if (!strcmp(reg, "r15")) a = regs.r15;
+                        else if (!strcmp(reg, "rsp")) a = regs.rsp;
+                        else if (!strcmp(reg, "r8")) a = regs.r8;
+                        else if (!strcmp(reg, "r9")) a = regs.r9;
+                        fprintf(stderr, "[bp] dump %s=%#lx\n", reg, a);
+                        for (unsigned long i = 0; i < n; i += 8) {
+                            errno = 0;
+                            long w = ptrace(PTRACE_PEEKDATA, pid, (void *)(a + i), NULL);
+                            if (errno) { fprintf(stderr, "  +%#lx <unmapped>\n", i); break; }
+                            fprintf(stderr, "  +%#03lx %#018lx\n", i, (unsigned long)w);
+                        }
+                    }
+                }
+            }
             /* Restore, rewind, single-step, re-arm. */
             ptrace(PTRACE_POKETEXT, pid, (void *)bp, (void *)orig);
             regs.rip = bp;
@@ -231,6 +274,11 @@ int main(int argc, char **argv) {
                         long w = ptrace(PTRACE_PEEKDATA, pid, (void *)sp, NULL);
                         if (errno) break;
                         fprintf(stderr, "  [rsp+%3d] %#lx\n", i * 8, (unsigned long)w);
+                        /* Resolve stack words that point into a mapped module:
+                         * those are the return addresses of the call chain. */
+                        if (getenv("BP_STACKMAP") && (unsigned long)w > 0x10000) {
+                            print_mapping(pid, (unsigned long)w);
+                        }
                     }
                 }
             }

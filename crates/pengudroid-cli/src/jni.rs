@@ -53,6 +53,7 @@ mod slot {
     pub const GET_OBJECT_CLASS: usize = 31;
     pub const GET_METHOD_ID: usize = 33;
     pub const CALL_OBJECT_METHOD_A: usize = 36;
+    pub const CALL_INT_METHOD_A: usize = 51;
     pub const NEW_OBJECT_A: usize = 30;
     pub const GET_FIELD_ID: usize = 94;
     pub const GET_OBJECT_FIELD: usize = 95;
@@ -63,8 +64,13 @@ mod slot {
     pub const GET_ARRAY_LENGTH: usize = 171;
     pub const GET_OBJECT_ARRAY_ELEMENT: usize = 173;
     pub const NEW_LONG_ARRAY: usize = 180;
+    pub const NEW_FLOAT_ARRAY: usize = 181;
+    pub const NEW_BYTE_ARRAY: usize = 176;
+    pub const SET_BYTE_ARRAY_REGION: usize = 208;
+    pub const SET_FLOAT_ARRAY_REGION: usize = 213;
     pub const CALL_VOID_METHOD_A: usize = 63;
     pub const GET_STATIC_METHOD_ID: usize = 113;
+    pub const GET_STATIC_FIELD_ID: usize = 144;
     pub const CALL_STATIC_OBJECT_METHOD_A: usize = 116;
     pub const CALL_STATIC_INT_METHOD_A: usize = 131;
     pub const CALL_STATIC_LONG_METHOD_A: usize = 134;
@@ -131,6 +137,20 @@ impl JniEnv {
             return None;
         }
         Some(m)
+    }
+
+    /// `GetStaticFieldID(clazz, name, sig)`.
+    pub fn static_field_id(&self, class: JClass, name: &str, sig: &str) -> Option<JFieldId> {
+        let cname = std::ffi::CString::new(name).ok()?;
+        let csig = std::ffi::CString::new(sig).ok()?;
+        let f: unsafe extern "C" fn(*mut c_void, JClass, *const i8, *const i8) -> JFieldId =
+            unsafe { self.func(slot::GET_STATIC_FIELD_ID) };
+        let id = unsafe { f(self.0, class, cname.as_ptr(), csig.as_ptr()) };
+        if id.is_null() {
+            self.describe_exception();
+            return None;
+        }
+        Some(id)
     }
 
     /// `GetStaticIntField(clazz, field_id)`.
@@ -235,6 +255,14 @@ impl JniEnv {
         self.exception_check()
     }
 
+    /// `CallIntMethodA(obj, method, args)`.
+    pub fn call_int(&self, obj: JObject, method: JMethodId, args: &[JValue]) -> Option<i32> {
+        let f: unsafe extern "C" fn(*mut c_void, JObject, JMethodId, *const JValue) -> i32 =
+            unsafe { self.func(slot::CALL_INT_METHOD_A) };
+        let v = unsafe { f(self.0, obj, method, args.as_ptr()) };
+        self.exception_check().then_some(v)
+    }
+
     /// `GetArrayLength(array)`.
     pub fn array_length(&self, array: JObject) -> i32 {
         if array.is_null() {
@@ -270,7 +298,44 @@ impl JniEnv {
         unsafe { f(self.0, array, index, value) }
     }
 
-    /// `NewLongArray(length)`.
+    /// `NewByteArray(len)`.
+    pub fn new_byte_array(&self, len: i32) -> Option<JObject> {
+        let f: unsafe extern "C" fn(*mut c_void, i32) -> JObject =
+            unsafe { self.func(slot::NEW_BYTE_ARRAY) };
+        let v = unsafe { f(self.0, len) };
+        self.exception_check().then_some(v)
+    }
+
+    /// `SetByteArrayRegion(array, start, len, buf)`.
+    pub fn set_byte_array_region(&self, array: JObject, start: i32, values: &[u8]) {
+        let f: unsafe extern "C" fn(*mut c_void, JObject, i32, i32, *const i8) =
+            unsafe { self.func(slot::SET_BYTE_ARRAY_REGION) };
+        unsafe {
+            f(
+                self.0,
+                array,
+                start,
+                values.len() as i32,
+                values.as_ptr() as *const i8,
+            )
+        };
+    }
+
+    /// `NewFloatArray(len)`.
+    pub fn new_float_array(&self, len: i32) -> JObject {
+        let f: unsafe extern "C" fn(*mut c_void, i32) -> JObject =
+            unsafe { self.func(slot::NEW_FLOAT_ARRAY) };
+        unsafe { f(self.0, len) }
+    }
+
+    /// `SetFloatArrayRegion(array, start, len, buf)`.
+    pub fn set_float_array_region(&self, array: JObject, start: i32, values: &[f32]) {
+        let f: unsafe extern "C" fn(*mut c_void, JObject, i32, i32, *const f32) =
+            unsafe { self.func(slot::SET_FLOAT_ARRAY_REGION) };
+        unsafe { f(self.0, array, start, values.len() as i32, values.as_ptr()) };
+    }
+
+    /// `NewLongArray(len)`.
     pub fn new_long_array(&self, len: i32) -> Option<JObject> {
         let f: unsafe extern "C" fn(*mut c_void, i32) -> JObject =
             unsafe { self.func(slot::NEW_LONG_ARRAY) };

@@ -137,6 +137,13 @@ const IPM_GET_PACKAGE_INFO: u32 = 3;
 /// `(String packageName, int flags, int userId)`.
 const IPM_GET_APPLICATION_INFO: u32 = 9;
 
+/// `IPackageManager` transaction code for `getActivityInfo`.
+///
+/// `AppCompatDelegate` resolves the activity through the package manager while
+/// it is being created; a `NameNotFoundException` there makes it fall back to
+/// the platform theme, which is not an AppCompat theme.
+const IPM_GET_ACTIVITY_INFO: u32 = 11;
+
 /// `IActivityTaskManager` transaction code for `getActivityClientController`.
 ///
 /// `ActivityClient.getDisplayId` calls it through a `Singleton`; with no system
@@ -159,6 +166,92 @@ const IUM_IS_USER_UNLOCKED: u32 = 79;
 /// `ContextImpl.getSharedPreferences` refuses credential-encrypted storage
 /// until this reports true, which is what NewPipe hits on `onCreate`.
 const IUM_IS_USER_UNLOCKING_OR_UNLOCKED: u32 = 71;
+
+/// `IContentProvider` transaction codes, read out of this framework.jar with
+/// `--dump-class android.content.IContentProvider`.
+///
+/// They are *not* the AOSP source order (the AIDL is generated), so they are
+/// listed explicitly rather than derived from a method list.
+const ICP_QUERY: u32 = 1;
+const ICP_GET_TYPE: u32 = 2;
+const ICP_INSERT: u32 = 3;
+const ICP_DELETE: u32 = 4;
+const ICP_UPDATE: u32 = 10;
+const ICP_BULK_INSERT: u32 = 13;
+const ICP_OPEN_FILE: u32 = 14;
+const ICP_OPEN_ASSET_FILE: u32 = 15;
+const ICP_APPLY_BATCH: u32 = 20;
+const ICP_CALL: u32 = 21;
+const ICP_GET_STREAM_TYPES: u32 = 22;
+const ICP_OPEN_TYPED_ASSET_FILE: u32 = 23;
+const ICP_CREATE_CANCELATION_SIGNAL: u32 = 24;
+const ICP_CANONICALIZE: u32 = 25;
+const ICP_UNCANONICALIZE: u32 = 26;
+const ICP_REFRESH: u32 = 27;
+const ICP_CHECK_URI_PERMISSION: u32 = 28;
+
+/// `IBulkCursor` transaction codes (`BulkCursorNative`).
+const IBC_GET_CURSOR_WINDOW: u32 = 1;
+const IBC_CLOSE: u32 = 4;
+
+/// `ISurfaceComposer` transaction code for `createDisplayEventConnection`.
+///
+/// `ISurfaceComposer` is a hand-written binder interface (`libs/gui/
+/// ISurfaceComposer.cpp`), not AIDL, so its reply carries **no status word**:
+/// the client's first read is `reply.readStrongBinder()` at offset 0.
+const ISC_CREATE_DISPLAY_EVENT_CONNECTION: u32 = 4;
+
+/// `IDisplayEventConnection` transaction code for `stealReceiveChannel`.
+///
+/// This one *is* AIDL, so the reply starts with a `Status` int32 and then the
+/// `out BitTube`, which `BitTube::readFromParcel` reads as two file descriptors.
+const IDEC_STEAL_RECEIVE_CHANNEL: u32 = 1;
+
+/// The send ends of the vsync channels handed out by `stealReceiveChannel`.
+///
+/// They are kept open for the life of the process: closing the send end would
+/// make the client's `recv` see EOF and tear the `Choreographer` down.
+static VSYNC_SEND_FDS: std::sync::LazyLock<std::sync::Mutex<Vec<RawFd>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// `IWindowManager` transaction code for `openSession`.
+const IWM_OPEN_SESSION: u32 = 4;
+
+/// `IWindowSession` transaction codes, read out of this framework.jar with
+/// `--dump-class android.view.IWindowSession$Stub`.
+const IWS_ADD_TO_DISPLAY_AS_USER: u32 = 2;
+const IWS_REMOVE: u32 = 4;
+const IWS_RELAYOUT: u32 = 5;
+const IWS_PREPARE_TO_REPLACE_WINDOWS: u32 = 7;
+const IWS_SET_INSETS: u32 = 9;
+const IWS_FINISH_DRAWING: u32 = 10;
+const IWS_SET_IN_TOUCH_MODE: u32 = 11;
+const IWS_GET_IN_TOUCH_MODE: u32 = 12;
+const IWS_PERFORM_HAPTIC_FEEDBACK: u32 = 13;
+const IWS_ON_RECTANGLE_ON_SCREEN_REQUESTED: u32 = 27;
+const IWS_GET_WINDOW_ID: u32 = 28;
+const IWS_POKE_DRAW_LOCK: u32 = 29;
+const IWS_UPDATE_POINTER_ICON: u32 = 32;
+const IWS_UPDATE_TAP_EXCLUDE_REGION: u32 = 33;
+const IWS_UPDATE_INPUT_CHANNEL: u32 = 38;
+const IWS_CLEAR_TOUCHABLE_REGION: u32 = 42;
+
+/// The reply to `IWindowSession.addToDisplayAsUser`, built by the host with the
+/// framework's own `Parcel` writer.
+static WINDOW_REPLY: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// `InsetsState.SIZE`, the number of inset types this framework knows about.
+///
+/// `ViewRootImpl` passes `mTempControls`, an `InsetsSourceControl[SIZE]`, as the
+/// `out InsetsSourceControl[]` argument, and the AIDL proxy reads it with
+/// `readTypedArray(T[], Creator)`, which throws "bad array lengths" unless the
+/// count matches exactly.
+static INSETS_SIZE: AtomicU32 = AtomicU32::new(0);
+
+/// The server ends of the input channels handed to the client.
+static INPUT_SERVER_FDS: std::sync::LazyLock<std::sync::Mutex<Vec<RawFd>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
 /// A serialized `ProviderInfo` for the `settings` provider.
 static PROVIDER_INFO: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
@@ -193,12 +286,22 @@ static PACKAGE_INFO: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
 static APPLICATION_INFO: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
+/// A serialized `ActivityInfo`, for `IPackageManager.getActivityInfo`.
+static ACTIVITY_INFO: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
 /// `flat_binder_object.type` for a handle that belongs to another process.
 ///
 /// `B_PACK_CHARS('s', 'h', '*', <low byte>)`; the low byte is the value the
 /// Android UAPI calls `BINDER_TYPE_HANDLE` (`0x85` in this build). The value was
 /// read out of libbinder's own object-type comparisons rather than guessed.
 const BINDER_TYPE_HANDLE: u32 = 0x7368_2A85;
+
+/// `flat_binder_object.type` for a file descriptor.
+///
+/// `B_PACK_CHARS('f', 'd', '*', BINDER_TYPE_FD)`; the low byte is `0x85` in
+/// this build, the same one `BINDER_TYPE_HANDLE` uses.
+const BINDER_TYPE_FD: u32 = 0x6664_2A85;
 
 /// Stability recorded for a `flat_binder_object` the broker hands out.
 ///
@@ -416,10 +519,235 @@ fn push_flat_handle(parcel: &mut Vec<u8>, objects: &mut Vec<u64>, handle: u32) {
     parcel.extend_from_slice(&BINDER_STABILITY_SYSTEM.to_ne_bytes());
 }
 
+/// Append a `flat_binder_object` of type `BINDER_TYPE_FD`.
+///
+/// `Parcel::writeFileDescriptor` writes the descriptor number in the `handle`
+/// slot and, unlike `writeStrongBinder`, no stability word follows: the
+/// stability is only written for binder objects.
+fn push_flat_fd(parcel: &mut Vec<u8>, objects: &mut Vec<u64>, fd: RawFd) {
+    objects.push(parcel.len() as u64);
+    parcel.extend_from_slice(&BINDER_TYPE_FD.to_ne_bytes());
+    parcel.extend_from_slice(&0x7fu32.to_ne_bytes()); // flags
+    parcel.extend_from_slice(&(fd as u32).to_ne_bytes()); // handle = fd
+    parcel.extend_from_slice(&0u32.to_ne_bytes()); // alignment
+    parcel.extend_from_slice(&0u64.to_ne_bytes()); // cookie
+}
+
+/// Build the reply to an `IContentProvider` transaction.
+///
+/// There is no real provider behind the handle, so every method answers with the
+/// "nothing here" value its client expects: a zero-row cursor for `query`, an
+/// empty `Bundle` for `call`, `0` rows for the mutators. The shapes come from
+/// `ContentProviderNative.onTransact` and `ContentProviderProxy` in this
+/// framework.jar, not from guesswork.
+fn provider_reply(code: u32, parcel: &mut Vec<u8>, objects: &mut Vec<u64>) {
+    // Every non-oneway method starts with `writeNoException()`.
+    parcel.extend_from_slice(&0u32.to_ne_bytes());
+    match code {
+        ICP_QUERY => {
+            // `[presence=1][BulkCursorDescriptor]`. The descriptor is
+            //   writeStrongBinder(cursor)
+            //   writeStringArray(columnNames)
+            //   writeInt(wantsAllOnMoveCalls)
+            //   writeInt(count)
+            //   writeInt(window != null) [+ CursorWindow]
+            // `BulkCursorToCursorAdaptor.getCount()` returns the descriptor's
+            // `count` without touching the binder, so a count of 0 makes every
+            // `moveToNext()` return false and the window is never requested.
+            parcel.extend_from_slice(&1u32.to_ne_bytes());
+            push_flat_handle(parcel, objects, handle_for("empty_cursor"));
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // no column names
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // wantsAllOnMoveCalls
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // count
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // no window
+        }
+        ICP_CALL => {
+            let bundle = EMPTY_BUNDLE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if bundle.is_empty() {
+                parcel.extend_from_slice(&(-1i32).to_ne_bytes()); // null Bundle
+            } else {
+                parcel.extend_from_slice(&bundle);
+            }
+        }
+        ICP_GET_TYPE => parcel.extend_from_slice(&(-1i32).to_ne_bytes()), // null String
+        ICP_INSERT | ICP_CANONICALIZE | ICP_UNCANONICALIZE => {
+            // `Uri.writeToParcel(null)` is a presence int.
+            parcel.extend_from_slice(&0u32.to_ne_bytes());
+        }
+        ICP_DELETE | ICP_UPDATE | ICP_BULK_INSERT | ICP_CHECK_URI_PERMISSION => {
+            parcel.extend_from_slice(&0u32.to_ne_bytes());
+        }
+        ICP_OPEN_FILE | ICP_OPEN_ASSET_FILE | ICP_OPEN_TYPED_ASSET_FILE => {
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // no fd
+        }
+        ICP_APPLY_BATCH | ICP_GET_STREAM_TYPES => {
+            parcel.extend_from_slice(&(-1i32).to_ne_bytes()); // null array
+        }
+        ICP_CREATE_CANCELATION_SIGNAL => {
+            push_flat_handle(parcel, objects, handle_for("empty_cursor"));
+        }
+        ICP_REFRESH => parcel.extend_from_slice(&(-1i32).to_ne_bytes()), // false
+        _ => {}
+    }
+    if trace_enabled() {
+        unsafe { diag(&format!("[binder]   -> provider code {code}\n")) };
+    }
+}
+
+/// Build the reply to an `IWindowSession` transaction.
+///
+/// The session is a stub: it accepts the window and reports success, which is
+/// what `ViewRootImpl.setView` needs to continue into its first traversal. The
+/// surface it hands back is not a real one yet, so drawing stops at the
+/// `SurfaceControl` boundary.
+fn window_session_reply(code: u32, parcel: &mut Vec<u8>, objects: &mut Vec<u64>) {
+    match code {
+        IWS_ADD_TO_DISPLAY_AS_USER => {
+            add_to_display_reply(parcel, objects);
+        }
+        IWS_GET_IN_TOUCH_MODE | IWS_PERFORM_HAPTIC_FEEDBACK => {
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // status
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // false / no feedback
+        }
+        IWS_GET_WINDOW_ID => {
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // status
+            push_flat_handle(parcel, objects, handle_for("window_token"));
+        }
+        IWS_REMOVE
+        | IWS_PREPARE_TO_REPLACE_WINDOWS
+        | IWS_SET_INSETS
+        | IWS_FINISH_DRAWING
+        | IWS_SET_IN_TOUCH_MODE
+        | IWS_ON_RECTANGLE_ON_SCREEN_REQUESTED
+        | IWS_POKE_DRAW_LOCK
+        | IWS_UPDATE_POINTER_ICON
+        | IWS_UPDATE_TAP_EXCLUDE_REGION
+        | IWS_UPDATE_INPUT_CHANNEL
+        | IWS_CLEAR_TOUCHABLE_REGION => {
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // status only
+        }
+        _ => {}
+    }
+    if trace_enabled() {
+        unsafe { diag(&format!("[binder]   -> window session code {code}\n")) };
+    }
+}
+
+/// Build the reply to `IWindowSession.addToDisplayAsUser`.
+///
+/// The status word is already in `parcel`. Everything after it mirrors what
+/// `IWindowSession$Stub` writes:
+///
+/// ```text
+/// int result                       ADD_OKAY
+/// InputChannel outInputChannel     presence + [hasPtr][fd][String8 name]
+/// InsetsState insetsState          presence 0 (client keeps its own)
+/// InsetsSourceControl[] controls   count == InsetsState.SIZE, all null
+/// Rect attachedFrame               presence 0 (client keeps its own)
+/// float[] sizeCompatScale          one element, 1.0
+/// ```
+///
+/// The `InputChannel` has to be built here rather than in the host because it
+/// carries a file descriptor, and `Parcel.marshall()` cannot express one.
+fn add_to_display_reply(parcel: &mut Vec<u8>, objects: &mut Vec<u64>) {
+    parcel.extend_from_slice(&0u32.to_ne_bytes()); // result: ADD_OKAY
+
+    match input_channel_pair() {
+        Some((client, server)) => {
+            INPUT_SERVER_FDS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(server);
+            if std::env::var_os("PENGUDROID_NO_INPUT_CHANNEL").is_some() {
+                parcel.extend_from_slice(&0u32.to_ne_bytes()); // absent
+            } else {
+                parcel.extend_from_slice(&1u32.to_ne_bytes()); // present
+                parcel.extend_from_slice(&1u32.to_ne_bytes()); // InputChannel.mPtr != 0
+                // `InputChannel::writeToParcel` writes the connection token, then
+                // the name as UTF-16, then the descriptor — in that order.
+                parcel.extend_from_slice(&[0u8; 24]); // null token binder
+                parcel.extend_from_slice(&string16("pengudroid"));
+                push_flat_fd(parcel, objects, client);
+            }
+        }
+        None => {
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // absent
+        }
+    }
+
+    // The out-parameters are read in the order the AIDL declares them.
+    parcel.extend_from_slice(&0u32.to_ne_bytes()); // InsetsState absent
+
+    let size = INSETS_SIZE.load(Ordering::Relaxed) as usize;
+    parcel.extend_from_slice(&(size as u32).to_ne_bytes());
+    for _ in 0..size {
+        parcel.extend_from_slice(&0u32.to_ne_bytes()); // null element
+    }
+
+    parcel.extend_from_slice(&0u32.to_ne_bytes()); // attachedFrame absent
+
+    parcel.extend_from_slice(&1u32.to_ne_bytes()); // float[1]
+    parcel.extend_from_slice(&1.0f32.to_ne_bytes());
+}
+
+/// `Parcel::writeString8`: a byte count, the bytes, then padding to 4.
+#[allow(dead_code)]
+fn push_string8(parcel: &mut Vec<u8>, s: &str) {
+    parcel.extend_from_slice(&(s.len() as u32).to_ne_bytes());
+    parcel.extend_from_slice(s.as_bytes());
+    while parcel.len() % 4 != 0 {
+        parcel.push(0);
+    }
+}
+
+/// Create the socket pair behind an `InputChannel`.
+fn input_channel_pair() -> Option<(RawFd, RawFd)> {
+    let mut fds = [0 as RawFd; 2];
+    // SAFETY: `fds` is a valid two-element array for `socketpair` to fill.
+    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    Some((fds[0], fds[1]))
+}
+
+/// Create the socket pair behind a `BitTube`.
+///
+/// `BitTube` is an `AF_UNIX` `SOCK_SEQPACKET` pair; the client keeps the receive
+/// end and the broker keeps the send end so it can deliver vsync events later.
+fn vsync_channel() -> Option<(RawFd, RawFd)> {
+    let mut fds = [0 as RawFd; 2];
+    // SAFETY: `fds` is a valid two-element array for `socketpair` to fill.
+    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    VSYNC_SEND_FDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(fds[1]);
+    Some((fds[0], fds[1]))
+}
+
 /// Reverse lookup of a handle, for diagnostics.
 fn name_for_handle(handle: u32) -> Option<String> {
     let map = SERVICE_HANDLES.lock().unwrap_or_else(|e| e.into_inner());
     map.iter().find(|(_, h)| **h == handle).map(|(n, _)| n.clone())
+}
+
+/// Whether a reply starts with an AIDL `Status` word.
+///
+/// Almost every interface here is AIDL, whose generated proxy reads the status
+/// before anything else. `ISurfaceComposer` is the exception: it is a
+/// hand-written binder interface, and the methods that return a binder read it
+/// straight from offset 0. Writing a status word there shifts every object by
+/// four bytes, `Parcel::finishUnflattenBinder` cannot find the object in the
+/// offset table, and `readStrongBinder` returns null.
+fn reply_has_status(handle: u32, code: u32) -> bool {
+    if handle == handle_for("SurfaceFlinger") {
+        // `createConnection` and `createDisplayEventConnection` both end in
+        // `reply.readStrongBinder()` with no preceding status.
+        return !matches!(code, 2 | ISC_CREATE_DISPLAY_EVENT_CONNECTION);
+    }
+    true
 }
 
 /// Build the reply parcel for a transaction.
@@ -438,7 +766,9 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             tr.target_handle, tr.code
         ));
     }
-    parcel.extend_from_slice(&0u32.to_ne_bytes());
+    if reply_has_status(tr.target_handle, tr.code) {
+        parcel.extend_from_slice(&0u32.to_ne_bytes());
+    }
     // Any transaction that carries a local binder object is a client handing us
     // a node it wants called back on. `attachApplication` is the one that
     // matters: its object is the app's `ApplicationThread`.
@@ -499,12 +829,20 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         }
     }
     if tr.target_handle == handle_for("settings_provider") {
-        let bundle = EMPTY_BUNDLE.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if !bundle.is_empty() {
-            parcel.extend_from_slice(&bundle);
-            if trace_enabled() {
-                diag(&format!("[binder]   -> empty Bundle ({} bytes)\n", bundle.len()));
+        provider_reply(tr.code, &mut parcel, &mut objects);
+    }
+    if tr.target_handle == handle_for("empty_cursor") {
+        // `BulkCursorToCursorAdaptor.close()` and `.getWindow()` are the only
+        // calls a zero-row cursor makes.
+        match tr.code {
+            IBC_GET_CURSOR_WINDOW => {
+                parcel.extend_from_slice(&0u32.to_ne_bytes()); // no exception
+                parcel.extend_from_slice(&0u32.to_ne_bytes()); // null window
             }
+            _ => parcel.extend_from_slice(&0u32.to_ne_bytes()),
+        }
+        if trace_enabled() {
+            diag(&format!("[binder]   -> empty cursor code {}\n", tr.code));
         }
     }
     if tr.target_handle == handle_for("user")
@@ -537,6 +875,73 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             parcel.extend_from_slice(&cached);
             if trace_enabled() {
                 diag(&format!("[binder]   -> PackageInfo ({} bytes)\n", cached.len()));
+            }
+        }
+    }
+    if tr.target_handle == handle_for("SurfaceFlinger") && tr.code == ISC_CREATE_DISPLAY_EVENT_CONNECTION {
+        // No status word: the client's first read is `readStrongBinder()`.
+        push_flat_handle(
+            &mut parcel,
+            &mut objects,
+            handle_for("display_event_connection"),
+        );
+        if trace_enabled() {
+            diag("[binder]   -> display_event_connection handle\n");
+        }
+    }
+    if tr.target_handle == handle_for("display_event_connection")
+        && tr.code == IDEC_STEAL_RECEIVE_CHANNEL
+    {
+        // `[present=1][BitTube]` — the status word was already written above.
+        // The presence int is `Parcel::readData(Parcelable*)`, which returns
+        // UNEXPECTED_NULL unless it reads `kNonNullParcelableFlag` (1) before
+        // the parcelable body: the AIDL runtime writes it in `writeParcelable`
+        // and reads it back here, so it is part of the wire format even though
+        // `BitTube` itself only serialises two descriptors.
+        parcel.extend_from_slice(&1u32.to_ne_bytes());
+        match vsync_channel() {
+            Some((recv, send)) => {
+                push_flat_fd(&mut parcel, &mut objects, recv);
+                push_flat_fd(&mut parcel, &mut objects, send);
+                if trace_enabled() {
+                    diag(&format!("[binder]   -> BitTube fds {recv},{send}\n"));
+                }
+            }
+            None => {
+                // `BitTube::readFromParcel` needs both descriptors; a null one
+                // makes it return BAD_TYPE, which is what the client reports
+                // as a failed `nativeInit`.
+                push_flat_fd(&mut parcel, &mut objects, -1);
+                push_flat_fd(&mut parcel, &mut objects, -1);
+            }
+        }
+    }
+    if tr.target_handle == handle_for("display_event_connection") {
+        // `setVsyncRate` / `requestNextVsync` / `getLatestVsyncEventData` are
+        // either oneway or not needed for the first frame; answer with a bare
+        // status so a synchronous caller does not block.
+        if tr.code != IDEC_STEAL_RECEIVE_CHANNEL {
+            parcel.extend_from_slice(&0u32.to_ne_bytes());
+        }
+    }
+    if tr.target_handle == handle_for("window") && tr.code == IWM_OPEN_SESSION {
+        // `IWindowManager.openSession` returns the `IWindowSession` the client
+        // keeps for the life of the window.
+        push_flat_handle(&mut parcel, &mut objects, handle_for("window_session"));
+        if trace_enabled() {
+            diag("[binder]   -> window_session handle\n");
+        }
+    }
+    if tr.target_handle == handle_for("window_session") {
+        window_session_reply(tr.code, &mut parcel, &mut objects);
+    }
+    if tr.target_handle == handle_for("package") && tr.code == IPM_GET_ACTIVITY_INFO {
+        let cached = ACTIVITY_INFO.lock().unwrap_or_else(|e| e.into_inner());
+        if !cached.is_empty() {
+            parcel.extend_from_slice(&1u32.to_ne_bytes());
+            parcel.extend_from_slice(&cached);
+            if trace_enabled() {
+                diag(&format!("[binder]   -> ActivityInfo ({} bytes)\n", cached.len()));
             }
         }
     }
@@ -1012,6 +1417,41 @@ pub unsafe extern "C" fn __pengudroid_binder_set_application_info(ptr: *const u8
     }
     let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
     *APPLICATION_INFO.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
+}
+
+/// `void __pengudroid_binder_set_insets_size(int size)`
+///
+/// # Safety
+/// Plain integer setter; safe to call from any thread.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_insets_size(size: c_int) {
+    INSETS_SIZE.store(size.max(0) as u32, Ordering::Relaxed);
+}
+
+/// `void __pengudroid_binder_set_window_reply(const uint8_t *bytes, size_t len)`
+///
+/// # Safety
+/// `ptr` must point to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_window_reply(ptr: *const u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
+    *WINDOW_REPLY.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
+}
+
+/// `void __pengudroid_binder_set_activity_info(const uint8_t *bytes, size_t len)`
+///
+/// # Safety
+/// `ptr` must point to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_activity_info(ptr: *const u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
+    *ACTIVITY_INFO.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
 }
 
 /// `void __pengudroid_binder_set_provider_info(const uint8_t *bytes, size_t len)`

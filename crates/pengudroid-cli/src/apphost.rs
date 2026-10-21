@@ -35,6 +35,9 @@ pub struct AppSpec<'a> {
     /// instantiate a plain `android.app.Application`, so the app's own
     /// `onCreate` (where Roblox loads its native library) never runs.
     pub app_class: Option<&'a str>,
+    /// `android:theme` resource id for the launched activity, if the manifest
+    /// declares one (the activity's own, else the application's).
+    pub theme: Option<u32>,
     /// Android uid for the app. There is no package manager here, so a fixed
     /// value is used; it only has to be stable and non-zero.
     pub uid: i32,
@@ -440,6 +443,15 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         return false;
     };
     install_package_manager_replies(env, app_info, spec.package);
+    // `RobloxApplication.onCreate` reads `Settings.Global` (through
+    // `Settings.NameValueCache`), which resolves the `settings` provider via
+    // `IActivityManager.getContentProvider` *during* the bind. The reply has to
+    // be in place before `handleBindApplication` runs, not after it.
+    install_provider_replies(env, app_info, spec.package);
+    // `RobloxApplication.onCreate` also asks `DisplayManager` for the default
+    // display's size, which goes through `IDisplayManager.getDisplayInfo`.
+    install_display_replies(env);
+    install_window_replies(env);
     // `handleBindApplication` calls `Typeface.loadPreinstalledSystemFontMap()`
     // itself, and that now works: the shim rewrites `stat64`/`lstat64` too, so
     // `FontListParser` accepts the font files and the map is built from
@@ -545,15 +557,11 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         if let Ok(name) = std::env::var("PENGUDROID_PROBE_APP_CLASS") {
             probe_app_class(env, data, &name);
         }
-        if std::env::var_os("PENGUDROID_DUMP_HOLDER").is_some() {
-            install_provider_replies(env, app_info, spec.package);
-        }
         report_display_metrics(env);
         report_application(env, thread);
         if let Ok(name) = std::env::var("PENGUDROID_LOAD_LIB") {
             probe_load_library(env, &name);
         }
-        install_display_replies(env);
         if let Ok(name) = std::env::var("PENGUDROID_LAUNCH_ACTIVITY") {
             launch_activity(env, thread, data, spec, &name);
         }
@@ -811,6 +819,18 @@ fn launch_activity(
     }
     if let Some(id) = env.field_id(ai_class, "exported", "Z") {
         env.set_boolean_field(activity_info, id, true);
+    }
+    if let Some(theme) = spec.theme {
+        if let Some(id) = env.field_id(ai_class, "theme", "I") {
+            env.set_int_field(activity_info, id, theme as i32);
+        }
+    }
+    // `AppCompatDelegate` asks `PackageManager.getActivityInfo` for the
+    // component while the activity is being created; without an answer it logs
+    // `NameNotFoundException` and falls back to the platform theme, which is
+    // not an AppCompat theme. Publish the same object the launch uses.
+    if let Some(bytes) = marshal_object(env, activity_info, "android/content/pm/ActivityInfo") {
+        install_reply(&bytes, "__pengudroid_binder_set_activity_info");
     }
 
     // Intent naming the component.
@@ -1282,12 +1302,98 @@ fn install_display_replies(env: &JniEnv) {
     set_int("type", 1);
     set_int("rotation", 0);
     set_int("modeId", 1);
+    // `Choreographer` asks the display for its refresh rate, which resolves
+    // `modeId` against `supportedModes`; an empty array makes `findMode` throw
+    // "Unable to locate mode 1".
+    if let Some(mode_class) = env.find_class("android/view/Display$Mode") {
+        let mut made = false;
+        for sig in ["(IIIF[F)V", "(IIIF)V"] {
+            let Some(ctor) = env.method_id(mode_class, "<init>", sig) else { continue };
+            let rates = env.new_float_array(1);
+            if !rates.is_null() {
+                env.set_float_array_region(rates, 0, &[60.0]);
+            }
+            let args: &[JValue] = if sig == "(IIIF[F)V" {
+                &[
+                    JValue { i: 1 },
+                    JValue { i: 1280 },
+                    JValue { i: 720 },
+                    JValue { f: 60.0 },
+                    JValue { l: rates },
+                ]
+            } else {
+                &[
+                    JValue { i: 1 },
+                    JValue { i: 1280 },
+                    JValue { i: 720 },
+                    JValue { f: 60.0 },
+                ]
+            };
+            let Some(mode) = env.new_object(mode_class, ctor, args) else { continue };
+            if let Some(arr) = env.new_object_array(1, mode_class, std::ptr::null_mut()) {
+                env.set_object_array_element(arr, 0, mode);
+                if let Some(id) = env.field_id(
+                    info_class,
+                    "supportedModes",
+                    "[Landroid/view/Display$Mode;",
+                ) {
+                    env.set_object_field(info, id, arr);
+                    made = true;
+                }
+            }
+            if made {
+                break;
+            }
+        }
+        if !made {
+            eprintln!("apphost: could not build a Display.Mode for supportedModes");
+        }
+    }
     set_int("layerStack", 0);
     set_int("displayGroupId", 0);
     set_int("colorMode", 0);
 
     if let Some(data) = marshal_object(env, info, "android/view/DisplayInfo") {
         install_reply(&data, "__pengudroid_binder_set_display_info");
+    }
+}
+
+/// Install what the window session needs.
+///
+/// `ViewRootImpl.setView` calls `IWindowManager.openSession` and then
+/// `IWindowSession.addToDisplayAsUser`. With no window manager the session is
+/// null and `addView` throws "Adding window failed". The reply itself is built
+/// in the shim (it carries a file descriptor, which `Parcel.marshall()` cannot
+/// express); all the host has to supply is `InsetsState.SIZE`, because
+/// `ViewRootImpl` passes an `InsetsSourceControl[SIZE]` as the
+/// `out InsetsSourceControl[]` argument and the AIDL proxy insists on an exact
+/// length match.
+fn install_window_replies(env: &JniEnv) {
+    let Some(insets_class) = env.find_class("android/view/InsetsState") else {
+        eprintln!("apphost: InsetsState not found");
+        return;
+    };
+    let Some(field) = env.static_field_id(insets_class, "SIZE", "I") else {
+        eprintln!("apphost: InsetsState.SIZE not found");
+        return;
+    };
+    let size = env.static_int_field(insets_class, field);
+    println!("apphost: InsetsState.SIZE = {size}");
+    if let Some(f) = shim_symbol("__pengudroid_binder_set_insets_size") {
+        let f: unsafe extern "C" fn(i32) = unsafe { std::mem::transmute(f) };
+        unsafe { f(size) };
+    }
+}
+
+/// Resolve a symbol exported by the preloaded shim.
+fn shim_symbol(name: &str) -> Option<*mut std::ffi::c_void> {
+    let c = std::ffi::CString::new(name).ok()?;
+    let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c.as_ptr()) };
+    if p.is_null() {
+        eprintln!("apphost: shim symbol {name} not found");
+        None
+    } else {
+        Some(p)
     }
 }
 
@@ -1492,6 +1598,25 @@ pub fn dump_class(env: &JniEnv, name: &str) {
     ) else {
         return;
     };
+    // Static fields carry the transaction codes (`QUERY_TRANSACTION`, ...), so
+    // print their values too: the names alone do not tell you what to answer.
+    let f_get = env.method_id(field_cls, "get", "(Ljava/lang/Object;)Ljava/lang/Object;");
+    let f_mods = env.method_id(field_cls, "getModifiers", "()I");
+    // AIDL `*_TRANSACTION` constants are package-private, so reflection needs
+    // the access check turned off before `Field.get` will hand back a value.
+    let f_accessible = env.method_id(field_cls, "setAccessible", "(Z)V");
+    let Some(string_cls) = env.find_class("java/lang/String") else {
+        return;
+    };
+    let Some(to_string) = env.method_id(string_cls, "toString", "()Ljava/lang/String;") else {
+        return;
+    };
+    let Some(integer_cls) = env.find_class("java/lang/Integer") else {
+        return;
+    };
+    let Some(int_value) = env.method_id(integer_cls, "intValue", "()I") else {
+        return;
+    };
     let Some(m_name) = env.method_id(method_cls, "getName", "()Ljava/lang/String;") else {
         return;
     };
@@ -1508,7 +1633,42 @@ pub fn dump_class(env: &JniEnv, name: &str) {
                 .call_object(f, f_type, &[])
                 .and_then(|c| env.call_object(c, get_name, &[]))
                 .and_then(|s| env.get_string(s));
-            println!("  {} {}", ty.unwrap_or_default(), n.unwrap_or_default());
+            let mut value = String::new();
+            let is_static = f_mods
+                .and_then(|m| env.call_int(f, m, &[]))
+                .is_some_and(|m| m & 0x0008 != 0);
+            if is_static {
+                if let Some(acc) = f_accessible {
+                    env.call_void(f, acc, &[JValue { z: 1 }]);
+                }
+                if let Some(get) = f_get {
+                    if let Some(v) = env.call_object(f, get, &[JValue { l: std::ptr::null_mut() }]) {
+                        // Method ids are per-class, so pick the accessor that
+                        // matches the field's declared type.
+                        value = match ty.as_deref() {
+                            Some("java.lang.String") => env
+                                .call_object(v, to_string, &[])
+                                .and_then(|s| env.get_string(s))
+                                .unwrap_or_default(),
+                            Some("int") | Some("short") | Some("byte") => env
+                                .call_int(v, int_value, &[])
+                                .map(|n| n.to_string())
+                                .unwrap_or_default(),
+                            _ => String::new(),
+                        };
+                    }
+                }
+            }
+            println!(
+                "  {} {}{}",
+                ty.unwrap_or_default(),
+                n.unwrap_or_default(),
+                if value.is_empty() {
+                    String::new()
+                } else {
+                    format!(" = {value}")
+                }
+            );
         }
     }
 

@@ -3,7 +3,109 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
-## Bugün eklenen (bu oturum)
+## Bu oturum: Roblox artık Activity'yi resume ediyor
+
+Hedef Roblox (`/tmp/roblox/base.apk` + `split_config.x86_64.apk`). Zincirin
+tamamı çalışıyor:
+
+```
+JNI_CreateJavaVM → handleBindApplication (Application.onCreate tamam)
+                 → handleLaunchActivity (ActivitySplash.onCreate tamam)
+                 → handleResumeActivity (window eklendi, onResume tamam)
+                 → Looper.loop()
+```
+
+Sonra `libroblox.so + 0x224e4af` içinde SIGSEGV. Yani sıradaki duvar
+**grafik yığını**: `relayout` gerçek bir `SurfaceControl` döndürmüyor, dolayısıyla
+motor çizemiyor.
+
+### Bu oturumda düzeltilen gerçek hatalar
+
+1. **`struct addrinfo` ABI'si (en büyük kazanç).** Bionic `ai_canonname`'i
+   `ai_addr`'dan **önce** koyar (0x18 / 0x20), glibc tersini yapar. Shim glibc
+   listesini olduğu gibi Bionic koduna veriyordu; `p->ai_addr` aslında
+   `ai_canonname` (NULL) okuyor ve `sockaddrToInetAddress` içinde SIGSEGV
+   oluyordu. `crates/pengudroid-shim/src/netdb.rs` iki yönlü çeviri yapıyor,
+   `AI_*` bayraklarını ve `EAI_*` kodlarını da eşliyor. `getaddrinfo`,
+   `freeaddrinfo`, `gai_strerror` de interpose edildi (gerçek glibc'ye
+   `dlsym(RTLD_NEXT, …)` ile ulaşılıyor, yoksa sonsuz özyineleme).
+2. **FORTIFY semantiği.** Bionic'in `__strncpy_chk2`/`__stpncpy_chk2`'si
+   `n > src_len` diye abort **etmez**; yalnızca kopyalama sırasında `src`'nin
+   sonunu geçerse abort eder. Biz glibc'nin katı kuralını uyguluyorduk ve
+   `libroblox.so` `strncpy(dst, "x", 4078)` yaptığı için süreç ölüyordu.
+   `__strncat_chk`, `__strlen_chk`, `__strchr_chk`, `__strrchr_chk` de Bionic'e
+   göre düzeltildi.
+3. **SDK seviyesi framework'e uyduruldu.** Shim `ro.build.version.sdk=36`
+   diyordu ama sysroot Android 13. Uygulamalar API 34+ yollarına girip
+   `NoSuchMethodError` alıyordu (Roblox: `JobScheduler.forNamespace`). Artık
+   `$PENGUDROID_ROOT/system/build.prop`'tan okunuyor (33).
+4. **`Settings` provider'ı bind'den önce kuruluyor.** `RobloxApplication.onCreate`
+   `Settings.Global` okuyor; reply `PENGUDROID_DUMP_HOLDER` arkasında ve bind'den
+   *sonra* kuruluyordu.
+5. **`IContentProvider` gerçek cevaplar.** `query` artık `BulkCursorDescriptor`
+   (count=0) döndürüyor; `call` boş `Bundle`; diğer metodlar kendi şekillerinde.
+   Transaction kodları `--dump-class android.content.IContentProvider` ile
+   okundu (QUERY=1, CALL=21, …).
+6. **`DisplayInfo.supportedModes`** dolduruldu (`Display.Mode` ctor'u
+   `(IIIF[F)V`); yoksa `Choreographer` "Unable to locate mode 1" atıyordu.
+7. **`IPackageManager.getActivityInfo`** cevaplanıyor ve `ActivityInfo.theme`
+   manifestteki `android:theme`'den geliyor; yoksa AppCompat
+   "You need to use a Theme.AppCompat theme" atıyordu.
+8. **SurfaceFlinger `createDisplayEventConnection`** (code 4, **statü kelimesi
+   yok**) + `IDisplayEventConnection.stealReceiveChannel` (code 1,
+   `[status][present=1][fd][fd]`). `BitTube` iki fd'dir; `Parcel::readData
+   (Parcelable*)` önce `kNonNullParcelableFlag=1` okur.
+9. **`IWindowManager.openSession` + `IWindowSession.addToDisplayAsUser`**.
+   Reply shim'de kuruluyor çünkü `InputChannel` bir fd taşıyor ve
+   `Parcel.marshall()` fd ifade edemiyor. `InputChannel`'ın tel formatı
+   `[token binder][UTF-16 ad][fd]` (Android 13 `InputChannel::writeToParcel`).
+   `activeControls` **tam olarak `InsetsState.SIZE` (26)** eleman olmalı:
+   proxy `readTypedArray(T[], Creator)` kullanıyor ve uzunluk eşleşmezse
+   "bad array lengths" atıyor.
+
+### Sıradaki adım (grafik)
+
+`IWindowSession.relayout` (code 5) gerçek bir `SurfaceControl` döndürmeli.
+Gerekenler:
+- `ISurfaceComposer.createConnection` (code 2) → `ISurfaceComposerClient`
+- `ISurfaceComposerClient.createSurface` → `SurfaceControl` (Java tarafı
+  `SurfaceControl.writeToParcel` bir binder + handle yazar)
+- `IGraphicBufferProducer` (`dequeueBuffer`/`queueBuffer`/`requestBuffer`) —
+  broker tarafında bir ring buffer
+- `pengudroid-hostgpu` + daemon'ın `zwp_linux_dmabuf_v1`'i ile Wayland'a sunum
+
+### Teşhis araçları (bu oturumda eklendi)
+
+- `tools/art/findclass_bp.c`: artık `BP_LIB` (hangi kütüphane), `BP_CALLER`
+  (dönüş adresi + modül/offset), `BP_DUMP=<reg>:<n>` (bellek dökümü),
+  `BP_STACKMAP` (stack'teki adresleri modüle çöz), `BP_REG` (r8/r9/rsp dahil).
+- `PENGUDROID_TRACE_ROOTFS=1`: her yol çevirisini yazar.
+- `--dump-class` artık **statik alanların değerini** de basıyor
+  (`setAccessible` + `Field.get`), yani AIDL `*_TRANSACTION` sabitleri
+  doğrudan okunabiliyor. Yeni `JniEnv` yardımcıları: `call_int`,
+  `static_field_id`, `new_byte_array`, `set_byte_array_region`,
+  `new_float_array`, `set_float_array_region`.
+
+### Yeniden üretme
+
+```sh
+export PATH="$HOME/.cargo/bin:$PATH"
+rm -rf /tmp/pengudroid-libs
+timeout 120 env PENGUDROID_LAUNCH_ACTIVITY=com.roblox.client.startup.ActivitySplash \
+  target/release/pengudroid art-test --sysroot .toolchain/sysroot \
+  --register-natives libandroid_runtime.so,libhwui.so \
+  --classpath /tmp/roblox/base.apk \
+  --classpath /tmp/roblox/split_config.x86_64.apk \
+  --bind-app --main android.app.ActivityThread --vm-option -Xint
+```
+
+Testler: `cargo test --workspace` → **174 geçiyor**.
+
+---
+
+için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
+
+## Önceki oturumlar
 
 - **`sysroot` eksikti, ART değil.** NewPipe'ın `NoClassDefFoundError`'ı geri
 geldi çünkü `.toolchain/sysroot`'ta `apex -> system/apex` bağlantısı yoktu

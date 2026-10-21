@@ -1648,6 +1648,19 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) {
         target_sdk: info.target_sdk.map(|v| v as i32).unwrap_or(35),
         min_sdk: info.min_sdk.map(|v| v as i32).unwrap_or(23),
         app_class: info.application_class.as_deref(),
+        // `ActivityInfo.theme` decides whether AppCompat accepts the activity:
+        // with no theme the framework falls back to the platform default and
+        // `setContentView` throws "You need to use a Theme.AppCompat theme".
+        // The activity's own `android:theme` wins over the application's.
+        theme: info
+            .activities
+            .iter()
+            .find(|a| {
+                Some(a.name.as_str())
+                    == std::env::var("PENGUDROID_LAUNCH_ACTIVITY").ok().as_deref()
+            })
+            .and_then(|a| a.theme)
+            .or(info.application_theme),
         // Must belong to user 0: `ActivityThread.getPackageInfo` skips its
         // `LoadedApk` cache when `UserHandle.getUserId(uid) != myUserId()`, and
         // a cache miss rebuilds the package info with `mIncludeCode == false`
