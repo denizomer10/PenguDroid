@@ -814,11 +814,21 @@ unsafe fn handle_write_read(wr: *mut WriteRead) -> c_int {
 
     if !out.is_empty() {
         if out.len() as u64 > wr.read_size {
+            if trace_enabled() {
+                diag(&format!(
+                    "[binder]   reply {} bytes does not fit read_size {}\n",
+                    out.len(),
+                    wr.read_size
+                ));
+            }
             *libc::__errno_location() = libc::ENOSPC;
             return -1;
         }
         std::ptr::copy_nonoverlapping(out.as_ptr(), wr.read_buffer as *mut u8, out.len());
         wr.read_consumed = out.len() as u64;
+        if trace_enabled() {
+            diag(&format!("[binder]   -> {} bytes, rc=0\n", out.len()));
+        }
         return 0;
     }
 
