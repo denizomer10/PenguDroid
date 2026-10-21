@@ -496,13 +496,328 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
     let ok = env.call_void(thread, handle, &[JValue { l: data }]);
     if ok {
         println!("apphost: handleBindApplication returned normally");
+        install_app_class_loader(env, data, spec.apk);
+        if let Some(compat) = compat {
+            report_include_code(env, thread, app_info, compat, data);
+        }
         if let Ok(name) = std::env::var("PENGUDROID_PROBE_APP_CLASS") {
             probe_app_class(env, data, &name);
+        }
+        if let Ok(name) = std::env::var("PENGUDROID_LAUNCH_ACTIVITY") {
+            launch_activity(env, thread, data, spec, &name);
         }
     } else {
         eprintln!("apphost: handleBindApplication threw");
     }
     ok
+}
+
+/// Give the calling thread a `Looper` if it has none.
+fn ensure_looper(env: &JniEnv) {
+    let Some(looper_class) = env.find_class("android/os/Looper") else {
+        return;
+    };
+    let Some(my_looper) = env.static_method_id(looper_class, "myLooper", "()Landroid/os/Looper;") else {
+        return;
+    };
+    if let Some(existing) = env.call_static_object(looper_class, my_looper, &[]) {
+        if !existing.is_null() {
+            return;
+        }
+    }
+    let Some(prepare) = env.static_method_id(looper_class, "prepare", "()V") else {
+        return;
+    };
+    if env.call_static_void(looper_class, prepare, &[]) {
+        println!("apphost: prepared a Looper for the bind thread");
+    } else {
+        eprintln!("apphost: Looper.prepare threw");
+    }
+}
+
+/// Start an Activity through `ActivityThread.handleLaunchActivity`.
+///
+/// This is what `system_server` triggers with `scheduleLaunchActivity`; calling
+/// it directly skips the parcel and the binder round trip, which is the same
+/// shortcut `--bind-app` takes for `handleBindApplication`.
+fn launch_activity(
+    env: &JniEnv,
+    thread: JObject,
+    data: JObject,
+    spec: &AppSpec<'_>,
+    activity_name: &str,
+) -> bool {
+    let Some(thread_class) = env.find_class("android/app/ActivityThread") else {
+        return false;
+    };
+    // `Activity`'s constructor creates a `Handler`, which requires a `Looper` on
+    // the calling thread. `ActivityThread.main` prepared the main looper on the
+    // helper thread; this thread needs its own before an Activity can be built.
+    ensure_looper(env);
+    let Some(bind_class) = env.find_class("android/app/ActivityThread$AppBindData") else {
+        return false;
+    };
+    let Some(info_field) = env.field_id(bind_class, "info", "Landroid/app/LoadedApk;") else {
+        return false;
+    };
+    let loaded_apk = env.object_field(data, info_field);
+    if loaded_apk.is_null() {
+        eprintln!("apphost: cannot launch an Activity before the app is bound");
+        return false;
+    }
+
+    // ActivityInfo
+    let Some(ai_class) = env.find_class("android/content/pm/ActivityInfo") else {
+        return false;
+    };
+    let Some((_, activity_info)) = new_instance(env, "android/content/pm/ActivityInfo") else {
+        eprintln!("apphost: cannot allocate ActivityInfo");
+        return false;
+    };
+    if let Some(id) = env.field_id(ai_class, "name", "Ljava/lang/String;") {
+        env.set_object_field(activity_info, id, env.new_string(activity_name));
+    }
+    if let Some(id) = env.field_id(ai_class, "packageName", "Ljava/lang/String;") {
+        env.set_object_field(activity_info, id, env.new_string(spec.package));
+    }
+    if let Some(id) = env.field_id(
+        ai_class,
+        "applicationInfo",
+        "Landroid/content/pm/ApplicationInfo;",
+    ) {
+        let app_info = env.object_field(loaded_apk, env.field_id(
+            env.find_class("android/app/LoadedApk").unwrap_or(std::ptr::null_mut()),
+            "mApplicationInfo",
+            "Landroid/content/pm/ApplicationInfo;",
+        ).unwrap_or(std::ptr::null_mut()));
+        if !app_info.is_null() {
+            env.set_object_field(activity_info, id, app_info);
+        }
+    }
+    if let Some(id) = env.field_id(ai_class, "exported", "Z") {
+        env.set_boolean_field(activity_info, id, true);
+    }
+
+    // Intent naming the component.
+    let Some(intent_class) = env.find_class("android/content/Intent") else {
+        return false;
+    };
+    let Some((_, intent)) = new_instance(env, "android/content/Intent") else {
+        eprintln!("apphost: cannot allocate Intent");
+        return false;
+    };
+    let Some(set_class_name) = env.method_id(
+        intent_class,
+        "setClassName",
+        "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;",
+    ) else {
+        eprintln!("apphost: Intent.setClassName missing");
+        return false;
+    };
+    let pkg = env.new_string(spec.package);
+    let cls = env.new_string(activity_name);
+    if env
+        .call_object(intent, set_class_name, &[JValue { l: pkg }, JValue { l: cls }])
+        .is_none()
+    {
+        eprintln!("apphost: Intent.setClassName threw");
+        return false;
+    }
+
+    // ActivityClientRecord
+    let Some(rec_class) = env.find_class("android/app/ActivityThread$ActivityClientRecord") else {
+        return false;
+    };
+    let Some((_, record)) = new_instance(env, "android/app/ActivityThread$ActivityClientRecord")
+    else {
+        eprintln!("apphost: cannot allocate ActivityClientRecord");
+        return false;
+    };
+    let mut set = |field: &str, sig: &str, value: JObject| {
+        if let Some(id) = env.field_id(rec_class, field, sig) {
+            env.set_object_field(record, id, value);
+        } else {
+            eprintln!("apphost: ActivityClientRecord.{field} not found");
+        }
+    };
+    set("activityInfo", "Landroid/content/pm/ActivityInfo;", activity_info);
+    set("intent", "Landroid/content/Intent;", intent);
+    set("packageInfo", "Landroid/app/LoadedApk;", loaded_apk);
+
+    let Some(handle) = env.method_id(
+        thread_class,
+        "handleLaunchActivity",
+        "(Landroid/app/ActivityThread$ActivityClientRecord;Landroid/app/servertransaction/PendingTransactionActions;Landroid/content/Intent;)Landroid/app/Activity;",
+    ) else {
+        eprintln!("apphost: ActivityThread.handleLaunchActivity not found");
+        return false;
+    };
+    println!("apphost: calling handleLaunchActivity for {activity_name}");
+    match env.call_object(
+        thread,
+        handle,
+        &[
+            JValue { l: record },
+            JValue { l: std::ptr::null_mut() },
+            JValue { l: std::ptr::null_mut() },
+        ],
+    ) {
+        Some(activity) if activity.is_null() => {
+            eprintln!("apphost: handleLaunchActivity returned null");
+            false
+        }
+        Some(_) => {
+            println!("apphost: handleLaunchActivity returned an Activity");
+            true
+        }
+        None => {
+            eprintln!("apphost: handleLaunchActivity threw");
+            false
+        }
+    }
+}
+
+/// Point the app's `LoadedApk` at a class loader that actually has the APK.
+///
+/// The loader the framework builds here comes out with an empty dex path
+/// (`DexPathList[[]]`), so the APK's own classes are unreachable and no
+/// Activity can be instantiated. `LoadedApk.getClassLoader()` returns
+/// `mClassLoader` when it is non-null, so installing one built from the APK is
+/// enough for `performLaunchActivity`.
+fn install_app_class_loader(env: &JniEnv, data: JObject, apk: &Path) -> bool {
+    let Some(bind_class) = env.find_class("android/app/ActivityThread$AppBindData") else {
+        return false;
+    };
+    let Some(info_field) = env.field_id(bind_class, "info", "Landroid/app/LoadedApk;") else {
+        return false;
+    };
+    let loaded_apk = env.object_field(data, info_field);
+    if loaded_apk.is_null() {
+        return false;
+    }
+    let Some(apk_class) = env.find_class("android/app/LoadedApk") else {
+        return false;
+    };
+
+    let Some(pcl_class) = env.find_class("dalvik/system/PathClassLoader") else {
+        eprintln!("apphost: PathClassLoader not found");
+        return false;
+    };
+    let Some(ctor) = env.method_id(
+        pcl_class,
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/ClassLoader;)V",
+    ) else {
+        eprintln!("apphost: PathClassLoader(String, ClassLoader) missing");
+        return false;
+    };
+    let Some(cl_class) = env.find_class("java/lang/ClassLoader") else {
+        return false;
+    };
+    let Some(get_system) = env.static_method_id(
+        cl_class,
+        "getSystemClassLoader",
+        "()Ljava/lang/ClassLoader;",
+    ) else {
+        return false;
+    };
+    let Some(parent) = env.call_static_object(cl_class, get_system, &[]) else {
+        return false;
+    };
+    let path = env.new_string(&apk.display().to_string());
+    let Some(loader) = env.new_object(pcl_class, ctor, &[JValue { l: path }, JValue { l: parent }])
+    else {
+        eprintln!("apphost: PathClassLoader construction threw");
+        return false;
+    };
+
+    let mut installed = false;
+    for field in ["mClassLoader", "mDefaultClassLoader"] {
+        if let Some(id) = env.field_id(apk_class, field, "Ljava/lang/ClassLoader;") {
+            env.set_object_field(loaded_apk, id, loader);
+            installed = true;
+        }
+    }
+    if installed {
+        println!("apphost: installed a PathClassLoader for {}", apk.display());
+    }
+    installed
+}
+
+/// Read `LoadedApk.mIncludeCode` for the bind's package info and for a fresh
+/// `getPackageInfoNoCheck` call.
+///
+/// The bind's instance reports `false`, which makes the class loader come out
+/// with an empty dex path. Comparing it against a direct call separates "the
+/// bind asks for a code-less package info" from "this build maps the
+/// constructor's boolean arguments differently".
+fn report_include_code(
+    env: &JniEnv,
+    thread: JObject,
+    app_info: JObject,
+    compat: JObject,
+    data: JObject,
+) {
+    let Some(apk_class) = env.find_class("android/app/LoadedApk") else {
+        return;
+    };
+    let Some(field) = env.field_id(apk_class, "mIncludeCode", "Z") else {
+        eprintln!("apphost: LoadedApk.mIncludeCode not found");
+        return;
+    };
+    let register_field = env.field_id(apk_class, "mRegisterPackage", "Z");
+    let security_field = env.field_id(apk_class, "mSecurityViolation", "Z");
+    let get_bool: unsafe extern "C" fn(*mut c_void, JObject, JFieldId) -> u8 = unsafe {
+        let table = *(env.0 as *const *const *const c_void);
+        std::mem::transmute(*table.add(96)) // GetBooleanField
+    };
+
+    let Some(bind_class) = env.find_class("android/app/ActivityThread$AppBindData") else {
+        return;
+    };
+    if let Some(info_field) = env.field_id(bind_class, "info", "Landroid/app/LoadedApk;") {
+        let apk = env.object_field(data, info_field);
+        if !apk.is_null() {
+            println!(
+                "apphost: bind's LoadedApk.mIncludeCode = {}",
+                unsafe { get_bool(env.0, apk, field) }
+            );
+        }
+    }
+
+    let Some(thread_class) = env.find_class("android/app/ActivityThread") else {
+        return;
+    };
+    let Some(get_info) = env.method_id(
+        thread_class,
+        "getPackageInfoNoCheck",
+        "(Landroid/content/pm/ApplicationInfo;Landroid/content/res/CompatibilityInfo;)Landroid/app/LoadedApk;",
+    ) else {
+        eprintln!("apphost: 2-arg getPackageInfoNoCheck not found");
+        return;
+    };
+    match env.call_object(thread, get_info, &[JValue { l: app_info }, JValue { l: compat }]) {
+        Some(apk) if !apk.is_null() => {
+            println!(
+                "apphost: fresh getPackageInfoNoCheck.mIncludeCode = {}",
+                unsafe { get_bool(env.0, apk, field) }
+            );
+            if let Some(id) = register_field {
+                println!(
+                    "apphost: fresh mRegisterPackage = {}",
+                    unsafe { get_bool(env.0, apk, id) }
+                );
+            }
+            if let Some(id) = security_field {
+                println!(
+                    "apphost: fresh mSecurityViolation = {}",
+                    unsafe { get_bool(env.0, apk, id) }
+                );
+            }
+        }
+        Some(_) => eprintln!("apphost: getPackageInfoNoCheck returned null"),
+        None => eprintln!("apphost: getPackageInfoNoCheck threw"),
+    }
 }
 
 /// Resolve a class through the app's own `LoadedApk` class loader.

@@ -137,6 +137,13 @@ const IPM_GET_PACKAGE_INFO: u32 = 3;
 /// `(String packageName, int flags, int userId)`.
 const IPM_GET_APPLICATION_INFO: u32 = 9;
 
+/// `IActivityTaskManager` transaction code for `getActivityClientController`.
+///
+/// `ActivityClient.getDisplayId` calls it through a `Singleton`; with no system
+/// server the reply is empty, the singleton caches null and the next call NPEs
+/// inside `createBaseContextForActivity`.
+const ATM_GET_ACTIVITY_CLIENT_CONTROLLER: u32 = 18;
+
 /// A `PackageInfo` reply serialized by the host with the framework's own
 /// `PackageInfo.writeToParcel`.
 ///
@@ -427,6 +434,16 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                 }
                 push_flat_handle(&mut parcel, &mut objects, handle_for(&name));
             }
+        }
+    }
+    if tr.target_handle == handle_for("activity_task") && tr.code == ATM_GET_ACTIVITY_CLIENT_CONTROLLER {
+        push_flat_handle(
+            &mut parcel,
+            &mut objects,
+            handle_for("activity_client_controller"),
+        );
+        if trace_enabled() {
+            diag("[binder]   -> activity_client_controller handle\n");
         }
     }
     if tr.target_handle == handle_for("package") && tr.code == IPM_GET_PACKAGE_INFO {

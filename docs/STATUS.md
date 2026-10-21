@@ -93,31 +93,42 @@ bu 4 bayt eksik olunca okuyucu kayıyor ve 7.6 GB'lık bir tahsis deniyordu.
 
 ### Sıradaki adım
 
-Uygulama bağlandı ama **Activity başlamadı**: `system_server`'ın
-`scheduleLaunchActivity` çağrısı yok. İlk ölçülen engel **uygulama sınıf
-yükleyicisi**:
+Uygulama bağlandı ve **Activity örneği oluşturuluyor**:
+`PENGUDROID_LAUNCH_ACTIVITY=<sınıf>` ile `ActivityThread.handleLaunchActivity`
+doğrudan çağrılıyor (parcel/binder turu atlanıyor). Yol boyunca çözülenler:
+
+- **`LoadedApk` sınıf yükleyicisi boş dex yoluyla geliyordu**
+  (`DexPathList[[]]`, `mIncludeCode = 0`). `handleBindApplication`'ın
+  `getPackageInfoNoCheck(..., includeCode=true)` çağrısı bu sürümde de false
+  sonuç veriyor (taze bir çağrıda da `mIncludeCode = 0`,
+  `mRegisterPackage`/`mSecurityViolation` ise beklendiği gibi false — yani
+  argüman sırası kayması değil). Çözüm: bind sonrası `LoadedApk.mClassLoader`
+  ve `mDefaultClassLoader` APK yoluna sahip bir `PathClassLoader` ile
+  değiştiriliyor; `getClassLoader()` bunu döndürdüğü için Activity sınıfı
+  çözülüyor (`app class loader resolved ...HTMLViewerActivity`).
+- **`ActivityClient.getDisplayId`** → `IActivityTaskManager.getActivityClientController`
+  (transaction **kodu 18**) boş yanıt alınca singleton null kalıyor ve
+  `createBaseContextForActivity` NPE veriyordu. Broker artık bu çağrıya
+  `activity_client_controller` handle'ı döndürüyor.
+- **`Looper`**: `Activity`'nin kurucusu `Handler` oluşturuyor; bind/launch
+  thread'inde Looper yoksa "Can't create handler inside thread ... that has not
+  called Looper.prepare()". Launch öncesi `Looper.prepare()` çağrılıyor.
+
+Şu an durduğu yer: `Activity.attach` içinde `Settings.Global.getInt` →
+`ContentResolver` → `IContentProvider` **null** ("settings" sağlayıcısı yok):
 
 ```
-apphost: LoadedApk.mIncludeCode = 0
-java.lang.ClassNotFoundException: Didn't find class
-  "com.android.htmlviewer.HTMLViewerActivity" on path: DexPathList[[]]
+NullPointerException: ... IContentProvider.call(...) on a null object reference
+  at android.provider.Settings$NameValueCache.getStringForUser(Settings.java:3161)
+  at android.app.Activity.attach(Activity.java:8266)
 ```
-
-`LoadedApk.createOrUpdateClassLoaderLocked` `mIncludeCode == false` görünce
-**boş** bir dex yolu ile yükleyici kuruyor (`DexPathList[[]]`), yani APK'nın
-kendi sınıfları erişilemez. `mApplicationInfo.sourceDir` doğru
-(`.toolchain/.../HTMLViewer.apk`), `mIncludeCode` yanlış. `handleBindApplication`
-`getPackageInfoNoCheck(..., includeCode=true)` çağırıyor gibi görünüyor, yani
-bu sürümün dex'i farklı davranıyor olabilir; ölçüm için
-`PENGUDROID_PROBE_APP_CLASS=<sınıf>` eklendi (bind sonrası `LoadedApk`'ın
-`mIncludeCode`/`sourceDir` değerlerini ve `loadClass` sonucunu yazar).
 
 Sırada:
-1. `mIncludeCode` neden false — dex'teki `getPackageInfoNoCheck`
-   imzalarını `--dump-class` ile doğrula; gerekirse `LoadedApk.mClassLoader`'ı
-   APK yoluna sahip bir `PathClassLoader` ile doğrudan ata.
+1. `IActivityManager.getContentProvider` yanıtı: `ContentProviderHolder`
+   (Parcelable) + içinde bir `IContentProvider` handle'ı; `call()` çağrılarına
+   `Bundle` döndürmek. Bu, `settings`/`Settings.Global` okumalarını açar.
 2. `IApplicationThread.scheduleLaunchActivity` (ActivityClientRecord parcel'ı)
-   → `onCreate/onStart/onResume`.
+   — şu an JNI ile doğrudan çağırıyoruz.
 3. Pencere yolu: `SurfaceFlinger`/`SurfaceComposerClient` yerine kendi
    EGL/dmabuf sunumumuz; HWUI EGL üzerinden çiziyor.
 4. `IPackageManager`'in geri kalanı (`getPackagesForUid`, `checkPermission`, ...)
