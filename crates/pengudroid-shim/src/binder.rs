@@ -221,6 +221,41 @@ unsafe fn hidl_arg_string(tr: &TransactionData, index: usize) -> Option<String> 
     Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
 }
 
+/// Write a `hidl_vec<hidl_string>` reply: the 16-byte vec struct, the element
+/// array, and each string, all as `binder_buffer_object` records.
+fn push_hidl_string_vec(parcel: &mut Vec<u8>, objects: &mut Vec<u64>, names: &[&str]) {
+    let mut data: Vec<(u64, u64)> = Vec::with_capacity(names.len());
+    for name in names {
+        data.push(leak_cstr(name));
+    }
+    let mut arr = Vec::with_capacity(16 * names.len());
+    for (ptr, len) in &data {
+        arr.extend_from_slice(&ptr.to_ne_bytes());
+        arr.extend_from_slice(&(len - 1).to_ne_bytes());
+    }
+    let arr: &'static [u8] = Box::leak(arr.into_boxed_slice());
+
+    let mut vec = Vec::with_capacity(16);
+    vec.extend_from_slice(&(arr.as_ptr() as u64).to_ne_bytes());
+    vec.extend_from_slice(&(names.len() as u32).to_ne_bytes());
+    vec.extend_from_slice(&0u32.to_ne_bytes());
+    let vec: &'static [u8] = Box::leak(vec.into_boxed_slice());
+
+    let vec_idx = push_buffer_object(parcel, objects, 0, vec.as_ptr() as u64, 16, 0, 0);
+    let arr_idx = push_buffer_object(
+        parcel,
+        objects,
+        1,
+        arr.as_ptr() as u64,
+        (16 * names.len()) as u64,
+        vec_idx,
+        0,
+    );
+    for (i, (ptr, len)) in data.iter().enumerate() {
+        push_buffer_object(parcel, objects, 1, *ptr, *len, arr_idx, (i * 16) as u64);
+    }
+}
+
 /// Write a `hidl_string` the way libhidlbase does.
 ///
 /// Measured from a live `getTransport` request: a string is a 40-byte struct
@@ -1535,6 +1570,21 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                 }
                 push_flat_handle(&mut parcel, &mut objects, handle_for(&name));
             }
+        }
+    }
+    if tr.target_handle == handle_for("codec2") {
+        // The first call on a HIDL proxy is `interfaceChain`; the client uses it
+        // to decide whether the proxy really implements the interface it asked
+        // for. Its code is a hash, not a small ordinal, so any call here is
+        // answered with the chain.
+        let chain = [
+            "android.hardware.media.c2@1.0::IComponentStore",
+            "android.hardware.media.c2@1.0::ICodec2",
+            "android.hidl.base@1.0::IBase",
+        ];
+        push_hidl_string_vec(&mut parcel, &mut objects, &chain);
+        if trace_enabled() {
+            diag(&format!("[binder]   -> codec2 interfaceChain ({})\n", tr.code));
         }
     }
     if tr.target_handle == 0 && is_hidl_request(tr) {
