@@ -391,6 +391,8 @@ pub fn sysroot(args: &[String]) -> i32 {
 }
 
 /// Sonames the shim provides itself; the Android copies must not shadow them.
+/// Bionic sonames the shim stands in for, so the real library is never copied
+/// into the scratch tree.
 const SHIM_SONAMES: &[&str] = &["libc.so", "libm.so", "libdl.so", "liblog.so", "libdl_android.so"];
 
 /// Stage a sysroot's library closure into a scratch directory and return it.

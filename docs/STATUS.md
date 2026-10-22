@@ -79,17 +79,22 @@ python3 tools/art/ppmstat.py /tmp/f.frame201.ppm   # renk dağılımı
 
 1. **`EGL_BAD_DISPLAY` gürültüsü.** Koşu başına ~240 kez
    `libEGL: validate_display:567 error 3008 (EGL_BAD_DISPLAY)` basılıyor.
-   Swap'ları engellemiyor (240 swap tamamlandı). **Önemli:** bu satır Mesa'dan
-   *gelmiyor* — `grep -c validate_display` hem `libEGL.so.1` hem
-   `libEGL_mesa.so.0` için 0 döndürüyor, sysroot'taki **Android
-   `libEGL.so`** ise 1. Yani süreçte Android'in libEGL'si de yüklü ve bir
-   şekilde çağrılıyor; ona Mesa'nın surfaceless display handle'ı verilince
-   `validate_display` reddediyor. gleshim `libhwui`'nin import ettiği tüm
-   `egl*` sembollerini artık export ediyor (bu oturumda sync/image ailesi de
-   eklendi), yani çağrı sembol interposition'ını atlayan bir yoldan geliyor —
-   en olası aday `dlopen`+`dlsym` ile doğrudan Android libEGL'sine giden bir
-   kod yolu. Sıradaki adım: `strace` yerine shim'in `dlopen` interposition'ında
-   sysroot `libEGL.so`'sunu isteyen çağrıyı loglamak.
+   Swap'ları engellemiyor (240 swap tamamlandı, kare doğru). **Önemli:** bu satır
+   Mesa'dan *gelmiyor* — `grep -c validate_display` hem `libEGL.so.1` hem
+   `libEGL_mesa.so.0` için 0, sysroot'taki **Android `libEGL.so`** için 1.
+   Yani süreçte Android'in libEGL'si de yüklü.
+
+   Denenen ve **işe yaramayan** yol: gleshim'e `-Wl,-soname,libEGL.so` verip
+   `art-libs`'a Android libEGL'sini kopyalamamak. O zaman Android'in
+   `libGLESv2.so`'su yüklenirken tek bir özel sembolü arıyor:
+   `_ZN7android18egl_get_connectionEv` (`libGLESv2.so`'nun libEGL'den istediği
+   *tek* sembol bu). Bu, Android libEGL + libGLESv2'nin bu ağaçta **çalışan bir
+   çift** olduğunu gösteriyor, dolayısıyla libEGL'i çıkarmak güvenli değil.
+
+   Sıradaki adım: `egl_get_connection()`'ı gleshim'de sağlayıp sonra
+   `art-libs`'tan Android libEGL'sini çıkarmak; ya da `validate_display`
+   çağıran yolu `LD_DEBUG=reloc` / `LD_DEBUG=bindings` ile bulup o çağrının
+   bizim display'imizi görmediğini doğrulamak.
 2. **`eglGetDisplay` her çağrıda yeni handle döndürüyor.** Cache'lenmeli;
    ikinci `EglManager` (AlertDialog) için ikinci bir display açılıyor.
 3. **Kare hızı.** 20 saniyede 240 kare ölçüldü, ama NewPipe'ın ana ekranı
