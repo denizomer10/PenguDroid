@@ -154,7 +154,7 @@ fn trace_enabled() -> bool {
 const RTLD_NEXT: *mut c_void = -1isize as *mut c_void;
 
 /// Resolve the host implementation of `name`, or `None`.
-unsafe fn next<T: Copy>(name: &[u8]) -> Option<T> {
+pub(crate) unsafe fn next<T: Copy>(name: &[u8]) -> Option<T> {
     debug_assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<*mut c_void>());
     let p = libc::dlsym(RTLD_NEXT, name.as_ptr() as *const c_char);
     if p.is_null() {

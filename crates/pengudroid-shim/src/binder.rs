@@ -2624,3 +2624,31 @@ mod tests {
         assert_eq!(parsed.sender_pid, 1);
     }
 }
+
+/// `android::hardware::Parcel::readNullableEmbeddedBuffer(size, handle,
+/// parentOffset, offset, out)`.
+///
+/// Interposed only to trace the size the HIDL reader expects for each embedded
+/// object; `PENGUDROID_TRACE_BINDER=1` prints it.
+#[no_mangle]
+pub unsafe extern "C" fn _ZNK7android8hardware6Parcel26readNullableEmbeddedBufferEmPmmmPPKv(
+    this: *mut c_void,
+    size: usize,
+    handle: *mut usize,
+    parent_offset: usize,
+    offset: usize,
+    out: *mut *const c_void,
+) -> i32 {
+    type F = unsafe extern "C" fn(*mut c_void, usize, *mut usize, usize, usize, *mut *const c_void) -> i32;
+    let next: Option<F> = crate::rootfs::next(b"_ZNK7android8hardware6Parcel26readNullableEmbeddedBufferEmPmmmPPKv\0");
+    let rc = match next {
+        Some(f) => f(this, size, handle, parent_offset, offset, out),
+        None => -22,
+    };
+    if trace_enabled() {
+        diag(&format!(
+            "[binder]   readNullableEmbeddedBuffer size={size} parentOffset={parent_offset} offset={offset} rc={rc}\n"
+        ));
+    }
+    rc
+}
