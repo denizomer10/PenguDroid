@@ -103,7 +103,9 @@ unsafe extern "C" fn func_clone(this: *const FuncObj) -> *mut FuncObj {
 }
 
 /// `__clone(void*)`: copy into the caller's buffer.
-unsafe extern "C" fn func_clone_into(this: *const FuncObj, out: *mut FuncObj) -> *mut FuncObj {
+///
+/// Called as `slot0(&buf, func)` — the destination comes first.
+unsafe extern "C" fn func_clone_into(out: *mut FuncObj, this: *const FuncObj) -> *mut FuncObj {
     std::ptr::copy_nonoverlapping(this, out, 1);
     out
 }
@@ -287,10 +289,10 @@ unsafe fn make_func(operator: usize) -> *const FuncObj {
     if vtable.is_null() {
         return std::ptr::null();
     }
-    *vtable.add(0) = func_noop as usize; // dtor
-    *vtable.add(1) = func_noop as usize; // deleting dtor
+    *vtable.add(0) = func_clone_into as usize; // __clone(void*)
+    *vtable.add(1) = func_noop as usize;
     *vtable.add(2) = func_clone as usize; // __clone()
-    *vtable.add(3) = func_clone_into as usize; // __clone(void*)
+    *vtable.add(3) = func_noop as usize;
     *vtable.add(4) = func_noop as usize;
     *vtable.add(5) = func_noop as usize;
     *vtable.add(6) = operator; // operator()
@@ -584,10 +586,14 @@ pub(crate) unsafe fn dispatch(code: u32, data: &[u8], objects: &[u64]) -> Option
     // own callback, and we marshal the reply ourselves.
     if code == 3 {
         CAPTURED.with(|c| *c.borrow_mut() = None);
+        let f = make_func(traits_operator as usize);
+        if trace_enabled() {
+            diag(&format!("[codec2]   direct listComponents func={f:p}\n"));
+        }
         let func = StdFunction {
             buf: [0; 4],
-            f20: make_func(traits_operator as usize),
-            f28: make_func(traits_operator as usize),
+            f20: f,
+            f28: f,
         };
         let list: unsafe extern "C" fn(*mut c_void, *const StdFunction) =
             std::mem::transmute(api.list_components);
