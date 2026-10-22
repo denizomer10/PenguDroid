@@ -1733,6 +1733,20 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             }
         }
     }
+    if tr.target_handle == handle_for("media.resource_manager") {
+        // `MediaCodec::init` returns `ResourceManagerServiceProxy::init()`'s
+        // error verbatim (`0x12d348: mov %r14d,%eax; ret`), so a missing
+        // resource manager makes every `createDecoderByType` fail with
+        // `UNKNOWN_ERROR` before codec2 is ever reached. The proxy only needs
+        // the binder to answer `INTERFACE_TRANSACTION` with its descriptor;
+        // every other call is a no-op that succeeds.
+        if tr.code == INTERFACE_TRANSACTION {
+            parcel.extend_from_slice(&string16("android.media.IResourceManagerService"));
+            if trace_enabled() {
+                diag("[binder]   -> resource manager descriptor\n");
+            }
+        }
+    }
     if tr.target_handle == handle_for("settings_provider") {
         provider_reply(tr.code, &mut parcel, &mut objects);
     }

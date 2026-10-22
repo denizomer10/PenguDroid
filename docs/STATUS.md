@@ -64,11 +64,35 @@ Trace'te `code 1` (createComponent) **hiç görünmüyor**. İz sürüldü:
 * `createComponent` HIDL'e hiç gitmiyor: `C2Store` bileşeni yerel olarak
   kurmaya çalışıp sessizce başarısız oluyor gibi görünüyor.
 
-Sıradaki adım: `C2Store::createComponent`'ı (`libcodec2_client.so`) izlemek —
-`loading dll`'den sonra hangi adımda vazgeçtiğini bulmak. Muhtemel sebep
-`createInterface`'in döndürdüğü `IComponentInterface` üzerinde yapılan
-`getTraits`/`getKind`/`getName` çağrılarının yanıtsız kalması (bunlar
-`BnHwComponentInterface` üzerinde, yani bizim broker'ımızdan geçmiyor).
+### `createDecoderByType` neden başarısız (ölçüldü)
+
+gdb ile: `Codec2Client::ForAllServices` 30 kez vuruluyor (hepsi
+`listComponents` sırasında), `Codec2Client::createComponent` **hiç**
+vurulmuyor, `CreateComponentByName` hiç çağrılmıyor. Yani codec2'ye hiç
+inilmiyor; hata `MediaCodec::init` (`libstagefright.so` `0x12d280`) içinde.
+
+`MediaCodec::init` `ResourceManagerServiceProxy::init()`'in döndürdüğü hatayı
+**aynen** döndürüyor:
+
+```
+12d2c4: call ResourceManagerServiceProxy::init()
+12d2c9: test %eax,%eax ; je 12d35d      ; başarılıysa devam
+12d2d1: mov %eax,%r14d                  ; hata saklanıyor
+...
+12d348: mov %r14d,%eax ; ret            ; hata dönülüyor
+```
+
+Sahte `media.resource_manager` servisi eklendi (`binder.rs`), ama istemcinin
+`BpBinder::getInterfaceDescriptor`'ı yanıtı **durum kelimesi olmadan** okuyor
+(`[String16]`), bizim broker ise her yanıta durum kelimesi koyuyor. Durum
+kelimesini bu işlem için kaldırmayı denedim: codec listesi hâlâ 53 çıkıyor ama
+süreç `getCodecInfos()` sonrasında deterministik olarak SIGSEGV veriyor, o
+yüzden geri alındı.
+
+Sıradaki adım: `BpBinder::getInterfaceDescriptor`'ı (`libbinder.so`)
+disassemble edip yanıt biçimini kesinleştirmek; sonra `reply_has_status`'u o
+işlem için doğru ayarlamak. Durum kelimesi kaldırıldığında oluşan SIGSEGV de
+ayrıca izlenmeli (codec listesi kurulduktan hemen sonra).
 
 Bundan sonra `IComponent` (`configure`, `start`, `queue`, `dequeue`,
 `setOutputSurface`) ve `IComponentListener` geri çağrıları aynı yöntemle
