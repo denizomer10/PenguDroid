@@ -121,6 +121,9 @@ unsafe extern "C" fn func_operator(_this: *mut FuncObj, parcel: *const c_void) {
     stabilize(&mut bytes, &objects, inc_strong());
     if trace_enabled() {
         diag(&format!(
+            "[codec2]   callback parcel={parcel:p} data={data:p} len={len} objects={count}\n"
+        ));
+        diag(&format!(
             "[codec2]   callback captured {} bytes, {} objects\n",
             bytes.len(),
             objects.len()
@@ -486,6 +489,9 @@ pub(crate) unsafe fn dispatch(code: u32, data: &[u8], objects: &[u64]) -> Option
         &callback as *const StdFunction as *const u8,
     );
     let captured = CAPTURED.with(|c| c.borrow_mut().take());
+    if trace_enabled() {
+        diag(&format!("[codec2]   reply parcel={:p}\n", reply.as_ptr()));
+    }
 
     let rbase = reply.as_ptr() as *const u8;
     let rdata = *(rbase.add(PARCEL_DATA) as *const *const u8);
