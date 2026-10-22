@@ -1626,7 +1626,10 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             // The parent check compares `*(u64*)(parentBuffer + parentOffset)`
             // with the child's buffer, so the aliases vector's buffer is its
             // data pointer, not the address of the struct field.
-            let aliases_idx = push_buffer_object(
+            // `readNullableEmbeddedBuffer(size*16, &handle, i*64, i*64+0x30)`
+            // reads the element array itself, so there is no separate object
+            // for the vector struct.
+            let alias_arr_idx = push_buffer_object(
                 &mut parcel,
                 &mut objects,
                 1,
@@ -1635,16 +1638,7 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                 arr_idx,
                 0x30,
             );
-            let alias_arr_idx = push_buffer_object(
-                &mut parcel,
-                &mut objects,
-                1,
-                alias_arr.as_ptr() as u64,
-                16,
-                aliases_idx,
-                0,
-            );
-            push_buffer_object(&mut parcel, &mut objects, 1, al_ptr, al_len, aliases_idx, 0);
+            push_buffer_object(&mut parcel, &mut objects, 1, al_ptr, al_len, alias_arr_idx, 0);
         } else {
             // `getConfigurable` and `getPoolClientManager` both return a binder;
             // handing back the store's own handle keeps the client's
