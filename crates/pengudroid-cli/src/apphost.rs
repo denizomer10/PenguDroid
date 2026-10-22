@@ -848,10 +848,63 @@ fn probe_media_codecs(env: &JniEnv) {
         ) {
             let mime = env.new_string("video/avc");
             match env.call_static_object(mc_class, create, &[JValue { l: mime }]) {
-                Some(codec) if !codec.is_null() => println!("media: createDecoderByType(video/avc) ok"),
+                Some(codec) if !codec.is_null() => {
+                    println!("media: createDecoderByType(video/avc) ok");
+                    probe_codec_configure(env, codec);
+                }
                 _ => eprintln!("media: createDecoderByType(video/avc) failed"),
             }
         }
+    }
+}
+
+/// Drive `configure` + `start` on a freshly created decoder.
+///
+/// Both go through `IComponent` on the local `BnHwComponent`, so they exercise
+/// the component side of the codec2 service.
+fn probe_codec_configure(env: &JniEnv, codec: JObject) {
+    let Some(fmt_class) = env.find_class("android/media/MediaFormat") else {
+        return;
+    };
+    let Some(create_fmt) = env.static_method_id(
+        fmt_class,
+        "createVideoFormat",
+        "(Ljava/lang/String;II)Landroid/media/MediaFormat;",
+    ) else {
+        return;
+    };
+    let mime = env.new_string("video/avc");
+    let Some(format) = env.call_static_object(
+        fmt_class,
+        create_fmt,
+        &[JValue { l: mime }, JValue { i: 320 }, JValue { i: 240 }],
+    ) else {
+        eprintln!("media: createVideoFormat threw");
+        return;
+    };
+    let Some(mc_class) = env.find_class("android/media/MediaCodec") else {
+        return;
+    };
+    if let Some(configure) = env.method_id(
+        mc_class,
+        "configure",
+        "(Landroid/media/MediaFormat;Landroid/view/Surface;Landroid/media/MediaCrypto;I)V",
+    ) {
+        let ok = env.call_void(
+            codec,
+            configure,
+            &[
+                JValue { l: format },
+                JValue { l: std::ptr::null_mut() },
+                JValue { l: std::ptr::null_mut() },
+                JValue { i: 0 },
+            ],
+        );
+        println!("media: MediaCodec.configure = {ok}");
+    }
+    if let Some(start) = env.method_id(mc_class, "start", "()V") {
+        let ok = env.call_void(codec, start, &[]);
+        println!("media: MediaCodec.start = {ok}");
     }
 }
 
