@@ -3,10 +3,10 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
-## Bu oturum: hwui çiziyor, ama EGL display kayboluyor
+## Bu oturum: hwui çiziyor ve Wayland'a sunuyor
 
-Grafik zinciri bu oturumda dört duvardan geçti ve artık `eglSwapBuffers`'a
-kadar geliyor. Düzeltilenler (commit `d80a76f`):
+Grafik zinciri bu oturumda dört duvardan geçti ve `eglSwapBuffers` → daemon →
+`wl_surface` hattı artık çalışıyor. Düzeltilenler (commit `d80a76f`, `e8fd6aa`):
 
 1. **`ADisplay_acquirePhysicalDisplays`** (`libnativedisplay.so`). hwui'nin
    `EglManager::initialize`'ı WCG config'i için fiziksel display listesi
@@ -45,24 +45,34 @@ döndürüyor (hwui başka bir değerde assert ediyor).
    (`force_window_frame`), yoksa ağaç 0x0 ölçülüyor ve `performDraw` boş dirty
    rect görüp hwui'yi hiç çağırmıyor.
 
-### Şu anki tam durak noktası
+### Şu anki durum: NewPipe çiziyor ve sunuyor
 
-`eglSwapBuffers` **çağrılıyor** (np9'da daemon yokken "cannot connect to the
-daemon" hatası alındı), yani çizim başladı. Ama sonraki turlarda RenderThread
-sürekli `libEGL: validate_display:567 error 3008 (EGL_BAD_DISPLAY)` basıyor ve
-swap tamamlanmıyor. Hata `EglManager::setSwapBehavior`'ın hemen ardından
-başlıyor ve saniyede ~10 kez tekrar ediyor.
+`eglSwapBuffers` saniyede ~60 kez çağrılıyor ve her kare daemon'a sorunsuz
+sunuluyor (20 sn'lik koşuda 240 swap, tek bir `present` hatası yok). Daemon
+tarafında her sunum gerçek bir `wl_surface` + `xdg_toplevel` üzerine
+`attach` + `damage` + `commit` yapıyor (`crates/pengudroid-daemon/src/graphics.rs`).
+Yani `pengudroid art-test ... --classpath NewPipe_v0.29.1.apk` artık NewPipe'ı
+çizip Wayland yüzeyine veriyor.
 
-**Sıradaki adım:** bu çağrının hangi EGL entry point'inden geldiğini bulmak.
-`eglMakeCurrent`, `eglSwapInterval`, `eglQuerySurface` artık null display'i
-cache'lenmiş display ile değiştiriyor (`resolve_display`), ama hata sürüyor —
-yani ya cache 0, ya da çağrı gleshim'in export etmediği bir fonksiyona gidiyor
-(ör. `eglCreateSyncKHR`, `eglWaitSync`, `eglCreateImageKHR`). En hızlı teşhis:
-gleshim'in export listesini `libhwui.so`'nun `egl*@plt` çağrılarıyla
-karşılaştırmak, ve eksik olanları eklemek.
+### Bilinen artıklar
 
-`ps` gözlemi: `RenderThread` `do_epoll_wait`'te bekliyor, ana thread `Looper`
-içinde; süreç ayakta kalıyor (exit 124), çökme yok.
+1. **`EGL_BAD_DISPLAY` gürültüsü.** Koşu başına ~240 kez
+   `libEGL: validate_display:567 error 3008` basılıyor. Swap'ları
+   engellemiyor (240 swap tamamlandı), yani ikinci bir `EglManager` —
+   `MainActivity.onCreate`'daki `AlertDialog`'un penceresi — kendi display'ini
+   kaybediyor. Sıradaki adım: `eglGetDisplay`'ın her çağrıda yeni bir handle
+   döndürmesini engelle (cache'le), ve gleshim'in export etmediği
+   `eglCreateSyncKHR`/`eglClientWaitSyncKHR`/`eglWaitSyncKHR`/
+   `eglDestroySyncKHR`/`eglDupNativeFenceFDANDROID`/
+   `eglGetNativeClientBufferANDROID`/`eglCreateImageKHR`/`eglDestroyImageKHR`
+   fonksiyonlarını da gleshim'e ekle — şu an gerçek Mesa'ya gidiyorlar.
+2. **Kare hızı düşük görünüyor.** 20 saniyede 240 kare ≈ 12 fps; vsync
+   zaman damgalarımız (`DisplayEventDispatcher: ~ last event processed while
+   scheduling was for ...`) hâlâ tutarsız. Doğru `timestamp`/`frameInterval`
+   ile 60 fps'e çıkmalı.
+3. **Ekran 1280x720.** `eglCreateWindowSurface` 1280x720 bildiriyor
+   (`PENGUDROID_SURFACE_W/H`), oysa `force_window_frame` 720x1280 yazıyor.
+   İkisi tek bir kaynaktan beslenmeli.
 
 ### Bu oturumda eklenen teşhis araçları
 
