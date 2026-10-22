@@ -932,6 +932,130 @@ fn probe_codec_configure(env: &JniEnv, codec: JObject) {
     if let Some(start) = env.method_id(mc_class, "start", "()V") {
         let ok = env.call_void(codec, start, &[]);
         println!("media: MediaCodec.start = {ok}");
+        if ok {
+            probe_codec_decode(env, mc_class, fmt_class, codec);
+        }
+    }
+}
+
+/// Feed one H.264 access unit through the decoder and report what comes out.
+///
+/// `tools/make_h264.py` writes the stream: SPS + PPS + one IDR frame coded as a
+/// single I_PCM macroblock, so no encoder is needed on the host.
+fn probe_codec_decode(env: &JniEnv, mc_class: JClass, fmt_class: JClass, codec: JObject) {
+    let path = std::env::var("PENGUDROID_H264").unwrap_or_else(|_| "/tmp/test.h264".to_string());
+    let Ok(data) = std::fs::read(&path) else {
+        eprintln!("media: cannot read {path}");
+        return;
+    };
+    let Some(deq_in) = env.method_id(mc_class, "dequeueInputBuffer", "(J)I") else {
+        eprintln!("media: dequeueInputBuffer missing");
+        return;
+    };
+    let Some(idx) = env.call_int(codec, deq_in, &[JValue { j: 1_000_000 }]) else {
+        eprintln!("media: dequeueInputBuffer threw");
+        return;
+    };
+    if idx < 0 {
+        eprintln!("media: dequeueInputBuffer = {idx}");
+        return;
+    }
+    let Some(get_in) = env.method_id(mc_class, "getInputBuffer", "(I)Ljava/nio/ByteBuffer;") else {
+        return;
+    };
+    let Some(buf) = env.call_object(codec, get_in, &[JValue { i: idx }]) else {
+        eprintln!("media: getInputBuffer threw");
+        return;
+    };
+    let dst = env.direct_buffer_address(buf);
+    if dst.is_null() {
+        eprintln!("media: getInputBuffer is not direct");
+        return;
+    }
+    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len()) };
+    let Some(queue) = env.method_id(mc_class, "queueInputBuffer", "(IIIJI)V") else {
+        return;
+    };
+    let ok = env.call_void(
+        codec,
+        queue,
+        &[
+            JValue { i: idx },
+            JValue { i: 0 },
+            JValue { i: data.len() as i32 },
+            JValue { j: 0 },
+            JValue { i: 0 },
+        ],
+    );
+    println!("media: queueInputBuffer({} bytes) = {ok}", data.len());
+
+    // Signal end of stream so the decoder drains whatever it is holding,
+    // unless PENGUDROID_NO_EOS asks for a plain steady-state dequeue.
+    if std::env::var_os("PENGUDROID_NO_EOS").is_none() {
+    if let Some(idx) = env.call_int(codec, deq_in, &[JValue { j: 1_000_000 }]) {
+        if idx >= 0 {
+            let queued = env.call_void(
+                codec,
+                queue,
+                &[
+                    JValue { i: idx },
+                    JValue { i: 0 },
+                    JValue { i: 0 },
+                    JValue { j: 0 },
+                    JValue { i: 4 }, // BUFFER_FLAG_END_OF_STREAM
+                ],
+            );
+            println!("media: queueInputBuffer(EOS) = {queued}");
+        }
+    }
+    }
+
+    let Some(info_class) = env.find_class("android/media/MediaCodec$BufferInfo") else {
+        return;
+    };
+    let Some(info_ctor) = env.method_id(info_class, "<init>", "()V") else {
+        return;
+    };
+    let Some(info) = env.new_object(info_class, info_ctor, &[]) else {
+        return;
+    };
+    let Some(deq_out) = env.method_id(
+        mc_class,
+        "dequeueOutputBuffer",
+        "(Landroid/media/MediaCodec$BufferInfo;J)I",
+    ) else {
+        return;
+    };
+    let Some(size_field) = env.field_id(info_class, "size", "I") else {
+        return;
+    };
+    let Some(flags_field) = env.field_id(info_class, "flags", "I") else {
+        return;
+    };
+    for round in 0..6 {
+        let out = env.call_int(codec, deq_out, &[JValue { l: info }, JValue { j: 5_000_000 }]);
+        let size = env.int_field(info, size_field);
+        let flags = env.int_field(info, flags_field);
+        println!("media: dequeueOutputBuffer[{round}] = {out:?} size={size} flags={flags}");
+        if out == Some(-2) {
+            // INFO_OUTPUT_FORMAT_CHANGED: the decoder accepted the stream.
+            if let Some(get_fmt) = env.method_id(mc_class, "getOutputFormat", "()Landroid/media/MediaFormat;") {
+                if let Some(fmt) = env.call_object(codec, get_fmt, &[]) {
+                    if let Some(get_int) = env.method_id(fmt_class, "getInteger", "(Ljava/lang/String;)I") {
+                        for key in ["width", "height"] {
+                            let k = env.new_string(key);
+                            if let Some(v) = env.call_int(fmt, get_int, &[JValue { l: k }]) {
+                                println!("media: output format {key}={v}");
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if out != Some(0) || flags & 4 != 0 {
+            break;
+        }
     }
 }
 

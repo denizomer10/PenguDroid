@@ -245,6 +245,91 @@ unsafe fn allocate_buffer(
     0
 }
 
+/// `android::GraphicBufferMapper::importBuffer(handle, width, height, format,
+/// usage, bufferId, generationNumber, out)`.
+///
+/// The real implementation goes to the gralloc mapper HAL. Our handles are
+/// memfd-backed and we are their only producer, so the handle doubles as the
+/// mapper handle and `lock` maps it directly.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper12importBufferEPK13native_handlejjjimjPS3_(
+    _this: *mut c_void,
+    handle: *const NativeHandle,
+    _width: u32,
+    _height: u32,
+    _format: u32,
+    _usage: i32,
+    _buffer_id: u64,
+    _generation: u32,
+    out: *mut *const NativeHandle,
+) -> i32 {
+    if handle.is_null() || out.is_null() {
+        return -22;
+    }
+    *out = handle;
+    0
+}
+
+/// `android::GraphicBufferMapper::lock(handle, usage, bounds, addr, bpp, stride)`.
+///
+/// Returns an `mmap` of the handle's memfd, which is all `C2AllocationGralloc`
+/// needs to write decoded pixels.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper4lockEPK13native_handlejRKNS_4RectEPPvPiS9_(
+    _this: *mut c_void,
+    handle: *const NativeHandle,
+    _usage: u32,
+    _bounds: *const c_void,
+    addr: *mut *mut c_void,
+    bytes_per_pixel: *mut i32,
+    stride: *mut i32,
+) -> i32 {
+    if handle.is_null() || addr.is_null() {
+        return -22;
+    }
+    let h = &*handle;
+    if h.num_fds < 1 || h.data.is_empty() {
+        return -22;
+    }
+    let fd = h.data[0];
+    let size = libc::lseek(fd, 0, libc::SEEK_END);
+    if size <= 0 {
+        return -22;
+    }
+    let p = libc::mmap(
+        std::ptr::null_mut(),
+        size as usize,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_SHARED,
+        fd,
+        0,
+    );
+    if p == libc::MAP_FAILED {
+        return -12;
+    }
+    *addr = p;
+    if !bytes_per_pixel.is_null() {
+        *bytes_per_pixel = 4;
+    }
+    if !stride.is_null() {
+        // `data[1]` is the stride we recorded at allocation time.
+        *stride = if h.num_ints >= 1 { h.data[1] } else { 0 };
+    }
+    if std::env::var_os("PENGUDROID_TRACE_AHB").is_some() {
+        eprintln!("[ahb] lock mapped {size} bytes");
+    }
+    0
+}
+
+/// `android::GraphicBufferMapper::unlock(handle)`.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper6unlockEPK13native_handle(
+    _this: *mut c_void,
+    _handle: *const NativeHandle,
+) -> i32 {
+    0
+}
+
 /// `android::GraphicBufferMapper::getTransportSize(handle, &numFds, &numInts)`.
 ///
 /// `GraphicBuffer::initWithSize` asks the mapper how many fds and ints a handle

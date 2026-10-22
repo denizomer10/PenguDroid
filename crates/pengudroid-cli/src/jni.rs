@@ -67,6 +67,7 @@ mod slot {
     pub const SET_FLOAT_FIELD: usize = 111;
     pub const GET_STATIC_OBJECT_FIELD: usize = 145;
     pub const GET_ARRAY_LENGTH: usize = 171;
+    pub const GET_DIRECT_BUFFER_ADDRESS: usize = 230;
     pub const GET_OBJECT_ARRAY_ELEMENT: usize = 173;
     pub const NEW_LONG_ARRAY: usize = 180;
     pub const NEW_FLOAT_ARRAY: usize = 181;
@@ -312,6 +313,16 @@ impl JniEnv {
             unsafe { self.func(slot::CALL_INT_METHOD_A) };
         let v = unsafe { f(self.0, obj, method, args.as_ptr()) };
         self.exception_check().then_some(v)
+    }
+
+    /// `GetDirectBufferAddress(buffer)`.
+    pub fn direct_buffer_address(&self, buffer: JObject) -> *mut u8 {
+        if buffer.is_null() {
+            return std::ptr::null_mut();
+        }
+        let f: unsafe extern "C" fn(*mut c_void, JObject) -> *mut u8 =
+            unsafe { self.func(slot::GET_DIRECT_BUFFER_ADDRESS) };
+        unsafe { f(self.0, buffer) }
     }
 
     /// `GetArrayLength(array)`.
