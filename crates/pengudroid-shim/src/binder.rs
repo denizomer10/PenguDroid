@@ -1623,11 +1623,14 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                 push_buffer_object(&mut parcel, &mut objects, 1, info.as_ptr() as u64, 64, vec_idx, 0);
             push_buffer_object(&mut parcel, &mut objects, 1, name_ptr, name_len, arr_idx, 0);
             push_buffer_object(&mut parcel, &mut objects, 1, mt_ptr, mt_len, arr_idx, 32);
+            // The parent check compares `*(u64*)(parentBuffer + parentOffset)`
+            // with the child's buffer, so the aliases vector's buffer is its
+            // data pointer, not the address of the struct field.
             let aliases_idx = push_buffer_object(
                 &mut parcel,
                 &mut objects,
                 1,
-                info.as_ptr() as u64 + 0x30,
+                alias_arr.as_ptr() as u64,
                 16,
                 arr_idx,
                 0x30,
