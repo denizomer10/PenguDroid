@@ -3,6 +3,88 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
+## Bu oturum: hwui çiziyor, ama EGL display kayboluyor
+
+Grafik zinciri bu oturumda dört duvardan geçti ve artık `eglSwapBuffers`'a
+kadar geliyor. Düzeltilenler (commit `d80a76f`):
+
+1. **`ADisplay_acquirePhysicalDisplays`** (`libnativedisplay.so`). hwui'nin
+   `EglManager::initialize`'ı WCG config'i için fiziksel display listesi
+   istiyor ve sayı pozitif değilse
+   `__android_log_assert("Failed to acquire physical displays for WCG
+   support!")` ile ölüyordu. Semboller C++ mangled (`android::ADisplay_*`), bu
+yüzden `#[export_name]` ile interpose edildi. Shim tek bir fiziksel display
+bildiriyor; `ADisplay_getPreferredWideColorFormat` `AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM`
+döndürüyor (hwui başka bir değerde assert ediyor).
+
+2. **gralloc** (`crates/pengudroid-shim/src/gralloc.rs`, yeni).
+   `AHardwareBuffer` bir `GraphicBuffer`'dır; `libui`'nin
+   `GraphicBufferAllocator`/`GraphicBufferMapper` constructor'ları HIDL
+   `IMapper` bulamayınca `LOG_ALWAYS_FATAL("gralloc-mapper is missing")`
+   yapıyordu. `GraphicBuffer::initWithSize` ve `free_handle` bu ikisine **PLT
+   üzerinden** erişiyor, bu yüzden interposition tutuyor: iki constructor
+   no-op'a çevrildi, `allocate`/`free`/`importBuffer`/`freeBuffer`/
+   `getTransportSize`/`lock`/`unlock` ve metadata getter'ları `memfd` üzerinde
+   yeniden yazıldı. `native_handle_t` düzeni bizim (tek üretici biziz):
+   `numFds=1` (memfd), `numInts=8` = stride/format/width/height/layers/
+   usage_lo/usage_hi/magic.
+
+3. **`eglSurfaceAttrib`**. hwui her surface'te `EGL_SWAP_BEHAVIOR` ayarlıyor ve
+   `EGL_FALSE` görürse "Unable to match the desired swap behavior" diyor.
+   Surface offscreen FBO olduğu için her attribute kabul ediliyor; ayrıca
+   `eglQuerySurface` `EGL_SWAP_BEHAVIOR`/`EGL_RENDER_BUFFER` cevaplıyor.
+
+4. **`IWindowSession.relayout`**. `--dump-class` artık metod **imzalarını** da
+   basıyor (`Method.getParameterTypes()`), ve bu, out parametrelerinin sırasını
+   kesinleştirdi: `ClientWindowFrames`, `MergedConfiguration`, `SurfaceControl`,
+   `InsetsState`, `InsetsSourceControl[]`, `Bundle`. İlk ikisi host tarafında
+   framework'ün kendi `Parcel.writeTypedObject`'i ile marshallanıyor
+   (`ClientWindowFrames` içindeki alan sırası framework detayı; bir kelime
+   kayarsa client `MergedConfiguration`'ı `SurfaceControl` baytlarından okuyor).
+   Ayrıca `ViewRootImpl`'in frame'i JNI ile doğrudan 720x1280'e ayarlanıyor
+   (`force_window_frame`), yoksa ağaç 0x0 ölçülüyor ve `performDraw` boş dirty
+   rect görüp hwui'yi hiç çağırmıyor.
+
+### Şu anki tam durak noktası
+
+`eglSwapBuffers` **çağrılıyor** (np9'da daemon yokken "cannot connect to the
+daemon" hatası alındı), yani çizim başladı. Ama sonraki turlarda RenderThread
+sürekli `libEGL: validate_display:567 error 3008 (EGL_BAD_DISPLAY)` basıyor ve
+swap tamamlanmıyor. Hata `EglManager::setSwapBehavior`'ın hemen ardından
+başlıyor ve saniyede ~10 kez tekrar ediyor.
+
+**Sıradaki adım:** bu çağrının hangi EGL entry point'inden geldiğini bulmak.
+`eglMakeCurrent`, `eglSwapInterval`, `eglQuerySurface` artık null display'i
+cache'lenmiş display ile değiştiriyor (`resolve_display`), ama hata sürüyor —
+yani ya cache 0, ya da çağrı gleshim'in export etmediği bir fonksiyona gidiyor
+(ör. `eglCreateSyncKHR`, `eglWaitSync`, `eglCreateImageKHR`). En hızlı teşhis:
+gleshim'in export listesini `libhwui.so`'nun `egl*@plt` çağrılarıyla
+karşılaştırmak, ve eksik olanları eklemek.
+
+`ps` gözlemi: `RenderThread` `do_epoll_wait`'te bekliyor, ana thread `Looper`
+içinde; süreç ayakta kalıyor (exit 124), çökme yok.
+
+### Bu oturumda eklenen teşhis araçları
+
+- `--dump-class` artık **metod imzalarını** basıyor: AIDL parcel düzeni
+  tahminine son verir.
+- `PENGUDROID_TRACE_GLES=1`: `eglCreateWindowSurface` ve her 60. `eglSwapBuffers`.
+- `tools/art/elfjump.py`, `tools/art/elfword.py`, `tools/art/elfstr.py`: bir
+  ELF'teki jump table / u32 sabit / string okumak için. `BnSurfaceComposer`,
+  `BnGraphicBufferProducer` gibi `onTransact` dispatch tablolarını çözmek için
+  yazıldı.
+
+### Doğrulanan wire detayları (bu oturum)
+
+- `android::gui::ISurfaceComposer` (AIDL) kodları: `bootFinished=1`,
+  `createConnection=2`, **`getPhysicalDisplayIds=3`** (`[Status][int64 vector]`),
+  `getPhysicalDisplayId=4`, `createDisplayEventConnection=5`.
+- `android.gui.IGraphicBufferProducer::sGetHalTokenTransactionCode` = `0x5f4e5547`
+  (`HpInterface::getHalToken`). Boş cevap `tokenCreated=false` demek; client
+  doğrudan binder'a düşüyor ve "HpInterface: No HAL token was created" uyarısı
+  zararsız.
+- `android::IGraphicBufferProducer::sGetHalTokenTransactionCode` = `0x5f474854`.
+
 ## Bu oturum: gerçek codec2 servisi çalışıyor (53 codec)
 
 `MediaCodecList` artık **gerçek** servisten besleniyor:

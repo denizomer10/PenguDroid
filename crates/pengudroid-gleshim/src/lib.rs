@@ -383,6 +383,22 @@ struct SurfaceRec {
     fbo: u32,
 }
 
+/// Substitute the cached host display for `EGL_NO_DISPLAY`.
+///
+/// hwui's `EglManager` keeps its own `mEglDisplay`, but a few call sites — the
+/// `SkiaOpenGLPipeline` cleanup paths in particular — pass `EGL_NO_DISPLAY` or
+/// what `eglGetCurrentDisplay` returned after a context teardown. Forwarding
+/// that to the host EGL produces `EGL_BAD_DISPLAY` from Mesa's
+/// `validate_display`, which makes every subsequent swap fail.
+fn resolve_display(dpy: EGLDisplay) -> EGLDisplay {
+    if dpy.is_null() {
+        let cached = lock_state().display;
+        cached as EGLDisplay
+    } else {
+        dpy
+    }
+}
+
 fn env_dim(name: &str, default: u32) -> u32 {
     std::env::var(name)
         .ok()
@@ -999,6 +1015,11 @@ pub unsafe extern "C" fn eglInitialize(
     if ok == EGL_TRUE {
         lock_state().display = dpy as usize;
     }
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+        eprintln!(
+            "[pengudroid-gleshim] eglInitialize dpy={dpy:p} -> {ok}"
+        );
+    }
     ok
 }
 
@@ -1191,6 +1212,7 @@ pub unsafe extern "C" fn eglMakeCurrent(
 
     // A surfaceless host display has no window surfaces; the app renders into
     // our FBO instead, so only the context is made current.
+    let dpy = resolve_display(dpy);
     let ok = (host.make_current)(
         dpy,
         std::ptr::null_mut(),
@@ -1205,7 +1227,9 @@ pub unsafe extern "C" fn eglMakeCurrent(
 
     {
         let mut st = lock_state();
-        st.display = dpy as usize;
+        if !dpy.is_null() {
+            st.display = dpy as usize;
+        }
         st.context = ctx as usize;
         st.current_surface = draw as usize;
     }
@@ -1263,7 +1287,7 @@ pub unsafe extern "C" fn eglBindAPI(api: u32) -> u32 {
 pub unsafe extern "C" fn eglSwapInterval(dpy: EGLDisplay, interval: c_int) -> u32 {
     match host().ok().and_then(|h| h.swap_interval) {
         // SAFETY: forwarded verbatim.
-        Some(swap_interval) => swap_interval(dpy, interval),
+        Some(swap_interval) => swap_interval(resolve_display(dpy), interval),
         None => EGL_FALSE,
     }
 }
@@ -1451,11 +1475,12 @@ pub unsafe extern "C" fn eglSurfaceAttrib(
 
 #[no_mangle]
 pub unsafe extern "C" fn eglQuerySurface(
-    _dpy: EGLDisplay,
+    dpy: EGLDisplay,
     surface: EGLSurface,
     attribute: c_int,
     value: *mut c_int,
 ) -> u32 {
+    let _ = resolve_display(dpy);
     if surface.is_null() || value.is_null() {
         return EGL_FALSE;
     }
