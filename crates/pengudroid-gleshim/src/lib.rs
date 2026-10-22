@@ -1839,9 +1839,15 @@ unsafe fn dump_frame_once(surface: EGLSurface, host: &Host) {
     };
     static DUMPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     // Skip the first frames: the first traversal draws the window background
-    // before the app has laid anything out.
+    // before the app has laid anything out. `PENGUDROID_DUMP_FRAME_AT` overrides
+    // the frame number, which matters for an app that only swaps a handful of
+    // times (a static screen) and would never reach the default.
+    let at: u64 = std::env::var("PENGUDROID_DUMP_FRAME_AT")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(200);
     let n = DUMPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if !(n == 200 || n == 201 || n == 400) {
+    if n != at {
         return;
     }
     let Some(read_pixels) = host.gl_read_pixels else {

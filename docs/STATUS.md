@@ -75,6 +75,49 @@ python3 tools/art/ppmstat.py /tmp/f.frame201.ppm   # renk dağılımı
 `ppmstat.py` çıktısı: 601 farklı renk, en sık `#eeeeee` (arka plan),
 `#999999` (thumbnail/ikincil), `#e53935` (NewPipe kırmızısı).
 
+### Kare zamanlaması (vsync) düzeltildi
+
+`Choreographer` artık hiç uyarı basmıyor. Üç ayrı hata vardı:
+
+1. **Zaman tabanı.** `send_vsync` her çağrıda zaman damgasını bir kare
+   aralığı kadar *artırıyordu*. Ama `send_vsync` hem 60 Hz iş parçacığından hem
+   de her `requestNextVsync`'te çağrılıyor, yani taban duvar saatinden hızlı
+   kayıyordu ve `Choreographer`
+   `Frame time is 29787 ms in the future!  Check that graphics HAL is generating
+   vsync timestamps using the correct timebase.` basıyordu. Artık gerçek
+   `CLOCK_MONOTONIC` okunuyor (zaten monotonik).
+2. **`VsyncEventData.frameTimelines` boştu.** Sıfır timeline, her kareyi
+   "zaten geç" gösteriyor; artık ilk girdi dolduruluyor
+   (`vsyncId`, `expectedPresentationTime`, `deadline`) ve
+   `preferredFrameTimelineIndex = 0`.
+3. **Çift darbe.** 60 Hz saat + istek üzerine gönderim, bir kare aralığında iki
+   vsync üretiyordu ve `DisplayEventDispatcher: ~ last event processed while
+   scheduling was for …` uyarısı çıkıyordu (25 sn'de 41 kez). `send_vsync`
+   artık yarım kare aralığında kendini sınırlıyor → uyarı 2'ye düştü, çizim
+   aynı.
+
+### `pengudroid launch` doğrulandı
+
+Kullanıcıya dönük komut uçtan uca çalışıyor:
+
+```
+$ pengudroid launch NewPipe_v0.29.1.apk --sysroot .toolchain/sysroot
+PenguDroid launch
+  package : org.schabi.newpipe
+  version : 0.29.1
+  backend : art (x86_64 libraries but no NativeActivity entry point)
+  activity: org.schabi.newpipe.MainActivity
+```
+
+`--sysroot` verilmezse uygulamanın ART'a ihtiyacı olduğunu söyleyip yol
+öneriyor. Bu yoldan alınan kare `docs/screenshots/newpipe-dialog.png`:
+NewPipe'ın **"Keep Android Open"** AlertDialog'u, doğru metin ve
+`SOLUTION`/`DETAILS` düğmeleriyle, arkası karartılmış halde — yani birden fazla
+pencere (activity + dialog) aynı anda çiziliyor.
+
+`PENGUDROID_DUMP_FRAME_AT=<n>` kare numarasını seçmeyi sağlıyor; statik bir
+ekran 200 kareye ulaşmadığı için `launch` yolunda varsayılan çok yüksekti.
+
 ### Bilinen artıklar
 
 1. **`EGL_BAD_DISPLAY` seli — ÇÖZÜLDÜ (`26ce279`).** Sebep `eglBeginFrame`.

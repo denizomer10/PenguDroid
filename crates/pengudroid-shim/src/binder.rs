@@ -1169,18 +1169,66 @@ fn send_vsync() {
     let mut event = [0u8; DISPLAY_EVENT_SIZE];
     event[0..4].copy_from_slice(&DISPLAY_EVENT_VSYNC.to_ne_bytes());
     // `displayId` stays 0 (the default display).
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    // SAFETY: `ts` is a valid `timespec` for `clock_gettime` to fill.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    let now = (ts.tv_sec as i64) * 1_000_000_000 + ts.tv_nsec as i64;
-    event[16..24].copy_from_slice(&now.to_ne_bytes());
+
+    // `Header.timestamp` is the *vsync* time: the moment the frame started. It
+    // has to be on `CLOCK_MONOTONIC` — the clock `System.nanoTime()` reads — and
+    // it must be the real time, not a counter stepped by one interval per call.
+    // `send_vsync` runs both from the 60 Hz thread and on every
+    // `requestNextVsync`, so stepping it made the timebase race ahead of the
+    // wall clock; `Choreographer` then logged
+    //
+    //     Frame time is 29787 ms in the future!  Check that graphics HAL is
+    //     generating vsync timestamps using the correct timebase.
+    //
+    // `CLOCK_MONOTONIC` is already monotonic, so reading it is all that is needed.
+    const FRAME_INTERVAL: i64 = 16_666_666;
+    static FRAME: AtomicU32 = AtomicU32::new(0);
+
+    let vsync_time = {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: `ts` is a valid `timespec` for `clock_gettime` to fill.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        (ts.tv_sec as i64) * 1_000_000_000 + ts.tv_nsec as i64
+    };
+
+    // `send_vsync` is called from the 60 Hz thread *and* on every
+    // `requestNextVsync`. Emitting both puts two pulses inside one frame
+    // interval, and the client then logs "dispatcher … ~ last event processed
+    // while scheduling was for …" for the surplus one. Half a frame interval is
+    // short enough that a request is still answered promptly and long enough
+    // that a request arriving just after a tick does not produce a second pulse.
+    {
+        static LAST_SEND: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        let previous = LAST_SEND.load(Ordering::Relaxed);
+        if previous != 0 && vsync_time - previous < FRAME_INTERVAL / 2 {
+            return;
+        }
+        LAST_SEND.store(vsync_time, Ordering::Relaxed);
+    }
+    let frame = FRAME.fetch_add(1, Ordering::Relaxed);
+
+    event[16..24].copy_from_slice(&vsync_time.to_ne_bytes());
     // `vsync.count` is the frame number; a monotonically increasing counter is
     // what `Choreographer` expects.
-    static FRAME: AtomicU32 = AtomicU32::new(0);
-    let frame = FRAME.fetch_add(1, Ordering::Relaxed);
     event[24..28].copy_from_slice(&frame.to_ne_bytes());
-    // `frameInterval` = 16.67 ms (60 Hz), the only timeline entry.
-    event[32..40].copy_from_slice(&16_666_666i64.to_ne_bytes());
+
+    // `VsyncEventData`: `{frameInterval, preferredFrameTimelineIndex, timelines[7]}`
+    // where a timeline is `{vsyncId, expectedPresentationTime, deadline}`.
+    // Leaving the timelines zeroed is what makes `Choreographer` treat every
+    // frame as already late, so the first entry is filled in and marked
+    // preferred.
+    const TIMELINES_OFFSET: usize = 48;
+    const TIMELINE_SIZE: usize = 24;
+    event[32..40].copy_from_slice(&FRAME_INTERVAL.to_ne_bytes());
+    event[40..44].copy_from_slice(&0u32.to_ne_bytes()); // preferredFrameTimelineIndex
+    let vsync_id = frame as i64;
+    let expected = vsync_time + FRAME_INTERVAL;
+    let base = TIMELINES_OFFSET;
+    event[base..base + 8].copy_from_slice(&vsync_id.to_ne_bytes());
+    event[base + 8..base + 16].copy_from_slice(&expected.to_ne_bytes());
+    event[base + 16..base + 24].copy_from_slice(&expected.to_ne_bytes());
+    // The remaining six entries stay zeroed; `preferredFrameTimelineIndex` is 0.
+    let _ = TIMELINE_SIZE;
 
     let fds = VSYNC_SEND_FDS.lock().unwrap_or_else(|e| e.into_inner());
     let mut dropped = 0usize;
@@ -1201,7 +1249,11 @@ fn send_vsync() {
         }
     }
     if trace_enabled() {
-        unsafe { diag(&format!("[binder]   -> vsync frame {frame} dropped={dropped}\n")) };
+        unsafe {
+            diag(&format!(
+                "[binder]   -> vsync frame {frame} ts={vsync_time} dropped={dropped}\n"
+            ))
+        };
     }
 }
 
