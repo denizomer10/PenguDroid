@@ -158,7 +158,7 @@ fn is_hidl_request(tr: &TransactionData) -> bool {
 /// record into the parcel data and puts its position in the offsets array,
 /// which `readObject<T>(handle)` then indexes. Returns the object's index in
 /// `objects`, which is what a child's `parent` field refers to.
-fn push_buffer_object(
+pub(crate) fn push_buffer_object(
     parcel: &mut Vec<u8>,
     objects: &mut Vec<u64>,
     flags: u32,
@@ -184,7 +184,7 @@ fn push_buffer_object(
 /// pointer into the `Vec` would dangle; the client dereferences the pointer
 /// after the reply has been handed over, and the number of HIDL strings we
 /// emit is tiny.
-fn leak_cstr(s: &str) -> (u64, u64) {
+pub(crate) fn leak_cstr(s: &str) -> (u64, u64) {
     let mut bytes = s.as_bytes().to_vec();
     bytes.push(0);
     let len = bytes.len() as u64;

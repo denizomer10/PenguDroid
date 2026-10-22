@@ -71,12 +71,20 @@ Kalan hata:
 hw-Parcel: Buffer length 1920 does not match expected size 57894563072
 ```
 
-`listComponents` yanıtındaki 16 baytlık `hidl_vec` yapısı yakalandığında zaten
-bozulmuş (`{ptr, 0x74da35eb23b4}` gibi). Yani geri çağrı, vektörün sahibi olan
-çerçeve dönmeden *önce* değil, *sonra* çalışıyor gibi görünüyor. Sıradaki adım
-`utils::ComponentStore::listComponents` (`libcodec2_hidl@1.0.so` `0x255b0`)
-içindeki `hidl_vec`'in nerede yaşadığını ve geri çağrının hangi çerçeveden
-çağrıldığını izlemek.
+`listComponents` **geri çağrıyı hiç kullanmıyor**: üretilen kod yanıt
+parcel'ini senkron yazıyor (`code 3` için trace'te "callback parcel" satırı
+yok), dolayısıyla `hidl_vec` `onTransact` dönene kadar bozuluyor. Gerçek
+sürücü tamponları `BC_REPLY` anında kopyalıyor.
+
+Bu yüzden `codec2.rs` artık `code 3` için `BnHwComponentStore::onTransact`'i
+atlayıp **`utils::ComponentStore::listComponents`'ı doğrudan** kendi geri
+çağrımızla çağırıyor ve trait'leri canlıyken kopyalayıp yanıtı kendisi yazıyor
+(`build_traits_reply`). Bu yol henüz çalışmıyor: `listComponents`
+`0x28(%rsi)`'yi `__f_` olarak okuyor ve bizim kurduğumuz `std::function`
+yerleşimi orada tutmuyor (`listComponents+0x38`'de SIGSEGV). Sıradaki adım
+`_hidl_listComponents`'ın (istemci tarafı) bu imza için `std::function`'ı nasıl
+kurduğunu disassemble etmek — `__f_`'nin hangi offsette olduğu oradan kesin
+çıkar.
 
 Bu yüzden barındırma `PENGUDROID_CODEC2_SERVICE=1` ile **opt-in**; varsayılan
 yol eski stub (codec listesi çalışıyor).

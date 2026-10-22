@@ -27,6 +27,8 @@
 use std::ffi::{c_char, c_void};
 use std::sync::OnceLock;
 
+use crate::binder::push_buffer_object;
+
 /// `android::hardware::Parcel` field offsets, measured from libhidlbase.
 ///
 /// `Parcel::setData` stores the buffer at `0x28` and the size at `0x30`;
@@ -71,11 +73,16 @@ struct FuncObj {
 }
 
 /// `std::function<void(Parcel&)>`.
+///
+/// The `__f_` pointer sits at `0x20` for the one-argument signature
+/// (`onTransact` reads `0x20(%r9)`) and at `0x28` for the two-argument one
+/// (`utils::ComponentStore::listComponents` reads `0x28(%rsi)`), so both slots
+/// carry it.
 #[repr(C)]
 struct StdFunction {
-    f: *const FuncObj,
-    alloc: usize,
-    buf: [usize; 3],
+    buf: [usize; 4],
+    f20: *const FuncObj,
+    f28: *const FuncObj,
 }
 
 thread_local! {
@@ -132,6 +139,123 @@ unsafe extern "C" fn func_operator(_this: *mut FuncObj, parcel: *const c_void) {
     CAPTURED.with(|c| *c.borrow_mut() = Some((bytes, objects)));
 }
 
+/// Copy a `hidl_string` at `base + off` into process-lifetime memory.
+///
+/// The source lives in the service's frame, so it has to be copied while the
+/// implementation call is still on the stack.
+unsafe fn copy_hidl_string(base: *const u8, off: usize) -> (u64, u64) {
+    let ptr = *(base.add(off) as *const *const u8);
+    let len = *(base.add(off + 8) as *const u32) as usize;
+    if ptr.is_null() || len == 0 {
+        return crate::binder::leak_cstr("");
+    }
+    let bytes = std::slice::from_raw_parts(ptr, len);
+    let text = String::from_utf8_lossy(bytes).into_owned();
+    crate::binder::leak_cstr(&text)
+}
+
+/// Build the `listComponents` reply from the traits vector the implementation
+/// handed us.
+///
+/// Layout (measured): `[hidl status][codec2 status][vec struct][traits array]
+/// [name][mediaType][aliases array][alias strings]...`, with `ComponentTraits`
+/// = `name`@0x00, `domain/kind/rank`@0x10, `mediaType`@0x20, `aliases`@0x30
+/// (element size 16).
+unsafe fn build_traits_reply(status: i32, vec: *const u8) -> (Vec<u8>, Vec<u64>) {
+    let data = *(vec as *const *const u8);
+    let count = *(vec.add(8) as *const u32) as usize;
+    let mut parcel = Vec::new();
+    let mut objects = Vec::new();
+    parcel.extend_from_slice(&0i32.to_ne_bytes()); // hidl status
+    parcel.extend_from_slice(&status.to_ne_bytes()); // codec2 status
+
+    let traits: &'static [u8] = Box::leak(vec![0u8; count * 64].into_boxed_slice());
+    let traits_ptr = traits.as_ptr() as *mut u8;
+
+    let mut vec_struct = Vec::with_capacity(16);
+    vec_struct.extend_from_slice(&(traits_ptr as u64).to_ne_bytes());
+    vec_struct.extend_from_slice(&(count as u32).to_ne_bytes());
+    vec_struct.extend_from_slice(&0u32.to_ne_bytes());
+    let vec_struct: &'static [u8] = Box::leak(vec_struct.into_boxed_slice());
+
+    let vec_idx =
+        push_buffer_object(&mut parcel, &mut objects, 0, vec_struct.as_ptr() as u64, 16, 0, 0);
+    let arr_idx = push_buffer_object(
+        &mut parcel,
+        &mut objects,
+        1,
+        traits_ptr as u64,
+        (count * 64) as u64,
+        vec_idx,
+        0,
+    );
+
+    for i in 0..count {
+        let src = data.add(i * 64);
+        let dst = traits_ptr.add(i * 64);
+        let (name_ptr, name_len) = copy_hidl_string(src, 0);
+        let (mt_ptr, mt_len) = copy_hidl_string(src, 0x20);
+        // domain/kind/rank are plain ints, copied verbatim.
+        std::ptr::copy_nonoverlapping(src.add(0x10), dst.add(0x10), 16);
+        *(dst as *mut u64) = name_ptr;
+        *(dst.add(8) as *mut u32) = (name_len - 1) as u32;
+        *(dst.add(0x20) as *mut u64) = mt_ptr;
+        *(dst.add(0x28) as *mut u32) = (mt_len - 1) as u32;
+
+        let alias_src = *(src.add(0x30) as *const *const u8);
+        let alias_count = *(src.add(0x38) as *const u32) as usize;
+        let alias_arr: &'static [u8] = Box::leak(vec![0u8; alias_count * 16].into_boxed_slice());
+        let alias_ptr = alias_arr.as_ptr() as *mut u8;
+        *(dst.add(0x30) as *mut u64) = alias_ptr as u64;
+        *(dst.add(0x38) as *mut u32) = alias_count as u32;
+        *(dst.add(0x3c) as *mut u32) = 0;
+
+        push_buffer_object(
+            &mut parcel,
+            &mut objects,
+            1,
+            name_ptr,
+            name_len,
+            arr_idx,
+            (i * 64) as u64,
+        );
+        push_buffer_object(
+            &mut parcel,
+            &mut objects,
+            1,
+            mt_ptr,
+            mt_len,
+            arr_idx,
+            (i * 64 + 0x20) as u64,
+        );
+        let alias_idx = push_buffer_object(
+            &mut parcel,
+            &mut objects,
+            1,
+            alias_ptr as u64,
+            (alias_count * 16) as u64,
+            arr_idx,
+            (i * 64 + 0x30) as u64,
+        );
+        for j in 0..alias_count {
+            let (ptr, len) = copy_hidl_string(alias_src, j * 16);
+            *(alias_ptr.add(j * 16) as *mut u64) = ptr;
+            *(alias_ptr.add(j * 16 + 8) as *mut u32) = (len - 1) as u32;
+            push_buffer_object(&mut parcel, &mut objects, 1, ptr, len, alias_idx, (j * 16) as u64);
+        }
+    }
+    if trace_enabled() {
+        diag(&format!("[codec2]   built traits reply for {count} codecs\n"));
+    }
+    (parcel, objects)
+}
+
+/// `operator()(Status, const hidl_vec<ComponentTraits>&)` for the direct call.
+unsafe extern "C" fn traits_operator(_this: *mut FuncObj, status: *const i32, vec: *const u8) {
+    let reply = build_traits_reply(*status, vec);
+    CAPTURED.with(|c| *c.borrow_mut() = Some(reply));
+}
+
 /// `RefBase::incStrong(void const*)`, resolved once.
 fn inc_strong() -> *mut c_void {
     static PTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -154,11 +278,11 @@ fn inc_strong() -> *mut c_void {
 static FUNC_OBJ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 unsafe fn func_obj() -> *const FuncObj {
-    use std::sync::atomic::Ordering;
-    let existing = FUNC_OBJ.load(Ordering::Relaxed);
-    if existing != 0 {
-        return existing as *const FuncObj;
-    }
+    make_func(func_operator as usize)
+}
+
+/// Build a `__func` object whose `operator()` is `operator`.
+unsafe fn make_func(operator: usize) -> *const FuncObj {
     let vtable = libc::malloc(7 * 8) as *mut usize;
     if vtable.is_null() {
         return std::ptr::null();
@@ -169,14 +293,13 @@ unsafe fn func_obj() -> *const FuncObj {
     *vtable.add(3) = func_clone_into as usize; // __clone(void*)
     *vtable.add(4) = func_noop as usize;
     *vtable.add(5) = func_noop as usize;
-    *vtable.add(6) = func_operator as usize; // operator()
+    *vtable.add(6) = operator; // operator()
     let obj = libc::malloc(std::mem::size_of::<FuncObj>()) as *mut FuncObj;
     if obj.is_null() {
         return std::ptr::null();
     }
     (*obj).vtable = vtable;
     (*obj).captures = [0; 5];
-    FUNC_OBJ.store(obj as usize, Ordering::Relaxed);
     obj
 }
 
@@ -202,6 +325,10 @@ struct Api {
     set_data_position: SetDataPosition,
     on_transact: Transact,
     store: *mut c_void,
+    /// The `utils::ComponentStore` implementation behind the binder stub.
+    store_impl: *mut c_void,
+    /// `utils::ComponentStore::listComponents(std::function<...>)`.
+    list_components: *mut c_void,
 }
 
 // SAFETY: the service objects are process-wide singletons; the codec2 HIDL
@@ -267,6 +394,10 @@ unsafe fn build() -> Option<Api> {
         b"libhidlbase.so\0",
         b"_ZN7android8hardware9BHwBinder8transactEjRKNS0_6ParcelEPS2_jNSt3__18functionIFvRS2_EEE\0",
     )?;
+    let list_components = sym(
+        b"libcodec2_hidl@1.0.so\0",
+        b"_ZN7android8hardware5media2c24V1_05utils14ComponentStore14listComponentsENSt3__18functionIFvNS3_6StatusERKNS0_8hidl_vecINS3_15IComponentStore15ComponentTraitsEEEEEE\0",
+    )?;
 
     // `GetCodec2PlatformComponentStore()` returns a `shared_ptr<C2ComponentStore>`
     // by value (sret), so the control block is a real one and the refcounts work.
@@ -316,6 +447,8 @@ unsafe fn build() -> Option<Api> {
         set_data_position: std::mem::transmute(set_data_position),
         on_transact: std::mem::transmute(transact),
         store: bn,
+        store_impl: store,
+        list_components,
     })
 }
 
@@ -445,6 +578,32 @@ unsafe fn stabilize(bytes: &mut [u8], objects: &[u64], inc_strong: *mut c_void) 
 pub(crate) unsafe fn dispatch(code: u32, data: &[u8], objects: &[u64]) -> Option<(Vec<u8>, Vec<u64>)> {
     let api = api()?;
 
+    // `listComponents` writes its reply synchronously, so the `hidl_vec` it
+    // points at is a dead local by the time `onTransact` returns. Call the
+    // implementation directly instead: the traits vector is alive inside our
+    // own callback, and we marshal the reply ourselves.
+    if code == 3 {
+        CAPTURED.with(|c| *c.borrow_mut() = None);
+        let func = StdFunction {
+            buf: [0; 4],
+            f20: make_func(traits_operator as usize),
+            f28: make_func(traits_operator as usize),
+        };
+        let list: unsafe extern "C" fn(*mut c_void, *const StdFunction) =
+            std::mem::transmute(api.list_components);
+        list(api.store_impl, &func);
+        if let Some(reply) = CAPTURED.with(|c| c.borrow_mut().take()) {
+            if trace_enabled() {
+                diag(&format!(
+                    "[codec2] code 3 -> direct call, {} bytes, {} objects\n",
+                    reply.0.len(),
+                    reply.1.len()
+                ));
+            }
+            return Some(reply);
+        }
+    }
+
     // The request parcel: `setData` allocates and copies the bytes, then we
     // install the offsets array. `Parcel::~Parcel` frees both with `free`, so
     // the array has to come from `malloc`.
@@ -476,9 +635,9 @@ pub(crate) unsafe fn dispatch(code: u32, data: &[u8], objects: &[u64]) -> Option
     (api.parcel_ctor)(reply.as_mut_ptr() as *mut c_void);
     CAPTURED.with(|c| *c.borrow_mut() = None);
     let callback = StdFunction {
-        f: func_obj(),
-        alloc: 0,
-        buf: [0; 3],
+        buf: [0; 4],
+        f20: func_obj(),
+        f28: func_obj(),
     };
     let rc = (api.on_transact)(
         api.store,
