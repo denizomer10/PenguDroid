@@ -1644,7 +1644,7 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                 aliases_idx,
                 0,
             );
-            push_buffer_object(&mut parcel, &mut objects, 1, al_ptr, al_len, alias_arr_idx, 0);
+            push_buffer_object(&mut parcel, &mut objects, 1, al_ptr, al_len, aliases_idx, 0);
         } else {
             // `getConfigurable` and `getPoolClientManager` both return a binder;
             // handing back the store's own handle keeps the client's
