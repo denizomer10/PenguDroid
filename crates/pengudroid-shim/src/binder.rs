@@ -1577,7 +1577,13 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         // `codec2.rs`), so the generated HIDL code does the marshalling for us.
         // The stub replies below are only the fallback for when the service
         // libraries cannot be loaded.
-        if tr.data_ptr != 0 {
+        //
+        // `IBase` methods (codes above `0x0F000000`) are answered by the stub:
+        // `interfaceChain` writes its reply synchronously, so the `hidl_vec` it
+        // points at is a dead local by the time `onTransact` returns. The
+        // methods that matter (`createComponent`, `listComponents`) hand the
+        // reply to the callback instead, which is where `codec2.rs` captures it.
+        if tr.data_ptr != 0 && tr.code < 0x0F00_0000 {
             let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
             let offsets: Vec<u64> = if tr.offsets_ptr != 0 && tr.offsets_size > 0 {
                 std::slice::from_raw_parts(

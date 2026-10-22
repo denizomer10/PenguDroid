@@ -37,31 +37,56 @@ alıyorduk.
 ### Sıradaki duvar: gerçek codec2 servisini barındırmak
 
 `crates/pengudroid-shim/src/codec2.rs` gerçek servisi süreç içinde kuruyor
-(`C2PlatformComponentStore` → `utils::ComponentStore` → `BnHwComponentStore`)
-ve `interfaceChain` doğru yanıtlanıyor (164 bayt, 4 nesne). Ama yanıt parcel'i
-gömülü tamponlarını servisin **kendi yığınına** işaret ettiriyor ve üretilen
-kod yanıtı ancak `std::function<void(Parcel&)>` geri çağrısı içinde teslim
-ediyor. Rust'tan libc++ `std::function` kurulamadığı için tamponlar
-`onTransact` dönmeden ölüyor:
+(`C2PlatformComponentStore` → `utils::ComponentStore` → `BnHwComponentStore`).
+`PENGUDROID_CODEC2_SERVICE=1` ile ölçülen durum:
 
 ```
-hw-Parcel: Buffer length 32 does not match expected size 15638207488
-HidlServiceManagement: getService: received incompatible service
+[codec2] code 8 -> rc=0 28 bytes, 1 objects      (getConfigurable)
+[codec2] code 7 -> rc=0 28 bytes, 1 objects      (getPoolClientManager)
+[codec2] code 3 -> rc=0 3688 bytes, 92 objects   (listComponents, 30 codec)
 ```
+
+Yani servis gerçekten çalışıyor ve 30 codec döndürüyor. Kalan sorun **gömülü
+tamponların ömrü**: yanıt parcel'i `hidl_vec`/`hidl_string` yapılarına işaret
+ediyor ve bunlar servisin yığınında; gerçek sürücü bu tamponları işlem
+sırasında kopyalar, bizim broker'ımız kopyalamıyor.
+
+Bu oturumda çözülen iki parça:
+
+1. **`std::function<void(Parcel&)>` elle kuruldu.** libc++ yerleşimi ölçüldü:
+   `std::function` 40 bayt `{__f_@0, allocator@8, __buf_@0x10}`; `__f_` 48
+   baytlık bir `__func` nesnesine işaret ediyor `{vtable@0, yakalananlar@8..}`;
+   vtable adres noktasında `__clone()` +0x10'da (`onTransact` `call *0x10(%rax)`
+   yapıyor), `operator()` +0x30'da (`_hidl_listComponents` `call *0x30(%rax)`).
+   Böylece yanıt geri çağrı içinde yakalanabiliyor.
+2. **Yerel binder nesneleri için `incStrong`.** Servis `getConfigurable`
+   yanıtında yerel bir `BnHwConfigurable` döndürüyor; yanıt parcel'i yok
+   edilince nesne ölüyor ve istemcinin `unflatten_binder`'ı ölü nesnede
+   `incStrong` çağırıp çöküyordu. `stabilize` artık `BINDER_TYPE_BINDER`
+   nesnelerinin cookie'sine `RefBase::incStrong` uyguluyor.
+
+Kalan hata:
+
+```
+hw-Parcel: Buffer length 1920 does not match expected size 57894563072
+```
+
+`listComponents` yanıtındaki 16 baytlık `hidl_vec` yapısı yakalandığında zaten
+bozulmuş (`{ptr, 0x74da35eb23b4}` gibi). Yani geri çağrı, vektörün sahibi olan
+çerçeve dönmeden *önce* değil, *sonra* çalışıyor gibi görünüyor. Sıradaki adım
+`utils::ComponentStore::listComponents` (`libcodec2_hidl@1.0.so` `0x255b0`)
+içindeki `hidl_vec`'in nerede yaşadığını ve geri çağrının hangi çerçeveden
+çağrıldığını izlemek.
 
 Bu yüzden barındırma `PENGUDROID_CODEC2_SERVICE=1` ile **opt-in**; varsayılan
 yol eski stub (codec listesi çalışıyor).
 
 Çözüm yolları, kolaydan zora:
 
-1. `std::function<void(Parcel&)>` için libc++ `__func` yerleşimini elle kur
-   (nesne 48 bayt: `{tablo@0, yakalananlar@8..0x30}`; tablo
-   `libhidlbase`'de `0xcd160`'ta, `__clone()` `0xa26f0`, `__clone(void*)`
-   `0xa2730`). Tablo slot sırası henüz kesinleşmedi.
-2. `BnHwComponentStore::onTransact` yerine `utils::ComponentStore`
-   metodlarını doğrudan çağır ve geri çağrıyı aynı şekilde kur.
-3. Gerçek bir binder **sunucusu** yaz (daemon'da), servisi ayrı süreçte
+1. `listComponents`'ın vektörünü geri çağrı anında kopyalamak (yukarıdaki iz).
+2. Gerçek bir binder **sunucusu** yaz (daemon'da), servisi ayrı süreçte
    çalıştır; o zaman sürücünün tampon kopyalama işini de biz yaparız.
+3. `IComponent` tarafını elle yazıp yalnızca `C2Component` API'sini kullan.
 
 ### Parcel yerleşimi (ölçüldü, `libhidlbase`)
 

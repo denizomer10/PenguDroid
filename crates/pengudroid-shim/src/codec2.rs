@@ -49,6 +49,134 @@ const PARCEL_BYTES: usize = 0x100;
 /// `BnHwComponentStore` overrides that slot.
 const VTBL_ON_TRANSACT: usize = 0x60;
 
+// --- a hand-built `std::function<void(Parcel&)>` ---------------------------
+//
+// The generated code hands the reply parcel to a `std::function` callback and
+// only *there* are the embedded buffers still alive (the `hidl_vec` it points
+// at is a local of the implementation call). Rust cannot construct a libc++
+// `std::function`, so we build the two objects it is made of by hand.
+//
+// Measured from libhidlbase:
+//   * `std::function` is 40 bytes: `{__f_@0, allocator@8, __buf_@0x10}`.
+//   * `__f_` points at a `__func` object of 48 bytes: `{vtable@0, captures@8..}`.
+//   * the vtable's address point holds `__clone()` at +0x10
+//     (`BnHwComponentStore::onTransact` does `call *0x10(%rax)`) and
+//     `operator()` at +0x30 (`_hidl_listComponents` does `call *0x30(%rax)`).
+
+/// `__func` object: vtable pointer followed by the captures.
+#[repr(C)]
+struct FuncObj {
+    vtable: *const usize,
+    captures: [usize; 5],
+}
+
+/// `std::function<void(Parcel&)>`.
+#[repr(C)]
+struct StdFunction {
+    f: *const FuncObj,
+    alloc: usize,
+    buf: [usize; 3],
+}
+
+thread_local! {
+    /// The reply parcel captured from inside the callback.
+    static CAPTURED: std::cell::RefCell<Option<(Vec<u8>, Vec<u64>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+unsafe extern "C" fn func_noop() {}
+
+/// `__clone()`: hand back a fresh object with the same vtable and captures.
+unsafe extern "C" fn func_clone(this: *const FuncObj) -> *mut FuncObj {
+    let copy = libc::malloc(std::mem::size_of::<FuncObj>()) as *mut FuncObj;
+    if !copy.is_null() {
+        std::ptr::copy_nonoverlapping(this, copy, 1);
+    }
+    copy
+}
+
+/// `__clone(void*)`: copy into the caller's buffer.
+unsafe extern "C" fn func_clone_into(this: *const FuncObj, out: *mut FuncObj) -> *mut FuncObj {
+    std::ptr::copy_nonoverlapping(this, out, 1);
+    out
+}
+
+/// `operator()(Parcel&)`: copy the reply out while its buffers are still valid.
+unsafe extern "C" fn func_operator(_this: *mut FuncObj, parcel: *const c_void) {
+    let base = parcel as *const u8;
+    let data = *(base.add(PARCEL_DATA) as *const *const u8);
+    let len = *(base.add(PARCEL_DATA_SIZE) as *const usize);
+    let offs = *(base.add(PARCEL_OBJECTS) as *const *const u64);
+    let count = *(base.add(PARCEL_OBJECTS_SIZE) as *const usize);
+    let mut bytes = if data.is_null() || len == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(data, len).to_vec()
+    };
+    let objects = if offs.is_null() || count == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(offs, count).to_vec()
+    };
+    stabilize(&mut bytes, &objects, inc_strong());
+    if trace_enabled() {
+        diag(&format!(
+            "[codec2]   callback captured {} bytes, {} objects\n",
+            bytes.len(),
+            objects.len()
+        ));
+    }
+    CAPTURED.with(|c| *c.borrow_mut() = Some((bytes, objects)));
+}
+
+/// `RefBase::incStrong(void const*)`, resolved once.
+fn inc_strong() -> *mut c_void {
+    static PTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    use std::sync::atomic::Ordering;
+    let existing = PTR.load(Ordering::Relaxed);
+    if existing != 0 {
+        return existing as *mut c_void;
+    }
+    let p = unsafe {
+        sym(b"libhidlbase.so\0", b"_ZNK7android7RefBase9incStrongEPKv\0").unwrap_or(std::ptr::null_mut())
+    };
+    PTR.store(p as usize, Ordering::Relaxed);
+    p
+}
+
+/// The vtable and the single `__func` object, built on first use.
+///
+/// One transaction is in flight at a time, so a single object suffices; the
+/// captures are unused because the reply is stashed in `CAPTURED` instead.
+static FUNC_OBJ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+unsafe fn func_obj() -> *const FuncObj {
+    use std::sync::atomic::Ordering;
+    let existing = FUNC_OBJ.load(Ordering::Relaxed);
+    if existing != 0 {
+        return existing as *const FuncObj;
+    }
+    let vtable = libc::malloc(7 * 8) as *mut usize;
+    if vtable.is_null() {
+        return std::ptr::null();
+    }
+    *vtable.add(0) = func_noop as usize; // dtor
+    *vtable.add(1) = func_noop as usize; // deleting dtor
+    *vtable.add(2) = func_clone as usize; // __clone()
+    *vtable.add(3) = func_clone_into as usize; // __clone(void*)
+    *vtable.add(4) = func_noop as usize;
+    *vtable.add(5) = func_noop as usize;
+    *vtable.add(6) = func_operator as usize; // operator()
+    let obj = libc::malloc(std::mem::size_of::<FuncObj>()) as *mut FuncObj;
+    if obj.is_null() {
+        return std::ptr::null();
+    }
+    (*obj).vtable = vtable;
+    (*obj).captures = [0; 5];
+    FUNC_OBJ.store(obj as usize, Ordering::Relaxed);
+    obj
+}
+
 type ParcelCtor = unsafe extern "C" fn(*mut c_void);
 type ParcelDtor = unsafe extern "C" fn(*mut c_void);
 type SetData = unsafe extern "C" fn(*mut c_void, *const u8, usize) -> i32;
@@ -209,6 +337,31 @@ pub(crate) fn available() -> bool {
 
 /// `binder_buffer_object` type tag, as written by `Parcel::writeEmbeddedBuffer`.
 const BINDER_TYPE_BUFFER: u32 = 0x7074_2a85;
+/// `flat_binder_object` tag for a *local* binder (`BINDER_TYPE_BINDER`).
+const BINDER_TYPE_BINDER: u32 = 0x7362_2a85;
+
+/// Take a strong reference on a local binder the service put in a reply.
+///
+/// The real driver calls `acquire_binder_object` while the transaction is in
+/// flight, so the object outlives the service's own `sp`. Our broker copies the
+/// reply after `onTransact` returns, and the service's `sp` is released when we
+/// destroy the reply parcel — the client's `unflatten_binder` then calls
+/// `incStrong` on a dead object and faults (measured: `unflatten_binder+0x73`).
+unsafe fn acquire_binder(cookie: u64, inc_strong: *mut c_void) {
+    if cookie == 0 || inc_strong.is_null() {
+        return;
+    }
+    let vtable = *(cookie as *const *const usize);
+    if vtable.is_null() {
+        return;
+    }
+    // `-0x18(%rax)` is the vtable's offset-to-top, which adjusts the pointer to
+    // the `RefBase` subobject.
+    let offset_to_top = *(vtable.sub(3)) as isize;
+    let this = (cookie as isize + offset_to_top) as *mut c_void;
+    let inc: unsafe extern "C" fn(*mut c_void, *const c_void) = std::mem::transmute(inc_strong);
+    inc(this, cookie as *const c_void);
+}
 
 /// Copy every embedded buffer in a reply to process-lifetime memory.
 ///
@@ -220,14 +373,23 @@ const BINDER_TYPE_BUFFER: u32 = 0x7074_2a85;
 ///
 /// Objects are written parent first, so one pass suffices: copy the payload,
 /// point the parent's copy at it, then rewrite the object's own `buffer` field.
-unsafe fn stabilize(bytes: &mut [u8], objects: &[u64]) {
+unsafe fn stabilize(bytes: &mut [u8], objects: &[u64], inc_strong: *mut c_void) {
     for (i, &off) in objects.iter().enumerate() {
         let o = off as usize;
-        if o + 40 > bytes.len() {
+        if o + 4 > bytes.len() {
             continue;
         }
         let ty = u32::from_ne_bytes(bytes[o..o + 4].try_into().unwrap());
-        if ty != BINDER_TYPE_BUFFER {
+        if ty == BINDER_TYPE_BINDER {
+            // `{type@0, flags@4, binder@8, cookie@0x10}` — 24 bytes, no
+            // stability word.
+            if o + 24 <= bytes.len() {
+                let cookie = u64::from_ne_bytes(bytes[o + 16..o + 24].try_into().unwrap());
+                acquire_binder(cookie, inc_strong);
+            }
+            continue;
+        }
+        if ty != BINDER_TYPE_BUFFER || o + 40 > bytes.len() {
             continue;
         }
         let buf = u64::from_ne_bytes(bytes[o + 8..o + 16].try_into().unwrap());
@@ -309,22 +471,30 @@ pub(crate) unsafe fn dispatch(code: u32, data: &[u8], objects: &[u64]) -> Option
 
     let mut reply = [0u8; PARCEL_BYTES];
     (api.parcel_ctor)(reply.as_mut_ptr() as *mut c_void);
-    let callback = [0u8; 48];
+    CAPTURED.with(|c| *c.borrow_mut() = None);
+    let callback = StdFunction {
+        f: func_obj(),
+        alloc: 0,
+        buf: [0; 3],
+    };
     let rc = (api.on_transact)(
         api.store,
         code,
         request.as_ptr() as *const c_void,
         reply.as_mut_ptr() as *mut c_void,
         0,
-        callback.as_ptr(),
+        &callback as *const StdFunction as *const u8,
     );
+    let captured = CAPTURED.with(|c| c.borrow_mut().take());
 
     let rbase = reply.as_ptr() as *const u8;
     let rdata = *(rbase.add(PARCEL_DATA) as *const *const u8);
     let rlen = *(rbase.add(PARCEL_DATA_SIZE) as *const usize);
     let roffs = *(rbase.add(PARCEL_OBJECTS) as *const *const u64);
     let rcount = *(rbase.add(PARCEL_OBJECTS_SIZE) as *const usize);
-    let out = if rdata.is_null() {
+    let out = if let Some(captured) = captured {
+        captured
+    } else if rdata.is_null() {
         (Vec::new(), Vec::new())
     } else {
         let mut bytes = std::slice::from_raw_parts(rdata, rlen).to_vec();
@@ -333,7 +503,7 @@ pub(crate) unsafe fn dispatch(code: u32, data: &[u8], objects: &[u64]) -> Option
         } else {
             std::slice::from_raw_parts(roffs, rcount).to_vec()
         };
-        stabilize(&mut bytes, &offs);
+        stabilize(&mut bytes, &offs, inc_strong());
         (bytes, offs)
     };
 
