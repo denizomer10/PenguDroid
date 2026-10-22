@@ -144,6 +144,22 @@ flipped_180 = (x, y) -> (w-1-x, y) -> (w-1-x, h-1-y) = (x, h-1-y)
 Yani tam olarak yukarı-aşağı çevirme — ihtiyacımız olan şey. Bedava: bileşitirici
 örneklerken uyguluyor, kopyalama yok.
 
+### Yoğunluk (density) düzeltildi — diyaloglar kırpılmıyordu
+
+`screenWidthDp`/`screenHeightDp` **eski yatay geometriden** kalma 487x274 idi,
+`densityDpi` ise 420. Yani uygulama kendini 487x274 dp'lik bir ekran sanıyordu
+(720/2.625 = 274 dp). Material `AlertDialog`'un minimum genişliği 280 dp olduğu
+ için diyalog ekrandan taşıyor, sağdaki `OK` düğmesi tamamen kesiliyordu
+(`docs/screenshots/newpipe-dialog.png` düzeltmeden sonra: üç düğme de görünüyor).
+
+Artık tek kaynak var: `apphost::DENSITY_DPI = 320`, ve
+`SURFACE_W/H`'den türetilen `SURFACE_W_DP/U_H_DP` (360x640 dp). Değerler dört
+ayrı yerde elle yazılmıyor, dolayısıyla bir daha kayamazlar.
+
+Kalan ufak kusur: diyalog penceresi hâlâ 720'den biraz geniş konumlanıyor
+(sol kenar x=96, sağ kenar 720'de bitiyor), yani tam ortalı değil. İçerik ve
+düğmeler görünür durumda.
+
 ### Bilinen artıklar
 
 1. **`EGL_BAD_DISPLAY` seli — ÇÖZÜLDÜ (`26ce279`).** Sebep `eglBeginFrame`.

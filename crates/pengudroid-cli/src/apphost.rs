@@ -28,6 +28,21 @@ use std::ffi::c_void;
 /// FBO the window frame described as 720x1280.
 const SURFACE_W: i32 = 720;
 const SURFACE_H: i32 = 1280;
+
+/// The display density, in dpi.
+///
+/// Everything the framework lays out is scaled by this: `dp = px * 160 / dpi`.
+/// At 320 dpi the surface is 360x640 dp, which is a conventional small phone.
+/// It used to be 420 dpi while the dp fields were still the *landscape* 1280x720
+/// values, so the app believed it had a 487x274 dp screen — and a Material
+/// `AlertDialog`, whose minimum width is 280 dp, came out wider than the 274 dp
+/// it thought it had and was clipped by the surface edge.
+const DENSITY_DPI: i32 = 320;
+
+/// The surface width in dp.
+const SURFACE_W_DP: i32 = SURFACE_W * 160 / DENSITY_DPI;
+/// The surface height in dp.
+const SURFACE_H_DP: i32 = SURFACE_H * 160 / DENSITY_DPI;
 use std::path::Path;
 
 use crate::jni::{JClass, JFieldId, JMethodId, JObject, JValue, JniEnv};
@@ -179,11 +194,11 @@ fn new_configuration(env: &JniEnv) -> Option<JObject> {
             env.set_int_field(config, id, value);
         }
     };
-    set_int("densityDpi", 420);
-    // 1280x720 at 420 dpi, in dp.
-    set_int("screenWidthDp", 487);
-    set_int("screenHeightDp", 274);
-    set_int("smallestScreenWidthDp", 274);
+    set_int("densityDpi", DENSITY_DPI);
+    // Derived from the surface so the two can never disagree again.
+    set_int("screenWidthDp", SURFACE_W_DP);
+    set_int("screenHeightDp", SURFACE_H_DP);
+    set_int("smallestScreenWidthDp", SURFACE_W_DP.min(SURFACE_H_DP));
     Some(config)
 }
 
@@ -279,7 +294,7 @@ fn fix_app_configuration(env: &JniEnv, data: JObject) {
         }
     }
     if let Some(id) = env.field_id(cfg_class, "densityDpi", "I") {
-        env.set_int_field(cfg, id, 420);
+        env.set_int_field(cfg, id, DENSITY_DPI);
     }
     // `ResourcesManager` builds every new `Resources` from its process-wide
     // configuration, and `Resources.getSystem()` exposes that same instance.
@@ -302,7 +317,7 @@ fn fix_app_configuration(env: &JniEnv, data: JObject) {
                         }
                     }
                     if let Some(id) = env.field_id(cfg_class, "densityDpi", "I") {
-                        env.set_int_field(sys_cfg, id, 420);
+                        env.set_int_field(sys_cfg, id, DENSITY_DPI);
                     }
                     if let Some(get_locales) = env.method_id(
                         cfg_class,
@@ -2425,7 +2440,7 @@ fn install_display_replies(env: &JniEnv) {
     // makes `DisplayMetrics.density` zero — which turns
     // `ThreadedRenderer.setLightCenter`'s `zRatio` into Infinity and aborts the
     // first traversal with "lightZ must be a finite positive".
-    set_int("logicalDensityDpi", 420);
+    set_int("logicalDensityDpi", DENSITY_DPI);
     // Display.STATE_ON = 2, Display.TYPE_INTERNAL = 1, Surface.ROTATION_0 = 0.
     set_int("state", 2);
     set_int("committedState", 2);
