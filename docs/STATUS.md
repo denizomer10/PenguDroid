@@ -42,12 +42,26 @@ aksi halde istemcinin `unflatten_binder`'ı ölü nesnede `incStrong` çağırı
 Servis varsayılan; `PENGUDROID_NO_CODEC2_SERVICE=1` eski stub yanıtlarına
 döner.
 
-### Sıradaki adım
+### Sıradaki adım: `createComponent`
 
-`IComponent` (`configure`, `start`, `queue`, `dequeue`, `setOutputSurface`) ve
-`IComponentListener` geri çağrıları. `createComponent` şu an gerçek servisten
-geçiyor; kare üretmek için `IComponent` yanıtlarının da aynı yöntemle
-(doğrudan çağrı + kendi marshalling) yazılması gerekiyor.
+Probe artık `MediaCodec.createDecoderByType("video/avc")` de çağırıyor ve şu
+an başarısız:
+
+```
+MediaCodec: Allocating component 'c2.android.avc.decoder' failed (-2147483648)
+java.io.IOException: Failed to find matching codec video/avc, error 0x80000000
+```
+
+Trace'te `code 1` (createComponent) **hiç görünmüyor** — yani istek servise
+ulaşmadan `Codec2Client::CreateComponentByName` dönüyor. Sıradaki adım
+`libcodec2_client.so`'daki `CreateComponentByName`'i izlemek: `createInterface`
+(kod 2) çağrıları çalışıyor, dolayısıyla hata ya `getTraits`/`getKind`/
+`getName` (kod 6/2/…, `IComponentInterface`) ya da `createComponent`'ın
+kendisinden önceki bir kontrolde.
+
+Bundan sonra `IComponent` (`configure`, `start`, `queue`, `dequeue`,
+`setOutputSurface`) ve `IComponentListener` geri çağrıları aynı yöntemle
+(doğrudan çağrı + kendi marshalling) yazılacak.
 
 ## Önceki oturum: codec listesi (stub ile)
 

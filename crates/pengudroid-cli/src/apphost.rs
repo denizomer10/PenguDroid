@@ -838,6 +838,21 @@ fn probe_media_codecs(env: &JniEnv) {
             }
         }
     }
+    // `createDecoderByType` goes through `Codec2Client::CreateComponentByName`
+    // → `IComponentStore::createComponent`, so it exercises the real service.
+    if let Some(mc_class) = env.find_class("android/media/MediaCodec") {
+        if let Some(create) = env.static_method_id(
+            mc_class,
+            "createDecoderByType",
+            "(Ljava/lang/String;)Landroid/media/MediaCodec;",
+        ) {
+            let mime = env.new_string("video/avc");
+            match env.call_static_object(mc_class, create, &[JValue { l: mime }]) {
+                Some(codec) if !codec.is_null() => println!("media: createDecoderByType(video/avc) ok"),
+                _ => eprintln!("media: createDecoderByType(video/avc) failed"),
+            }
+        }
+    }
 }
 
 /// Print the display metrics the app sees.
