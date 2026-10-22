@@ -1640,9 +1640,14 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             );
             push_buffer_object(&mut parcel, &mut objects, 1, al_ptr, al_len, alias_arr_idx, 0);
         } else {
-            // `getConfigurable` and `getPoolClientManager` both return a binder;
-            // handing back the store's own handle keeps the client's
-            // `static_cast<sp<...>>` from dereferencing a null.
+            // `getConfigurable`, `getPoolClientManager` and `createInterface`
+            // all return a binder; handing back the store's own handle keeps
+            // the client's `static_cast<sp<...>>` from dereferencing a null.
+            // `createInterface` is code 2 and the client's `mDataPos` is 8 when
+            // it reads the object, so that reply carries a padding word.
+            if tr.code == 2 {
+                parcel.extend_from_slice(&0u32.to_ne_bytes());
+            }
             push_flat_handle(&mut parcel, &mut objects, handle_for("codec2"));
         }
         if trace_enabled() {
