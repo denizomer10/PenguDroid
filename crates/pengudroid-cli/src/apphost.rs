@@ -1585,6 +1585,69 @@ fn launch_activity(
     }
 }
 
+/// Force `ViewRootImpl`'s window frame to the surface size.
+///
+/// The frame reaches `ViewRootImpl` through the `ClientWindowFrames`
+/// out-parameter of `IWindowSession.relayout`, which the broker answers. When
+/// that reply is not picked up (or the traversal runs before it), the frame
+/// stays `0x0`; `performMeasure` then measures the whole tree to nothing and
+/// `performDraw` finds an empty dirty rect, so hwui is never asked to draw.
+///
+/// Setting it here is the same kind of nudge the rest of this file makes: the
+/// framework object is mutated in place through JNI, so the very next traversal
+/// measures against the real surface.
+fn force_window_frame(env: &JniEnv, root: JObject, width: i32, height: i32) {
+    let Some(root_class) = env.find_class("android/view/ViewRootImpl") else {
+        return;
+    };
+    let Some(rect_class) = env.find_class("android/graphics/Rect") else {
+        return;
+    };
+    let set = env.method_id(rect_class, "set", "(IIII)V");
+
+    // Android 13 moved the frame into `mClientWindowFrames.frame`; older trees
+    // still have a plain `mWinFrame`. Try both.
+    let mut target = env
+        .field_id(root_class, "mWinFrame", "Landroid/graphics/Rect;")
+        .map(|f| env.object_field(root, f));
+    if target.map_or(true, |r| r.is_null()) {
+        target = env
+            .field_id(
+                root_class,
+                "mClientWindowFrames",
+                "Landroid/window/ClientWindowFrames;",
+            )
+            .map(|f| env.object_field(root, f))
+            .filter(|frames| !frames.is_null())
+            .and_then(|frames| {
+                let frames_class = env.find_class("android/window/ClientWindowFrames")?;
+                let field = env.field_id(frames_class, "frame", "Landroid/graphics/Rect;")?;
+                Some(env.object_field(frames, field))
+            });
+    }
+    let Some(rect) = target.filter(|r| !r.is_null()) else {
+        eprintln!("apphost: no window frame field on ViewRootImpl");
+        return;
+    };
+    let Some(set) = set else {
+        return;
+    };
+    if env.call_void(
+        rect,
+        set,
+        &[
+            JValue { i: 0 },
+            JValue { i: 0 },
+            JValue { i: width },
+            JValue { i: height },
+        ],
+    ) {
+        println!("apphost: window frame set to {width}x{height}");
+    } else {
+        eprintln!("apphost: Rect.set on the window frame threw");
+    }
+}
+
 /// `Object.getClass().getName()` for diagnostics.
 fn class_name_of(env: &JniEnv, obj: JObject) -> Option<String> {
     if obj.is_null() {
@@ -1893,6 +1956,7 @@ fn force_visible(env: &JniEnv, record: JObject) {
                 }
             }
         }
+        force_window_frame(env, root, 720, 1280);
         dump_draw_state(env, root, index as usize);
         // `performTraversals` must run inside a Choreographer frame callback:
         // calling it directly makes `Choreographer.getFrameTimeNanos()` throw
@@ -2429,6 +2493,109 @@ fn install_window_replies(env: &JniEnv) {
     if let Some(f) = shim_symbol("__pengudroid_binder_set_insets_size") {
         let f: unsafe extern "C" fn(i32) = unsafe { std::mem::transmute(f) };
         unsafe { f(size) };
+    }
+    install_relayout_frames_reply(env);
+}
+
+/// Build the `ClientWindowFrames` half of the `relayout` reply.
+///
+/// `IWindowSession$Stub$Proxy.relayout` takes a `ClientWindowFrames` carrying
+/// the four rectangles the window manager computed. The shim cannot build it by
+/// hand reliably (the field order is a framework implementation detail), so the
+/// host writes it with the framework's own `writeToParcel` and hands the bytes
+/// over; the shim appends the `SurfaceControl` half, which carries binder
+/// objects and therefore cannot be marshalled.
+///
+/// The frame is the whole surface: `ViewRootImpl` copies it into `mWinFrame`,
+/// and a 0x0 frame makes every view measure to nothing and `performDraw` find
+/// an empty dirty region, so nothing is ever rendered.
+fn install_relayout_frames_reply(env: &JniEnv) {
+    let Some(rect_class) = env.find_class("android/graphics/Rect") else {
+        return;
+    };
+    let Some(frames_class) = env.find_class("android/window/ClientWindowFrames") else {
+        eprintln!("apphost: ClientWindowFrames not found");
+        return;
+    };
+    let Some(ctor) = env.method_id(frames_class, "<init>", "()V") else {
+        return;
+    };
+    let Some(frames) = env.new_object(frames_class, ctor, &[]) else {
+        return;
+    };
+    // `Rect(int left, int top, int right, int bottom)`.
+    let Some(rect_ctor) = env.method_id(rect_class, "<init>", "(IIII)V") else {
+        return;
+    };
+    for name in ["frame", "displayFrame", "parentFrame", "attachedFrame"] {
+        let Some(f) = env.field_id(frames_class, name, "Landroid/graphics/Rect;") else {
+            eprintln!("apphost: ClientWindowFrames.{name} not found");
+            return;
+        };
+        let Some(rect) = env.new_object(
+            rect_class,
+            rect_ctor,
+            &[
+                JValue { i: 0 },
+                JValue { i: 0 },
+                JValue { i: 720 },
+                JValue { i: 1280 },
+            ],
+        ) else {
+            return;
+        };
+        env.set_object_field(frames, f, rect);
+    }
+    if let Some(f) = env.field_id(frames_class, "compatScale", "F") {
+        env.set_float_field(frames, f, 1.0);
+    }
+
+    let Some(parcel_class) = env.find_class("android/os/Parcel") else {
+        return;
+    };
+    let Some(obtain) = env.static_method_id(parcel_class, "obtain", "()Landroid/os/Parcel;") else {
+        return;
+    };
+    let Some(parcel) = env.call_static_object(parcel_class, obtain, &[]) else {
+        return;
+    };
+    let Some(write_typed) = env.method_id(
+        parcel_class,
+        "writeTypedObject",
+        "(Landroid/os/Parcelable;I)V",
+    ) else {
+        eprintln!("apphost: Parcel.writeTypedObject not found");
+        return;
+    };
+    env.call_void(
+        parcel,
+        write_typed,
+        &[JValue { l: frames }, JValue { i: 0 }],
+    );
+    // A null `MergedConfiguration`: `ViewRootImpl` keeps the one it allocated.
+    env.call_void(
+        parcel,
+        write_typed,
+        &[JValue { l: std::ptr::null_mut() }, JValue { i: 0 }],
+    );
+    let Some(marshall) = env.method_id(parcel_class, "marshall", "()[B") else {
+        return;
+    };
+    let Some(bytes) = env.call_object(parcel, marshall, &[]) else {
+        eprintln!("apphost: Parcel.marshall for ClientWindowFrames failed");
+        return;
+    };
+    if let Some(data) = env.byte_array_copy(bytes) {
+        let words: Vec<String> = data
+            .chunks_exact(4)
+            .map(|w| format!("{}", i32::from_ne_bytes([w[0], w[1], w[2], w[3]])))
+            .collect();
+        println!(
+            "apphost: relayout frames parcel ({} bytes) = [{}]",
+            data.len(),
+            words.join(", ")
+        );
+        install_reply(&data, "__pengudroid_binder_set_relayout_frames");
     }
 }
 

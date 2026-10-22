@@ -64,6 +64,7 @@ mod slot {
     pub const SET_OBJECT_FIELD: usize = 104;
     pub const SET_BOOLEAN_FIELD: usize = 105;
     pub const SET_INT_FIELD: usize = 109;
+    pub const SET_FLOAT_FIELD: usize = 111;
     pub const GET_STATIC_OBJECT_FIELD: usize = 145;
     pub const GET_ARRAY_LENGTH: usize = 171;
     pub const GET_OBJECT_ARRAY_ELEMENT: usize = 173;
@@ -280,6 +281,13 @@ impl JniEnv {
         let f: unsafe extern "C" fn(*mut c_void, JObject, JFieldId, u8) =
             unsafe { self.func(slot::SET_BOOLEAN_FIELD) };
         unsafe { f(self.0, obj, field, value as u8) }
+    }
+
+    /// `SetFloatField(obj, field, value)`.
+    pub fn set_float_field(&self, obj: JObject, field: JFieldId, value: f32) {
+        let f: unsafe extern "C" fn(*mut c_void, JObject, JFieldId, f32) =
+            unsafe { self.func(slot::SET_FLOAT_FIELD) };
+        unsafe { f(self.0, obj, field, value) }
     }
 
     /// `CallVoidMethodA(obj, method, args)`.

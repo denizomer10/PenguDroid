@@ -652,6 +652,15 @@ const IDM_GET_DISPLAY_INFO: u32 = 1;
 static DISPLAY_INFO: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
+/// The marshalled `ClientWindowFrames` + `MergedConfiguration` prefix of an
+/// `IWindowSession.relayout` reply.
+///
+/// Built by the host with the framework's own `Parcel.writeTypedObject`, because
+/// the field order inside `ClientWindowFrames` is a framework detail and getting
+/// it wrong shifts every following out-parameter.
+static RELAYOUT_FRAMES: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
 /// A `PackageInfo` reply serialized by the host with the framework's own
 /// `PackageInfo.writeToParcel`.
 ///
@@ -1001,30 +1010,30 @@ fn window_session_reply(code: u32, parcel: &mut Vec<u8>, objects: &mut Vec<u64>)
             parcel.extend_from_slice(&0u32.to_ne_bytes()); // false / no feedback
         }
         IWS_RELAYOUT => {
-            // `[result][outFrames][outMergedConfiguration][outSurfaceControl]
-            //  [insetsState][activeControls][bundle]`.
+            // `[result][ClientWindowFrames][MergedConfiguration][SurfaceControl]
+            //  [InsetsState][InsetsSourceControl[]][Bundle]`, in the order
+            // `IWindowSession$Stub$Proxy.relayout` declares its `out` parameters
+            // (`--dump-class android.view.IWindowSession$Stub$Proxy`, now printing
+            // signatures).
             //
-            // `outFrames` used to be written as absent, which left
-            // `ViewRootImpl.mTmpFrames` at its pre-allocated 0x0 and made
-            // `mWidth`/`mHeight` zero. `draw()` then ran with an empty dirty
-            // rect and never called into hwui. LineageOS 20's
-            // `ClientWindowFrames.readFromParcel` is
-            // `[frame][displayFrame][parentFrame][attachedFrame][bool][float]`,
-            // each `Rect` being four int32s, and the AIDL out-parameter is a
-            // presence word followed by that payload.
+            // The first two out-parameters are marshalled by the host with the
+            // framework's own `Parcel.writeTypedObject`: the field order inside
+            // `ClientWindowFrames` is a framework detail, and shifting it by one
+            // word makes the client read `MergedConfiguration` out of the
+            // `SurfaceControl` bytes. An absent `ClientWindowFrames` used to leave
+            // `ViewRootImpl`'s frame at 0x0, so every view measured to nothing and
+            // `draw()` skipped hwui entirely.
             parcel.extend_from_slice(&0u32.to_ne_bytes()); // result
-            parcel.extend_from_slice(&1u32.to_ne_bytes()); // outFrames present
-            for _ in 0..3 {
-                // frame, displayFrame, parentFrame
-                parcel.extend_from_slice(&0i32.to_ne_bytes()); // left
-                parcel.extend_from_slice(&0i32.to_ne_bytes()); // top
-                parcel.extend_from_slice(&1280i32.to_ne_bytes()); // right
-                parcel.extend_from_slice(&720i32.to_ne_bytes()); // bottom
+            {
+                let prefix = RELAYOUT_FRAMES.lock().unwrap_or_else(|e| e.into_inner());
+                if prefix.is_empty() {
+                    // Both absent; `ViewRootImpl` keeps what it pre-allocated.
+                    parcel.extend_from_slice(&0u32.to_ne_bytes());
+                    parcel.extend_from_slice(&0u32.to_ne_bytes());
+                } else {
+                    parcel.extend_from_slice(&prefix);
+                }
             }
-            parcel.extend_from_slice(&0u32.to_ne_bytes()); // attachedFrame absent
-            parcel.extend_from_slice(&0u32.to_ne_bytes()); // parentClippedByDisplayCutout
-            parcel.extend_from_slice(&1.0f32.to_ne_bytes()); // compatScale
-            parcel.extend_from_slice(&0u32.to_ne_bytes()); // merged config absent
             // `outSurfaceControl`: present, so `ViewRootImpl` has something to
             // draw into. `SurfaceControl.readFromParcel` reads the Java-side
             // header (name + size + presence) and then
@@ -2580,6 +2589,19 @@ pub unsafe extern "C" fn __pengudroid_binder_set_display_info(ptr: *const u8, le
     }
     let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
     *DISPLAY_INFO.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
+}
+
+/// `void __pengudroid_binder_set_relayout_frames(const uint8_t *bytes, size_t len)`
+///
+/// # Safety
+/// `ptr` must point to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_relayout_frames(ptr: *const u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
+    *RELAYOUT_FRAMES.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
 }
 
 /// `int __pengudroid_binder_mmap_prot(int fd, int prot)`
