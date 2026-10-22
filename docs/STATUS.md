@@ -215,6 +215,80 @@ düğmeler görünür durumda.
   zararsız.
 - `android::IGraphicBufferProducer::sGetHalTokenTransactionCode` = `0x5f474854`.
 
+## Bu oturum: decoder gerçekten çözüyor
+
+Video zinciri bu oturumda codec listesinden **çözmenin içine** kadar geldi:
+
+```
+media: MediaCodecList.getCodecCount() = 53          (video/avc dahil)
+media: createDecoderByType(video/avc) ok
+media: MediaCodec.configure = true
+media: MediaCodec.start = true
+media: queueInputBuffer(412 bytes) = true
+[ahb] lock mapped 368640 bytes                      (320x240x4 cikti blogu)
+media: dequeueOutputBuffer[0] = Some(-2)            (INFO_OUTPUT_FORMAT_CHANGED)
+media: output format width=320 height=240
+media: dequeueOutputBuffer[1] = Some(0) size=0 flags=4   (EOS, kare yok)
+```
+
+Yani `libcodec2_soft_avcdec.so` H.264'u **gercekten cozuyor** ve sonucu
+`memfd` tabanli cikti bloguna yaziyor. Eksik olan tek sey `CCodec`'in kareyi
+`dequeueOutputBuffer`'a teslim etmesi.
+
+Bu oturumda cozulen engeller:
+
+1. **`media.resource_manager`.** `MediaCodec::init`
+   `ResourceManagerServiceProxy::init()`'in hatasini aynen donduruyor
+   (`libstagefright.so` `0x12d348: mov %r14d,%eax; ret`), bu yuzden servis
+   olmadan her `createDecoderByType` `UNKNOWN_ERROR` aliyordu. Broker artik
+   `INTERFACE_TRANSACTION`'a `android.media.IResourceManagerService`
+   descriptor'i ile cevap veriyor - **durum kelimesi olmadan**, cunku
+   `BpBinder::getInterfaceDescriptor` (`libbinder.so` `0x5ef60`) `transact`'tan
+   hemen sonra `Parcel::readString16()` cagiriyor.
+2. **`acquire_binder_object`.** Surucu her yerel binder icin `incStrong`
+   yapar, `Parcel::~Parcel` de `release_object` ile dengeler. Broker bunu
+   yapmadigi icin `_hidl_createComponent` cokuyordu (`RefBase::decStrong`).
+   Istek parcel'inde 1, yanit parcel'inde 2 referans aliniyor.
+3. **`/dev/dma_heap`.** `libdmabufheap` `/dev/dma_heap/system` acip
+   `DMA_HEAP_IOCTL_ALLOC` yapiyor; yoksa `CCodecBufferChannel::start`
+   "cannot allocate memory at all" diyor. Shim bu yolda bir memfd veriyor ve
+   alloc ioctl'unu boyutlu bir memfd'e ceviriyor.
+4. **`GraphicBufferMapper::importBuffer`/`lock`/`unlock`.** Decoder cikti
+   blogunu haritalamak icin bunlari kullaniyor; interpose edilmedikleri icin
+   gercek gralloc HAL'ina gidip cokuyordu. Artik `importBuffer` handle'i
+   oldugu gibi donduruyor, `lock` memfd'i `mmap` edip kayitli stride'i
+   bildiriyor.
+
+Test akisi `tools/make_h264.py` ile uretiliyor (SPS + PPS + tek I_PCM
+makroblok, 16x16; `rbsp_trailing_bits` dahil - eksikligi decoder'in kareyi
+dusurmesine yetiyordu).
+
+### Siradaki engel: `CCodec` kareyi teslim etmiyor
+
+Iki somut iz, ikisi de log'da:
+
+```
+CCodecBufferChannel: Ignoring stale input buffer done callback:
+    last flush index = 0, frameIndex = 0
+C2AllocatorGralloc: failed transaction: freeBuffer
+```
+
+1. Birincisi, `onWorkDone` ile gelen `frameIndex`'in `CCodec`'in beklediginden
+   kucuk oldugunu gosteriyor; kare bu yuzden "bayat" sayilip dusuruluyor
+   olabilir. `queue` ve `onWorkDone` yerel `BnHwComponent`/`BnHwComponentListener`
+   uzerinden gittigi icin marshalling gercek; `WorkBundle`'daki
+   `C2WorkOrdinalStruct`/`frameIndex` alanlarinin kaymadigi dogrulanmali.
+2. Ikincisi, `C2AllocatorGralloc`'in `free` yolu HIDL `IMapper`'a gidiyor ve
+   broker bu HAL'i yanitlamadigi icin "failed transaction" aliyor. Blok
+   havuzunun yasam dongusu bozulursa cikti tamponu istemciye hic ulasmaz.
+   Cozum: `IMapper` (`android.hardware.graphics.mapper@4.0`) icin broker'da
+   `importBuffer`/`freeBuffer`/`getMetadata` yanitlari, ya da
+   `C2AllocatorGralloc::free`/`CheckHandle` interposition'i.
+
+Bundan sonra sirada `SurfaceView` icin ikinci compositor katmani, ses
+(`AudioTrack`/`AudioFlinger`) ve girdi var. Beach Buggy Racing 2 ayri bir dag:
+oyun arm64/armv7, yani once ARM ceviri katmani gerekiyor.
+
 ## Bu oturum: gerçek codec2 servisi çalışıyor (53 codec)
 
 `MediaCodecList` artık **gerçek** servisten besleniyor:
