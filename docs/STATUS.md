@@ -3,7 +3,53 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
-## Bu oturum: codec listesi çalışıyor
+## Bu oturum: gerçek codec2 servisi çalışıyor (53 codec)
+
+`MediaCodecList` artık **gerçek** servisten besleniyor:
+
+```
+media: MediaCodecList.getCodecCount() = 53
+media: getCodecInfos() returned 53
+media:   codec 0: c2.android.aac.decoder
+media:   codec 1: OMX.google.aac.decoder
+...
+Codec2InfoBuilder: adding type 'video/avc'
+```
+
+### Nasıl çözüldü
+
+`crates/pengudroid-shim/src/codec2.rs` gerçek servisi süreç içinde kuruyor
+(`C2PlatformComponentStore` → `utils::ComponentStore` → `BnHwComponentStore`).
+Üç ayrı engel vardı ve üçü de ölçümle çözüldü:
+
+1. **Yanıt tamponlarının ömrü.** `listComponents` yanıtı senkron yazıyor, yani
+   `hidl_vec` `onTransact` dönünce ölü. Çözüm: `code 3` için binder stub'ını
+   atlayıp `utils::ComponentStore::listComponents`'ı **doğrudan** çağırmak ve
+   trait'leri geri çağrı içinde canlıyken kopyalamak (`build_traits_reply`).
+2. **`std::function` ABI'si.** Rust'tan libc++ `std::function` kurmak için:
+   nesne 48 bayt `{__buf_@0..0x20, __f_@0x20}`; `__f_` 48 baytlık bir `__func`
+   nesnesi `{vtable@0, yakalananlar@8..}`; vtable adres noktasında
+   **slot 0 = `__clone(void*)`** (argüman sırası `(hedef, kaynak)`),
+   **slot 2 = `__clone()`**, **slot 6 = `operator()`**.
+3. **`Return<void>` sret.** `listComponents` bir 16 baytlık `Return<void>`
+   döndürüyor, yani çağrı `(sret, this, &cb)` — ilk argümanı `this` sanmak
+   `0x28(%rsi)`'yi callback sanmaya ve SIGSEGV'e yol açıyordu.
+
+Ayrıca yanıtlardaki yerel binder nesneleri için `RefBase::incStrong`
+uygulanıyor (`acquire_binder`); gerçek sürücü bunu işlem sırasında yapıyor,
+aksi halde istemcinin `unflatten_binder`'ı ölü nesnede `incStrong` çağırıyor.
+
+Servis varsayılan; `PENGUDROID_NO_CODEC2_SERVICE=1` eski stub yanıtlarına
+döner.
+
+### Sıradaki adım
+
+`IComponent` (`configure`, `start`, `queue`, `dequeue`, `setOutputSurface`) ve
+`IComponentListener` geri çağrıları. `createComponent` şu an gerçek servisten
+geçiyor; kare üretmek için `IComponent` yanıtlarının da aynı yöntemle
+(doğrudan çağrı + kendi marshalling) yazılması gerekiyor.
+
+## Önceki oturum: codec listesi (stub ile)
 
 `MediaCodecList` artık iki codec görüyor ve `MediaCodecInfo` nesnelerini
 dolduruyor:

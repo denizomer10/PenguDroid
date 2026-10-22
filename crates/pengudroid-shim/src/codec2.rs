@@ -455,14 +455,11 @@ unsafe fn build() -> Option<Api> {
 }
 
 fn api() -> Option<&'static Api> {
-    // Opt-in: the service objects build and answer `interfaceChain`, but the
-    // reply parcel points its embedded buffers at the service's own stack, and
-    // the generated code only hands the reply to the `std::function` callback
-    // *inside* the implementation call. We cannot yet build a libc++
-    // `std::function<void(Parcel&)>` from Rust, so the buffers are dead by the
-    // time `onTransact` returns (measured: `Buffer length 32 does not match
-    // expected size 15638207488`). See docs/STATUS.md.
-    if std::env::var_os("PENGUDROID_CODEC2_SERVICE").is_none() {
+    // On by default: the real service answers `getConfigurable`,
+    // `getPoolClientManager`, `listComponents` (53 codecs, `video/avc`
+    // included) and `createInterface`. `PENGUDROID_NO_CODEC2_SERVICE=1` falls
+    // back to the hand-written stub replies.
+    if std::env::var_os("PENGUDROID_NO_CODEC2_SERVICE").is_some() {
         return None;
     }
     API.get_or_init(|| unsafe { build() }).as_ref()
@@ -595,9 +592,12 @@ pub(crate) unsafe fn dispatch(code: u32, data: &[u8], objects: &[u64]) -> Option
             f20: f,
             f28: f,
         };
-        let list: unsafe extern "C" fn(*mut c_void, *const StdFunction) =
+        // `Return<void> listComponents(std::function<...> cb)` returns a 16-byte
+        // struct, so the first argument is the sret slot: (sret, this, &cb).
+        let mut ret = [0u8; 16];
+        let list: unsafe extern "C" fn(*mut u8, *mut c_void, *const StdFunction) =
             std::mem::transmute(api.list_components);
-        list(api.store_impl, &func);
+        list(ret.as_mut_ptr(), api.store_impl, &func);
         if let Some(reply) = CAPTURED.with(|c| c.borrow_mut().take()) {
             if trace_enabled() {
                 diag(&format!(
