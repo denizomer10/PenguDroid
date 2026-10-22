@@ -1583,6 +1583,11 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                 "android.hidl.base@1.0::IBase",
             ];
             push_hidl_string_vec(&mut parcel, &mut objects, &chain);
+        } else {
+            // `getConfigurable` and `getPoolClientManager` both return a binder;
+            // handing back the store's own handle keeps the client's
+            // `static_cast<sp<...>>` from dereferencing a null.
+            push_flat_handle(&mut parcel, &mut objects, handle_for("codec2"));
         }
         if trace_enabled() {
             diag(&format!("[binder]   -> codec2 call code {}\n", tr.code));
