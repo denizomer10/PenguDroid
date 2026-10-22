@@ -52,12 +52,23 @@ MediaCodec: Allocating component 'c2.android.avc.decoder' failed (-2147483648)
 java.io.IOException: Failed to find matching codec video/avc, error 0x80000000
 ```
 
-Trace'te `code 1` (createComponent) **hiç görünmüyor** — yani istek servise
-ulaşmadan `Codec2Client::CreateComponentByName` dönüyor. Sıradaki adım
-`libcodec2_client.so`'daki `CreateComponentByName`'i izlemek: `createInterface`
-(kod 2) çağrıları çalışıyor, dolayısıyla hata ya `getTraits`/`getKind`/
-`getName` (kod 6/2/…, `IComponentInterface`) ya da `createComponent`'ın
-kendisinden önceki bir kontrolde.
+Trace'te `code 1` (createComponent) **hiç görünmüyor**. İz sürüldü:
+
+* `CreateComponentByName` (`0x2b610` → `0x21880`) `ForAllServices` ile
+  servisleri geziyor ve lambda içinde `Codec2Client::createComponent`
+  (`0x17820`) çağırıyor; hata yolu (`0x21933`, "Failed to create component")
+  **loglanmıyor**, yani lambda OK dönüyor.
+* Her `createInterface` (kod 2) çağrısından hemen sonra istemci tarafında
+  `C2Store: in init` / `C2Store: loading dll` görünüyor — yani istemci
+  `libcodec2_client.so` içindeki `C2Store` ile bileşen arayüzünü kuruyor.
+* `createComponent` HIDL'e hiç gitmiyor: `C2Store` bileşeni yerel olarak
+  kurmaya çalışıp sessizce başarısız oluyor gibi görünüyor.
+
+Sıradaki adım: `C2Store::createComponent`'ı (`libcodec2_client.so`) izlemek —
+`loading dll`'den sonra hangi adımda vazgeçtiğini bulmak. Muhtemel sebep
+`createInterface`'in döndürdüğü `IComponentInterface` üzerinde yapılan
+`getTraits`/`getKind`/`getName` çağrılarının yanıtsız kalması (bunlar
+`BnHwComponentInterface` üzerinde, yani bizim broker'ımızdan geçmiyor).
 
 Bundan sonra `IComponent` (`configure`, `start`, `queue`, `dequeue`,
 `setOutputSurface`) ve `IComponentListener` geri çağrıları aynı yöntemle
