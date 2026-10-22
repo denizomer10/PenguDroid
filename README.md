@@ -38,7 +38,7 @@ $ ps -eo pid,comm,args | grep pengudroid
 > (what runs, what does not, and the exact failure point of each attempt).
 > Last verified: **NewPipe 0.29.1 launches, draws and presents on screen** —
 > `pengudroid launch NewPipe_v0.29.1.apk` opens a Wayland window with the live
-> feed, rendered by hwui on the host GPU at 60 fps. x86_64 NativeActivity games
+> feed, rendered by hwui on the host GPU. x86_64 NativeActivity games
 > run on the GPU too. Beach Buggy Racing 2 still stops at the ARM translator.
 >
 > ![NewPipe running under PenguDroid](docs/screenshots/newpipe.png)
@@ -92,7 +92,7 @@ milestone. Nothing below is overstated.
 | **Running real DEX bytecode (ART)** | **Working (VM + DEX)** | `JNI_CreateJavaVM` now returns `JNI_OK` against an extracted LineageOS 20 (Android 13) tree: ART's whole startup path completes and Java code executes. Classes from a real APK's `classes.dex` load and link through the system class loader |
 | **Activity lifecycle driven from the host** | **Working** | with `--bind-app` the host plays `system_server`'s part: it builds `AppBindData` over JNI, calls `handleBindApplication`, then `handleLaunchActivity`/`handleResumeActivity` for the manifest's launcher activity. No `system_server`, no `AppBindData` parcel |
 | **hwui drawing** | **Working** | `ViewRootImpl.performTraversals` reaches `performDraw`, `ThreadedRenderer` renders the real view hierarchy into the shim's FBO, and `eglSwapBuffers` runs every frame |
-| **Presenting an app's frames on Wayland** | **Working** | the gleshim exports the FBO as a dma-buf, the daemon imports it through `zwp_linux_dmabuf_v1` and commits it; NewPipe's live feed is on screen at ~60 fps |
+| **Presenting an app's frames on Wayland** | **Working** | the gleshim exports the FBO as a dma-buf, the daemon imports it through `zwp_linux_dmabuf_v1` and commits it; NewPipe's live feed is on screen (`docs/screenshots/newpipe.png`) |
 | **Pointer input** | **Working** | the daemon binds `wl_seat` and forwards pointer events to the guest that owns the surface; the host turns them into `MotionEvent`s and delivers them through `ViewRootImpl.dispatchInputEvent`. A click opens NewPipe's video page |
 | **Keyboard input** | **Partial** | events arrive with Linux keycodes; the Android keycode mapping is not written yet |
 | **Video playback (`MediaCodec`)** | **Partial** | the real codec2 service runs in-process (`C2PlatformComponentStore` → `utils::ComponentStore` → `BnHwComponentStore`), so `MediaCodecList` reports **53 codecs** with full `MediaCodecInfo` objects, `video/avc` included; `IComponent` (`configure`/`start`/`queue`/`dequeue`) is not answered yet, so no frame is decoded |

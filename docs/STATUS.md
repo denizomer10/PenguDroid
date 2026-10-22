@@ -45,14 +45,35 @@ döndürüyor (hwui başka bir değerde assert ediyor).
    (`force_window_frame`), yoksa ağaç 0x0 ölçülüyor ve `performDraw` boş dirty
    rect görüp hwui'yi hiç çağırmıyor.
 
-### Şu anki durum: NewPipe çiziyor ve sunuyor
+### Şu anki durum: NewPipe çiziyor ve sunuyor — DOĞRULANDI
 
 `eglSwapBuffers` saniyede ~60 kez çağrılıyor ve her kare daemon'a sorunsuz
-sunuluyor (20 sn'lik koşuda 240 swap, tek bir `present` hatası yok). Daemon
-tarafında her sunum gerçek bir `wl_surface` + `xdg_toplevel` üzerine
-`attach` + `damage` + `commit` yapıyor (`crates/pengudroid-daemon/src/graphics.rs`).
-Yani `pengudroid art-test ... --classpath NewPipe_v0.29.1.apk` artık NewPipe'ı
-çizip Wayland yüzeyine veriyor.
+sunuluyor. Daemon tarafında her sunum gerçek bir `wl_surface` +
+`xdg_toplevel` üzerine `attach` + `damage` + `commit` yapıyor
+(`crates/pengudroid-daemon/src/graphics.rs`).
+
+Kanıt: `PENGUDROID_DUMP_FRAME=/tmp/f` ile 200. kare PPM olarak alınıp PNG'ye
+çevrildi — `docs/assets/newpipe-frame.png`. Karede NewPipe'ın kırmızı
+(#e53935) uygulama çubuğu, dört sekme ikonu, sekme göstergesi ve **ağdan
+çekilmiş gerçek "Live" akışı** var (TheBurntPeanut 49K, The Rubin Report 4.8K,
+Jynxzi 19K, TimTheTatman 12K izleyici). Yani layout, text shaping, tema,
+renkler ve Ağ/HTTP2 yolu birlikte çalışıyor.
+
+Kareyi yeniden üretmek için:
+
+```sh
+setsid target/release/pengudroid daemon > /tmp/d.log 2>&1 < /dev/null &
+PENGUDROID_DUMP_FRAME=/tmp/f PENGUDROID_LAUNCH_ACTIVITY=org.schabi.newpipe.MainActivity \
+  timeout 25 target/release/pengudroid art-test --sysroot .toolchain/sysroot \
+  --register-natives libandroid_runtime.so,libhwui.so \
+  --classpath NewPipe_v0.29.1.apk --bind-app --main android.app.ActivityThread \
+  --vm-option -Xint
+python3 tools/art/ppm2png.py /tmp/f.frame201.ppm /tmp/frame.png
+python3 tools/art/ppmstat.py /tmp/f.frame201.ppm   # renk dağılımı
+```
+
+`ppmstat.py` çıktısı: 601 farklı renk, en sık `#eeeeee` (arka plan),
+`#999999` (thumbnail/ikincil), `#e53935` (NewPipe kırmızısı).
 
 ### Bilinen artıklar
 
