@@ -1523,7 +1523,10 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             diag("[binder]   -> display_token handle\n");
         }
     }
-    if tr.target_handle == 0 && (tr.code == ISM_GET_SERVICE || tr.code == ISM_CHECK_SERVICE) {
+    if tr.target_handle == 0
+        && (tr.code == ISM_GET_SERVICE || tr.code == ISM_CHECK_SERVICE)
+        && !is_hidl_request(tr)
+    {
         if tr.data_size > 0 && tr.data_ptr != 0 {
             let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
             if let Some(name) = last_string16(data) {
