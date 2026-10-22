@@ -1614,6 +1614,9 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             vec.extend_from_slice(&0u32.to_ne_bytes());
             let vec: &'static [u8] = Box::leak(vec.into_boxed_slice());
 
+            // The client's `mDataPos` is 8 when it reads the first object, so
+            // the reply carries one extra word after the status.
+            parcel.extend_from_slice(&0u32.to_ne_bytes());
             let vec_idx =
                 push_buffer_object(&mut parcel, &mut objects, 0, vec.as_ptr() as u64, 16, 0, 0);
             let arr_idx =
