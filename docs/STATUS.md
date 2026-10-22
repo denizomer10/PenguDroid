@@ -118,6 +118,32 @@ pencere (activity + dialog) aynı anda çiziliyor.
 `PENGUDROID_DUMP_FRAME_AT=<n>` kare numarasını seçmeyi sağlıyor; statik bir
 ekran 200 kareye ulaşmadığı için `launch` yolunda varsayılan çok yüksekti.
 
+### Görüntü ters dönmesi düzeltildi
+
+Belirti: pencere açılıyor, içerik doğru, ama **baş aşağı**. Uygulama çubuğu
+altta, metin 180° dönmüş.
+
+Kök neden: misafir bir GL framebuffer'ına çiziyor ve GL'in ilk satırı
+görüntünün **alt** satırıdır. `zwp_linux_dmabuf_v1` ise `wl_shm` gibi
+**üst satır önce** tanımlıdır. Yani dma-buf'un içeriği baş aşağı gidiyordu.
+
+Kanıt: `PENGUDROID_DUMP_FRAME_NOFLIP=1` kareyi okuma sırasında (yani dma-buf'un
+kendi düzeninde) yazıyor — `docs/screenshots/diagnostic-noflip.png`. O karede
+uygulama çubuğu altta ve metin ters; `PENGUDROID_DUMP_FRAME` ise aynı kareyi
+çevirerek yazdığı için normal görünüyordu. Yani hata sunumda, çizimde değil.
+
+Düzeltme: daemon `present_dmabuf` içinde
+`wl_surface.set_buffer_transform(WL_OUTPUT_TRANSFORM_FLIPPED_180)` çağırıyor.
+Protokol tanımına göre (wayland.xml) "flipped" değerleri önce **dikey eksen
+etrafında** aynalama, sonra döndürme demek:
+
+```
+flipped_180 = (x, y) -> (w-1-x, y) -> (w-1-x, h-1-y) = (x, h-1-y)
+```
+
+Yani tam olarak yukarı-aşağı çevirme — ihtiyacımız olan şey. Bedava: bileşitirici
+örneklerken uyguluyor, kopyalama yok.
+
 ### Bilinen artıklar
 
 1. **`EGL_BAD_DISPLAY` seli — ÇÖZÜLDÜ (`26ce279`).** Sebep `eglBeginFrame`.

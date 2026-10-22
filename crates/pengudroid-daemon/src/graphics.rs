@@ -47,8 +47,8 @@ mod imp {
     use pengudroid_proto::abi;
     use wayland_client::globals::{registry_queue_init, GlobalListContents};
     use wayland_client::protocol::{
-        wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat,
-        wl_shm, wl_shm_pool, wl_surface,
+        wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_registry,
+        wl_seat, wl_shm, wl_shm_pool, wl_surface,
     };
     use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
     use wayland_protocols::wp::linux_dmabuf::zv1::client::{
@@ -576,6 +576,17 @@ mod imp {
             );
             params.destroy();
 
+            // The guest renders into a GL framebuffer, whose first row in memory is
+            // the *bottom* of the image; `zwp_linux_dmabuf_v1` buffers are defined
+            // top row first, like `wl_shm`. Without this the window comes out
+            // upside down (the app bar along the bottom, text rotated 180°).
+            //
+            // `flipped_180` is "flip about the vertical axis, then rotate 180°",
+            // which composes to a flip about the horizontal axis — a vertical flip,
+            // exactly what is needed here. It is free: the compositor applies it
+            // while sampling, so nothing is copied.
+            s.wl_surface
+                .set_buffer_transform(wl_output::Transform::Flipped180);
             s.wl_surface.attach(Some(&buffer), 0, 0);
             s.wl_surface.damage(0, 0, width as i32, height as i32);
             s.wl_surface.commit();

@@ -1867,8 +1867,16 @@ unsafe fn dump_frame_once(surface: EGLSurface, host: &Host) {
     );
     let mut ppm = Vec::with_capacity(w * h * 3 + 32);
     ppm.extend_from_slice(format!("P6\n{w} {h}\n255\n").as_bytes());
-    // GL's origin is bottom-left; PPM's is top-left.
-    for y in (0..h).rev() {
+    // GL's origin is bottom-left; PPM's is top-left. `PENGUDROID_DUMP_FRAME_NOFLIP`
+    // writes the rows in readback order instead, which is exactly what the
+    // dma-buf handed to the compositor contains — so the two images together show
+    // whether presentation needs a flip.
+    let y_range: Vec<usize> = if std::env::var_os("PENGUDROID_DUMP_FRAME_NOFLIP").is_some() {
+        (0..h).collect()
+    } else {
+        (0..h).rev().collect()
+    };
+    for y in y_range {
         for x in 0..w {
             let i = (y * w + x) * 4;
             ppm.extend_from_slice(&rgba[i..i + 3]);
