@@ -1593,12 +1593,12 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             let mut info = Vec::with_capacity(64);
             info.extend_from_slice(&name_ptr.to_ne_bytes());
             info.extend_from_slice(&(name_len - 1).to_ne_bytes());
-            info.extend_from_slice(&mt_ptr.to_ne_bytes());
-            info.extend_from_slice(&(mt_len - 1).to_ne_bytes());
             info.extend_from_slice(&1u32.to_ne_bytes()); // Domain::VIDEO
             info.extend_from_slice(&0u32.to_ne_bytes()); // Kind::DECODER
             info.extend_from_slice(&0u32.to_ne_bytes()); // rank
             info.extend_from_slice(&0u32.to_ne_bytes()); // padding
+            info.extend_from_slice(&mt_ptr.to_ne_bytes());
+            info.extend_from_slice(&(mt_len - 1).to_ne_bytes());
             info.extend_from_slice(&0u64.to_ne_bytes()); // aliases.mData
             info.extend_from_slice(&0u64.to_ne_bytes()); // aliases.mSize
             let info: &'static [u8] = Box::leak(info.into_boxed_slice());
@@ -1614,7 +1614,7 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             let arr_idx =
                 push_buffer_object(&mut parcel, &mut objects, 1, info.as_ptr() as u64, 64, vec_idx, 0);
             push_buffer_object(&mut parcel, &mut objects, 1, name_ptr, name_len, arr_idx, 0);
-            push_buffer_object(&mut parcel, &mut objects, 1, mt_ptr, mt_len, arr_idx, 16);
+            push_buffer_object(&mut parcel, &mut objects, 1, mt_ptr, mt_len, arr_idx, 32);
         } else {
             // `getConfigurable` and `getPoolClientManager` both return a binder;
             // handing back the store's own handle keeps the client's
