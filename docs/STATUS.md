@@ -48,6 +48,20 @@ olması gerekiyor (`c2.android.avc.decoder` orada var).
 `android.hardware.media.c2@1.0.so`'daki
 `_hidl_listComponents`'ın dönüş yazma kodundan çıkarılmalı.
 
+**Ölçüldü** (`writeEmbeddedToParcel(ComponentTraits, ...)`, `0x5de70`):
+
+```
+0x00  hidl_string   (name)
+0x10  hidl_string   (mediaType)
+0x20  u32 domain, u32 kind, u32 rank, u32 pad
+0x30  hidl_vec<hidl_string> aliases   (ptr @0x30, size @0x38)
+0x40  hidl_string   (?)               ← üçüncü string
+```
+
+Yani struct **80 bayt** ve `aliases` 0x30'da bir vektör. Sıradaki iş bu
+yerleşimi `push_buffer_object` çağrılarıyla yazmak: vec struct (16), eleman
+dizisi (80), sonra her string/vektör için gömülü nesneler.
+
 ## Önceki oturum: NewPipe ekranda — çizim ve sunum çalışıyor
 
 ### Yol boyunca bulunan dört gerçek hata
