@@ -1414,6 +1414,12 @@ fn reply_has_status(handle: u32, code: u32) -> bool {
         // `callRemote` reads the out parameters first and the status last.
         return false;
     }
+    if handle == handle_for("media.resource_manager") && code == INTERFACE_TRANSACTION {
+        // `BpBinder::getInterfaceDescriptor` (`libbinder.so` `0x5ef60`) calls
+        // `transact` and then `Parcel::readString16()` straight away, with no
+        // status word in front of the descriptor.
+        return false;
+    }
     true
 }
 

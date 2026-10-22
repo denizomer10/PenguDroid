@@ -475,6 +475,30 @@ const BINDER_TYPE_BUFFER: u32 = 0x7074_2a85;
 /// `flat_binder_object` tag for a *local* binder (`BINDER_TYPE_BINDER`).
 const BINDER_TYPE_BINDER: u32 = 0x7362_2a85;
 
+/// Take a strong reference on every local binder in a parcel.
+///
+/// The driver's `acquire_binder_object` does this for each `BINDER_TYPE_BINDER`
+/// it moves between processes, and `Parcel::~Parcel` → `release_object` calls
+/// `decStrong` to balance it. Our broker copies parcels verbatim, so without
+/// this the destructor drops a reference nobody took (measured:
+/// `RefBase::decStrong` faulting inside `_hidl_createComponent`).
+unsafe fn acquire_binders(bytes: &[u8], objects: &[u64], inc_strong: *mut c_void, times: usize) {
+    for &off in objects {
+        let o = off as usize;
+        if o + 24 > bytes.len() {
+            continue;
+        }
+        let ty = u32::from_ne_bytes(bytes[o..o + 4].try_into().unwrap());
+        if ty != BINDER_TYPE_BINDER {
+            continue;
+        }
+        let cookie = u64::from_ne_bytes(bytes[o + 16..o + 24].try_into().unwrap());
+        for _ in 0..times {
+            acquire_binder(cookie, inc_strong);
+        }
+    }
+}
+
 /// Take a strong reference on a local binder the service put in a reply.
 ///
 /// The real driver calls `acquire_binder_object` while the transaction is in
@@ -517,9 +541,11 @@ unsafe fn stabilize(bytes: &mut [u8], objects: &[u64], inc_strong: *mut c_void) 
         let ty = u32::from_ne_bytes(bytes[o..o + 4].try_into().unwrap());
         if ty == BINDER_TYPE_BINDER {
             // `{type@0, flags@4, binder@8, cookie@0x10}` — 24 bytes, no
-            // stability word.
+            // stability word. Two references: one for the reply parcel's
+            // destructor, one for the client.
             if o + 24 <= bytes.len() {
                 let cookie = u64::from_ne_bytes(bytes[o + 16..o + 24].try_into().unwrap());
+                acquire_binder(cookie, inc_strong);
                 acquire_binder(cookie, inc_strong);
             }
             continue;
@@ -639,6 +665,9 @@ pub(crate) unsafe fn dispatch(code: u32, data: &[u8], objects: &[u64]) -> Option
 
     let mut reply = [0u8; PARCEL_BYTES];
     (api.parcel_ctor)(reply.as_mut_ptr() as *mut c_void);
+    // Balance the request parcel's destructor, which `decStrong`s every local
+    // binder it holds.
+    acquire_binders(data, objects, inc_strong(), 1);
     CAPTURED.with(|c| *c.borrow_mut() = None);
     let callback = StdFunction {
         buf: [0; 4],
