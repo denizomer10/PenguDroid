@@ -997,6 +997,16 @@ pub unsafe extern "C" fn eglGetDisplay(native_display: *mut c_void) -> EGLDispla
 
     let mut display = std::ptr::null_mut();
     if native_display.is_null() {
+        // One surfaceless display for the whole process. The framework creates an
+        // `EglManager` per window (the activity's, then a dialog's), and each one
+        // calls `eglGetDisplay`, so without this cache the second window opened a
+        // second display and context — two render paths over one FBO-backed
+        // surface set. The host returns the same object for the surfaceless
+        // platform anyway; skipping the call keeps the shim's own state single.
+        let cached = lock_state().display as EGLDisplay;
+        if !cached.is_null() {
+            return cached;
+        }
         if let Some(get_platform_display) = host.get_platform_display_ext {
             // SAFETY: the surfaceless platform ignores both arguments.
             display = get_platform_display(

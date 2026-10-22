@@ -77,30 +77,29 @@ python3 tools/art/ppmstat.py /tmp/f.frame201.ppm   # renk dağılımı
 
 ### Bilinen artıklar
 
-1. **`EGL_BAD_DISPLAY` gürültüsü.** Koşu başına ~240 kez
-   `libEGL: validate_display:567 error 3008 (EGL_BAD_DISPLAY)` basılıyor.
-   Swap'ları engellemiyor (240 swap tamamlandı, kare doğru). **Önemli:** bu satır
-   Mesa'dan *gelmiyor* — `grep -c validate_display` hem `libEGL.so.1` hem
-   `libEGL_mesa.so.0` için 0, sysroot'taki **Android `libEGL.so`** için 1.
-   Yani süreçte Android'in libEGL'si de yüklü.
+1. **`EGL_BAD_DISPLAY` seli — ÇÖZÜLDÜ (`26ce279`).** Sebep `eglBeginFrame`.
+   hwui her karede `eglBeginFrame(EGLDisplay, EGLSurface)` çağırıyor ve bu
+   sembol Bionic `libEGL.so`'ya düşüyordu; o da ilk iş olarak display'i kendi
+   kayıt defterinde arıyor, bizimki host'un surfaceless display'i olduğu için
+   her karede `validate_display:567 error 3008 (EGL_BAD_DISPLAY)` basıyordu
+   (koşu başına ~250 satır). gleshim bu sembolü artık kendi cevaplıyor (FBO
+   senkron olduğu için yapacak iş yok) → sel **sıfır**, çizim aynı.
 
-   Denenen ve **işe yaramayan** yol: gleshim'e `-Wl,-soname,libEGL.so` verip
-   `art-libs`'a Android libEGL'sini kopyalamamak. O zaman Android'in
-   `libGLESv2.so`'su yüklenirken tek bir özel sembolü arıyor:
-   `_ZN7android18egl_get_connectionEv` (`libGLESv2.so`'nun libEGL'den istediği
-   *tek* sembol bu). Bu, Android libEGL + libGLESv2'nin bu ağaçta **çalışan bir
-   çift** olduğunu gösteriyor, dolayısıyla libEGL'i çıkarmak güvenli değil.
+   Teşhisi mümkün kılan: `LD_DEBUG=bindings` çıktısını "hangi kütüphaneye
+   bağlanıyor" diye ayrıştırmak. `libhwui`'nin egl sembollerinin 29'u gleshim'e,
+   kalan 2'si (`eglBeginFrame`, `egl_set_cache_filename`) Bionic libEGL'ye
+   gidiyordu. Ayrıca `PENGUDROID_TRACE_GLESHIM=1` artık süreçte map'li
+   `libEGL`/`libGLESv2` imajlarını da yazıyor (`trace_mapped_gl`).
 
-   Sıradaki adım: `egl_get_connection()`'ı gleshim'de sağlayıp sonra
-   `art-libs`'tan Android libEGL'sini çıkarmak; ya da `validate_display`
-   çağıran yolu `LD_DEBUG=reloc` / `LD_DEBUG=bindings` ile bulup o çağrının
-   bizim display'imizi görmediğini doğrulamak.
+   Not: GL işi hiç o çiftten geçmiyor — `gl*` bağlamaları host'un
+   `libGLESv2.so.2`'sine gidiyor. Bionic `libGLESv1_CM`/`v2`/`v3` sadece
+   trampolin; onların libEGL'den istediği 3 sembol de artık gleshim'de
+   (`android::egl_get_connection`, `egl_get_init_count`,
+   `egl_get_string_for_current_context`), ayrıca `eglPresentationTimeANDROID`.
 2. **`eglGetDisplay` her çağrıda yeni handle döndürüyor.** Cache'lenmeli;
    ikinci `EglManager` (AlertDialog) için ikinci bir display açılıyor.
-3. **Kare hızı.** 20 saniyede 240 kare ölçüldü, ama NewPipe'ın ana ekranı
-   statik olduğu için `Choreographer` yalnızca iş olduğunda kare istiyor;
-   bu sayı tek başına bir yavaşlık göstergesi değil. Animasyonlu bir ekranda
-   ölçmek gerekiyor.
+3. **Kare hızı.** Ölçüm için animasyonlu bir ekran gerekiyor; statik feed'de
+   `Choreographer` yalnızca iş olduğunda kare istiyor.
 
 ### Geometri tek kaynağa indirildi
 
