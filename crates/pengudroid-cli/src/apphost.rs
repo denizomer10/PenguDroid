@@ -801,12 +801,22 @@ fn probe_media_codecs(env: &JniEnv) {
             None => eprintln!("media: getCodecCount threw"),
         }
     }
-    if let Some(infos) = env.static_method_id(
+    // `getCodecInfos()` is an *instance* method (`new MediaCodecList(kind)`),
+    // not a static one; asking for it as static throws `NoSuchMethodError`.
+    let Some(ctor) = env.method_id(list_class, "<init>", "(I)V") else {
+        eprintln!("media: MediaCodecList(int) constructor missing");
+        return;
+    };
+    let Some(list) = env.new_object(list_class, ctor, &[JValue { i: 1 }]) else {
+        eprintln!("media: new MediaCodecList(ALL_CODECS) threw");
+        return;
+    };
+    if let Some(infos) = env.method_id(
         list_class,
         "getCodecInfos",
         "()[Landroid/media/MediaCodecInfo;",
     ) {
-        if let Some(array) = env.call_static_object(list_class, infos, &[]) {
+        if let Some(array) = env.call_object(list, infos, &[]) {
             if !array.is_null() {
                 let len = env.array_length(array);
                 println!("media: getCodecInfos() returned {len}");

@@ -1573,6 +1573,36 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         }
     }
     if tr.target_handle == handle_for("codec2") {
+        // The real codec2 service objects are hosted in this process (see
+        // `codec2.rs`), so the generated HIDL code does the marshalling for us.
+        // The stub replies below are only the fallback for when the service
+        // libraries cannot be loaded.
+        if tr.data_ptr != 0 {
+            let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
+            let offsets: Vec<u64> = if tr.offsets_ptr != 0 && tr.offsets_size > 0 {
+                std::slice::from_raw_parts(
+                    tr.offsets_ptr as *const u64,
+                    (tr.offsets_size / 8) as usize,
+                )
+                .to_vec()
+            } else {
+                Vec::new()
+            };
+            if let Some((bytes, offs)) = crate::codec2::dispatch(tr.code, data, &offsets) {
+                if trace_enabled() {
+                    diag(&format!(
+                        "[binder]   -> codec2 service code {} ({} bytes, {} objects)\n",
+                        tr.code,
+                        bytes.len(),
+                        offs.len()
+                    ));
+                }
+                return Reply {
+                    parcel: bytes,
+                    objects: offs,
+                };
+            }
+        }
         // The first call on a HIDL proxy is `interfaceChain`; the client uses it
         // to decide whether the proxy really implements the interface it asked
         // for. Its code is a hash, not a small ordinal.
@@ -1614,9 +1644,15 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             vec.extend_from_slice(&0u32.to_ne_bytes());
             let vec: &'static [u8] = Box::leak(vec.into_boxed_slice());
 
-            // The client's `mDataPos` is 8 when it reads the first object, so
-            // the reply carries one extra word after the status.
-            parcel.extend_from_slice(&0u32.to_ne_bytes());
+            // `listComponents() generates (Status, vec<ComponentTraits>)`.
+            // The reply is `[hidl status][codec2 status][vec struct][elements]`:
+            // the client reads the HIDL `Status`, then a second int32 that is
+            // the codec2 `V1_0::Status` handed to the callback (measured: a
+            // non-zero value here makes `Codec2Client::_listComponents` log
+            // "call failed: BAD_STATE"), then the 16-byte vec struct and the
+            // element array. The element count comes from the vec struct, not
+            // from this word.
+            parcel.extend_from_slice(&0i32.to_ne_bytes()); // codec2 Status::OK
             let vec_idx =
                 push_buffer_object(&mut parcel, &mut objects, 0, vec.as_ptr() as u64, 16, 0, 0);
             let arr_idx =
@@ -1639,6 +1675,12 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                 0x30,
             );
             push_buffer_object(&mut parcel, &mut objects, 1, al_ptr, al_len, alias_arr_idx, 0);
+        } else if tr.code == 1 {
+            // `createComponent(hidl_string name, sp<IComponentListener>,
+            // sp<IClientManager>) generates (Status, sp<IComponent>)`. The
+            // client reads the status and then the binder, so the object sits
+            // at offset 4 (measured: "read object ... at offset 4").
+            push_flat_handle(&mut parcel, &mut objects, handle_for("codec2_component"));
         } else {
             // `getConfigurable`, `getPoolClientManager` and `createInterface`
             // all return a binder; handing back the store's own handle keeps
@@ -2622,6 +2664,34 @@ mod tests {
         assert_eq!(parsed.data_size, 8);
         assert_eq!(parsed.sender_pid, 1);
     }
+}
+
+/// `android::hardware::Parcel::readEmbeddedBuffer(size, handle, parentHandle,
+/// parentOffset, out)`.
+///
+/// The non-nullable twin of `readNullableEmbeddedBuffer`; it has its own
+/// implementation, so it needs its own interposer to trace the reads.
+#[no_mangle]
+pub unsafe extern "C" fn _ZNK7android8hardware6Parcel18readEmbeddedBufferEmPmmmPPKv(
+    this: *mut c_void,
+    size: usize,
+    handle: *mut usize,
+    parent_handle: usize,
+    parent_offset: usize,
+    out: *mut *const c_void,
+) -> i32 {
+    type F = unsafe extern "C" fn(*mut c_void, usize, *mut usize, usize, usize, *mut *const c_void) -> i32;
+    let next: Option<F> = crate::rootfs::next(b"_ZNK7android8hardware6Parcel18readEmbeddedBufferEmPmmmPPKv\0");
+    let rc = match next {
+        Some(f) => f(this, size, handle, parent_handle, parent_offset, out),
+        None => -22,
+    };
+    if trace_enabled() {
+        diag(&format!(
+            "[binder]   readEmbeddedBuffer size={size} parent={parent_handle} parentOffset={parent_offset} rc={rc}\n"
+        ));
+    }
+    rc
 }
 
 /// `android::hardware::Parcel::readNullableEmbeddedBuffer(size, handle,

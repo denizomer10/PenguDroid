@@ -3,7 +3,79 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
-## Bu oturum: MediaCodec — HIDL yolu açıldı
+## Bu oturum: codec listesi çalışıyor
+
+`MediaCodecList` artık iki codec görüyor ve `MediaCodecInfo` nesnelerini
+dolduruyor:
+
+```
+media: MediaCodecList.getCodecCount() = 2
+media: getCodecInfos() returned 2
+media:   codec 0: c2.android.avc.decoder
+media:   codec 1: OMX.google.h264.decoder
+```
+
+Bunu mümkün kılan üç ölçüm:
+
+1. **`createComponent` (kod 1) yanıtı `[status][flat_binder_object]`**, nesne
+   offset 4'te. Daha önce bir padding kelimesi eklenmişti; istemci o zaman
+   "read object at offset 4" diyordu — yani padding *yanlıştı*.
+2. **`listComponents` (kod 3) yanıtı `[hidl status][codec2 status][vec struct]
+   [eleman dizisi]…`** — yani **iki** durum kelimesi var. İkinci kelime
+   `V1_0::Status` ve doğrudan geri çağrıya geçiyor; sıfır olmazsa
+   `Codec2Client::_listComponents` "call failed: BAD_STATE" diyor. Vektörün
+   eleman sayısı bu kelimeden değil, 16 baytlık vec yapısının `+8` alanından
+   okunuyor (gdb ile doğrulandı: `Status&&` = 1, `vec` = `{ptr, 1}`).
+3. **`ComponentTraits` yerleşimi**: `name`@0x00, `mediaType`@0x20,
+   `aliases`@0x30 (eleman boyu 16, `hidl_vec` boyu 16). `domain/kind/rank`
+   `0x10`'da ama parcel'den okunmuyor, tampondan geliyor.
+
+`getCodecInfos()` bir **örnek** metodu (`new MediaCodecList(ALL_CODECS)`),
+statik değil — sonda bunu statik çağırdığımız için `NoSuchMethodError`
+alıyorduk.
+
+### Sıradaki duvar: gerçek codec2 servisini barındırmak
+
+`crates/pengudroid-shim/src/codec2.rs` gerçek servisi süreç içinde kuruyor
+(`C2PlatformComponentStore` → `utils::ComponentStore` → `BnHwComponentStore`)
+ve `interfaceChain` doğru yanıtlanıyor (164 bayt, 4 nesne). Ama yanıt parcel'i
+gömülü tamponlarını servisin **kendi yığınına** işaret ettiriyor ve üretilen
+kod yanıtı ancak `std::function<void(Parcel&)>` geri çağrısı içinde teslim
+ediyor. Rust'tan libc++ `std::function` kurulamadığı için tamponlar
+`onTransact` dönmeden ölüyor:
+
+```
+hw-Parcel: Buffer length 32 does not match expected size 15638207488
+HidlServiceManagement: getService: received incompatible service
+```
+
+Bu yüzden barındırma `PENGUDROID_CODEC2_SERVICE=1` ile **opt-in**; varsayılan
+yol eski stub (codec listesi çalışıyor).
+
+Çözüm yolları, kolaydan zora:
+
+1. `std::function<void(Parcel&)>` için libc++ `__func` yerleşimini elle kur
+   (nesne 48 bayt: `{tablo@0, yakalananlar@8..0x30}`; tablo
+   `libhidlbase`'de `0xcd160`'ta, `__clone()` `0xa26f0`, `__clone(void*)`
+   `0xa2730`). Tablo slot sırası henüz kesinleşmedi.
+2. `BnHwComponentStore::onTransact` yerine `utils::ComponentStore`
+   metodlarını doğrudan çağır ve geri çağrıyı aynı şekilde kur.
+3. Gerçek bir binder **sunucusu** yaz (daemon'da), servisi ayrı süreçte
+   çalıştır; o zaman sürücünün tampon kopyalama işini de biz yaparız.
+
+### Parcel yerleşimi (ölçüldü, `libhidlbase`)
+
+```
+0x28  u8*  mData        0x30  size_t mDataSize    0x38  size_t mDataCapacity
+0x40  size_t mDataPos   0x48  size_t* mObjects   0x50  size_t mObjectsSize
+0x58  size_t mObjectsCapacity   0x60  size_t mNextObjectHint
+```
+
+`setData` (`0xb9d80`) tamponu 0x28'e, boyu 0x30'a yazar; `readObject<T>`
+(`0xb8ca0`) 0x40/0x48/0x50'yi okur. Bir istek parcel'ini yeniden kurmak için
+`Parcel()` + `setData` + bu alanları elle doldurmak yetiyor.
+
+## Önceki oturum: MediaCodec — HIDL yolu açıldı
 
 Hedef: `MediaCodecList` codec görsün, `MediaCodec` kare üretsin. Bu oturumda
 zincirin **taşıma katmanı** tamamen çalışır hale geldi; codec2 istemcisi

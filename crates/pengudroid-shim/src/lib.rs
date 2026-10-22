@@ -53,6 +53,7 @@ use libc::{c_char, c_int, c_void};
 mod ahardwarebuffer;
 mod android_native;
 mod binder;
+mod codec2;
 mod netdb;
 mod pathshim;
 mod rootfs;
