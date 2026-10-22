@@ -18,6 +18,7 @@
 use std::ffi::CStr;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use libc::{c_int, c_ulong, c_void};
 
@@ -2345,10 +2346,72 @@ pub unsafe extern "C" fn __pengudroid_binder_open(path: *const libc::c_char) -> 
     if path.is_null() {
         return -1;
     }
-    match open_device(CStr::from_ptr(path).to_bytes()) {
+    let bytes = CStr::from_ptr(path).to_bytes();
+    if bytes.starts_with(b"/dev/dma_heap/") {
+        return open_dma_heap().unwrap_or(-1);
+    }
+    match open_device(bytes) {
         Some(fd) => fd,
         None => -1,
     }
+}
+
+// --- dma-buf heaps ---------------------------------------------------------
+//
+// `libdmabufheap` opens `/dev/dma_heap/system` and allocates with
+// `DMA_HEAP_IOCTL_ALLOC`. There is no such device on a desktop kernel, and
+// without it `CCodecBufferChannel::start` fails with "cannot allocate memory at
+// all". A memfd is a perfectly good dma-buf for our purposes: it is mappable,
+// shareable and the GL shim already treats dma-bufs as memfds.
+
+/// `_IOWR('H', 0, struct dma_heap_allocation_data)`.
+const DMA_HEAP_IOCTL_ALLOC: c_ulong = 0xC018_4800;
+
+/// Fds we handed out for `/dev/dma_heap/*`.
+static DMA_HEAP_FDS: Mutex<Vec<c_int>> = Mutex::new(Vec::new());
+
+unsafe fn memfd(name: &[u8]) -> c_int {
+    libc::memfd_create(name.as_ptr() as *const libc::c_char, libc::MFD_CLOEXEC)
+}
+
+unsafe fn open_dma_heap() -> Option<c_int> {
+    let fd = memfd(b"pengudroid-dma-heap\0");
+    if fd < 0 {
+        return None;
+    }
+    DMA_HEAP_FDS.lock().unwrap_or_else(|e| e.into_inner()).push(fd);
+    if trace_enabled() {
+        diag(&format!("[binder]   dma_heap fd {fd}\n"));
+    }
+    Some(fd)
+}
+
+/// `struct dma_heap_allocation_data { u64 len; u32 fd; u32 fd_flags; u64 heap_flags; }`.
+unsafe fn dma_heap_ioctl(fd: c_int, request: c_ulong, arg: *mut c_void) -> Option<i64> {
+    let known = DMA_HEAP_FDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&fd);
+    if !known {
+        return None;
+    }
+    if request != DMA_HEAP_IOCTL_ALLOC || arg.is_null() {
+        return Some(-(libc::EINVAL as i64));
+    }
+    let len = *(arg as *const u64);
+    let buf = memfd(b"pengudroid-dmabuf\0");
+    if buf < 0 {
+        return Some(-(libc::ENOMEM as i64));
+    }
+    if libc::ftruncate(buf, len as libc::off_t) != 0 {
+        libc::close(buf);
+        return Some(-(libc::ENOMEM as i64));
+    }
+    *((arg as *mut u32).add(2)) = buf as u32;
+    if trace_enabled() {
+        diag(&format!("[binder]   dma_heap alloc {len} -> fd {buf}\n"));
+    }
+    Some(0)
 }
 
 /// `long __pengudroid_binder_ioctl(int fd, unsigned long request, void *arg)`
@@ -2365,7 +2428,10 @@ pub unsafe extern "C" fn __pengudroid_binder_ioctl(
 ) -> i64 {
     match ioctl(fd, request, arg) {
         Some(result) => result as i64,
-        None => -4096,
+        None => match dma_heap_ioctl(fd, request, arg) {
+            Some(result) => result,
+            None => -4096,
+        },
     }
 }
 
