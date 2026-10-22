@@ -1575,16 +1575,17 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
     if tr.target_handle == handle_for("codec2") {
         // The first call on a HIDL proxy is `interfaceChain`; the client uses it
         // to decide whether the proxy really implements the interface it asked
-        // for. Its code is a hash, not a small ordinal, so any call here is
-        // answered with the chain.
-        let chain = [
-            "android.hardware.media.c2@1.0::IComponentStore",
-            "android.hardware.media.c2@1.0::ICodec2",
-            "android.hidl.base@1.0::IBase",
-        ];
-        push_hidl_string_vec(&mut parcel, &mut objects, &chain);
+        // for. Its code is a hash, not a small ordinal.
+        if tr.code == 0x0F43_484E {
+            let chain = [
+                "android.hardware.media.c2@1.0::IComponentStore",
+                "android.hardware.media.c2@1.0::ICodec2",
+                "android.hidl.base@1.0::IBase",
+            ];
+            push_hidl_string_vec(&mut parcel, &mut objects, &chain);
+        }
         if trace_enabled() {
-            diag(&format!("[binder]   -> codec2 interfaceChain ({})\n", tr.code));
+            diag(&format!("[binder]   -> codec2 call code {}\n", tr.code));
         }
     }
     if tr.target_handle == 0 && is_hidl_request(tr) {
