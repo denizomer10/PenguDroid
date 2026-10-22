@@ -579,11 +579,16 @@ pub fn export_surface_dmabuf(surface: EGLSurface) -> Result<DmabufExport, String
     } else {
         current_context
     };
-    let display = host
-        .get_current_display
-        .map(|f| unsafe { f() })
-        .filter(|d| !d.is_null())
-        .unwrap_or(cached_display as EGLDisplay);
+    // Prefer the display this process actually initialized: every image this
+    // module creates is created against that one, and Mesa's dma-buf entry
+    // points validate the display before anything else.
+    let display = if cached_display != 0 {
+        cached_display as EGLDisplay
+    } else {
+        host.get_current_display
+            .map(|f| unsafe { f() })
+            .unwrap_or(std::ptr::null_mut())
+    };
     if display.is_null() {
         return Err("export: display is not initialized".into());
     }
@@ -1025,11 +1030,22 @@ pub unsafe extern "C" fn eglInitialize(
 
 #[no_mangle]
 pub unsafe extern "C" fn eglTerminate(dpy: EGLDisplay) -> u32 {
-    match host() {
-        // SAFETY: `dpy` is the caller's display handle.
-        Ok(host) => (host.terminate)(dpy),
-        Err(_) => EGL_FALSE,
-    }
+    // Deliberately *not* forwarded.
+    //
+    // There is exactly one host display for the whole process — the surfaceless
+    // platform `eglGetDisplay` hands out — and every `EglManager` in the app
+    // shares it, because the framework creates one per window (the activity's,
+    // then the dialog's). Forwarding `eglTerminate` let whichever teardown ran
+    // first invalidate the display for everybody, and from then on every host
+    // call logged
+    //
+    //     libEGL: validate_display:567 error 3008 (EGL_BAD_DISPLAY)
+    //
+    // about once per frame while the surviving renderer kept using it. The
+    // display is a process-lifetime resource here, so terminating it is a no-op
+    // that reports success.
+    let _ = dpy;
+    EGL_TRUE
 }
 
 #[no_mangle]
@@ -1212,6 +1228,9 @@ pub unsafe extern "C" fn eglMakeCurrent(
 
     // A surfaceless host display has no window surfaces; the app renders into
     // our FBO instead, so only the context is made current.
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+        eprintln!("[gleshim] eglMakeCurrent dpy={dpy:p} draw={draw:p} ctx={ctx:p}");
+    }
     let dpy = resolve_display(dpy);
     let ok = (host.make_current)(
         dpy,
@@ -1384,8 +1403,8 @@ pub unsafe extern "C" fn eglCreateWindowSurface(
     // buffer in agreement; the env vars are only a fallback.
     let (mut w, mut h) = window_size(native_window);
     if w == 0 || h == 0 {
-        w = env_dim("PENGUDROID_SURFACE_W", 1280);
-        h = env_dim("PENGUDROID_SURFACE_H", 720);
+        w = env_dim("PENGUDROID_SURFACE_W", 720);
+        h = env_dim("PENGUDROID_SURFACE_H", 1280);
     }
     if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
         eprintln!("[gleshim] eglCreateWindowSurface -> {w}x{h}");
@@ -1509,6 +1528,123 @@ pub unsafe extern "C" fn eglQuerySurface(
             EGL_TRUE
         }
         _ => EGL_FALSE,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EGL sync objects and images
+// ---------------------------------------------------------------------------
+//
+// `libhwui` imports these from `libEGL`, and none of them was exported by the
+// gleshim — so Skia's fence handling called straight into Mesa with our synthetic
+// surface and display handles. Mesa's first act in every entry point is
+// `validate_display`, which is where the flood of
+// "libEGL: validate_display:567 error 3008 (EGL_BAD_DISPLAY)" came from.
+//
+// A sync object here is a bare sentinel: the FBO is rendered synchronously and
+// presentation copies the whole buffer, so there is never anything to wait for.
+
+/// `EGL_CONDITION_SATISFIED_KHR`.
+const EGL_CONDITION_SATISFIED_KHR: c_int = 0x30F6;
+
+/// Distinct sentinels so a client that compares syncs sees different objects.
+static SYNC_SENTINEL: u8 = 0;
+
+/// `eglCreateSyncKHR(dpy, type, attrib_list)`.
+#[no_mangle]
+pub unsafe extern "C" fn eglCreateSyncKHR(
+    _dpy: EGLDisplay,
+    _type: u32,
+    _attrib_list: *const c_int,
+) -> *mut c_void {
+    std::ptr::addr_of!(SYNC_SENTINEL) as *mut c_void
+}
+
+/// `eglDestroySyncKHR(dpy, sync)`.
+#[no_mangle]
+pub unsafe extern "C" fn eglDestroySyncKHR(_dpy: EGLDisplay, _sync: *mut c_void) -> u32 {
+    EGL_TRUE
+}
+
+/// `eglClientWaitSyncKHR(dpy, sync, flags, timeout)` — always already signalled.
+#[no_mangle]
+pub unsafe extern "C" fn eglClientWaitSyncKHR(
+    _dpy: EGLDisplay,
+    _sync: *mut c_void,
+    _flags: c_int,
+    _timeout: u64,
+) -> c_int {
+    EGL_CONDITION_SATISFIED_KHR
+}
+
+/// `eglWaitSyncKHR(dpy, sync, flags)`.
+#[no_mangle]
+pub unsafe extern "C" fn eglWaitSyncKHR(
+    _dpy: EGLDisplay,
+    _sync: *mut c_void,
+    _flags: c_int,
+) -> u32 {
+    EGL_TRUE
+}
+
+/// `eglGetSyncAttribKHR(dpy, sync, attribute, value)`.
+#[no_mangle]
+pub unsafe extern "C" fn eglGetSyncAttribKHR(
+    _dpy: EGLDisplay,
+    _sync: *mut c_void,
+    attribute: c_int,
+    value: *mut c_int,
+) -> u32 {
+    if !value.is_null() {
+        // EGL_SYNC_STATUS_KHR -> EGL_SIGNALED_KHR, EGL_SYNC_TYPE_KHR -> EGL_SYNC_FENCE_KHR.
+        *value = match attribute {
+            0x30F1 => 0x30F2, // EGL_SYNC_STATUS_KHR -> EGL_SIGNALED_KHR
+            0x30F0 => 0x30F9, // EGL_SYNC_TYPE_KHR -> EGL_SYNC_FENCE_KHR
+            _ => 0,
+        };
+    }
+    EGL_TRUE
+}
+
+/// `eglDupNativeFenceFDANDROID(dpy, sync)` — no fence, so `EGL_NO_NATIVE_FENCE_FD_ANDROID`.
+#[no_mangle]
+pub unsafe extern "C" fn eglDupNativeFenceFDANDROID(
+    _dpy: EGLDisplay,
+    _sync: *mut c_void,
+) -> c_int {
+    -1
+}
+
+/// `eglGetNativeClientBufferANDROID(buffer)` — `AHardwareBuffer` is already the
+/// native client buffer, so this is the identity.
+#[no_mangle]
+pub unsafe extern "C" fn eglGetNativeClientBufferANDROID(buffer: *mut c_void) -> EGLClientBuffer {
+    buffer
+}
+
+/// `eglCreateImageKHR(dpy, ctx, target, buffer, attrib_list)`.
+#[no_mangle]
+pub unsafe extern "C" fn eglCreateImageKHR(
+    dpy: EGLDisplay,
+    ctx: EGLContext,
+    target: u32,
+    buffer: EGLClientBuffer,
+    attrib_list: *const c_int,
+) -> EGLImageKHR {
+    match host().ok().and_then(|h| h.create_image_khr) {
+        // SAFETY: forwarded verbatim; the host owns the argument contract.
+        Some(create) => create(resolve_display(dpy), ctx, target, buffer, attrib_list),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// `eglDestroyImageKHR(dpy, image)`.
+#[no_mangle]
+pub unsafe extern "C" fn eglDestroyImageKHR(dpy: EGLDisplay, image: EGLImageKHR) -> u32 {
+    match host().ok().and_then(|h| h.destroy_image_khr) {
+        // SAFETY: forwarded verbatim.
+        Some(destroy) => destroy(resolve_display(dpy), image),
+        None => EGL_FALSE,
     }
 }
 

@@ -326,13 +326,13 @@ pub unsafe extern "C" fn ANativeWindow_release(_w: *mut c_void) {}
 /// `ANativeWindow_getWidth(w)`.
 #[no_mangle]
 pub unsafe extern "C" fn ANativeWindow_getWidth(_w: *mut c_void) -> i32 {
-    surface_dimension("PENGUDROID_SURFACE_W", 1280)
+    surface_dimension("PENGUDROID_SURFACE_W", 720)
 }
 
 /// `ANativeWindow_getHeight(w)`.
 #[no_mangle]
 pub unsafe extern "C" fn ANativeWindow_getHeight(_w: *mut c_void) -> i32 {
-    surface_dimension("PENGUDROID_SURFACE_H", 720)
+    surface_dimension("PENGUDROID_SURFACE_H", 1280)
 }
 
 /// `ANativeWindow_getFormat(w)` — `WINDOW_FORMAT_RGBA_8888`.

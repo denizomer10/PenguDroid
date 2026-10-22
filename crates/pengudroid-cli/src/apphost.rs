@@ -16,6 +16,18 @@
 //! That is what the binder callback does, minus the marshalling.
 
 use std::ffi::c_void;
+
+/// The PenguDroid surface geometry, in pixels.
+///
+/// This is the one place the size is written down. Everything that has to agree
+/// about it reads these: the `DisplayInfo` the framework sees, the
+/// `SurfaceControl` handed to `ViewRootImpl`, the window frame, and (through
+/// `PENGUDROID_SURFACE_W`/`_H`, which `art_test` mirrors) the EGL surface the
+/// gleshim renders into. Before this existed the defaults disagreed — portrait in
+/// two places and landscape in two others — so hwui rendered 1280x720 into an
+/// FBO the window frame described as 720x1280.
+const SURFACE_W: i32 = 720;
+const SURFACE_H: i32 = 1280;
 use std::path::Path;
 
 use crate::jni::{JClass, JFieldId, JMethodId, JObject, JValue, JniEnv};
@@ -1956,7 +1968,7 @@ fn force_visible(env: &JniEnv, record: JObject) {
                 }
             }
         }
-        force_window_frame(env, root, 720, 1280);
+        force_window_frame(env, root, SURFACE_W, SURFACE_H);
         dump_draw_state(env, root, index as usize);
         // `performTraversals` must run inside a Choreographer frame callback:
         // calling it directly makes `Choreographer.getFrameTimeNanos()` throw
@@ -1997,7 +2009,7 @@ fn build_surface_control(env: &JniEnv) -> Option<JObject> {
         env.call_object(
             builder,
             set_size,
-            &[JValue { i: 1280 }, JValue { i: 720 }],
+            &[JValue { i: SURFACE_W }, JValue { i: SURFACE_H }],
         );
     }
     let build = env.method_id(builder_class, "build", "()Landroid/view/SurfaceControl;")?;
@@ -2398,7 +2410,14 @@ fn install_display_replies(env: &JniEnv) {
         "smallestNominalAppWidth",
         "smallestNominalAppHeight",
     ] {
-        set_int(field, if field.contains("Height") { 720 } else { 1280 });
+        set_int(
+            field,
+            if field.contains("Height") {
+                SURFACE_H
+            } else {
+                SURFACE_W
+            },
+        );
     }
     // `DisplayInfo` has no `densityDpi` field in this build; the density is
     // derived from the logical size and the display metrics.
@@ -2427,16 +2446,16 @@ fn install_display_replies(env: &JniEnv) {
             let args: &[JValue] = if sig == "(IIIF[F)V" {
                 &[
                     JValue { i: 1 },
-                    JValue { i: 1280 },
-                    JValue { i: 720 },
+                    JValue { i: SURFACE_W },
+                    JValue { i: SURFACE_H },
                     JValue { f: 60.0 },
                     JValue { l: rates },
                 ]
             } else {
                 &[
                     JValue { i: 1 },
-                    JValue { i: 1280 },
-                    JValue { i: 720 },
+                    JValue { i: SURFACE_W },
+                    JValue { i: SURFACE_H },
                     JValue { f: 60.0 },
                 ]
             };

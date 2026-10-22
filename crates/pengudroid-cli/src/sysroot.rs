@@ -677,7 +677,12 @@ pub fn art_test(args: &[String]) -> i32 {
             "PENGUDROID_ROOT",
             std::fs::canonicalize(&layout.root).unwrap_or_else(|_| layout.root.clone()),
         )
-        .env("PENGUDROID_SUPPRESS_DESTRUCTORS", "1");
+        .env("PENGUDROID_SUPPRESS_DESTRUCTORS", "1")
+        // One surface geometry for the whole tree: the shim reports these through
+        // `ANativeWindow_getWidth`/`_getHeight`, the gleshim sizes its FBO from
+        // them, and the host lays the window frame out against the same numbers.
+        .env("PENGUDROID_SURFACE_W", "720")
+        .env("PENGUDROID_SURFACE_H", "1280");
     if let Some(bridge) = &native_bridge {
         // Enabling the bridge is pure property configuration, exactly as on a
         // device: ART's libnativebridge dlopens the named library and reads its

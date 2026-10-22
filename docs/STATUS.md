@@ -57,22 +57,32 @@ Yani `pengudroid art-test ... --classpath NewPipe_v0.29.1.apk` artık NewPipe'ı
 ### Bilinen artıklar
 
 1. **`EGL_BAD_DISPLAY` gürültüsü.** Koşu başına ~240 kez
-   `libEGL: validate_display:567 error 3008` basılıyor. Swap'ları
-   engellemiyor (240 swap tamamlandı), yani ikinci bir `EglManager` —
-   `MainActivity.onCreate`'daki `AlertDialog`'un penceresi — kendi display'ini
-   kaybediyor. Sıradaki adım: `eglGetDisplay`'ın her çağrıda yeni bir handle
-   döndürmesini engelle (cache'le), ve gleshim'in export etmediği
-   `eglCreateSyncKHR`/`eglClientWaitSyncKHR`/`eglWaitSyncKHR`/
-   `eglDestroySyncKHR`/`eglDupNativeFenceFDANDROID`/
-   `eglGetNativeClientBufferANDROID`/`eglCreateImageKHR`/`eglDestroyImageKHR`
-   fonksiyonlarını da gleshim'e ekle — şu an gerçek Mesa'ya gidiyorlar.
-2. **Kare hızı düşük görünüyor.** 20 saniyede 240 kare ≈ 12 fps; vsync
-   zaman damgalarımız (`DisplayEventDispatcher: ~ last event processed while
-   scheduling was for ...`) hâlâ tutarsız. Doğru `timestamp`/`frameInterval`
-   ile 60 fps'e çıkmalı.
-3. **Ekran 1280x720.** `eglCreateWindowSurface` 1280x720 bildiriyor
-   (`PENGUDROID_SURFACE_W/H`), oysa `force_window_frame` 720x1280 yazıyor.
-   İkisi tek bir kaynaktan beslenmeli.
+   `libEGL: validate_display:567 error 3008 (EGL_BAD_DISPLAY)` basılıyor.
+   Swap'ları engellemiyor (240 swap tamamlandı). **Önemli:** bu satır Mesa'dan
+   *gelmiyor* — `grep -c validate_display` hem `libEGL.so.1` hem
+   `libEGL_mesa.so.0` için 0 döndürüyor, sysroot'taki **Android
+   `libEGL.so`** ise 1. Yani süreçte Android'in libEGL'si de yüklü ve bir
+   şekilde çağrılıyor; ona Mesa'nın surfaceless display handle'ı verilince
+   `validate_display` reddediyor. gleshim `libhwui`'nin import ettiği tüm
+   `egl*` sembollerini artık export ediyor (bu oturumda sync/image ailesi de
+   eklendi), yani çağrı sembol interposition'ını atlayan bir yoldan geliyor —
+   en olası aday `dlopen`+`dlsym` ile doğrudan Android libEGL'sine giden bir
+   kod yolu. Sıradaki adım: `strace` yerine shim'in `dlopen` interposition'ında
+   sysroot `libEGL.so`'sunu isteyen çağrıyı loglamak.
+2. **`eglGetDisplay` her çağrıda yeni handle döndürüyor.** Cache'lenmeli;
+   ikinci `EglManager` (AlertDialog) için ikinci bir display açılıyor.
+3. **Kare hızı.** 20 saniyede 240 kare ölçüldü, ama NewPipe'ın ana ekranı
+   statik olduğu için `Choreographer` yalnızca iş olduğunda kare istiyor;
+   bu sayı tek başına bir yavaşlık göstergesi değil. Animasyonlu bir ekranda
+   ölçmek gerekiyor.
+
+### Geometri tek kaynağa indirildi
+
+Önceden dört ayrı yerde varsayılan vardı: `android_native` 1280x720,
+`gleshim` 1280x720, `binder` 720x1280, `apphost` 720x1280. Sonuç: hwui
+1280x720'lik bir FBO'ya çiziyor, pencere frame'i 720x1280 diyordu. Artık
+`apphost::SURFACE_W/H` tek kaynak, `art-test` da
+`PENGUDROID_SURFACE_W/H`'yi açıkça set ediyor, geri kalan her şey onu okuyor.
 
 ### Bu oturumda eklenen teşhis araçları
 
