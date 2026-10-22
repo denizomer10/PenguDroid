@@ -37,11 +37,16 @@ $ ps -eo pid,comm,args | grep pengudroid
 > **Where we are right now:** `docs/STATUS.md` is the up-to-date handoff note
 > (what runs, what does not, and the exact failure point of each attempt).
 > Last verified: **NewPipe 0.29.1 launches, draws and presents on screen** —
-> `pengudroid launch NewPipe_v0.29.1.apk` opens a Wayland window with the live
-> feed, rendered by hwui on the host GPU. x86_64 NativeActivity games
-> run on the GPU too. Beach Buggy Racing 2 still stops at the ARM translator.
+> `pengudroid launch NewPipe_v0.29.1.apk --sysroot <dir>` opens a Wayland window
+> with the live feed, rendered by hwui on the host GPU, with a clean log (no EGL
+> or vsync warnings). x86_64 NativeActivity games run on the GPU too. Beach Buggy
+> Racing 2 still stops at the ARM translator.
 >
 > ![NewPipe running under PenguDroid](docs/screenshots/newpipe.png)
+>
+> Two windows at once — NewPipe's own `AlertDialog` over the dimmed activity:
+>
+> ![NewPipe dialog under PenguDroid](docs/screenshots/newpipe-dialog.png)
 
 ## Status: what actually works vs. what is stubbed
 
