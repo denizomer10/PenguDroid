@@ -1590,7 +1590,7 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             // vector @0x30 and a third string @0x40 (80 bytes total).
             let (name_ptr, name_len) = leak_cstr("c2.android.avc.decoder");
             let (mt_ptr, mt_len) = leak_cstr("video/avc");
-            let mut info = Vec::with_capacity(80);
+            let mut info = Vec::with_capacity(64);
             info.extend_from_slice(&name_ptr.to_ne_bytes());
             info.extend_from_slice(&(name_len - 1).to_ne_bytes());
             info.extend_from_slice(&mt_ptr.to_ne_bytes());
@@ -1601,8 +1601,6 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             info.extend_from_slice(&0u32.to_ne_bytes()); // padding
             info.extend_from_slice(&0u64.to_ne_bytes()); // aliases.mData
             info.extend_from_slice(&0u64.to_ne_bytes()); // aliases.mSize
-            info.extend_from_slice(&0u64.to_ne_bytes()); // third string
-            info.extend_from_slice(&0u64.to_ne_bytes());
             let info: &'static [u8] = Box::leak(info.into_boxed_slice());
 
             let mut vec = Vec::with_capacity(16);
@@ -1614,7 +1612,7 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             let vec_idx =
                 push_buffer_object(&mut parcel, &mut objects, 0, vec.as_ptr() as u64, 16, 0, 0);
             let arr_idx =
-                push_buffer_object(&mut parcel, &mut objects, 1, info.as_ptr() as u64, 80, vec_idx, 0);
+                push_buffer_object(&mut parcel, &mut objects, 1, info.as_ptr() as u64, 64, vec_idx, 0);
             push_buffer_object(&mut parcel, &mut objects, 1, name_ptr, name_len, arr_idx, 0);
             push_buffer_object(&mut parcel, &mut objects, 1, mt_ptr, mt_len, arr_idx, 16);
         } else {
