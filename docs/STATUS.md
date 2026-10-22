@@ -6,17 +6,49 @@ için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2
 ## Bu oturum: MediaCodec — HIDL yolu açıldı
 
 Hedef: `MediaCodecList` codec görsün, `MediaCodec` kare üretsin. Bu oturumda
-zincirin **HIDL tarafı** çalışır hale geldi; codec servisi henüz yok.
+zincirin **taşıma katmanı** tamamen çalışır hale geldi; codec2 istemcisi
+kuruluyor, `listComponents` yanıtı kaldı.
 
 Ölçülen son durum:
 
 ```
-[binder]   -> hidl manager code 0x5f504e47   (ping)
-[binder]   -> hidl manager code 0x3          (getTransport)
-[binder]   -> hidl manager code 0x5          (listByInterface)
-Codec2Client: No Codec2 services declared in the manifest.
-media: MediaCodecList.getCodecCount() = 0    ← çökmüyor, asılmıyor
+Codec2Client: Available Codec2 services: "default"
+Codec2Client: Client to Codec2 service "default" created
+[binder]   -> codec2 call code 8      (getConfigurable)
+[binder]   -> codec2 call code 2      (getPoolClientManager)
+[binder]   -> codec2 call code 256067662  (interfaceChain)
+[binder]   -> codec2 call code 3      (listComponents)
+media: MediaCodecList.getCodecCount() = 0
 ```
+
+### Sıradaki somut adım: `ComponentTraits` yerleşimi
+
+`Codec2InfoBuilder::buildMediaCodecList` (`frameworks/av/media/codec2/sfplugin/
+Codec2InfoBuilder.cpp`) şunları yapıyor:
+
+```cpp
+std::vector<Traits> traits = Codec2Client::ListComponents();
+for (const Traits& trait : traits) {
+    std::vector<std::string> nameAndAliases = trait.aliases;   // ← vec<string>
+    nameAndAliases.insert(nameAndAliases.begin(), trait.name);
+    for (name : nameAndAliases) {
+        auto intf = Codec2Client::CreateInterfaceByName(name, &client);  // ← createInterface
+        if (!intf) { ALOGD("could not create interface for %s"); continue; }
+        if (parser.getCodecMap().count(name) == 0) { ... }        // ← XML'de olmalı
+    }
+}
+```
+
+Yani `listComponents` yanıtındaki her trait'te `name`, **`aliases` (vektör)**,
+`domain`, `kind`, `rank`, `mediaType` olmalı; ardından istemci
+`createInterface(name)` çağırıyor ve codec'in `media_codecs.xml`'de bir kaydı
+olması gerekiyor (`c2.android.avc.decoder` orada var).
+
+Şu anki yanıt `aliases`'i tek string olarak yazıyor; doğru yerleşim
+`android.hardware.media.c2@1.0.so`'daki
+`_hidl_listComponents`'ın dönüş yazma kodundan çıkarılmalı.
+
+## Önceki oturum: NewPipe ekranda — çizim ve sunum çalışıyor
 
 ### Yol boyunca bulunan dört gerçek hata
 
