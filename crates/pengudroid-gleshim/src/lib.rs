@@ -179,6 +179,10 @@ impl Host {
         let gles_handle = open_first(&["libGLESv2.so.2", "libGLESv2.so"])
             .ok_or_else(|| "could not dlopen libGLESv2.so.2".to_string())?;
 
+        if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+            trace_mapped_gl();
+        }
+
         // Core entry points are looked up in libEGL itself; the extension
         // entry points may only be published through `eglGetProcAddress`.
         let core = |name: &str| sym_ptr(egl_handle, name);
@@ -296,6 +300,27 @@ fn open_first(names: &[&str]) -> Option<*mut c_void> {
         }
     }
     None
+}
+
+/// Print every mapped `libEGL`/`libGLESv2` image, for diagnostics.
+///
+/// `PENGUDROID_TRACE_GLESHIM=1` runs call this once. It answers the question the
+/// symbol-level debugging cannot: *which* `libEGL` the process actually mapped,
+/// the host's or the Bionic tree's copy that `nativeloader` also pulls in.
+fn trace_mapped_gl() {
+    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
+        return;
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    for line in maps.lines() {
+        let Some(path) = line.split_whitespace().last() else { continue };
+        if !(path.contains("libEGL") || path.contains("libGLES")) {
+            continue;
+        }
+        if seen.insert(path.to_string()) {
+            eprintln!("[gleshim] mapped {path}");
+        }
+    }
 }
 
 fn sym_ptr(handle: *mut c_void, name: &str) -> Option<*mut c_void> {
@@ -1647,6 +1672,85 @@ pub unsafe extern "C" fn eglDestroyImageKHR(dpy: EGLDisplay, image: EGLImageKHR)
         None => EGL_FALSE,
     }
 }
+
+/// `eglPresentationTimeANDROID(dpy, surface, time)`.
+///
+/// Android's `libEGL` extension. `libandroid_runtime` imports it, and that was
+/// the per-frame path that reached the Bionic `libEGL` instead of this shim.
+/// A surface here is a synchronous offscreen FBO, so a presentation timestamp
+/// has nothing to do; accepting it is the whole contract.
+#[no_mangle]
+pub unsafe extern "C" fn eglPresentationTimeANDROID(
+    _dpy: EGLDisplay,
+    surface: EGLSurface,
+    _time: i64,
+) -> u32 {
+    if surface.is_null() {
+        return EGL_FALSE;
+    }
+    EGL_TRUE
+}
+
+// ---------------------------------------------------------------------------
+// Bionic libEGL internals
+// ---------------------------------------------------------------------------
+//
+// The Bionic `libGLESv1_CM`/`libGLESv2`/`libGLESv3` are thin trampolines: their
+// `gl*` entry points dispatch through the connection that `libEGL` sets up. Three
+// of them plus one `libandroid_runtime` hook are the *only* symbols the rest of
+// the tree takes from the Bionic `libEGL`, and leaving them unexported meant
+// that library stayed in the call path — where its own `EGLDisplay` registry
+// rejects this shim's surfaceless display:
+//
+//     libEGL: validate_display:567 error 3008 (EGL_BAD_DISPLAY)
+//
+// GL work never actually goes through those trampolines here: `LD_DEBUG=bindings`
+// shows every `gl*` binding resolving to the host's `libGLESv2.so.2`. So they only
+// have to link and be callable without crashing.
+
+/// Opaque stand-in for the Bionic `egl_connection_t`.
+///
+/// Non-null so a trampoline that stores it does not fault immediately; its
+/// dispatch table is empty on purpose, because the host's GL library is what
+/// actually gets called.
+static EGL_CONNECTION: [u8; 256] = [0; 256];
+
+/// `android::egl_get_connection()`.
+#[export_name = "_ZN7android18egl_get_connectionEv"]
+pub unsafe extern "C" fn egl_get_connection() -> *mut c_void {
+    std::ptr::addr_of!(EGL_CONNECTION) as *mut c_void
+}
+
+/// `android::egl_get_init_count(void*)` — `libandroid_runtime` asks whether EGL
+/// has been initialized for a display.
+#[export_name = "_ZN7android18egl_get_init_countEPv"]
+pub unsafe extern "C" fn egl_get_init_count(_dpy: *mut c_void) -> u32 {
+    if _dpy.is_null() {
+        0
+    } else {
+        1
+    }
+}
+
+/// `android::egl_get_string_for_current_context(unsigned int)` — the GLESv1
+/// trampoline's `glGetString` for extension strings.
+#[export_name = "_ZN7android34egl_get_string_for_current_contextEj"]
+#[allow(non_snake_case)]
+#[no_mangle]
+pub unsafe extern "C" fn egl_get_string_for_current_context(_name: u32) -> *const c_char {
+    std::ptr::null()
+}
+
+/// `eglBeginFrame(EGLDisplay, EGLSurface)`.
+///
+/// `libhwui` calls this once per frame when the driver advertises
+/// `EGL_ANDROID_frame_timestamps`/debug-marking support, and it was the *only*
+/// per-frame symbol still resolving to the Bionic `libEGL`. That copy validates
+/// the display against its own registry first, which is where the
+/// `validate_display:567 error 3008` flood came from. There is nothing to begin:
+/// the surface is a synchronous offscreen FBO.
+#[export_name = "_Z13eglBeginFramePvS_"]
+pub unsafe extern "C" fn eglBeginFrame(_dpy: EGLDisplay, _surface: EGLSurface) {}
 
 #[no_mangle]
 pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -> u32 {
