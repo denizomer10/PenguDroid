@@ -1599,8 +1599,13 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             info.extend_from_slice(&0u32.to_ne_bytes()); // padding
             info.extend_from_slice(&mt_ptr.to_ne_bytes());
             info.extend_from_slice(&(mt_len - 1).to_ne_bytes());
-            info.extend_from_slice(&0u64.to_ne_bytes()); // aliases.mData
-            info.extend_from_slice(&0u64.to_ne_bytes()); // aliases.mSize
+            let (al_ptr, al_len) = leak_cstr("OMX.google.h264.decoder");
+            let mut alias_arr = Vec::with_capacity(16);
+            alias_arr.extend_from_slice(&al_ptr.to_ne_bytes());
+            alias_arr.extend_from_slice(&(al_len - 1).to_ne_bytes());
+            let alias_arr: &'static [u8] = Box::leak(alias_arr.into_boxed_slice());
+            info.extend_from_slice(&(alias_arr.as_ptr() as u64).to_ne_bytes()); // aliases.mData
+            info.extend_from_slice(&1u64.to_ne_bytes()); // aliases.mSize
             let info: &'static [u8] = Box::leak(info.into_boxed_slice());
 
             let mut vec = Vec::with_capacity(16);
@@ -1615,6 +1620,25 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                 push_buffer_object(&mut parcel, &mut objects, 1, info.as_ptr() as u64, 64, vec_idx, 0);
             push_buffer_object(&mut parcel, &mut objects, 1, name_ptr, name_len, arr_idx, 0);
             push_buffer_object(&mut parcel, &mut objects, 1, mt_ptr, mt_len, arr_idx, 32);
+            let aliases_idx = push_buffer_object(
+                &mut parcel,
+                &mut objects,
+                1,
+                info.as_ptr() as u64 + 0x30,
+                16,
+                arr_idx,
+                0x30,
+            );
+            let alias_arr_idx = push_buffer_object(
+                &mut parcel,
+                &mut objects,
+                1,
+                alias_arr.as_ptr() as u64,
+                16,
+                aliases_idx,
+                0,
+            );
+            push_buffer_object(&mut parcel, &mut objects, 1, al_ptr, al_len, alias_arr_idx, 0);
         } else {
             // `getConfigurable` and `getPoolClientManager` both return a binder;
             // handing back the store's own handle keeps the client's
