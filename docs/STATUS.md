@@ -3,6 +3,34 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
+## Bu oturum: kare neden dusuyor (kesin)
+
+`ERROR Codec2-Component: Component::Listener::onWorkDone_nb -- received corrupted work items.`
+
+Cozulen kare istemciye ulasmadan `WorkBundle` -> `C2Work` donusumunde "bozuk"
+sayilip atiliyor. `dequeueOutputBuffer`'in `size=0` donmesinin dogrudan nedeni
+bu.
+
+Onceki iki iz:
+- `Ignoring stale input buffer done callback: last flush index = 0, frameIndex = 0`
+  **zararsiz**: `CCodecBufferChannel::queueInputBuffer` frameIndex'i kendisi 0
+  veriyor (`libsfplugin_ccodec.so` `0x55344: xor %ecx,%ecx`).
+- `C2AllocatorGralloc: failed transaction: freeBuffer` **cozuldu**: interposition
+  `void` donuyordu, `status_t` olmasi gerekiyordu.
+
+Olculenler:
+- `CCodecBufferChannel` `libsfplugin_ccodec.so` icinde (libstagefright'da degil).
+- `CCodec::onWorkDone` ve `CCodecBufferChannel::onWorkDone` **vuruluyor**, yani
+  kare CCodec'e kadar geliyor.
+- `_C2BlockFactory::CreateGraphicBlock(const native_handle*)` **hic cagrilmiyor**.
+
+Siradaki adim: "corrupted work items" dogrulamasini bulmak (`libcodec2_client.so`
+veya `libcodec2_hidl_client@1.0.so`; `libcodec2_client.so` `0x8987`'de yakin bir
+metin var) ve `output.numBuffers != output.buffers.size()` karsilastirmasini
+okumak. Decoder cikti blogunu haritaladigi halde `output.buffers` bos geliyorsa
+sorun `hidl_handle` -> `C2GraphicBlock` donusumunde; handle baska bir yoldan
+geliyor olmali.
+
 ## Bu oturum: hwui çiziyor ve Wayland'a sunuyor
 
 Grafik zinciri bu oturumda dört duvardan geçti ve `eglSwapBuffers` → daemon →
