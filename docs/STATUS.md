@@ -273,9 +273,27 @@ CCodecBufferChannel: Ignoring stale input buffer done callback:
 C2AllocatorGralloc: failed transaction: freeBuffer
 ```
 
-1. Birincisi, `onWorkDone` ile gelen `frameIndex`'in `CCodec`'in beklediginden
-   kucuk oldugunu gosteriyor; kare bu yuzden "bayat" sayilip dusuruluyor
-   olabilir. `queue` ve `onWorkDone` yerel `BnHwComponent`/`BnHwComponentListener`
+1. Birincisi **kesinlesti**. `CCodecBufferChannel`
+   `libsfplugin_ccodec.so` icinde (libstagefright'da degil!).
+   `CCodecBufferChannel::onInputBufferDone` (~`0x63c70`) su kontrolu yapiyor:
+
+   ```
+   63d0e: mov 0x248(%rbx),%r8      ; mFlushIndex
+   63d15: cmp %r15,%r8             ; frameIndex (arguman)
+   63d18: js 0x63d40               ; mFlushIndex < frameIndex -> normal yol
+   63d21: ... "Ignoring stale input buffer done callback" logu
+   ```
+
+   Yani log, `frameIndex <= mFlushIndex` iken basiliyor; ikisi de 0 oldugu icin
+   kare bayat sayiliyor. `frameIndex` geri cagriyla **0** geliyor, `CCodec` ise
+   bunun `mFlushIndex`'ten buyuk olmasini bekliyor.
+
+   Siradaki adim: `Codec2Client::Component::queue` ile
+   `CCodecBufferChannel::queueInputBuffer`'a kinkilama koyup `C2Work`'un
+   `workChain.ordinal.frameIndex` degerinin `utils::objcpy` sirasinda kayip
+   kaybetmedigini karsilastirmak. `queue` yerel `BnHwComponent` uzerinden
+   gittigi icin broker devrede degil; kayip `WorkBundle` <-> `C2Work`
+   donusumunde olmali. `queue` ve `onWorkDone` yerel `BnHwComponent`/`BnHwComponentListener`
    uzerinden gittigi icin marshalling gercek; `WorkBundle`'daki
    `C2WorkOrdinalStruct`/`frameIndex` alanlarinin kaymadigi dogrulanmali.
 2. Ikincisi **cozuldu**: `GraphicBufferMapper::freeBuffer` interposition'i
