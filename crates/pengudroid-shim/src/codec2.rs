@@ -376,6 +376,22 @@ unsafe fn sym(soname: &[u8], name: &[u8]) -> Option<*mut c_void> {
 
 /// Build the service objects on first use.
 unsafe fn build() -> Option<Api> {
+    // `C2PlatformComponentStore` picks its allocators from
+    // `GetCodec2PoolMask()` (`debug.stagefright.c2-poolmask`). The gralloc
+    // allocator gives the decoder a *graphic* block, which `utils::objcpy`
+    // cannot turn back into a `WorkBundle`, and CCodec's ByteBuffer mode
+    // expects linear output. Try the software allocator instead.
+    // Measured: this property does not change the allocator the store picks
+    // (the output block stays graphic, 368640 bytes), and it may not even be
+    // visible to `GetCodec2PoolMask` because that uses the cached property
+    // area rather than `__system_property_get`. Kept opt-in for further
+    // experiments.
+    if let Ok(mask) = std::env::var("PENGUDROID_POOL_MASK") {
+        crate::set_prop("debug.stagefright.c2-poolmask", &mask);
+        if trace_enabled() {
+            diag(&format!("[codec2] c2-poolmask={mask}\n"));
+        }
+    }
     let parcel_ctor = sym(b"libhidlbase.so\0", b"_ZN7android8hardware6ParcelC1Ev\0")?;
     let parcel_dtor = sym(b"libhidlbase.so\0", b"_ZN7android8hardware6ParcelD1Ev\0")?;
     let set_data = sym(b"libhidlbase.so\0", b"_ZN7android8hardware6Parcel7setDataEPKhm\0")?;

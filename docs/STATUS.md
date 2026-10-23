@@ -33,6 +33,13 @@ yani blok bizim tahsisimizdan `CreateGraphicBlock(shared_ptr<C2GraphicAllocation
 ile kuruluyor ve handle'i `objcpy`'nin bekledigi plane/metadata bilgisini
 tasimiyor olabilir.
 
+**Denendi ve ise yaramadi:** `debug.stagefright.c2-poolmask` (`PENGUDROID_POOL_MASK`)
+ile allocator'i degistirmek. Cikti blogu hala graphic (368640 bayt) ve
+`objcpy` hala basarisiz. Prop muhtemelen `GetCodec2PoolMask`'a ulasmiyor
+(o da `android::base::GetUintProperty` ile onbellekli property alanini
+okuyor, bizim `__system_property_get` interposition'imizi degil). Deney
+`PENGUDROID_POOL_MASK` ile opt-in birakildi.
+
 En umut verici cozum: cikti icin **yazilim/lineer** allocator kullanmak. O
 zaman decoder `C2LinearBlock`a yazar, `objcpy` cok daha basit bir donusum
 yapar ve `CCodec`'in ByteBuffer modu ile de ortusur (`size=0` sorunu da
