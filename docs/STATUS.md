@@ -285,6 +285,16 @@ C2AllocatorGralloc: failed transaction: freeBuffer
    `importBuffer`/`freeBuffer`/`getMetadata` yanitlari, ya da
    `C2AllocatorGralloc::free`/`CheckHandle` interposition'i.
 
+**Denendi ve ise yaramadi:** `MediaFormat`'a `color-format = 21`
+(`COLOR_FormatYUV420Flexible`) eklemek `size=0`'i degistirmedi; cikti blogu
+hala 368640 bayt (320x240x**4**, RGBA graphic), yani 115200 baytlik lineer
+YUV blok degil. Allocator secimi `C2PlatformAllocatorStoreImpl` icinde,
+`color-format`'tan bagimsiz. Dolayisiyla asil soru su: ByteBuffer modunda
+`CCodec` lineer bir blok havuzu istemeli; bunu saglamak icin ya allocator
+store'a yazilim allocator'ini tercih ettirmek, ya da `CCodec`'in `size=0`
+hesabini `GraphicBufferMapper::getMetadata`/`getPlaneLayout` ile duzeltmek
+gerekir.
+
 Bundan sonra sirada `SurfaceView` icin ikinci compositor katmani, ses
 (`AudioTrack`/`AudioFlinger`) ve girdi var. Beach Buggy Racing 2 ayri bir dag:
 oyun arm64/armv7, yani once ARM ceviri katmani gerekiyor.

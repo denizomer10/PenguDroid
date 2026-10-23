@@ -912,6 +912,16 @@ fn probe_codec_configure(env: &JniEnv, codec: JObject) {
     let Some(mc_class) = env.find_class("android/media/MediaCodec") else {
         return;
     };
+    // `CCodec` logs "ByteBuffer mode decoder w/o color format set: using default
+    // planar color format", and then the store hands the decoder a *graphic*
+    // gralloc block while CCodec expects linear output — the frame then comes
+    // back with size 0. Asking for flexible YUV makes CCodec request a linear
+    // block pool instead.
+    if let Some(set_int) = env.method_id(fmt_class, "setInteger", "(Ljava/lang/String;I)V") {
+        let key = env.new_string("color-format");
+        let ok = env.call_void(format, set_int, &[JValue { l: key }, JValue { i: 21 }]);
+        println!("media: set color-format=21 (flexible YUV) = {ok}");
+    }
     if let Some(configure) = env.method_id(
         mc_class,
         "configure",
