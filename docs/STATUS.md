@@ -278,8 +278,11 @@ C2AllocatorGralloc: failed transaction: freeBuffer
    olabilir. `queue` ve `onWorkDone` yerel `BnHwComponent`/`BnHwComponentListener`
    uzerinden gittigi icin marshalling gercek; `WorkBundle`'daki
    `C2WorkOrdinalStruct`/`frameIndex` alanlarinin kaymadigi dogrulanmali.
-2. Ikincisi, `C2AllocatorGralloc`'in `free` yolu HIDL `IMapper`'a gidiyor ve
-   broker bu HAL'i yanitlamadigi icin "failed transaction" aliyor. Blok
+2. Ikincisi **cozuldu**: `GraphicBufferMapper::freeBuffer` interposition'i
+   `void` donuyordu, oysa `status_t` donmesi gerekiyor; cagiran cop deger
+   okuyup `C2AllocatorGralloc: failed transaction: freeBuffer` basiyordu.
+   Donus tipi `i32` yapildi, hata kayboldu. (Bu, `size=0`'i tek basina
+   duzeltmedi.) Blok
    havuzunun yasam dongusu bozulursa cikti tamponu istemciye hic ulasmaz.
    Cozum: `IMapper` (`android.hardware.graphics.mapper@4.0`) icin broker'da
    `importBuffer`/`freeBuffer`/`getMetadata` yanitlari, ya da

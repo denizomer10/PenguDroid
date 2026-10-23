@@ -358,15 +358,16 @@ pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper16getTransportSizeEPK13
 pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper10freeBufferEPK13native_handle(
     _this: *mut c_void,
     handle: *const NativeHandle,
-) {
+) -> i32 {
     if handle.is_null() {
-        return;
+        return -22;
     }
     let h = &*handle;
     if h.num_fds > 0 && !h.data.is_empty() {
         libc::close(h.data[0]);
     }
     drop(Box::from_raw(handle as *mut NativeHandle));
+    0
 }
 
 /// `AHardwareBuffer_allocate(desc, out)`.
