@@ -24,7 +24,23 @@ Olculenler:
   kare CCodec'e kadar geliyor.
 - `_C2BlockFactory::CreateGraphicBlock(const native_handle*)` **hic cagrilmiyor**.
 
-Siradaki adim: "corrupted work items" dogrulamasini bulmak (`libcodec2_client.so`
+Siradaki adim (guncel): `utils::Component` (`libcodec2_hidl@1.0.so`, string
+`0x11e3b`) `C2Work`'u `WorkBundle`'a `utils::objcpy` ile cevirmeye calisip
+basarisiz olunca bu hatayi basiyor; yani **cikti blogu** WorkBundle'a
+cevrilemiyor. Blok `C2AllocatorGralloc`'dan geliyor (graphic, 320x240x4) ve
+`_C2BlockFactory::CreateGraphicBlock(const native_handle*)` hic cagrilmiyor,
+yani blok bizim tahsisimizdan `CreateGraphicBlock(shared_ptr<C2GraphicAllocation>)`
+ile kuruluyor ve handle'i `objcpy`'nin bekledigi plane/metadata bilgisini
+tasimiyor olabilir.
+
+En umut verici cozum: cikti icin **yazilim/lineer** allocator kullanmak. O
+zaman decoder `C2LinearBlock`a yazar, `objcpy` cok daha basit bir donusum
+yapar ve `CCodec`'in ByteBuffer modu ile de ortusur (`size=0` sorunu da
+kalkar). `CCodec` allocator secimini `GetCodec2PoolMask()`
+(`debug.stagefright.c2-poolmask`, `libcodec2_vndk.so`) uzerinden yapiyor;
+props shim'e bu anahtari ekleyip maskeyi denemek ilk adim.
+
+Eski not: `"corrupted work items" dogrulamasini bulmak` (`libcodec2_client.so`
 veya `libcodec2_hidl_client@1.0.so`; `libcodec2_client.so` `0x8987`'de yakin bir
 metin var) ve `output.numBuffers != output.buffers.size()` karsilastirmasini
 okumak. Decoder cikti blogunu haritaladigi halde `output.buffers` bos geliyorsa
