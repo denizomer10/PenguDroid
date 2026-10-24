@@ -91,7 +91,15 @@ unsafe fn jni_new_object(
 // libgui entry points
 // ---------------------------------------------------------------------------
 
-type CreateBufferQueue = unsafe extern "C" fn(*mut [u64; 2], *mut [u64; 2]);
+/// `BLASTBufferQueue(const std::string& name, bool updateDestinationFrame)`.
+///
+/// The name is only used for tracing, so an empty `std::string` is passed: a
+/// zeroed 24-byte buffer is libc++'s short-string representation of `""`
+/// (`__size_ = 0`, short flag clear).
+type BlastCtor = unsafe extern "C" fn(*mut c_void, *const u8, bool);
+/// `sp<Surface> BLASTBufferQueue::getSurface(bool)` — 16-byte return, so the
+/// caller supplies the destination first.
+type GetSurface = unsafe extern "C" fn(*mut [u64; 2], *mut c_void, bool);
 type SurfaceCtor =
     unsafe extern "C" fn(*mut c_void, *const [u64; 2], bool, *const [u64; 2]);
 type SurfaceIntSetter = unsafe extern "C" fn(*mut c_void, i32) -> i32;
@@ -110,7 +118,8 @@ unsafe fn guest_sym(soname: &[u8], name: &[u8]) -> *mut c_void {
 }
 
 struct Gui {
-    create_buffer_queue: CreateBufferQueue,
+    blast_ctor: BlastCtor,
+    get_surface: GetSurface,
     surface_ctor: SurfaceCtor,
     set_buffers_format: SurfaceIntSetter,
     set_user_dimensions: SurfaceDimsSetter,
@@ -120,9 +129,13 @@ static GUI: std::sync::OnceLock<Option<Gui>> = std::sync::OnceLock::new();
 
 fn gui() -> Option<&'static Gui> {
     GUI.get_or_init(|| unsafe {
-        let create_buffer_queue = guest_sym(
+        let blast_ctor = guest_sym(
             b"libgui.so\0",
-            b"_ZN7android16BLASTBufferQueue17createBufferQueueEPNS_2spINS_22IGraphicBufferProducerEEEPNS1_INS_22IGraphicBufferConsumerEEE\0",
+            b"_ZN7android16BLASTBufferQueueC1ERKNSt3__112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEEb\0",
+        );
+        let get_surface = guest_sym(
+            b"libgui.so\0",
+            b"_ZN7android16BLASTBufferQueue10getSurfaceEb\0",
         );
         let surface_ctor = guest_sym(
             b"libgui.so\0",
@@ -136,7 +149,8 @@ fn gui() -> Option<&'static Gui> {
             b"libgui.so\0",
             b"_ZN7android7Surface24setBuffersUserDimensionsEjj\0",
         );
-        if create_buffer_queue.is_null()
+        if blast_ctor.is_null()
+            || get_surface.is_null()
             || surface_ctor.is_null()
             || set_buffers_format.is_null()
             || set_user_dimensions.is_null()
@@ -145,7 +159,8 @@ fn gui() -> Option<&'static Gui> {
             return None;
         }
         Some(Gui {
-            create_buffer_queue: std::mem::transmute(create_buffer_queue),
+            blast_ctor: std::mem::transmute(blast_ctor),
+            get_surface: std::mem::transmute(get_surface),
             surface_ctor: std::mem::transmute(surface_ctor),
             set_buffers_format: std::mem::transmute(set_buffers_format),
             set_user_dimensions: std::mem::transmute(set_user_dimensions),
@@ -208,27 +223,33 @@ unsafe extern "C" fn native_create(
     let Some(gui) = gui() else {
         return 0;
     };
-    let mut producer = [0u64; 2];
-    let mut consumer = [0u64; 2];
-    (gui.create_buffer_queue)(&mut producer, &mut consumer);
-    if producer[0] == 0 || consumer[0] == 0 {
-        eprintln!("[blast] createBufferQueue returned nothing");
+    // A real `android::BLASTBufferQueue`: its constructor builds the BufferQueue
+    // and the `Surface` for us. Calling `createBufferQueue` directly does not
+    // work — it is a member function, so the first argument is `this`, and
+    // calling it as if it were static dereferences the caller's out-parameter as
+    // an object (measured: SIGSEGV at `createBufferQueue+0x1b3`).
+    let queue = libc::calloc(1, 4096);
+    if queue.is_null() {
         return 0;
     }
-    // `Surface(const sp<IGraphicBufferProducer>&, bool controlledByApp, const
-    // sp<IBinder>&)`. 512 bytes is comfortably larger than the class.
-    let surface = libc::calloc(1, 512);
-    if surface.is_null() {
+    // An empty libc++ `std::string` (short form: `__size_ = 0`).
+    let empty_name = [0u8; 24];
+    (gui.blast_ctor)(queue, empty_name.as_ptr(), true);
+
+    // `sp<Surface>` returned through the caller's storage.
+    let mut surface_sp = [0u64; 2];
+    (gui.get_surface)(&mut surface_sp, queue, false);
+    if surface_sp[0] == 0 {
+        eprintln!("[blast] BLASTBufferQueue::getSurface returned nothing");
         return 0;
     }
-    let no_binder = [0u64; 2];
-    (gui.surface_ctor)(surface, &producer, true, &no_binder);
+    let surface = surface_sp[0] as *mut c_void;
     (gui.set_buffers_format)(surface, format);
     (gui.set_user_dimensions)(surface, width.max(1) as u32, height.max(1) as u32);
 
     let blast = Box::new(Blast {
-        producer,
-        consumer,
+        producer: surface_sp,
+        consumer: [0u64; 2],
         surface,
         java_surface: std::ptr::null_mut(),
         width: width.max(1) as u32,
@@ -241,8 +262,8 @@ unsafe extern "C" fn native_create(
         .unwrap_or_else(|e| e.into_inner())
         .push(ptr as usize);
     eprintln!(
-        "[blast] created {width}x{height} fmt={format:#x} producer={:#x} consumer={:#x}",
-        producer[0], consumer[0]
+        "[blast] created {width}x{height} fmt={format:#x} surface={:#x}",
+        surface as usize
     );
     ptr as i64
 }

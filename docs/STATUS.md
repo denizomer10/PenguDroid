@@ -3,6 +3,36 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
+## Bu oturum (8): BLASTBufferQueue gerçekten oluşuyor
+
+`PENGUDROID_FORCE_SURFACE=1` ile `updateSurface()` çalıştırıldığında artık:
+
+```
+[blast] created 1x1 fmt=0x0 surface=0x7f2dd400a280
+[blast] update 720x405 fmt=0x4
+```
+
+Yani `SurfaceControl` yolu geçildi ve `BLASTBufferQueue` **gerçek sınıfla**
+kuruldu. Öncesinde çöküyordu çünkü `BLASTBufferQueue::createBufferQueue`'yu
+statik sanıp çağırıyordum; oysa **üye fonksiyon**, yani ilk argüman `this`.
+Ölçüm: `createBufferQueue+0x1b3`'te `mov (%r14),%rbx` — `rdx` çöp olduğu için
+SIGSEGV. Düzeltme: `BLASTBufferQueue(const std::string&, bool)` kurucusu
+(boş isim = sıfırlanmış 24 baytlık libc++ kısa string) + `getSurface(bool)`.
+
+### Kalan çökme (tam yer)
+
+```
+#0 android::RefBase::incStrong(void const*) const      (rdi = çöp)
+#1 android::nativeGetFromBlastBufferQueue(_JNIEnv*, _jclass*, long, long)
+#2 art_quick_generic_jni_trampoline
+```
+
+Yani kuyruk oluşuyor, `update` geliyor, ama framework'ün
+`Surface.nativeGetFromBlastBufferQueue` çağrısı bizim sahte `SurfaceControl`
+işaretçimizi gerçek bir nesne sanıp `incStrong` yapıyor. Sıradaki adım: bu
+native'i de host etmek (aynı `registerNativeMethods` hilesiyle) ve elimizdeki
+Java `Surface`'ı döndürmek.
+
 ## Bu oturum (7): GUI derleniyor, keymapper GUI'den, FPS sayacı, süslemeler
 
 ### GUI artık derleniyor ve açılıyor
