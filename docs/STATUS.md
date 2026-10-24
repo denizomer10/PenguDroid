@@ -211,6 +211,34 @@ Kalan ufak kusur: diyalog penceresi hâlâ 720'den biraz geniş konumlanıyor
 (sol kenar x=96, sağ kenar 720'de bitiyor), yani tam ortalı değil. İçerik ve
 düğmeler görünür durumda.
 
+### İki pencere artık birbirini ezmiyor
+
+Belirti: NewPipe'ın `AlertDialog`'u ile arkasındaki aktivite aynı anda
+görünmüyordu; hangisi son çizdiyse o kalıyordu.
+
+Kök neden: gleshim süreç başına **tek** bir Wayland surface id tutuyordu
+(`State::surface_id`, sadece ilk pencerenin boyutuyla bir kez yaratılıyordu).
+Framework her pencereye ayrı bir EGL surface veriyor (aktivite + dialog, aynı
+render thread üzerinde), ama ikisi de aynı daemon surface'ine sunum yapıyordu.
+
+Ölçüm: sunum günlüğünde tek bir id görünüyordu (`presented surface 3`) — yani
+ikinci pencere hiç ayrı bir surface'e çıkmıyordu.
+
+Düzeltme: surface id artık `SurfaceRec` içinde, yani her pencere için ayrı.
+Aynı koşuda günlük:
+
+```
+19 presented surface 1 720x1280
+23 presented surface 2 720x1280
+```
+
+`PENGUDROID_DUMP_FRAME` dosya adına surface id'sini de koyuyor
+(`s<id>frame<n>.ppm`), çünkü kare sayacı global.
+
+Kalan kusur: dialog kendi penceresi içinde hâlâ (96,96) noktasından başlıyor ve
+sağdan 96 px taşıyor (`content x: 96..719`), yani tam ortalı değil. İçerik ve
+üç düğme görünür.
+
 ### Bilinen artıklar
 
 1. **`EGL_BAD_DISPLAY` seli — ÇÖZÜLDÜ (`26ce279`).** Sebep `eglBeginFrame`.

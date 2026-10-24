@@ -406,6 +406,14 @@ struct SurfaceRec {
     h: u32,
     tex: u32,
     fbo: u32,
+    /// The daemon's surface id for this window, or 0 until the first present.
+    ///
+    /// It lives here rather than on the shared `State` because the framework
+    /// gives each window its own EGL surface: an activity and a dialog on the
+    /// same render thread. A single process-wide id made both windows present
+    /// into one Wayland surface, so they overwrote each other and only whichever
+    /// drew last was visible.
+    surface_id: u32,
 }
 
 /// Substitute the cached host display for `EGL_NO_DISPLAY`.
@@ -747,9 +755,9 @@ fn close_fds(fds: &[RawFd]) {
 }
 
 /// Connect + handshake + resolve/create the surface id, lazily and once.
-fn ensure_surface_id(st: &mut State, w: u32, h: u32) -> Result<u32, String> {
-    if let Some(id) = st.surface_id {
-        return Ok(id);
+fn ensure_surface_id(st: &mut State, rec: &mut SurfaceRec) -> Result<u32, String> {
+    if rec.surface_id != 0 {
+        return Ok(rec.surface_id);
     }
 
     if st.conn.is_none() {
@@ -783,11 +791,12 @@ fn ensure_surface_id(st: &mut State, w: u32, h: u32) -> Result<u32, String> {
 
     if let Ok(value) = std::env::var("PENGUDROID_SURFACE_ID") {
         if let Ok(id) = value.trim().parse::<u32>() {
-            st.surface_id = Some(id);
+            rec.surface_id = id;
             return Ok(id);
         }
     }
 
+    let (w, h) = (rec.w, rec.h);
     let request = Message::CreateSurface {
         width: w,
         height: h,
@@ -816,7 +825,7 @@ fn ensure_surface_id(st: &mut State, w: u32, h: u32) -> Result<u32, String> {
     close_fds(&fds);
     match reply {
         Message::SurfaceCreated { surface_id, .. } => {
-            st.surface_id = Some(surface_id);
+            rec.surface_id = surface_id;
             subscribe_input(surface_id);
             Ok(surface_id)
         }
@@ -925,7 +934,8 @@ pub unsafe extern "C" fn pengudroid_input_poll(out: *mut u8) -> i32 {
 /// The connection is taken out of the global state for the duration, so even a
 /// blocked `recv` does not leave the mutex in a state that other EGL calls
 /// would deadlock on; the mutex is held only for this single request/response.
-fn present_dmabuf(
+unsafe fn present_dmabuf(
+    surface: EGLSurface,
     width: u32,
     height: u32,
     stride: u32,
@@ -935,7 +945,9 @@ fn present_dmabuf(
     fd: RawFd,
 ) -> Result<(), String> {
     let mut st = lock_state();
-    let surface_id = ensure_surface_id(&mut st, width, height)?;
+    // SAFETY: every non-null surface is a `SurfaceRec` this module allocated.
+    let rec = &mut *(surface as *mut SurfaceRec);
+    let surface_id = ensure_surface_id(&mut st, rec)?;
 
     let conn = st
         .conn
@@ -977,6 +989,14 @@ fn present_dmabuf(
         st.connect_attempted = false;
     } else {
         st.conn = Some(conn);
+    }
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+        match &result {
+            Ok(()) => eprintln!(
+                "[gleshim] presented surface {surface_id} {width}x{height}"
+            ),
+            Err(e) => eprintln!("[gleshim] present failed: {e}"),
+        }
     }
     result
 }
@@ -1449,6 +1469,7 @@ pub unsafe extern "C" fn eglCreateWindowSurface(
         h,
         tex: 0,
         fbo: 0,
+        surface_id: 0,
     });
     let surface = Box::into_raw(rec) as EGLSurface;
     lock_state().current_surface = surface as usize;
@@ -1500,7 +1521,7 @@ pub unsafe extern "C" fn eglCreatePbufferSurface(
             i += 2;
         }
     }
-    let rec = Box::new(SurfaceRec { w, h, tex: 0, fbo: 0 });
+    let rec = Box::new(SurfaceRec { w, h, tex: 0, fbo: 0, surface_id: 0 });
     let surface = Box::into_raw(rec) as EGLSurface;
     lock_state().current_surface = surface as usize;
     surface
@@ -1812,6 +1833,7 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
     let fd = OwnedFd::from_raw_fd(exported.fd);
 
     match present_dmabuf(
+        surface,
         rec.w,
         rec.h,
         exported.stride,
@@ -1883,7 +1905,9 @@ unsafe fn dump_frame_once(surface: EGLSurface, host: &Host) {
         }
     }
     let path = std::path::PathBuf::from(path);
-    let path = path.with_extension(format!("frame{n}.ppm"));
+    // The surface id is part of the name because two windows render at once and
+    // the frame counter is global.
+    let path = path.with_extension(format!("s{}frame{n}.ppm", rec.surface_id));
     match std::fs::write(&path, &ppm) {
         Ok(()) => eprintln!("[gleshim] wrote {} ({w}x{h})", path.display()),
         Err(e) => eprintln!("[gleshim] cannot write {}: {e}", path.display()),
