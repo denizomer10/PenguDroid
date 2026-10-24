@@ -283,6 +283,39 @@ pub fn extract_named_bytes(data: &[u8], name: &str) -> Result<Vec<u8>, String> {
     extract_entry(data, entry)
 }
 
+/// Extract every entry whose name starts with `prefix` into `dest`, stripping the
+/// prefix. Returns the number of bytes written (0 when nothing matched).
+///
+/// Used to materialise an APK's `assets/` so an app that opens relative paths
+/// against its working directory can find them.
+pub fn extract_prefix(path: &str, prefix: &str, dest: &std::path::Path) -> Result<u64, String> {
+    let data = std::fs::read(path).map_err(|e| format!("cannot read `{path}`: {e}"))?;
+    let entries = read_central_directory(&data)?;
+    let mut written = 0u64;
+    for entry in &entries {
+        let Some(rel) = entry.name.strip_prefix(prefix) else {
+            continue;
+        };
+        if rel.is_empty() || rel.ends_with('/') {
+            continue;
+        }
+        // Refuse to escape the destination.
+        if rel.split('/').any(|p| p == "..") {
+            continue;
+        }
+        let target = dest.join(rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        }
+        let bytes = extract_entry(&data, entry)?;
+        std::fs::write(&target, &bytes)
+            .map_err(|e| format!("cannot write {}: {e}", target.display()))?;
+        written += bytes.len() as u64;
+    }
+    Ok(written)
+}
+
 /// Whether `class_name` is defined by any `classes*.dex` in the APK at `path`.
 ///
 /// `art-test` uses this to drop manifest components the APK does not actually

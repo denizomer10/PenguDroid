@@ -201,10 +201,13 @@ pub fn create_prefix(prefix: &Path, package: &str) -> Result<Vec<(String, String
 
 /// The ART sysroot to use: `--sysroot`, else `$PENGUDROID_ART_SYSROOT`.
 fn art_sysroot(explicit: Option<&str>) -> Option<PathBuf> {
+    // Absolute, because the guest runs with the app's asset directory as its
+    // working directory: a relative `--sysroot` would resolve against that.
+    let absolute = |p: PathBuf| std::fs::canonicalize(&p).unwrap_or(p);
     if let Some(p) = explicit {
-        return Some(PathBuf::from(p));
+        return Some(absolute(PathBuf::from(p)));
     }
-    std::env::var_os("PENGUDROID_ART_SYSROOT").map(PathBuf::from)
+    std::env::var_os("PENGUDROID_ART_SYSROOT").map(|p| absolute(PathBuf::from(p)))
 }
 
 /// `pengudroid launch <app.apk> [options]`
@@ -309,6 +312,17 @@ pub fn launch(args: &[String]) -> i32 {
         }
     }
 
+    // The guest runs in the asset directory, so every path handed to it has to be
+    // absolute.
+    app_path = std::fs::canonicalize(&app_path)
+        .map(|p| p.display().to_string())
+        .unwrap_or(app_path);
+    for split in &mut split_paths {
+        if let Ok(p) = std::fs::canonicalize(&*split) {
+            *split = p.display().to_string();
+        }
+    }
+
     println!("PenguDroid launch");
     println!("  package : {}", info.package);
     if let Some(v) = &info.version_name {
@@ -330,6 +344,9 @@ pub fn launch(args: &[String]) -> i32 {
                 cmd.arg("--component").arg(c);
             }
             apply_env(&mut cmd, &env);
+            if let Some(dir) = asset_root(&app_path, &prefix, &split_paths) {
+                cmd.current_dir(dir);
+            }
             run_child(cmd)
         }
         Backend::Art => {
@@ -386,6 +403,9 @@ pub fn launch(args: &[String]) -> i32 {
                 cmd.arg("--").args(&app_args);
             }
             apply_env(&mut cmd, &env);
+            if let Some(dir) = asset_root(&app_path, &prefix, &split_paths) {
+                cmd.current_dir(dir);
+            }
             run_child(cmd)
         }
     }
@@ -428,6 +448,36 @@ fn apply_env(cmd: &mut std::process::Command, env: &[(String, String)]) {
     for (k, v) in env {
         cmd.env(k, v);
     }
+}
+
+/// Materialise the APK's `assets/` and return the directory to run the app in.
+///
+/// Android apps read assets through `AssetManager`, which this project serves
+/// straight out of the APK, so extracting them should be unnecessary. Roblox
+/// does not: it opens `content/guac/defaultConfigs/GuacDefaultPolicy-GlobalDist.json`
+/// with a **relative path**, i.e. against the process working directory. When that
+/// open fails its configuration map stays empty, and the next lookup returns
+/// null and `libroblox.so + 0x224e4af` dereferences it — the crash that blocked
+/// this app for two sessions. Running from the asset root fixes it.
+///
+/// The directory is created once under the prefix; a marker file records that the
+/// extraction finished, so a later launch does not repeat a ~60 MB unpack.
+fn asset_root(apk: &str, prefix: &Path, splits: &[String]) -> Option<PathBuf> {
+    let root = prefix.join("assets");
+    let marker = root.join(".extracted");
+    if !marker.exists() {
+        // `assets/` is only in the base APK; a split never carries it.
+        let Ok(bytes) = crate::apk::extract_prefix(apk, "assets/", &root) else {
+            return None;
+        };
+        if bytes == 0 {
+            return None;
+        }
+        let _ = std::fs::write(&marker, bytes.to_string());
+        println!("  assets  : {bytes} byte(s) -> {}", root.display());
+    }
+    let _ = splits;
+    Some(root)
 }
 
 fn run_child(mut cmd: std::process::Command) -> i32 {

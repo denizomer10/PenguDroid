@@ -1684,27 +1684,40 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) {
                 continue;
             }
         };
+        if std::env::var_os("PENGUDROID_TRACE_ROOTFS").is_some() {
+            let abis: std::collections::BTreeSet<&str> =
+                libs.iter().map(|l| l.abi.as_str()).collect();
+            eprintln!("apphost: {apk}: {} libraries, abis {abis:?}", libs.len());
+            eprintln!("apphost: native lib dir = {}", lib_dir.display());
+        }
         for lib in libs.iter().filter(|l| l.abi == "x86_64") {
             let dest = lib_dir.join(&lib.file);
             if dest.exists() {
                 continue;
             }
-            if let Ok(bytes) = crate::apk::extract_named(apk, &lib.entry) {
-                if std::fs::write(&dest, bytes).is_ok() {
-                    extracted += 1;
-                }
+            match crate::apk::extract_named(apk, &lib.entry) {
+                Ok(bytes) => match std::fs::write(&dest, &bytes) {
+                    Ok(()) => extracted += 1,
+                    Err(e) => eprintln!(
+                        "apphost: cannot write {} ({} bytes): {e}",
+                        dest.display(),
+                        bytes.len()
+                    ),
+                },
+                Err(e) => eprintln!("apphost: cannot extract {}: {e}", lib.entry),
             }
         }
     }
     if extracted > 0 {
         println!("apphost: extracted {extracted} x86_64 native libraries");
-    } else {
-        // Printed even when nothing came out: an empty `lib/` is exactly what
-        // makes `System.loadLibrary("roblox")` fail silently and every
-        // `native*` method an UnsatisfiedLinkError, and a silent zero here hid
-        // that for a whole session.
+    } else if std::fs::read_dir(&lib_dir).map(|d| d.count()).unwrap_or(0) == 0 {
+        // Only when the directory really ends up empty: this runs more than once
+        // per launch, and on the second call every file already exists, which is
+        // not a problem. An empty `lib/` is, because `System.loadLibrary` then
+        // fails silently and every `native*` method is an UnsatisfiedLinkError.
         eprintln!(
-            "apphost: no x86_64 native libraries extracted (classpath: {})",
+            "apphost: no x86_64 native libraries in {} (classpath: {})",
+            lib_dir.display(),
             classpath.join(":")
         );
     }
