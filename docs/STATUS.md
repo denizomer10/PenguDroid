@@ -44,6 +44,33 @@ sabitlendi, keymap ayrıştırma/round-trip/red testleri var, ve uçtan uca test
 cihazı oluşturup tap enjekte ediyor (geri okuma `/dev/input` izni istediği için
 izin yoksa atlıyor — enjeksiyon yine doğrulanmış oluyor).
 
+### Video yüzeyi: kök neden bulundu (layout, SurfaceFlinger değil)
+
+`PENGUDROID_PROBE_VIEWS=1` (yeni) pencere ağacını gezip her `SurfaceView`'ın
+karar alanlarını basıyor. NewPipe'ın oynatıcısı `ExpandableSurfaceView` ve ölçüm:
+
+```
+views: org.schabi.newpipe.views.ExpandableSurfaceView
+views:   mHaveFrame = false
+views:   mSurfaceControl = null
+views:   mBlastBufferQueue = null
+views:   mSurface = set
+views:   mSurfaceWidth = -1
+views:   mSurfaceHeight = -1
+views:   mFormat = -1
+views:   size = 0x405
+```
+
+Yani `SurfaceView` **0 piksel genişliğinde** düzenlenmiş. `updateSurface()`
+`mHaveFrame` false olduğu için hemen dönüyor; `SurfaceControl` ve
+`BLASTBufferQueue` hiç oluşturulmuyor, dolayısıyla decoder'ın kareleri gidecek
+bir yüzey yok. Sorun SurfaceFlinger eksikliği değil, **layout**: genişlik 0.
+
+Sıradaki iş bu yüzden net: oynatıcı görünümüne sıfırdan farklı bir genişlik
+vermek (parent ölçümü/`ConstraintLayout` kısıtı). `BLASTBufferQueue` host'u bu
+arada hazır (`crates/pengudroid-shim/src/blast.rs`, 12 native, reflection ile
+imza çıkarımı) ve `SurfaceView` yüzey istediğinde devreye girecek.
+
 ### Sıradaki: Slint GUI
 
 Fizibilite ölçüldü: crates.io erişilebilir (`slint` indirilebilir) ve
