@@ -3,6 +3,63 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
+## Bu oturum (6): gerçek native input — `uinput` + keymapper
+
+Yeni crate: **`crates/pengudroid-input`**. Android `MotionEvent`'i taklit etmek
+yerine olaylar **çekirdeğin input alt sistemine** yazılıyor, yani bir oyunun kendi
+`AInputQueue`'su, SDL2/Unity/Unreal döngüsü veya bir compositor bunları gerçek bir
+dokunmatik ekran gibi görüyor.
+
+* `uinput::VirtualTouch` — çoklu dokunma paneli (`ABS_MT_*` + `BTN_TOUCH`).
+  `down`/`move_to`/`up`/`tap`/`swipe`. Koordinatlar panelin kendi biriminde,
+  yani çağıran ekran pikselini verir, ölçekleme yok.
+* `uinput::VirtualKeyboard` — keymapper'ın bastığı tuşlar için.
+* `uinput::EventReader` — gerçek `/dev/input/eventN` cihazlarını okur.
+* `keymap` — paket başına tuş→hareket eşlemesi, bağımlılıksız satır formatı:
+
+  ```
+  W     = hold 640 900
+  SPACE = tap  660 1150
+  SHIFT = swipe 400 800 700 800 12
+  ```
+
+  `hold` tuş basılı kaldıkça parmağı tutar (sanal joystick), `tap`/`swipe` basma
+  kenarında çalışır. Dosyalar `$XDG_CONFIG_HOME/pengudroid/keymaps/<paket>.keymap`.
+* `mapper::KeyMapper` — cihaz başına bir iş parçacığı; tuşları okur, panele
+  hareket olarak yazar. Bağlamalar çalışırken değiştirilebilir (GUI düzenleyecek).
+
+### Doğrulama
+
+```
+$ pengudroid input-test
+input: creating a 1280x1280 virtual touch panel
+input: device node = /dev/input/event23
+input: tap at 640,640 injected
+input: swipe injected
+```
+
+`/dev/uinput` bu makinede yazılabilir; cihaz çekirdekte `event23` olarak belirdi.
+Testler: ioctl numaraları ve `uinput_user_dev` düzeni çekirdek başlıklarıyla
+sabitlendi, keymap ayrıştırma/round-trip/red testleri var, ve uçtan uca test
+cihazı oluşturup tap enjekte ediyor (geri okuma `/dev/input` izni istediği için
+izin yoksa atlıyor — enjeksiyon yine doğrulanmış oluyor).
+
+### Sıradaki: Slint GUI
+
+Fizibilite ölçüldü: crates.io erişilebilir (`slint` indirilebilir) ve
+`/dev/uinput` yazılabilir. Planlanan arayüz (`crates/pengudroid-gui`):
+
+* solda yüklü uygulama/oyun listesi, `+` düğmesi ve sürükle-bırak ile APK kurma;
+* Başlat / Durdur / Kaldır;
+* ayarlar: keymapper ve FPS sayacı aç-kapa;
+* arka planda çalışan örnek varsa kapatırken onay ("tüm örnekleri kapatalım mı?");
+* logo `logo.png`;
+* pencere yönetimi (yeniden boyutlandırma/küçültme/büyütme/kapatma) XFCE/GNOME/KDE
+  fark etmeksizin `xdg_toplevel` istekleriyle.
+
+Bu oturumda GUI **yazılmadı**; input katmanı ve keymapper hazır ve test edilmiş
+durumda.
+
 ## Bu oturum (5): ses yolu — `AudioTrack` gerçek PCM çıkarıyor
 
 4. oturumun sonunda oynatma ses yüzünden duruyordu:

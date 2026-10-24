@@ -18,6 +18,7 @@ mod client;
 mod deps;
 mod doctor;
 mod gpu;
+mod input;
 mod guest;
 mod isolate;
 mod jni;
@@ -69,6 +70,7 @@ fn real_main() -> i32 {
         "gpu-info" => gpu::info(),
         "gpu-test" => gpu::test(),
         "audio-test" => audio::test(&args[2..]),
+        "input-test" => input::test(&args[2..]),
         "libpath" => nativelib::libpath(&args[2..]),
         "de-bionic" => nativelib::de_bionic(&args[2..]),
         "nativelib" => nativelib::nativelib(&args[2..]),

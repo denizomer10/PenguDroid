@@ -55,12 +55,12 @@ const SLOT_REGISTER_NATIVES: usize = 215;
 const SLOT_GET_DIRECT_BUFFER_ADDRESS: usize = 230;
 
 /// A `JNIEnv*` as the JNI expects it: a pointer to a table of function pointers.
-unsafe fn jni_slot(env: *mut std::os::raw::c_void, slot: usize) -> *const std::os::raw::c_void {
+pub(crate) unsafe fn jni_slot(env: *mut std::os::raw::c_void, slot: usize) -> *const std::os::raw::c_void {
     let table = *(env as *const *const *const std::os::raw::c_void);
     *table.add(slot)
 }
 
-unsafe fn jni_find_class(env: *mut std::os::raw::c_void, name: &CStr) -> *mut std::os::raw::c_void {
+pub(crate) unsafe fn jni_find_class(env: *mut std::os::raw::c_void, name: &CStr) -> *mut std::os::raw::c_void {
     let f: unsafe extern "C" fn(
         *mut std::os::raw::c_void,
         *const c_char,
@@ -231,10 +231,10 @@ unsafe fn jni_direct_buffer(
 
 /// One entry of `JNINativeMethod`.
 #[repr(C)]
-struct NativeMethod {
-    name: *const c_char,
-    signature: *const c_char,
-    fn_ptr: *mut std::os::raw::c_void,
+pub(crate) struct NativeMethod {
+    pub(crate) name: *const c_char,
+    pub(crate) signature: *const c_char,
+    pub(crate) fn_ptr: *mut std::os::raw::c_void,
 }
 
 /// The `class → method → implementation` table this module overrides.
@@ -309,7 +309,7 @@ fn override_for(class: &str, method: &str) -> Option<*mut std::os::raw::c_void> 
         ("android/media/AudioTrack", "native_get_dual_mono_mode") => native_zero as *mut _,
         ("android/media/AudioTrack", "native_getPortId") => native_zero as *mut _,
         ("android/media/AudioTrack", "native_setPresentation") => native_zero as *mut _,
-        _ => return None,
+        _ => return crate::blast::override_for(class, method),
     };
     Some(f)
 }
@@ -331,7 +331,9 @@ pub unsafe extern "C" fn _ZN7android14AndroidRuntime21registerNativeMethodsEP7_J
         return -1;
     }
     let name = CStr::from_ptr(class_name).to_string_lossy().into_owned();
-    let should_patch = name == "android/media/AudioTrack" || name == "android/media/AudioSystem";
+    let should_patch = name == "android/media/AudioTrack"
+        || name == "android/media/AudioSystem"
+        || crate::blast::hosts(&name);
     if !should_patch || methods.is_null() || count <= 0 {
         let Some(real) = dlsym_next::<unsafe extern "C" fn(
             *mut std::os::raw::c_void,

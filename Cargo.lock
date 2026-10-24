@@ -81,6 +81,7 @@ dependencies = [
  "miniz_oxide",
  "pengudroid-elf",
  "pengudroid-hostgpu",
+ "pengudroid-input",
  "pengudroid-proto",
  "pengudroid-socket",
 ]
@@ -112,6 +113,13 @@ dependencies = [
 
 [[package]]
 name = "pengudroid-hostgpu"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "pengudroid-input"
 version = "0.1.0"
 dependencies = [
  "libc",

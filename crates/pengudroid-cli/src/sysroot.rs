@@ -1452,6 +1452,30 @@ fn register_framework_natives(env: &crate::jni::JniEnv, path: &str, libs: Option
     let mut failed = Vec::new();
     let mut missing = 0usize;
     for name in &names {
+        // `BLASTBufferQueue`'s natives are registered from *inside*
+        // `libandroid_runtime` (its `RegisterMethodsOrDie` is statically linked
+        // there), so the shim's `registerNativeMethods` hook never sees them.
+        // The shim registers that class itself instead.
+        if name.contains("register_android_graphics_BLASTBufferQueue") {
+            let ours = unsafe {
+                libc::dlsym(
+                    libc::RTLD_DEFAULT,
+                    c"__pengudroid_register_blast_buffer_queue".as_ptr(),
+                )
+            };
+            if ours.is_null() {
+                failed.push((name.clone(), -1));
+                continue;
+            }
+            let f: Register = unsafe { std::mem::transmute(ours) };
+            let rc = unsafe { f(env.0) };
+            if rc == 0 {
+                ok += 1;
+            } else {
+                failed.push((name.clone(), rc));
+            }
+            continue;
+        }
         let Ok(cname) = CString::new(name.as_str()) else {
             continue;
         };

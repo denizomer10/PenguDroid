@@ -846,6 +846,9 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         if std::env::var_os("PENGUDROID_PROBE_AUDIO").is_some() {
             probe_audio_track(env);
         }
+        if std::env::var_os("PENGUDROID_TEXTURE_VIEW").is_some() {
+            enable_texture_view(env, thread, spec.package);
+        }
         if let Ok(name) = std::env::var("PENGUDROID_LAUNCH_ACTIVITY") {
             launch_activity(env, thread, data, spec, &name);
         }
@@ -853,6 +856,239 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         eprintln!("apphost: handleBindApplication threw");
     }
     ok
+}
+
+/// Print the state of every `SurfaceView` in the window hierarchy.
+///
+/// `SurfaceView` only creates its `SurfaceControl`/`BLASTBufferQueue` once it has
+/// a frame and a `ViewRootImpl`, and it bails silently otherwise. These are the
+/// fields that decide it, so printing them says exactly which precondition is
+/// missing instead of guessing from the absence of a log line.
+fn report_surface_views(env: &JniEnv) {
+    let Some(wmg_class) = env.find_class("android/view/WindowManagerGlobal") else {
+        return;
+    };
+    let Some(get_instance) = env.static_method_id(
+        wmg_class,
+        "getInstance",
+        "()Landroid/view/WindowManagerGlobal;",
+    ) else {
+        return;
+    };
+    let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else {
+        return;
+    };
+    let Some(roots_field) = env.field_id(wmg_class, "mViews", "Ljava/util/ArrayList;") else {
+        return;
+    };
+    let roots = env.object_field(wmg, roots_field);
+    if roots.is_null() {
+        return;
+    }
+    let Some(list_class) = env.find_class("java/util/ArrayList") else {
+        return;
+    };
+    let (Some(size_m), Some(get_m)) = (
+        env.method_id(list_class, "size", "()I"),
+        env.method_id(list_class, "get", "(I)Ljava/lang/Object;"),
+    ) else {
+        return;
+    };
+    let Some(view_class) = env.find_class("android/view/View") else {
+        return;
+    };
+    let Some(get_class) = env.method_id(view_class, "getClass", "()Ljava/lang/Class;") else {
+        return;
+    };
+    let Some(class_class) = env.find_class("java/lang/Class") else {
+        return;
+    };
+    let Some(get_name) = env.method_id(class_class, "getName", "()Ljava/lang/String;") else {
+        return;
+    };
+    let Some(view_group) = env.find_class("android/view/ViewGroup") else {
+        return;
+    };
+    let (Some(child_count), Some(get_child)) = (
+        env.method_id(view_group, "getChildCount", "()I"),
+        env.method_id(view_group, "getChildAt", "(I)Landroid/view/View;"),
+    ) else {
+        return;
+    };
+
+    // Depth-first walk; the player's SurfaceView is a few levels down.
+    fn walk(
+        env: &JniEnv,
+        view: JObject,
+        depth: usize,
+        get_class: JMethodId,
+        get_name: JMethodId,
+        child_count: JMethodId,
+        get_child: JMethodId,
+    ) {
+        if view.is_null() || depth > 24 {
+            return;
+        }
+        let name = env
+            .call_object(view, get_class, &[])
+            .and_then(|c| env.call_object(c, get_name, &[]))
+            .and_then(|s| env.get_string(s))
+            .unwrap_or_default();
+        println!("views: {:width$}{name}", "", width = depth * 2);
+        if name.contains("SurfaceView") || name.contains("TextureView") {
+            // The object's own `Class` is a valid `jclass`, so no class lookup
+            // is needed (and `FindClass` would not see app classes anyway).
+            let class = env.call_object(view, get_class, &[]).unwrap_or(std::ptr::null_mut());
+            for (field, sig) in [
+                ("mHaveFrame", "Z"),
+                ("mSurfaceControl", "Landroid/view/SurfaceControl;"),
+                ("mBlastBufferQueue", "Landroid/graphics/BLASTBufferQueue;"),
+                ("mSurface", "Landroid/view/Surface;"),
+                ("mSurfaceWidth", "I"),
+                ("mSurfaceHeight", "I"),
+                ("mFormat", "I"),
+            ] {
+                if class.is_null() {
+                    continue;
+                }
+                let Some(id) = env.field_id(class, field, sig) else {
+                    continue;
+                };
+                let value = match sig {
+                    "Z" => format!("{}", env.boolean_field(view, id)),
+                    "I" => format!("{}", env.int_field(view, id)),
+                    _ => {
+                        let o = env.object_field(view, id);
+                        if o.is_null() {
+                            "null".to_string()
+                        } else {
+                            "set".to_string()
+                        }
+                    }
+                };
+                println!("views:   {field} = {value}");
+            }
+            let w = env
+                .method_id(class, "getWidth", "()I")
+                .and_then(|m| env.call_int(view, m, &[]))
+                .unwrap_or(-1);
+            let h = env
+                .method_id(class, "getHeight", "()I")
+                .and_then(|m| env.call_int(view, m, &[]))
+                .unwrap_or(-1);
+            println!("views:   size = {w}x{h}");
+        }
+        // `ViewGroup.getChildCount` must not be invoked on a plain `View`: JNI
+        // does not check the receiver's class, and ART faults on the mismatch.
+        let class = env.call_object(view, get_class, &[]).unwrap_or(std::ptr::null_mut());
+        // A null receiver must not reach JNI: ART faults on it. Whether this is
+        // a container is decided by looking the method up on the object's own
+        // class, which is cheaper and safer than an `isInstance` round trip.
+        if class.is_null() {
+            return;
+        }
+        let Some(own_count) = env.method_id(class, "getChildCount", "()I") else {
+            return;
+        };
+        let count = env.call_int(view, own_count, &[]).unwrap_or(0);
+        for i in 0..count {
+            println!("views: {:width$}child {i}/{count}", "", width = depth * 2);
+            if let Some(child) = env.call_object(view, get_child, &[JValue { i }]) {
+                walk(env, child, depth + 1, get_class, get_name, child_count, get_child);
+            }
+        }
+    }
+
+    let root_count = env.call_int(roots, size_m, &[]).unwrap_or(0);
+    println!("views: {root_count} window root(s)");
+    for i in 0..root_count {
+        // A failed reflective lookup leaves an exception pending, and every JNI
+        // call after that silently returns null — which is exactly how a walk
+        // "stops" halfway through a tree.
+        env.describe_exception();
+        if let Some(root) = env.call_object(roots, get_m, &[JValue { i }]) {
+            walk(env, root, 0, get_class, get_name, child_count, get_child);
+        }
+    }
+}
+
+/// Turn on the app's "use `TextureView` for video" preference.
+///
+/// `SurfaceView` needs a `BLASTBufferQueue`, which is a `SurfaceFlinger` client —
+/// there is no SurfaceFlinger here, so the player's surface is never created and
+/// decoded frames have nowhere to go. `TextureView` instead hands the frames to
+/// hwui as a GL texture, so the app's own renderer composites the video into the
+/// window we already present. NewPipe exposes exactly this as a user setting
+/// ("Use TextureView"), stored in the default preferences file under
+/// `texture_view`; this flips it before the player is built.
+fn enable_texture_view(env: &JniEnv, thread: JObject, package: &str) {
+    let Some(thread_class) = env.find_class("android/app/ActivityThread") else {
+        return;
+    };
+    let Some(field) = env.field_id(
+        thread_class,
+        "mInitialApplication",
+        "Landroid/app/Application;",
+    ) else {
+        eprintln!("apphost: ActivityThread.mInitialApplication not found");
+        return;
+    };
+    let app = env.object_field(thread, field);
+    if app.is_null() {
+        eprintln!("apphost: no Application to set preferences on");
+        return;
+    }
+    let Some(ctx_class) = env.find_class("android/content/Context") else {
+        return;
+    };
+    let Some(get_prefs) = env.method_id(
+        ctx_class,
+        "getSharedPreferences",
+        "(Ljava/lang/String;I)Landroid/content/SharedPreferences;",
+    ) else {
+        eprintln!("apphost: Context.getSharedPreferences missing");
+        return;
+    };
+    // `PreferenceManager.getDefaultSharedPreferencesName(context)` is
+    // `<package>_preferences`; using the name directly avoids loading androidx
+    // classes through the app's class loader.
+    let name = env.new_string(&format!("{package}_preferences"));
+    let Some(prefs) = env.call_object(app, get_prefs, &[JValue { l: name }, JValue { i: 0 }])
+    else {
+        eprintln!("apphost: getSharedPreferences threw");
+        return;
+    };
+    let Some(sp_class) = env.find_class("android/content/SharedPreferences") else {
+        return;
+    };
+    let Some(edit) = env.method_id(
+        sp_class,
+        "edit",
+        "()Landroid/content/SharedPreferences$Editor;",
+    ) else {
+        return;
+    };
+    let Some(editor) = env.call_object(prefs, edit, &[]) else {
+        eprintln!("apphost: SharedPreferences.edit threw");
+        return;
+    };
+    let Some(editor_class) = env.find_class("android/content/SharedPreferences$Editor") else {
+        return;
+    };
+    let Some(put) = env.method_id(
+        editor_class,
+        "putBoolean",
+        "(Ljava/lang/String;Z)Landroid/content/SharedPreferences$Editor;",
+    ) else {
+        return;
+    };
+    let key = env.new_string("texture_view");
+    env.call_object(editor, put, &[JValue { l: key }, JValue { i: 1 }]);
+    let Some(commit) = env.method_id(editor_class, "commit", "()Z") else {
+        return;
+    };
+    let ok = env.call_boolean(editor, commit, &[]);
+    println!("apphost: texture_view preference committed = {ok:?}");
 }
 
 /// `PENGUDROID_PROBE_AUDIO=1`: build an `AudioTrack`, play half a second of PCM
@@ -2477,6 +2713,10 @@ fn spawn_input_pump(env: &JniEnv) {
                 std::thread::sleep(std::time::Duration::from_millis(80));
                 inject(ACTION_UP, x, y, now);
                 println!("apphost: synthetic click at {x},{y} injected");
+                if std::env::var_os("PENGUDROID_PROBE_VIEWS").is_some() {
+                    std::thread::sleep(std::time::Duration::from_secs(12));
+                    report_surface_views(&env);
+                }
             }
         }
 
@@ -4564,6 +4804,43 @@ pub fn dump_class(env: &JniEnv, name: &str) {
             if let Some(n) = env.call_object(m, m_name, &[]).and_then(|s| env.get_string(s)) {
                 println!("  {n}");
             }
+        }
+    }
+
+    // Constructors are not in `getDeclaredMethods`, and their signatures are
+    // what a host-side builder needs (`Surface(long)` is the one that wraps a
+    // native `Surface*`, for instance).
+    println!("--- constructors of {name}");
+    let ctors = env
+        .method_id(
+            class_cls,
+            "getDeclaredConstructors",
+            "()[Ljava/lang/reflect/Constructor;",
+        )
+        .and_then(|m| env.call_object(class, m, &[]));
+    let params = env
+        .find_class("java/lang/reflect/Constructor")
+        .and_then(|c| env.method_id(c, "getParameterTypes", "()[Ljava/lang/Class;"));
+    if let (Some(ctors), Some(params)) = (ctors, params) {
+        for i in 0..env.array_length(ctors) {
+            let c = env.array_get(ctors, i);
+            if c.is_null() {
+                continue;
+            }
+            let mut sig = String::from("(");
+            if let Some(types) = env.call_object(c, params, &[]) {
+                for j in 0..env.array_length(types) {
+                    let t = env.array_get(types, j);
+                    let n = env
+                        .call_object(t, get_name, &[])
+                        .and_then(|s| env.get_string(s))
+                        .unwrap_or_default();
+                    sig.push_str(&n);
+                    sig.push(',');
+                }
+            }
+            sig.push(')');
+            println!("  <init>{sig}");
         }
     }
 }

@@ -1,0 +1,11 @@
+[package]
+name = "pengudroid-input"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Native Linux input for PenguDroid: uinput injection and an evdev keymapper."
+
+[dependencies]
+libc.workspace = true

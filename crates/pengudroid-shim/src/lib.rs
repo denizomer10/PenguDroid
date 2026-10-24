@@ -54,6 +54,7 @@ mod ahardwarebuffer;
 mod android_native;
 mod audiotrack;
 mod binder;
+mod blast;
 mod codec2;
 mod netdb;
 mod pathshim;

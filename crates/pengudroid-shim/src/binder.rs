@@ -542,6 +542,15 @@ const IBC_CLOSE: u32 = 4;
 /// reply is a bare `strongBinder` with no status word.
 const ISC_CREATE_CONNECTION: u32 = 2;
 
+/// Legacy `ISurfaceComposer::authenticateSurfaceTexture(IGraphicBufferConsumer)`.
+///
+/// Measured, not guessed: `TextureView` triggers it right after
+/// `SurfaceUtils: connecting to surface … (reconnect)`, and the transaction is
+/// `code=9` on the `android.ui.ISurfaceComposer` handle. Code 8 is
+/// `setTransactionState` (it also carries binders, which is what made 8 look
+/// plausible at first).
+const ISC_AUTHENTICATE_SURFACE: u32 = 9;
+
 /// `ISurfaceComposerClient` transaction code for `createSurface`.
 ///
 /// `ISurfaceComposerClient` is hand-written too, and `callRemote` reads the out
@@ -2139,7 +2148,7 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
     }
     if is_media_metrics_handle(tr.target_handle) && tr.code == IMM_GET_PLAYBACK_SESSION_ID {
         // `MediaMetricsManager.createPlaybackSession` wraps this reply in a
-        // `PlaybackSession`, whose constructor 
+        // `PlaybackSession`, whose constructor
         // `AnnotationValidations.validate(NonNull.class, null, id)` rejects a null
         // id with an NPE. ExoPlayer 2.18 registers such a listener unconditionally
         // on API 31+, so without an id `Player.initPlayback` dies and no playback
@@ -2295,6 +2304,18 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         parcel.extend_from_slice(&0i32.to_ne_bytes()); // status: NO_ERROR
         if trace_enabled() {
             diag("[binder]   -> createSurface handle + gbp\n");
+        }
+    }
+    if is_surface_flinger(tr.target_handle) && tr.code == ISC_AUTHENTICATE_SURFACE {
+        // `TextureView` asks SurfaceFlinger to vouch for its `SurfaceTexture`
+        // before the first frame. An empty reply makes `Parcel::readBool` fail
+        // and the framework logs
+        // "authenticateSurfaceTexture: error retrieving result: No data available".
+        // There is no SurfaceFlinger to authenticate against, and the consumer
+        // is ours, so the answer is simply "yes".
+        parcel.extend_from_slice(&1i32.to_ne_bytes());
+        if trace_enabled() {
+            diag("[binder]   -> authenticateSurfaceTexture = true\n");
         }
     }
     if is_surface_flinger(tr.target_handle) && tr.code == ISC_CREATE_DISPLAY_EVENT_CONNECTION {

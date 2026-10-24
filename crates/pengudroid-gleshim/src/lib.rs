@@ -1871,8 +1871,21 @@ unsafe fn dump_frame_once(surface: EGLSurface, host: &Host) {
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(200);
+    // `PENGUDROID_DUMP_FRAME_EVERY=<n>` writes every n-th frame instead of one
+    // specific frame. A playing video invalidates continuously, so a sequence of
+    // frames is the only way to tell "the video is on screen" from "the last
+    // drawn frame happened to be the video".
+    let every: u64 = std::env::var("PENGUDROID_DUMP_FRAME_EVERY")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
     let n = DUMPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if n != at {
+    let wanted = if every > 0 {
+        n > 0 && n % every == 0
+    } else {
+        n == at
+    };
+    if !wanted {
         return;
     }
     let Some(read_pixels) = host.gl_read_pixels else {
