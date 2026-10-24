@@ -54,6 +54,9 @@ mod imp {
     use wayland_protocols::wp::linux_dmabuf::zv1::client::{
         zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1,
     };
+    use wayland_protocols::xdg::decoration::zv1::client::{
+        zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
+    };
     use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
     /// A mapped toplevel plus the memory backing it.
@@ -98,6 +101,13 @@ mod imp {
         pub compositor: Option<wl_compositor::WlCompositor>,
         pub shm: Option<wl_shm::WlShm>,
         pub wm_base: Option<xdg_wm_base::XdgWmBase>,
+        /// `zxdg_decoration_manager_v1`, when the compositor offers it.
+        ///
+        /// Without a decoration object the window has no title bar on XFCE or
+        /// KDE (GNOME draws its own), so there is no close or maximise button —
+        /// the user can only kill the guest. Asking for server-side decorations
+        /// is what makes the window behave like a normal application window.
+        pub decoration: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
         /// `zwp_linux_dmabuf_v1`, when the compositor advertises it (v3+, which
         /// carries format modifiers).
         pub dmabuf: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
@@ -115,6 +125,8 @@ mod imp {
         pending: Vec<Pending>,
         /// Toplevel proxies awaiting their surface's first configure.
         toplevels: HashMap<u32, xdg_toplevel::XdgToplevel>,
+        /// Decoration proxies, kept alive for the surface's lifetime.
+        decorations: HashMap<u32, zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
         /// Ids of surfaces the compositor asked us to close.
         pub close_requests: Vec<u32>,
         /// The seat, once the compositor advertises one.
@@ -271,6 +283,12 @@ mod imp {
             state.compositor = globals.bind(&qh, 1..=6, ()).ok();
             state.shm = globals.bind(&qh, 1..=1, ()).ok();
             state.wm_base = globals.bind(&qh, 1..=6, ()).ok();
+            state.decoration = globals.bind(&qh, 1..=1, ()).ok();
+            if state.decoration.is_some() {
+                crate::info!("server-side decorations available (xdg-decoration)");
+            } else {
+                crate::info!("no xdg-decoration; the compositor draws its own title bar");
+            }
             // v3 adds format modifiers, which we need to import GPU buffers.
             state.dmabuf = globals.bind(&qh, 3..=4, ()).ok();
             // Input: the seat gives us pointer and keyboard events, which are
@@ -381,6 +399,13 @@ mod imp {
             let xdg_surface = wm_base.get_xdg_surface(&wl_surface, &qh, ());
             let xdg_toplevel = xdg_surface.get_toplevel(&qh, SurfaceId(id));
             xdg_toplevel.set_title(title.to_string());
+            // Ask for a real title bar. The compositor may ignore it (GNOME
+            // always draws client-side), which is why the request is best-effort.
+            if let Some(manager) = self.state.decoration.clone() {
+                let decoration = manager.get_toplevel_decoration(&xdg_toplevel, &qh, ());
+                decoration.set_mode(zxdg_toplevel_decoration_v1::Mode::ServerSide);
+                self.state.decorations.insert(id, decoration);
+            }
             wl_surface.commit();
 
             self.state.pending.push(Pending {
@@ -861,6 +886,36 @@ mod imp {
                 proxy.ack_configure(serial);
                 state.finalize_surface(proxy, qh);
             }
+        }
+    }
+
+    impl Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()> for State {
+        fn event(
+            _: &mut Self,
+            _: &zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
+            _: zxdg_decoration_manager_v1::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            // The manager has no events.
+        }
+    }
+
+    impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, ()> for State {
+        fn event(
+            _: &mut Self,
+            _: &zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
+            event: zxdg_toplevel_decoration_v1::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            // `Configure` reports which mode the compositor settled on. We asked
+            // for server-side and cannot draw client-side decorations, so there
+            // is nothing to react to; the event is consumed to keep the queue
+            // clean.
+            let _ = event;
         }
     }
 
