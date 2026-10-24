@@ -127,6 +127,9 @@ mod imp {
         toplevels: HashMap<u32, xdg_toplevel::XdgToplevel>,
         /// Decoration proxies, kept alive for the surface's lifetime.
         decorations: HashMap<u32, zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
+        /// Frames presented per surface, for the FPS meter:
+        /// `(frames since the last update, when that was)`.
+        fps: HashMap<u32, (u32, std::time::Instant)>,
         /// Ids of surfaces the compositor asked us to close.
         pub close_requests: Vec<u32>,
         /// The seat, once the compositor advertises one.
@@ -670,6 +673,25 @@ mod imp {
             s.buffer = buffer;
             s.dmabuf_fd = Some(fd);
             let _ = self.conn.flush();
+
+            // FPS meter: the daemon is the only component that sees every
+            // presented frame, so it is the honest place to count them. The
+            // window title is used as the display because it needs no overlay
+            // rendering and every compositor shows it.
+            if std::env::var_os("PENGUDROID_FPS_METER").is_some() {
+                let now = std::time::Instant::now();
+                let entry = self.state.fps.entry(id).or_insert((0, now));
+                entry.0 += 1;
+                let elapsed = now.duration_since(entry.1).as_secs_f32();
+                if elapsed >= 1.0 {
+                    let fps = entry.0 as f32 / elapsed;
+                    entry.0 = 0;
+                    entry.1 = now;
+                    if let Some(toplevel) = self.state.toplevels.get(&id) {
+                        toplevel.set_title(format!("PenguDroid \u{2014} {fps:.0} fps"));
+                    }
+                }
+            }
             Ok(())
         }
     }
