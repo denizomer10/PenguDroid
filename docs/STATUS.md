@@ -71,6 +71,18 @@ vermek (parent ölçümü/`ConstraintLayout` kısıtı). `BLASTBufferQueue` host
 arada hazır (`crates/pengudroid-shim/src/blast.rs`, 12 native, reflection ile
 imza çıkarımı) ve `SurfaceView` yüzey istediğinde devreye girecek.
 
+### Denenen ve ölçülen: `PENGUDROID_FORCE_SURFACE=1`
+
+`layout(0,0,720,405)` çağrısı görünümü gerçekten 720x405 yapıyor (`size = 720x405`)
+ama `mHaveFrame` **hâlâ false** — yani bu sürümde `layout()` o bayrağı set
+etmiyor. Alanı doğrudan `true` yapıp `updateSurface()` çağrıldığında ise süreç
+**SIGSEGV** alıyor; hemen öncesinde
+`HpInterface: No HAL token was created` uyarıları geliyor. Yani sıradaki duvar
+`updateSurface()` içindeki `SurfaceControl`/`SurfaceComposerClient` yolu
+(`HpInterface` HAL token'ı). Sıradaki adım: `SurfaceControl.Builder.build()`
+çağrısının nerede çöktüğünü gdb ile bulmak (`crash.gdb`) ve `SurfaceSession`
+yolunu sahte bir `SurfaceComposerClient` ile beslemek.
+
 ### Sıradaki: Slint GUI
 
 Fizibilite ölçüldü: crates.io erişilebilir (`slint` indirilebilir) ve

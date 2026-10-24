@@ -864,6 +864,14 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
 /// a frame and a `ViewRootImpl`, and it bails silently otherwise. These are the
 /// fields that decide it, so printing them says exactly which precondition is
 /// missing instead of guessing from the absence of a log line.
+fn surface_dimension(var: &str, default: i32) -> i32 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
 fn report_surface_views(env: &JniEnv) {
     let Some(wmg_class) = env.find_class("android/view/WindowManagerGlobal") else {
         return;
@@ -939,6 +947,42 @@ fn report_surface_views(env: &JniEnv) {
             // The object's own `Class` is a valid `jclass`, so no class lookup
             // is needed (and `FindClass` would not see app classes anyway).
             let class = env.call_object(view, get_class, &[]).unwrap_or(std::ptr::null_mut());
+            // A `SurfaceView` that measured 0 wide never sets `mHaveFrame`, so
+            // `updateSurface()` returns immediately and neither the
+            // `SurfaceControl` nor the `BLASTBufferQueue` is ever created — which
+            // is exactly what NewPipe hits. Re-laying it out at the window size
+            // is enough to make the framework take its normal path.
+            if std::env::var_os("PENGUDROID_FORCE_SURFACE").is_some() && !class.is_null() {
+                if let Some(layout) = env.method_id(class, "layout", "(IIII)V") {
+                    let w = surface_dimension("PENGUDROID_SURFACE_W", 720);
+                    let h = env
+                        .method_id(class, "getHeight", "()I")
+                        .and_then(|m| env.call_int(view, m, &[]))
+                        .unwrap_or(405)
+                        .max(1);
+                    env.call_void(
+                        view,
+                        layout,
+                        &[
+                            JValue { i: 0 },
+                            JValue { i: 0 },
+                            JValue { i: w },
+                            JValue { i: h },
+                        ],
+                    );
+                    println!("views:   forced layout to {w}x{h}");
+                }
+                // `layout()` alone does not set `mHaveFrame` in this release, and
+                // `updateSurface()` returns on it. Set the flag and call the
+                // method the framework would have called.
+                if let Some(flag) = env.field_id(class, "mHaveFrame", "Z") {
+                    env.set_boolean_field(view, flag, true);
+                }
+                if let Some(update) = env.method_id(class, "updateSurface", "()V") {
+                    env.call_void(view, update, &[]);
+                    println!("views:   updateSurface() called");
+                }
+            }
             for (field, sig) in [
                 ("mHaveFrame", "Z"),
                 ("mSurfaceControl", "Landroid/view/SurfaceControl;"),
