@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Write a minimal H.264 baseline stream: SPS + PPS + one IDR I_PCM frame.
+"""Write a minimal H.264 baseline stream: SPS + PPS + one IDR frame of I_PCM MBs.
 
 Used by the MediaCodec probe: the soft AVC decoder needs a real elementary
 stream to produce a frame, and no H.264 encoder is installed on the host.
-A single 16x16 macroblock coded as I_PCM keeps the bitstream trivial — no
-transform, no prediction, no CABAC.
+Every macroblock is coded as I_PCM, so the bitstream needs no transform, no
+prediction and no CABAC — and the sample values are exactly what we wrote,
+which makes the decoded frame verifiable byte for byte.
+
+    tools/make_h264.py out.h264 [width_mb] [height_mb]
 """
 
 import sys
@@ -63,7 +66,7 @@ def nal(header, rbsp):
     return b"\x00\x00\x00\x01" + bytes([header]) + escape(rbsp)
 
 
-def sps():
+def sps(mb_w=1, mb_h=1):
     b = Bits()
     b.u(66, 8)  # profile_idc: baseline
     b.u(0, 8)  # constraint flags
@@ -74,8 +77,8 @@ def sps():
     b.ue(0)  # log2_max_pic_order_cnt_lsb_minus4
     b.ue(1)  # max_num_ref_frames
     b.u(0, 1)  # gaps_in_frame_num_value_allowed_flag
-    b.ue(0)  # pic_width_in_mbs_minus1 -> 16 px
-    b.ue(0)  # pic_height_in_map_units_minus1 -> 16 px
+    b.ue(mb_w - 1)  # pic_width_in_mbs_minus1
+    b.ue(mb_h - 1)  # pic_height_in_map_units_minus1
     b.u(1, 1)  # frame_mbs_only_flag
     b.u(1, 1)  # direct_8x8_inference_flag
     b.u(0, 1)  # frame_cropping_flag
@@ -106,6 +109,12 @@ def pps():
 
 
 def idr(y, u, v):
+    """One IDR slice whose every macroblock is I_PCM with the given samples.
+
+    The slice header and the slice data are a single continuous bitstream: only
+    the PCM samples are byte aligned (`pcm_alignment_zero_bit`), so everything is
+    built in one `Bits` and only packed to bytes at the very end.
+    """
     b = Bits()
     b.ue(0)  # first_mb_in_slice
     b.ue(7)  # slice_type: I (all slices)
@@ -116,22 +125,37 @@ def idr(y, u, v):
     b.u(0, 1)  # no_output_of_prior_pics_flag
     b.u(0, 1)  # long_term_reference_flag
     b.se(0)  # slice_qp_delta
-    b.ue(25)  # mb_type: I_PCM
-    b.align()
-    rbsp = bytearray(b.bytes())
-    rbsp += bytes([y]) * 256
-    rbsp += bytes([u]) * 64
-    rbsp += bytes([v]) * 64
-    rbsp += bytes([0x80])
-    return nal(0x65, bytes(rbsp))
+    for my in range(MB_H):
+        for mx in range(MB_W):
+            b.ue(25)  # mb_type: I_PCM
+            b.align()  # pcm_alignment_zero_bit
+            for row in range(16):
+                for col in range(16):
+                    # A gradient across the frame so a decoded picture is
+                    # numerically and visually distinguishable from a zeroed
+                    # buffer.
+                    b.u(0x40 + ((mx * 10 + col) & 0x3F), 8)
+            for _ in range(64):
+                b.u(u, 8)
+            for _ in range(64):
+                b.u(v, 8)
+    b.trailing()  # rbsp_slice_trailing_bits
+    return nal(0x65, b.bytes())
+
+
+MB_W = 1
+MB_H = 1
 
 
 def main():
+    global MB_W, MB_H
     path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/test.h264"
-    data = sps() + pps() + idr(0x80, 0x80, 0x80)
+    MB_W = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+    MB_H = int(sys.argv[3]) if len(sys.argv) > 3 else 1
+    data = sps(MB_W, MB_H) + pps() + idr(0x40, 0x80, 0xC0)
     with open(path, "wb") as f:
         f.write(data)
-    print(f"wrote {len(data)} bytes to {path}")
+    print(f"wrote {len(data)} bytes to {path} ({MB_W * 16}x{MB_H * 16})")
 
 
 if __name__ == "__main__":

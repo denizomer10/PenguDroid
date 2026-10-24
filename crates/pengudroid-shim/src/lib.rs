@@ -113,6 +113,12 @@ pub fn format_log_line(prio: i32, tag: &str, text: &str) -> String {
 /// success, or `-1` on error. This mirrors the "bytes written / negative on
 /// error" contract callers expect from the Bionic log functions.
 pub fn log_to_stderr(prio: i32, tag: &str, text: &str) -> isize {
+    // One choke point for every log entry (Bionic has half a dozen of them), so
+    // `PENGUDROID_TRACE_BT` works no matter which one the caller picked. The
+    // `bt` tag is this hook's own output and must not recurse.
+    if tag != "bt" {
+        unsafe { maybe_backtrace(text) };
+    }
     let mut line = format_log_line(prio, tag, text).into_bytes();
     line.push(b'\n');
 
@@ -176,7 +182,66 @@ pub unsafe extern "C" fn __pengudroid_log_rendered(
     tag: *const c_char,
     rendered: *const c_char,
 ) {
-    log_to_stderr(prio, &cstr_lossy(tag), &cstr_lossy(rendered));
+    let line = cstr_lossy(rendered);
+    log_to_stderr(prio, &cstr_lossy(tag), &line);
+}
+
+/// `backtrace(3)` from the host C library.
+extern "C" {
+    fn backtrace(buffer: *mut *mut c_void, size: c_int) -> c_int;
+}
+
+/// Print a symbolized backtrace for log lines containing `PENGUDROID_TRACE_BT`.
+///
+/// gdb cannot follow the libraries this process `dlopen`s (the shim loads them
+/// itself, so `ld.so`'s debug hook never fires and gdb never sees a solib
+/// event), which makes "who logged this line" impossible to answer from the
+/// debugger. A `dladdr` backtrace from inside the log sink answers it instead:
+/// each frame prints `library +offset`, which maps straight back onto the
+/// disassembly.
+unsafe fn maybe_backtrace(line: &str) {
+    static NEEDLE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    static SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let needle = NEEDLE.get_or_init(|| std::env::var("PENGUDROID_TRACE_BT").ok());
+    let Some(needle) = needle.as_deref() else {
+        return;
+    };
+    if needle.is_empty() || !line.contains(needle) {
+        return;
+    }
+    // A handful is enough to find the call path; a hot line would flood.
+    if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 8 {
+        return;
+    }
+    let mut frames = [std::ptr::null_mut::<c_void>(); 40];
+    let n = backtrace(frames.as_mut_ptr(), frames.len() as c_int);
+    for (i, &frame) in frames[..n.max(0) as usize].iter().enumerate() {
+        if frame.is_null() {
+            continue;
+        }
+        let mut info: libc::Dl_info = std::mem::zeroed();
+        if libc::dladdr(frame, &mut info) == 0 || info.dli_fbase.is_null() {
+            let _ = log_to_stderr(ANDROID_LOG_DEBUG, "bt", &format!("  #{i} {frame:p}"));
+            continue;
+        }
+        let lib = if info.dli_fname.is_null() {
+            "?".to_string()
+        } else {
+            cstr_lossy(info.dli_fname)
+        };
+        let offset = frame as usize - info.dli_fbase as usize;
+        let name = if info.dli_sname.is_null() {
+            String::new()
+        } else {
+            format!(" {}", cstr_lossy(info.dli_sname))
+        };
+        let _ = log_to_stderr(
+            ANDROID_LOG_DEBUG,
+            "bt",
+            &format!("  #{i} {lib}+{offset:#x}{name}"),
+        );
+    }
+    let _ = log_to_stderr(ANDROID_LOG_DEBUG, "bt", "  --");
 }
 
 /// The `noreturn` tail of a rendered `__android_log_assert`. Called only from

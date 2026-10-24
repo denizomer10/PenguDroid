@@ -1100,7 +1100,48 @@ fn probe_codec_decode(env: &JniEnv, mc_class: JClass, fmt_class: JClass, codec: 
         if out != Some(0) || flags & 4 != 0 {
             break;
         }
+        if let Some(index) = out.filter(|&i| i >= 0) {
+            report_output_bytes(env, mc_class, codec, index, size);
+        }
     }
+}
+
+/// Read the decoded frame out of the output `ByteBuffer` and summarise it.
+///
+/// This is the end-to-end check for the video path: `size` alone only proves a
+/// buffer of the right length came back, whereas the statistics prove the
+/// decoder wrote pixels into it (the generated stream is a known gradient).
+fn report_output_bytes(env: &JniEnv, mc_class: JClass, codec: JObject, round: i32, size: i32) {
+    let Some(get_out) = env.method_id(mc_class, "getOutputBuffer", "(I)Ljava/nio/ByteBuffer;") else {
+        eprintln!("media: getOutputBuffer missing");
+        return;
+    };
+    let Some(buf) = env.call_object(codec, get_out, &[JValue { i: round }]) else {
+        eprintln!("media: getOutputBuffer({round}) threw");
+        return;
+    };
+    let addr = env.direct_buffer_address(buf);
+    if addr.is_null() {
+        eprintln!("media: output buffer {round} is not direct");
+        return;
+    }
+    let len = size.max(0) as usize;
+    let bytes = unsafe { std::slice::from_raw_parts(addr as *const u8, len) };
+    let sum: u64 = bytes.iter().map(|&b| b as u64).sum();
+    let mut distinct = std::collections::BTreeSet::new();
+    for &b in bytes.iter().take(4096) {
+        distinct.insert(b);
+    }
+    println!(
+        "media: frame[{round}] {} bytes, mean={:.1}, min={} max={}, distinct(first 4K)={}",
+        len,
+        if len > 0 { sum as f64 / len as f64 } else { 0.0 },
+        bytes.iter().copied().min().unwrap_or(0),
+        bytes.iter().copied().max().unwrap_or(0),
+        distinct.len()
+    );
+    let head: Vec<String> = bytes.iter().take(16).map(|b| format!("{b:02x}")).collect();
+    println!("media: frame[{round}] head={}", head.join(" "));
 }
 
 /// Print the display metrics the app sees.

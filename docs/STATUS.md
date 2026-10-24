@@ -3,6 +3,75 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
+## Bu oturum: KARE ÇIKIYOR — video zinciri tamam
+
+Kök neden tek bir alandı ve `ahardwarebuffer.rs` içinde düzeltildi:
+
+> `native_handle_t.version` **12** olmak zorunda. Biz `sizeof(NativeHandle)` = **44**
+yazıyorduk.
+
+codec2'nin `_WrapNativeCodec2GrallocHandle`'ı (`libcodec2_vndk.so` `0x50cd2`)
+handle'ı sarmadan önce `handle->version == 0xc` kontrolü yapıyor ve uymazsa
+**NULL** dönüyor. Eşleşince olanlar:
+
+- `map()` hâlâ çalışıyor, çünkü o yolu `hidl_handle`ın taşıdığı gerçek handle
+  kullanıyor → **decoder gerçekten çözüyor ve pikselleri yazıyor**,
+- ama `C2GraphicBlock::handle()` `[this+0x50] ?: [this+0x40]` dönüyor
+  (`0x51a90`) ve ikisi de null kalıyordu → `utils::objcpy` çıktı bloğunu
+  `WorkBundle`a çeviremiyordu → `addBaseBlock called on a null C2Handle` →
+  `received corrupted work items` → `dequeueOutputBuffer` `size=0`.
+
+Düzeltmeden sonra, `PENGUDROID_PROBE_MEDIA=1` ile (ayrıntı: `docs/API.md`):
+
+```
+media: dequeueOutputBuffer[0] = Some(-2) size=0 flags=0
+media: output format width=320
+media: output format height=240
+media: dequeueOutputBuffer[1] = Some(0) size=115200 flags=0
+media: frame[0] 115200 bytes, mean=116.3, min=64 max=192, distinct(first 4K)=64
+media: frame[0] head=40 41 42 43 44 45 46 47 48 49 4a 4b 4c 4d 4e 4f
+media: dequeueOutputBuffer[2] = Some(1) size=0 flags=4
+```
+
+`115200 = 320*240*3/2` ve içerik `ffmpeg`in aynı akış için ürettiği referansla
+**bayt bayt aynı** (`40..4f` gradyanı, U=`80`, V=`c0`, ortalama 116.3). Yani
+H.264 → `C2SoftAvcDec` → memfd graphic block → HIDL `WorkBundle` → `CCodec` →
+Java `ByteBuffer` zinciri uçtan uca çalışıyor.
+
+### Bu oturumda eklenen araçlar
+
+1. **`PENGUDROID_TRACE_BT=<alt-dize>`** — log satırı bu alt-dizeyi içeriyorsa
+   `dladdr` ile sembolleştirilmiş bir backtrace basar. gdb bu süreçteki
+   `dlopen`ları **takip edemiyor** (shim kütüphaneleri kendi yüklüyor, `ld.so`
+   debug hook'u hiç ateşlenmiyor, `new_objfile` olayı gelmiyor), bu yüzden
+   "bunu kim logladı" sorusunun tek cevabı bu hook. Çıktı `log_to_stderr`
+   içinde, yani Bionic'in hangi giriş noktası kullanılırsa kullanılsın çalışır.
+   Not: satırlar log satırından **önce** basılır ve 8 isabetle sınırlıdır.
+2. **`PENGUDROID_DUMP_GBUF=<dizin>`** — her `GraphicBufferMapper::unlock`ta
+   bloğun o anki içeriğini `gbuf-<fd>.bin` olarak yazar. "Decoder gerçekten bu
+   bloğa yazdı mı, yoksa istemci başka bir bloğu mu okuyor?" sorusunu
+   kesinleştirdi: `gbuf-63/71` toplamı `13401600` (gradyan), `gbuf-60` toplamı
+   `0` (boş havuz bloğu).
+3. **`tools/make_h264.py <yol> [genişlik_mb] [yükseklik_mb]`** — artık
+   istenen boyutta, her makrobloğu I_PCM olan bir gradyan akışı üretiyor.
+   **Bu betikte bir hata vardı ve düzeltildi:** slice header'ı ayrı yazıp
+   bayta hizalıyordu. H.264'te header ile slice data **tek bit akışıdır**;
+   yalnızca PCM örnekleri bayta hizalanır (`pcm_alignment_zero_bit`). Eski
+   akış `ffmpeg`te `mb_type 207 in I slice too large` veriyordu — yani decoder
+   haklı olarak boş kare üretiyordu. Yeni akış `ffmpeg`te hatasız çözülüyor.
+4. `PENGUDROID_TRACE_AHB` artık `fd`/`numInts`/`stride` ve ret nedenlerini de
+   basıyor.
+
+### Sonraki adım
+
+`SurfaceView` (surface modu). `NewPipe` video oynatırken `MediaCodec`
+`configure(fmt, surface, ...)` ile çağrılıyor; o yol `C2BlockPool::BASIC_GRAPHIC`
+bloklarını **`IGraphicBufferProducer`a bağlayıp** sunmak istiyor, ki bu ayrı bir
+bileşen katmanı (`docs/STATUS.md` eski bölümleri + `docs/LIMITATIONS.md`).
+ByteBuffer modu (bu oturumda biten yol) ile surface modu arasındaki fark
+`CCodecBufferChannel::start` içindeki blok havuzu seçimi (`libsfplugin_ccodec.so`
+`0x5eec2`: `poolId = (mod == 3) ? 1 /*BASIC_GRAPHIC*/ : 0 /*BASIC_LINEAR*/`).
+
 ## Bu oturum: splash atlandı, native motor çalıştı, `stage = 4`'te takıldı
 
 Bu oturumun en büyük ilerlemesi: **`ActivitySplash` tamamen atlanıp doğrudan

@@ -135,6 +135,21 @@ pub struct NativeHandle {
     pub data: [i32; 8],
 }
 
+/// The `version` every `native_handle_t` must carry: `sizeof(native_handle_t)`
+/// in Bionic, i.e. the three header ints only, *not* our whole fixed-size
+/// struct (which is 44 bytes because the inline `data` array is sized for the
+/// largest handle we ever produce).
+///
+/// This is load-bearing, not cosmetic: codec2's
+/// `_WrapNativeCodec2GrallocHandle` validates the handle with
+/// `handle->version == 0xc` before wrapping it in a `C2HandleGralloc`
+/// (`libcodec2_vndk.so` `0x50cd2`, returns NULL on mismatch). A handle with the
+/// wrong version still maps fine through `libui` (decode succeeds), but the
+/// resulting `C2GraphicBlock::handle()` is NULL, so `objcpy` cannot serialise the
+/// output buffer into a `WorkBundle` and the decoded frame is dropped as
+/// "corrupted work items".
+pub const NATIVE_HANDLE_VERSION: i32 = 12;
+
 /// `android::GraphicBufferAllocator::allocate(w, h, format, layerCount, usage,
 /// outHandle, outStride, outBufferId, requestorName)`.
 ///
@@ -221,7 +236,7 @@ unsafe fn allocate_buffer(
         return -12;
     }
     let handle = Box::new(NativeHandle {
-        version: std::mem::size_of::<NativeHandle>() as i32,
+        version: NATIVE_HANDLE_VERSION,
         num_fds: 1,
         num_ints: 6,
         data: [
@@ -240,7 +255,7 @@ unsafe fn allocate_buffer(
         *out_stride = stride;
     }
     if std::env::var_os("PENGUDROID_TRACE_AHB").is_some() {
-        eprintln!("[ahb] allocated {width}x{height} fmt={format} stride={stride} ({size} bytes)");
+        eprintln!("[ahb] allocated {width}x{height} fmt={format} stride={stride} ({size} bytes) fd={fd}");
     }
     0
 }
@@ -289,11 +304,17 @@ pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper4lockEPK13native_handle
     }
     let h = &*handle;
     if h.num_fds < 1 || h.data.is_empty() {
+        if std::env::var_os("PENGUDROID_TRACE_AHB").is_some() {
+            eprintln!("[ahb] lock rejected: numFds={}", h.num_fds);
+        }
         return -22;
     }
     let fd = h.data[0];
     let size = libc::lseek(fd, 0, libc::SEEK_END);
     if size <= 0 {
+        if std::env::var_os("PENGUDROID_TRACE_AHB").is_some() {
+            eprintln!("[ahb] lock rejected: fd={fd} size={size}");
+        }
         return -22;
     }
     let p = libc::mmap(
@@ -316,17 +337,60 @@ pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper4lockEPK13native_handle
         *stride = if h.num_ints >= 1 { h.data[1] } else { 0 };
     }
     if std::env::var_os("PENGUDROID_TRACE_AHB").is_some() {
-        eprintln!("[ahb] lock mapped {size} bytes");
+        eprintln!(
+            "[ahb] lock mapped {size} bytes fd={fd} numInts={} stride={}",
+            h.num_ints,
+            if h.num_ints >= 1 { h.data[1] } else { 0 }
+        );
     }
     0
 }
 
 /// `android::GraphicBufferMapper::unlock(handle)`.
+///
+/// Nothing to do for this mapper: `lock` is a plain `mmap` of the block's memfd
+/// and the mapping stays valid until `freeBuffer`. When `PENGUDROID_DUMP_GBUF`
+/// names a directory the block's *current contents* are written out here — the
+/// only point where "did anyone actually write pixels into this block?" can be
+/// answered. A decoded frame that never reaches the client shows up as one file
+/// holding the expected gradient and another still holding zeros.
 #[no_mangle]
 pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper6unlockEPK13native_handle(
     _this: *mut c_void,
-    _handle: *const NativeHandle,
+    handle: *const NativeHandle,
 ) -> i32 {
+    if handle.is_null() {
+        return -22;
+    }
+    if let Some(dir) = std::env::var_os("PENGUDROID_DUMP_GBUF") {
+        let h = &*handle;
+        if h.num_fds >= 1 && !h.data.is_empty() {
+            let fd = h.data[0];
+            let size = libc::lseek(fd, 0, libc::SEEK_END);
+            if size > 0 {
+                let p = libc::mmap(
+                    std::ptr::null_mut(),
+                    size as usize,
+                    libc::PROT_READ,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                );
+                if p != libc::MAP_FAILED {
+                    let bytes = std::slice::from_raw_parts(p as *const u8, size as usize);
+                    let sum: u64 = bytes.iter().map(|&b| b as u64).sum();
+                    let path = std::path::Path::new(&dir).join(format!("gbuf-{fd}.bin"));
+                    let _ = std::fs::write(&path, bytes);
+                    eprintln!(
+                        "[ahb] dumped {} ({} bytes, sum={sum})",
+                        path.display(),
+                        bytes.len()
+                    );
+                    libc::munmap(p, size as usize);
+                }
+            }
+        }
+    }
     0
 }
 
@@ -412,7 +476,7 @@ pub unsafe extern "C" fn AHardwareBuffer_allocate(
             _pad: 0,
         },
         handle: NativeHandle {
-            version: std::mem::size_of::<NativeHandle>() as i32,
+            version: NATIVE_HANDLE_VERSION,
             num_fds: 1,
             num_ints: 6,
             data: [
@@ -521,7 +585,7 @@ pub unsafe extern "C" fn AHardwareBuffer_createFromHandle(
             _pad: 0,
         },
         handle: NativeHandle {
-            version: std::mem::size_of::<NativeHandle>() as i32,
+            version: NATIVE_HANDLE_VERSION,
             num_fds: 1,
             num_ints: 6,
             data: [
@@ -668,4 +732,47 @@ pub unsafe extern "C" fn AHardwareBuffer_to_ANativeWindowBuffer(
 #[no_mangle]
 pub unsafe extern "C" fn __pengudroid_ahb_fd(buffer: *mut FakeHardwareBuffer) -> i32 {
     as_buf(buffer).map(|b| b.fd).unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// codec2 rejects a handle whose `version` is not `sizeof(native_handle_t)`,
+    /// and the rejection is silent apart from the dropped frame: the allocation
+    /// still maps, so the decoder succeeds and only `C2GraphicBlock::handle()`
+    /// comes back NULL. Pin the value so it cannot drift back to
+    /// `size_of::<NativeHandle>()` (44).
+    #[test]
+    fn native_handle_version_is_bionic_sizeof() {
+        assert_eq!(NATIVE_HANDLE_VERSION, 12);
+        assert_eq!(
+            std::mem::offset_of!(NativeHandle, data),
+            NATIVE_HANDLE_VERSION as usize
+        );
+    }
+
+    /// A handle we allocate must describe itself the way `C2AllocatorGralloc`
+    /// and `GraphicBufferMapper` read it: one fd first, then the gralloc0
+    /// metadata the module documents.
+    #[test]
+    fn allocated_handle_layout() {
+        let mut out: *const NativeHandle = std::ptr::null();
+        let mut stride = 0u32;
+        let status = unsafe {
+            allocate_buffer(320, 240, 0x3231_5659, 1, 0x100, &mut out, &mut stride)
+        };
+        assert_eq!(status, 0);
+        assert!(!out.is_null());
+        let h = unsafe { &*out };
+        assert_eq!(h.version, NATIVE_HANDLE_VERSION);
+        assert_eq!(h.num_fds, 1);
+        assert_eq!(h.num_ints, 6);
+        assert_eq!(h.data[1], 320, "data[0] is the fd, data[1] the stride");
+        assert_eq!(h.data[2], 0x3231_5659);
+        assert_eq!(h.data[3], 320);
+        assert_eq!(h.data[4], 240);
+        unsafe { libc::close(h.data[0]) };
+        unsafe { drop(Box::from_raw(out as *mut NativeHandle)) };
+    }
 }

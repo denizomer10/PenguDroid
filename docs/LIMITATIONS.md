@@ -99,8 +99,10 @@ What that does **not** give you is a real system: there is still no package
 manager (installed packages are synthesised per launch), no `ActivityManager`
 lifecycle (no `onPause`/`onStop`/task switching), no input dispatch, no
 `SurfaceFlinger` (the app's frames are exported straight to the compositor), and
-no `MediaCodec`/`AudioFlinger`. Apps that only need to draw a view hierarchy
-work; apps that need the platform's services do not.
+no `AudioFlinger`. `MediaCodec` decodes in ByteBuffer mode (H.264 through
+`libcodec2_soft_avcdec.so`, verified byte-exact against `ffmpeg`) but not yet to
+a `Surface`. Apps that only need to draw a view hierarchy work; apps that need
+the platform's services do not.
 
 ### 2.1 ARM translation (Intel's NDK translation / Houdini lineage)
 
@@ -481,7 +483,10 @@ hanging forever, so a wedged guest cannot freeze its peers.
 10. ~~Vulkan.~~ **Done**: the Bionic soname maps to the host loader;
     `fixtures/native-vulkan` enumerates the GPU and creates a device.
 11. `AHardwareBuffer`/`gralloc` on dma-buf, then hardware composition.
-12. `MediaCodec` (codec2) + `AudioTrack`/`AudioFlinger`, so video plays.
+12. ~~`MediaCodec` (codec2), so video decodes.~~ **Done for ByteBuffer mode**:
+    the in-process codec2 service decodes H.264 and the frame reaches Java with
+    the right pixels. Surface (`SurfaceView`) output and
+    `AudioTrack`/`AudioFlinger` are still missing.
 13. Input dispatch (touch/key) from the Wayland seat into the app's window.
 14. Guest ARM code execution, so arm64-only apps (Beach Buggy Racing 2,
     Genshin Impact) can run at all — see §2.1.

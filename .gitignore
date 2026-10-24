@@ -12,6 +12,10 @@ fixtures/opensl-app/opensl-app
 fixtures/*/libmain.so
 fixtures/*/*.o
 
+# Generated H.264 probe stream (tools/make_h264.py is deterministic)
+fixtures/*.h264
+/tmp/*.h264
+
 # Local build environment: a private rustup + compiler bridge used on hosts that
 # have no system Rust/gcc. Never part of the repo.
 /.toolchain
