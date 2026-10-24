@@ -1307,11 +1307,13 @@ fn spawn_input_pump(env: &JniEnv) {
             eprintln!("apphost: input pump: dispatchInputEvent not found");
             return;
         };
+        let set_axis_value = env.method_id(motion_class, "setAxisValue", "(IF)V");
 
         const ACTION_DOWN: i32 = 0;
         const ACTION_UP: i32 = 1;
         const ACTION_MOVE: i32 = 2;
         const ACTION_HOVER_MOVE: i32 = 7;
+        const ACTION_SCROLL: i32 = 8;
 
         let mut down_time = 0i64;
         let mut pressed = false;
@@ -1358,6 +1360,50 @@ fn spawn_input_pump(env: &JniEnv) {
             }
         };
 
+        // The same, but with a wheel delta attached: `setAxisValue` has to run on
+        // the instance that is actually dispatched, which is per-root.
+        let inject_scroll = |x: f32, y: f32, delta: f32| {
+            let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else {
+                return;
+            };
+            let roots = env.object_field(wmg, roots_field);
+            if roots.is_null() {
+                return;
+            }
+            let count = env.call_int(roots, size_m, &[]).unwrap_or(0);
+            for i in 0..count {
+                let Some(root) = env.call_object(roots, get_m, &[JValue { i }]) else {
+                    continue;
+                };
+                if root.is_null() {
+                    continue;
+                }
+                let now = env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
+                let Some(event) = env.call_static_object(
+                    motion_class,
+                    obtain,
+                    &[
+                        JValue { j: now },
+                        JValue { j: now },
+                        JValue { i: ACTION_SCROLL },
+                        JValue { f: x },
+                        JValue { f: y },
+                        JValue { i: 0 },
+                    ],
+                ) else {
+                    continue;
+                };
+                if event.is_null() {
+                    continue;
+                }
+                if let Some(set_axis) = set_axis_value {
+                    // AXIS_VSCROLL = 9.
+                    env.call_void(event, set_axis, &[JValue { i: 9 }, JValue { f: delta }]);
+                }
+                env.call_void(root, dispatch, &[JValue { l: event }]);
+            }
+        };
+
         // `PENGUDROID_SYNTH_CLICK=x,y` injects one tap after the UI settles.
         // There is no way to click a window from a sandboxed session, so this is
         // how the input path is exercised end to end.
@@ -1381,6 +1427,13 @@ fn spawn_input_pump(env: &JniEnv) {
             let tag = u32::from_le_bytes(buf[4..8].try_into().unwrap());
             let a = f32::from_le_bytes(buf[8..12].try_into().unwrap());
             let b = f32::from_le_bytes(buf[12..16].try_into().unwrap());
+            // Mouse wheel: Wayland's axis value is positive when scrolling down,
+            // while `MotionEvent.AXIS_VSCROLL` is positive when scrolling up, so
+            // sign flips. This is what lets the user scroll a feed at all.
+            if tag == 5 && a as u8 == 0 {
+                inject_scroll(last.0, last.1, -b);
+                continue;
+            }
             let (action, x, y) = match tag {
                 1 | 3 => {
                     last = (a, b);

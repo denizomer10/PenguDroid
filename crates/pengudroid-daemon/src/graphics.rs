@@ -771,6 +771,10 @@ mod imp {
                 wl_pointer::Event::Enter { surface, surface_x, surface_y, .. } => {
                     state.pointer_focus = state.surface_id_of(&surface);
                     state.pointer_pos = (surface_x, surface_y);
+                    crate::info!(
+                        "pointer entered surface {:?} at {surface_x:.0},{surface_y:.0}",
+                        state.pointer_focus
+                    );
                     state.push_input(InputKind::PointerEnter {
                         x: surface_x as f32,
                         y: surface_y as f32,
