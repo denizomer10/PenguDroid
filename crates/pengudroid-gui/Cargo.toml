@@ -1,0 +1,29 @@
+[package]
+name = "pengudroid-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "PenguDroid's desktop app: install, launch and manage Android apps."
+
+[dependencies]
+# `default-features = false` drops the accessibility bridge (accesskit → zbus),
+# whose current releases need rustc 1.87 while this tree builds with 1.85. The
+# software renderer keeps the dependency set small and works over a remote
+# session, where there may be no GL context at all.
+slint = { version = "1.6", default-features = false, features = [
+    "std",
+    "compat-1-2",
+    "backend-winit",
+    "renderer-software",
+] }
+pengudroid-input.workspace = true
+libc.workspace = true
+
+[build-dependencies]
+slint-build = "1.6"
+
+[[bin]]
+name = "pengudroid-gui"
+path = "src/main.rs"

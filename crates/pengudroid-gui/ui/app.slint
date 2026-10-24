@@ -1,0 +1,323 @@
+// PenguDroid's desktop shell.
+//
+// Layout: a fixed sidebar on the left (installed apps, "+" to install) and a
+// detail pane on the right (launch/stop/uninstall plus per-app settings). The
+// palette is deliberately dark and flat: the app is a launcher for games, and a
+// light theme fights with the game's own colours.
+
+export struct AppEntry {
+    package: string,
+    label: string,
+    activity: string,
+    running: bool,
+}
+
+export component MainWindow inherits Window {
+    title: "PenguDroid";
+    preferred-width: 1080px;
+    preferred-height: 720px;
+    background: #14161a;
+
+    in property <[AppEntry]> apps;
+    in-out property <int> selected: -1;
+    in property <bool> keymapper-on: true;
+    in property <bool> fps-meter-on: false;
+    in property <string> status: "Ready";
+    in property <bool> confirm-close: false;
+    in property <int> running-count: 0;
+
+    callback install-requested();
+    callback launch-requested(int);
+    callback stop-requested(int);
+    callback uninstall-requested(int);
+    callback keymapper-toggled(bool);
+    callback fps-meter-toggled(bool);
+    callback confirm-close-yes();
+    callback confirm-close-no();
+
+    HorizontalLayout {
+        // ---------------------------------------------------------------- sidebar
+        Rectangle {
+            width: 300px;
+            background: #1b1e24;
+
+            VerticalLayout {
+                padding: 16px;
+                spacing: 12px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Image {
+                        width: 32px;
+                        height: 32px;
+                        source: @image-url("../../../logo.png");
+                        image-fit: contain;
+                    }
+                    Text {
+                        text: "PenguDroid";
+                        color: #f2f4f8;
+                        font-size: 18px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    // "+" installs an APK; the same action is reachable by
+                    // dropping a file on the window.
+                    Rectangle {
+                        width: 32px;
+                        height: 32px;
+                        border-radius: 8px;
+                        background: install-touch.has-hover ? #2f6feb : #262b33;
+                        Text {
+                            text: "+";
+                            color: #ffffff;
+                            font-size: 20px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        install-touch := TouchArea {
+                            clicked => { root.install-requested(); }
+                        }
+                    }
+                }
+
+                Rectangle { height: 1px; background: #2a2f38; }
+
+                Text {
+                    text: "Installed";
+                    color: #8b93a1;
+                    font-size: 12px;
+                    font-weight: 600;
+                }
+
+                // The list scrolls; each row is a whole-width hit target.
+                ScrollView {
+                    vertical-stretch: 1;
+                    for app[i] in root.apps : Rectangle {
+                        height: 56px;
+                        border-radius: 10px;
+                        background: root.selected == i
+                            ? #2a3340
+                            : (row-touch.has-hover ? #232830 : transparent);
+
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            spacing: 10px;
+                            vertical-alignment: center;
+
+                            Rectangle {
+                                width: 8px;
+                                height: 8px;
+                                border-radius: 4px;
+                                background: app.running ? #3ddc84 : #3a404b;
+                            }
+                            VerticalLayout {
+                                vertical-alignment: center;
+                                spacing: 2px;
+                                Text {
+                                    text: app.label;
+                                    color: #e8ebf1;
+                                    font-size: 14px;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: app.package;
+                                    color: #7d8592;
+                                    font-size: 11px;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+                        row-touch := TouchArea {
+                            clicked => { root.selected = i; }
+                        }
+                    }
+                }
+
+                Text {
+                    text: "Drop an .apk here or press +";
+                    color: #6b7280;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------- detail
+        Rectangle {
+            background: #14161a;
+            VerticalLayout {
+                padding: 24px;
+                spacing: 16px;
+
+                if root.selected >= 0 && root.selected < root.apps.length : VerticalLayout {
+                    spacing: 6px;
+                    Text {
+                        text: root.apps[root.selected].label;
+                        color: #f2f4f8;
+                        font-size: 24px;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: root.apps[root.selected].package + "  ·  " + root.apps[root.selected].activity;
+                        color: #8b93a1;
+                        font-size: 12px;
+                    }
+                }
+
+                Rectangle { height: 1px; background: #232830; }
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    enabled: root.selected >= 0;
+
+                    Rectangle {
+                        width: 120px;
+                        height: 40px;
+                        border-radius: 10px;
+                        background: launch-touch.has-hover ? #3b82f6 : #2f6feb;
+                        Text {
+                            text: "Launch";
+                            color: #ffffff;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        launch-touch := TouchArea {
+                            clicked => { root.launch-requested(root.selected); }
+                        }
+                    }
+                    Rectangle {
+                        width: 120px;
+                        height: 40px;
+                        border-radius: 10px;
+                        background: stop-touch.has-hover ? #3a404b : #262b33;
+                        Text {
+                            text: "Stop";
+                            color: #e8ebf1;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        stop-touch := TouchArea {
+                            clicked => { root.stop-requested(root.selected); }
+                        }
+                    }
+                    Rectangle {
+                        width: 140px;
+                        height: 40px;
+                        border-radius: 10px;
+                        background: remove-touch.has-hover ? #7f1d1d : #3b1d1d;
+                        Text {
+                            text: "Uninstall";
+                            color: #fca5a5;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        remove-touch := TouchArea {
+                            clicked => { root.uninstall-requested(root.selected); }
+                        }
+                    }
+                }
+
+                Rectangle { height: 1px; background: #232830; }
+
+                Text {
+                    text: "In-game";
+                    color: #8b93a1;
+                    font-size: 12px;
+                    font-weight: 600;
+                }
+
+                HorizontalLayout {
+                    spacing: 24px;
+                    CheckBox {
+                        text: "Keymapper";
+                        checked: root.keymapper-on;
+                        toggled => { root.keymapper-toggled(self.checked); }
+                    }
+                    CheckBox {
+                        text: "FPS meter";
+                        checked: root.fps-meter-on;
+                        toggled => { root.fps-meter-toggled(self.checked); }
+                    }
+                }
+
+                Rectangle { vertical-stretch: 1; }
+
+                Text {
+                    text: root.status;
+                    color: #7d8592;
+                    font-size: 12px;
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------- close confirmation
+    if root.confirm-close : Rectangle {
+        background: #00000080;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 420px;
+                border-radius: 14px;
+                background: #1b1e24;
+                VerticalLayout {
+                    padding: 24px;
+                    spacing: 16px;
+                    Text {
+                        text: "Quit PenguDroid?";
+                        color: #f2f4f8;
+                        font-size: 18px;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: root.running-count == 1
+                            ? "1 app is still running. Quitting stops it."
+                            : (root.running-count + " apps are still running. Quitting stops them all.");
+                        color: #a8b0bd;
+                        font-size: 13px;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            height: 38px;
+                            border-radius: 10px;
+                            background: cancel-touch.has-hover ? #2a2f38 : #232830;
+                            Text {
+                                text: "Cancel";
+                                color: #e8ebf1;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            cancel-touch := TouchArea {
+                                clicked => { root.confirm-close-no(); }
+                            }
+                        }
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            height: 38px;
+                            border-radius: 10px;
+                            background: quit-touch.has-hover ? #b91c1c : #991b1b;
+                            Text {
+                                text: "Quit all";
+                                color: #ffffff;
+                                font-weight: 600;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            quit-touch := TouchArea {
+                                clicked => { root.confirm-close-yes(); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
