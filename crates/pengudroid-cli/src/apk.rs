@@ -283,6 +283,34 @@ pub fn extract_named_bytes(data: &[u8], name: &str) -> Result<Vec<u8>, String> {
     extract_entry(data, entry)
 }
 
+/// Whether `class_name` is defined by any `classes*.dex` in the APK at `path`.
+///
+/// `art-test` uses this to drop manifest components the APK does not actually
+/// ship. Roblox declares a `<provider>` for a GMA feature split that the
+/// `3arch` bundle omits, and `ActivityThread.installContentProviders` treats the
+/// resulting `ClassNotFoundException` as fatal for the whole bind — so the app
+/// never got past `handleBindApplication`.
+///
+/// A dex class's type descriptor (`Lpkg/Name;`) lives in the string pool, so a
+/// byte search finds every class the APK defines.
+pub fn contains_class(path: &str, class_name: &str) -> bool {
+    let Ok(data) = std::fs::read(path) else {
+        return false;
+    };
+    let Ok(entries) = read_central_directory(&data) else {
+        return false;
+    };
+    let needle = format!("L{};", class_name.replace('.', "/"));
+    let needle = needle.as_bytes();
+    for entry in entries.iter().filter(|e| e.name.ends_with(".dex")) {
+        let Ok(bytes) = extract_entry(&data, entry) else { continue };
+        if bytes.windows(needle.len()).any(|w| w == needle) {
+            return true;
+        }
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Binary XML (AXML)
 // ---------------------------------------------------------------------------

@@ -51,6 +51,15 @@ use crate::jni::{JClass, JFieldId, JMethodId, JObject, JValue, JniEnv};
 pub struct AppSpec<'a> {
     pub package: &'a str,
     pub apk: &'a Path,
+    /// Additional APKs of a split bundle (`.apkm`/`.xapk` `config.<abi>` etc.).
+    ///
+    /// They are not just native libraries: a split can also carry dex. The app's
+    /// `PathClassLoader` is built from `ApplicationInfo.sourceDir` plus
+    /// `splitSourceDirs`, so without this a class that lives in the split is
+    /// invisible — which is how Roblox died, with
+    /// "ClassNotFoundException: com.roblox.client.gmasdk...GmaWebViewInitializerProvider"
+    /// for a provider its own manifest declares.
+    pub splits: &'a [std::path::PathBuf],
     pub data_dir: &'a Path,
     pub native_lib_dir: &'a Path,
     pub target_sdk: i32,
@@ -111,6 +120,31 @@ fn build_app_info(env: &JniEnv, spec: &AppSpec<'_>) -> Option<JObject> {
     }
     set_str("sourceDir", &spec.apk.display().to_string());
     set_str("publicSourceDir", &spec.apk.display().to_string());
+    // A split bundle's other APKs go into `splitSourceDirs`, which is what
+    // `LoadedApk.createOrUpdateClassLoaderLocked` appends to the dex path. Without
+    // this, every class that lives in a split is "not found" even though the file
+    // is right there.
+    if !spec.splits.is_empty() {
+        let joined: Vec<String> = spec.splits.iter().map(|p| p.display().to_string()).collect();
+        let text = joined.join(":");
+        match env.field_id(class, "splitSourceDirs", "[Ljava/lang/String;") {
+            Some(id) => match env.string_array(&joined) {
+                Some(arr) => {
+                    env.set_object_field(info, id, arr);
+                    println!("apphost: ApplicationInfo.splitSourceDirs = {text}");
+                }
+                None => eprintln!("apphost: could not build splitSourceDirs"),
+            },
+            None => eprintln!("apphost: ApplicationInfo.splitSourceDirs not found"),
+        }
+        // `splitPublicSourceDirs` mirrors it for callers that only look at public
+        // paths (package manager dumps, some asset loaders).
+        if let Some(id) = env.field_id(class, "splitPublicSourceDirs", "[Ljava/lang/String;") {
+            if let Some(arr) = env.string_array(&joined) {
+                env.set_object_field(info, id, arr);
+            }
+        }
+    }
     set_str("dataDir", &spec.data_dir.display().to_string());
     // `ContextImpl.createDeviceProtectedStorageContext()` resolves its data
     // directory through `LoadedApk.getDeviceProtectedDataDirFile()`, which is

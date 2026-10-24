@@ -1693,15 +1693,42 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) {
     if extracted > 0 {
         println!("apphost: extracted {extracted} x86_64 native libraries");
     }
+    // Every `--classpath` after the first is a split of the same bundle, so it
+    // belongs on the app's class path, not just in the native library search.
+    let splits: Vec<std::path::PathBuf> = classpath
+        .iter()
+        .skip(1)
+        .map(|p| std::path::PathBuf::from(p))
+        .collect();
+    // Drop providers whose class the APK does not ship. A missing one makes
+    // `installContentProviders` throw, which aborts the whole
+    // `handleBindApplication`; a split-based bundle can legitimately lack a
+    // feature split that its manifest still names.
+    let usable_providers: Vec<crate::apk::Component> = info
+        .providers
+        .iter()
+        .filter(|p| {
+            let present = classpath.iter().any(|a| crate::apk::contains_class(a, &p.name));
+            if !present {
+                println!(
+                    "apphost: skipping provider {} (class not in the APK)",
+                    p.name
+                );
+            }
+            present
+        })
+        .cloned()
+        .collect();
     let spec = crate::apphost::AppSpec {
         package: &package,
         apk: &apk_path,
+        splits: &splits,
         data_dir: &data_dir,
         native_lib_dir: &lib_dir,
         target_sdk: info.target_sdk.map(|v| v as i32).unwrap_or(35),
         min_sdk: info.min_sdk.map(|v| v as i32).unwrap_or(23),
         app_class: info.application_class.as_deref(),
-        providers: &info.providers,
+        providers: &usable_providers,
         // `ActivityInfo.theme` decides whether AppCompat accepts the activity:
         // with no theme the framework falls back to the platform default and
         // `setContentView` throws "You need to use a Theme.AppCompat theme".
