@@ -657,6 +657,36 @@ pub fn parse_axml(data: &[u8]) -> Result<ApkInfo, String> {
                     "intent-filter" => {
                         frame.is_intent = true;
                     }
+                    // `<activity-alias>` is how a manifest names its launcher
+                    // without putting MAIN/LAUNCHER on the activity itself —
+                    // Roblox's `ActivitySplash` is only reachable that way. The
+                    // alias becomes an activity entry pointing at
+                    // `android:targetActivity`, because `ActivityThread` needs a
+                    // real class to instantiate (there is no package manager here
+                    // to resolve aliases at launch time).
+                    "activity-alias" => {
+                        let target = attr_str(&pool, &attrs, "targetActivity")
+                            .map(|t| info.resolve(&t))
+                            .or_else(|| attr_str(&pool, &attrs, "name").map(|n| info.resolve(&n)));
+                        if let Some(resolved) = target {
+                            let explicit = attr_bool(&attrs, "exported");
+                            let component = Component {
+                                name: resolved.clone(),
+                                exported: explicit.unwrap_or(true),
+                                is_launcher: false,
+                                theme: attr_ref(&attrs, "theme"),
+                                authority: None,
+                                grant_uri_permissions: false,
+                                meta: Vec::new(),
+                            };
+                            info.activities.push(component);
+                            let idx = info.activities.len() - 1;
+                            frame.resolved_name = Some(resolved);
+                            frame.comp_index = Some(idx);
+                            frame.comp_kind = Some(CompKind::Activity);
+                            frame.explicit_exported = explicit;
+                        }
+                    }
                     "meta-data" => {
                         frame.meta_name = attr_str(&pool, &attrs, "name");
                         frame.meta_value = attr_meta_value(&pool, &attrs);

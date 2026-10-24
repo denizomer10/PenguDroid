@@ -270,6 +270,11 @@ pub fn launch(args: &[String]) -> i32 {
     // the architecture we intend to use, and the OBB payload. Everything after
     // this point works on an ordinary APK path.
     let mut app_path = apk_path.clone();
+    // Every other member of a split bundle has to reach the app's class path as
+    // well: a `config.<abi>` split carries native libraries, but Roblox's bundle
+    // layout also names components that live beside the base. `art-test` puts
+    // each extra `--classpath` into `ApplicationInfo.splitSourceDirs`.
+    let mut split_paths: Vec<String> = Vec::new();
     if crate::bundle::is_bundle(std::path::Path::new(&apk_path)) {
         match crate::bundle::Bundle::open(std::path::Path::new(&apk_path)) {
             Ok(b) => {
@@ -283,6 +288,12 @@ pub fn launch(args: &[String]) -> i32 {
                         }
                         if let Some(base) = written.first() {
                             app_path = base.display().to_string();
+                        }
+                        for extra in written.iter().skip(1) {
+                            split_paths.push(extra.display().to_string());
+                        }
+                        if !split_paths.is_empty() {
+                            println!("  splits  : {}", split_paths.len());
                         }
                     }
                     Err(e) => {
@@ -334,13 +345,16 @@ pub fn launch(args: &[String]) -> i32 {
                 .arg("--sysroot")
                 .arg(&sysroot)
                 .arg("--classpath")
-                .arg(&app_path)
-                // The framework's JNI natives live in libandroid_runtime.so and
-                // are registered by calling every exported `register_*` entry
-                // point, which is what app_process does. libhwui.so registers the
-                // renderer's natives (`ThreadedRenderer`, `RenderNode`), without
-                // which hardware drawing cannot start.
-                .arg("--register-natives")
+                .arg(&app_path);
+            for split in &split_paths {
+                cmd.arg("--classpath").arg(split);
+            }
+            // The framework's JNI natives live in libandroid_runtime.so and
+            // are registered by calling every exported `register_*` entry
+            // point, which is what app_process does. libhwui.so registers the
+            // renderer's natives (`ThreadedRenderer`, `RenderNode`), without
+            // which hardware drawing cannot start.
+            cmd.arg("--register-natives")
                 .arg("libandroid_runtime.so,libhwui.so");
             let main = component.clone().unwrap_or_else(|| {
                 // An Activity has no `main(String[])`; the closest honest entry
@@ -394,8 +408,15 @@ fn bundle_abi(b: &crate::bundle::Bundle, backend: Backend) -> Option<String> {
             }
         }
         Backend::Art => {
-            if b.abis.iter().any(|a| a == "arm64-v8a") {
-                Some("arm64-v8a".to_string())
+            // Prefer the host ABI. Picking `arm64-v8a` here (as this used to) is
+            // exactly backwards on an x86_64 host: without a working ARM
+            // translator the arm64 split's native libraries cannot be loaded, and
+            // the x86_64 split — the one that actually contains `libroblox.so` —
+            // is never even extracted, so every `native*` method becomes an
+            // `UnsatisfiedLinkError`.
+            let host = crate::nativelib::host_abi();
+            if b.abis.iter().any(|a| a == host) {
+                Some(host.to_string())
             } else {
                 b.abis.first().cloned()
             }

@@ -1677,7 +1677,13 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) {
     // ActivitySplash dies on its first one).
     let mut extracted = 0usize;
     for apk in classpath {
-        let Ok(libs) = crate::apk::native_libs(apk) else { continue };
+        let libs = match crate::apk::native_libs(apk) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("apphost: cannot list native libraries of {apk}: {e}");
+                continue;
+            }
+        };
         for lib in libs.iter().filter(|l| l.abi == "x86_64") {
             let dest = lib_dir.join(&lib.file);
             if dest.exists() {
@@ -1692,6 +1698,15 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) {
     }
     if extracted > 0 {
         println!("apphost: extracted {extracted} x86_64 native libraries");
+    } else {
+        // Printed even when nothing came out: an empty `lib/` is exactly what
+        // makes `System.loadLibrary("roblox")` fail silently and every
+        // `native*` method an UnsatisfiedLinkError, and a silent zero here hid
+        // that for a whole session.
+        eprintln!(
+            "apphost: no x86_64 native libraries extracted (classpath: {})",
+            classpath.join(":")
+        );
     }
     // Every `--classpath` after the first is a split of the same bundle, so it
     // belongs on the app's class path, not just in the native library search.
