@@ -3173,6 +3173,67 @@ fn install_provider_replies(env: &JniEnv, app_info: JObject, package: &str) {
             install_reply(&data, "__pengudroid_binder_set_empty_bundle");
         }
     }
+    install_settings_replies(env);
+}
+
+/// The `Settings.Secure`/`Global` keys a device has to answer.
+///
+/// These are the ones apps actually read during startup. `android_id` is the
+/// load-bearing one: Roblox reads it in `ActivitySplash.onCreate`
+/// (`Settings.Secure.getString(cr, "android_id")`) and keeps it in a static for
+/// the rest of the process, so a null there is a device without an identity.
+/// The rest are cheap to answer and stop apps falling back to "unknown".
+const SETTINGS_VALUES: &[(&str, &str)] = &[
+    ("android_id", "a1b2c3d4e5f60718"),
+    ("device_name", "PenguDroid"),
+    ("bluetooth_name", "PenguDroid"),
+    ("adb_enabled", "0"),
+    ("device_provisioned", "1"),
+    ("user_setup_complete", "1"),
+];
+
+/// Install one marshalled `Bundle` per `Settings` key.
+///
+/// `Settings.NameValueCache.getStringForUser` asks the provider with
+/// `call("GET_secure", key, null)` and reads `reply.getString(key)`, so the
+/// reply Bundle has to carry that key.
+fn install_settings_replies(env: &JniEnv) {
+    for (key, value) in SETTINGS_VALUES {
+        let Some((bundle_class, bundle)) = new_instance(env, "android/os/Bundle") else {
+            return;
+        };
+        let Some(put) = env.method_id(
+            bundle_class,
+            "putString",
+            "(Ljava/lang/String;Ljava/lang/String;)V",
+        ) else {
+            return;
+        };
+        let k = env.new_string(key);
+        let v = env.new_string(value);
+        env.call_void(bundle, put, &[JValue { l: k }, JValue { l: v }]);
+        let Some(data) = marshal_object(env, bundle, "android/os/Bundle") else {
+            continue;
+        };
+        install_setting(key, &data);
+    }
+}
+
+/// Hand one key's marshalled `Bundle` to the binder broker.
+fn install_setting(key: &str, data: &[u8]) {
+    // SAFETY: the shim is loaded in this process and copies both buffers.
+    unsafe {
+        let name = std::ffi::CString::new("__pengudroid_binder_set_setting").ok();
+        let Some(name) = name else { return };
+        let sym = libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr());
+        if sym.is_null() {
+            eprintln!("apphost: binder broker does not export __pengudroid_binder_set_setting");
+            return;
+        }
+        type Install = unsafe extern "C" fn(*const u8, usize, *const u8, usize);
+        let install: Install = std::mem::transmute(sym);
+        install(key.as_ptr(), key.len(), data.as_ptr(), data.len());
+    }
 }
 
 /// Give the `ActivityThread` an empty core-settings `Bundle` if it has none.

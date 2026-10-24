@@ -25,6 +25,8 @@ typedef unsigned int __pd_mode_t;
 /* Provided by rootfs.rs and binder.rs. */
 extern char *__pengudroid_map_path(const char *path);
 extern void __pengudroid_free_path(char *p);
+extern void __pengudroid_note_open(const char *path, int err);
+extern int *__errno_location(void);
 extern int __pengudroid_binder_open(const char *path);
 extern long __pengudroid_binder_ioctl(int fd, unsigned long request, void *arg);
 extern void __pengudroid_binder_mapping(int fd, void *addr, unsigned long len);
@@ -71,6 +73,9 @@ static int pd_openat(int dirfd, const char *path, int flags, __pd_mode_t mode) {
     char *mapped = __pengudroid_map_path(path);
     const char *p = mapped != 0 ? mapped : path;
     long r = syscall(PD_SYS_OPENAT, dirfd, p, flags, mode);
+    if (r < 0) {
+        __pengudroid_note_open(p, *__errno_location());
+    }
     __pengudroid_free_path(mapped);
     return (int)r;
 }

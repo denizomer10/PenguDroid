@@ -127,6 +127,52 @@ Native motor çalışıyor ve `StartupController` ~2.5 sn'de bitiyor, ama **4** 
   log dosyasına düşmedi). Flag cache imzalı/derlenmiş bir dosya
   (`[DFLog::FlagCache]`) — yolunu bulmak ayrı bir iş.
 
+### `Settings` sağlayıcısı artık gerçek değer dönüyor
+
+Eskiden her anahtara boş `Bundle` dönüyordu ve `Settings.Secure.getString`
+null veriyordu. Artık host, anahtar başına gerçek bir `Bundle` marshallayıp
+`__pengudroid_binder_set_setting` ile kuruyor; shim `IContentProvider.call`
+parcel'ında anahtarı eşleyip o Bundle'ı dönüyor (`SETTING_ENTRIES`).
+
+Kurulan anahtarlar (`apphost::SETTINGS_VALUES`): `android_id`,
+`device_name`, `bluetooth_name`, `adb_enabled`, `device_provisioned`,
+`user_setup_complete`.
+
+Doğrulama: Roblox `ActivitySplash.onCreate` içinde
+`Settings.Secure.getString(cr, "android_id")` çağırıyor (`sg.a1.g0`);
+öncesinde `ClassCastException` atıyordu, artık hiç atmıyor (`grep -c sg.a1.g0`:
+önce 1, sonra 0). **Ama `stage` değişmedi** — yani device-init'in derdi
+`android_id` değildi.
+
+### Denenip işe yaramayan şeyler (tekrar denemeyin)
+
+* **Jump-table yaması.** `stage 4` girişini (`0xd31408`, .rodata) doğrudan
+  `stage 2` işleyicisine (`0x61401f4`) çevirmek **hiçbir şeyi değiştirmedi**:
+  bildirim yine `result: 1` geldi. Yani JSON'u üreten şey o switch değil;
+  switch'ten *önce* çalışıyor. (Yama geri alındı; `libroblox.so` orijinal hâlinde.)
+* **`appData/ClientSettings/ClientAppSettings.json`** yazmak: Roblox okumadı.
+* **Temiz durum** (data + `appData` silinip yeniden): `stage` hâlâ 4.
+
+### `stage` senkron karar (önemli ipucu)
+
+Temiz durumda bildirim **0.33 s**'de geliyor (önbellekli durumda 2.5 s).
+Yani `stage` bir ağ görevinin başarısızlığından değil, `StartupController`
+kurulurken **anında** verilen bir karardan geliyor. Ağ görevleri (BTID,
+app-version) bu karardan *sonra* çalışacaktı; bu yüzden hiç istek atmıyorlar.
+
+Bu, `StartedFor` / `INIT_STATE_NONE` hattını öne çıkarıyor:
+hem splash hem native main yolunda `InitHelper` 
+`initState = INIT_STATE_NONE, StartedFor: SYSTEM` diyor ve `StartedForEnum.SYSTEM`
+framework'te *varsayılan* değer (`sget-object … SYSTEM`), yani activity'ye hiçbir
+başlangıç sebebi geçmemiş oluyor.
+
+### Yeni teşhis anahtarı: `PENGUDROID_TRACE_OPEN`
+
+Başarısız `open`/`openat` çağrılarını (path + `errno`, her yol için bir kez)
+stderr'e yazar. Bu oturumda Roblox'un eksik dosya yüzünden düşmediğini
+gösterdi: sysroot lib aramaları, `primary.prof`, `tzdata` dışında kayda değer
+bir `ENOENT` yok.
+
 ### Sıradaki adım (öncelik sırasıyla)
 
 1. **`stage = 4`'ü 2 yapan koşulu bulmak.** En kısa yol: `ptrace` tabanlı küçük

@@ -645,6 +645,20 @@ static PROVIDER_INFO: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
 static EMPTY_BUNDLE: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
+/// Per-key `Bundle` replies for `Settings.Secure/Global/System.getString`.
+///
+/// The framework asks the `settings` provider with
+/// `IContentProvider.call("GET_secure", <key>, …)` and reads
+/// `reply.getString(<key>)`. There is no provider here, so the host installs a
+/// marshalled `Bundle` per key with [`__pengudroid_binder_set_setting`].
+///
+/// A few keys are load-bearing rather than cosmetic: Roblox reads
+/// `Settings.Secure.getString(cr, "android_id")` in `ActivitySplash.onCreate`
+/// and keeps the result for the whole process, so returning null there is a
+/// device that has no identity at all.
+static SETTING_ENTRIES: std::sync::LazyLock<std::sync::Mutex<Vec<(String, Vec<u8>)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
 /// `IThermalService` transaction codes, read out of the framework's own
 /// `android.os.IThermalService$Stub` static fields (`--dump-class`).
 ///
@@ -957,7 +971,7 @@ fn push_flat_fd(parcel: &mut Vec<u8>, objects: &mut Vec<u64>, fd: RawFd) {
 /// empty `Bundle` for `call`, `0` rows for the mutators. The shapes come from
 /// `ContentProviderNative.onTransact` and `ContentProviderProxy` in this
 /// framework.jar, not from guesswork.
-fn provider_reply(code: u32, parcel: &mut Vec<u8>, objects: &mut Vec<u64>) {
+fn provider_reply(code: u32, data: Option<&[u8]>, parcel: &mut Vec<u8>, objects: &mut Vec<u64>) {
     // The status word was already written by `make_reply`; writing another one
     // here shifts every result by four bytes, which turns the `call` reply's
     // `Bundle` into an empty one (`readBundle` reads the extra zero as a length)
@@ -981,11 +995,28 @@ fn provider_reply(code: u32, parcel: &mut Vec<u8>, objects: &mut Vec<u64>) {
             parcel.extend_from_slice(&0u32.to_ne_bytes()); // no window
         }
         ICP_CALL => {
-            let bundle = EMPTY_BUNDLE.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            if bundle.is_empty() {
-                parcel.extend_from_slice(&(-1i32).to_ne_bytes()); // null Bundle
-            } else {
-                parcel.extend_from_slice(&bundle);
+            // `Settings.NameValueCache` calls with the key as the `arg`
+            // argument and reads `bundle.getString(key)`; `getStringsForPrefix`
+            // asks for a prefix instead and expects a `HashMap` under "value".
+            // Match the parcel against the keys the host installed rather than
+            // trying to parse the AIDL argument order.
+            let matched = data.and_then(|data| {
+                let entries = SETTING_ENTRIES.lock().unwrap_or_else(|e| e.into_inner());
+                entries
+                    .iter()
+                    .find(|(key, _)| parcel_contains_utf16(data, key))
+                    .map(|(_, bytes)| bytes.clone())
+            });
+            match matched {
+                Some(bytes) if !bytes.is_empty() => parcel.extend_from_slice(&bytes),
+                _ => {
+                    let bundle = EMPTY_BUNDLE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    if bundle.is_empty() {
+                        parcel.extend_from_slice(&(-1i32).to_ne_bytes()); // null Bundle
+                    } else {
+                        parcel.extend_from_slice(&bundle);
+                    }
+                }
             }
         }
         ICP_GET_TYPE => parcel.extend_from_slice(&(-1i32).to_ne_bytes()), // null String
@@ -1835,7 +1866,15 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         }
     }
     if tr.target_handle == handle_for("settings_provider") {
-        provider_reply(tr.code, &mut parcel, &mut objects);
+        let data = if tr.data_size > 0 && tr.data_ptr != 0 {
+            Some(std::slice::from_raw_parts(
+                tr.data_ptr as *const u8,
+                tr.data_size as usize,
+            ))
+        } else {
+            None
+        };
+        provider_reply(tr.code, data, &mut parcel, &mut objects);
     }
     if tr.target_handle == handle_for("empty_cursor") {
         // `BulkCursorToCursorAdaptor.close()` and `.getWindow()` are the only
@@ -2679,6 +2718,33 @@ pub unsafe extern "C" fn __pengudroid_binder_set_empty_bundle(ptr: *const u8, le
     *EMPTY_BUNDLE.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
 }
 
+/// `void __pengudroid_binder_set_setting(const char *key, size_t key_len,
+///                                      const uint8_t *bytes, size_t len)`
+///
+/// # Safety
+/// `key` must point to `key_len` readable bytes and `bytes` to `len` readable
+/// bytes.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_setting(
+    key: *const u8,
+    key_len: usize,
+    ptr: *const u8,
+    len: usize,
+) {
+    if key.is_null() || key_len == 0 || ptr.is_null() || len == 0 {
+        return;
+    }
+    let Ok(name) = std::str::from_utf8(std::slice::from_raw_parts(key, key_len)) else {
+        return;
+    };
+    let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
+    let mut entries = SETTING_ENTRIES.lock().unwrap_or_else(|e| e.into_inner());
+    match entries.iter_mut().find(|(k, _)| k == name) {
+        Some(slot) => slot.1 = bytes,
+        None => entries.push((name.to_string(), bytes)),
+    }
+}
+
 /// `void __pengudroid_binder_set_display_info(const uint8_t *bytes, size_t len)`
 ///
 /// # Safety
@@ -2840,6 +2906,38 @@ mod tests {
         let reply = unsafe { make_reply(&tr, 1) };
         assert_eq!(reply.parcel.len(), 8);
         assert_eq!(&reply.parcel[4..8], &0u32.to_ne_bytes());
+    }
+
+    /// `Settings.NameValueCache` reads `Bundle.getString(key)` from the
+    /// provider's `call` reply, so the reply has to be the Bundle installed for
+    /// *that* key — an empty one makes every setting read return null.
+    #[test]
+    fn settings_answer_the_requested_key() {
+        let key = "android_id";
+        let value = vec![0xde, 0xad, 0xbe, 0xef];
+        // SAFETY: both slices outlive the call.
+        unsafe {
+            __pengudroid_binder_set_setting(
+                key.as_ptr(),
+                key.len(),
+                value.as_ptr(),
+                value.len(),
+            );
+        }
+        let data: Vec<u8> = key.encode_utf16().flat_map(|u| u.to_ne_bytes()).collect();
+        let mut parcel = Vec::new();
+        let mut objects = Vec::new();
+        provider_reply(ICP_CALL, Some(&data), &mut parcel, &mut objects);
+        assert_eq!(parcel, value);
+
+        // A key nobody installed must not borrow another key's Bundle.
+        let data: Vec<u8> = "no_such_setting"
+            .encode_utf16()
+            .flat_map(|u| u.to_ne_bytes())
+            .collect();
+        let mut parcel = Vec::new();
+        provider_reply(ICP_CALL, Some(&data), &mut parcel, &mut objects);
+        assert_ne!(parcel, value);
     }
 
     /// A one-way transaction must still be acknowledged.

@@ -150,6 +150,39 @@ fn trace_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("PENGUDROID_TRACE_ROOTFS").is_some())
 }
 
+/// Report an `open`/`openat` that failed, when `PENGUDROID_TRACE_OPEN` is set.
+///
+/// A guest that silently gives up on a missing resource is the hardest kind of
+/// bug to see: the failure is one `errno` inside native code that logs nothing.
+/// This lists each distinct path exactly once, so a full run costs a few hundred
+/// lines instead of one per retry. Host paths that legitimately come and go
+/// (`/proc`, `/sys`, `/dev`) are skipped.
+///
+/// `err` is the `errno` captured right after the syscall.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_note_open(path: *const c_char, err: c_int) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("PENGUDROID_TRACE_OPEN").is_some()) {
+        return;
+    }
+    if path.is_null() {
+        return;
+    }
+    let p = CStr::from_ptr(path).to_string_lossy().into_owned();
+    for skip in ["/proc/", "/sys/", "/dev/", "/tmp/pengudroid-art-"] {
+        if p.starts_with(skip) {
+            return;
+        }
+    }
+    static SEEN: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let mut guard = seen.lock().unwrap_or_else(|e| e.into_inner());
+    if !guard.insert(p.clone()) {
+        return;
+    }
+    eprintln!("[rootfs] open failed (errno {err}): {p}");
+}
+
 /// `RTLD_NEXT` — search after this object.
 const RTLD_NEXT: *mut c_void = -1isize as *mut c_void;
 
