@@ -3,7 +3,60 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
-## Bu oturum: girdi çalışıyor; Roblox bind+launch+resume'a ulaştı
+## Bu oturum: Roblox AÇILIYOR (splash'ı çiziyor)
+
+```
+$ pengudroid launch com.roblox.client_*.apkm --sysroot .toolchain/sysroot
+  bundle  : apkm (2 members)
+  splits  : 1
+  activity: com.roblox.client.startup.ActivitySplash
+  assets  : 87777660 byte(s)
+handleBindApplication  → returned normally
+handleLaunchActivity   → returned an Activity
+handleResumeActivity   → returned
+Looper.loop()          → ayakta, çökme yok
+```
+
+90 saniyelik koşuda **4429 kare sunuldu**, RSS ~380 MB, CPU ~%22. Ekran
+görüntüsü: `docs/assets/rbx-frame120.png` — Roblox'un kendi splash ekranı
+(logosu + "Loading..."), doğru yönde, 720x1280.
+
+### Bu oturumu açan düzeltme: CWD = asset kökü
+
+Roblox `content/guac/defaultConfigs/GuacDefaultPolicy-GlobalDist.json` yolunu
+**göreli** açıyor, yani süreç çalışma dizinine göre. Açma başarısız olunca
+config haritası boş kalıyor, sonraki lookup null dönüyor ve
+`libroblox.so + 0x224e4af` onu dereference ediyor (iki oturumdur bu duraktaydı).
+`launch` artık APK'nın `assets/` ağacını prefix altına bir kez çıkarıp misafiri
+o dizinde çalıştırıyor; misafire verilen tüm yollar da mutlaklaştırılıyor.
+
+### Yol boyunca yıkılan diğer duvarlar
+
+1. **`ApplicationInfo.splitSourceDirs` hiç set edilmiyordu** — `PathClassLoader`
+   yalnızca `base.apk`'ı görüyordu, split'teki sınıflar "not found" idi.
+2. **`installContentProviders` eksik sınıfta ölümcül** — manifest'te adı geçen
+   ama APK'da olmayan provider artık `apk::contains_class` ile atlanıyor.
+3. **`<activity-alias>` parse edilmiyordu** — Roblox launcher'ı yalnızca alias ile
+   işaretliyor; `launch` "no launcher activity" diyordu.
+4. **Split ABI seçimi tersti** — ART backend `arm64-v8a`'yı tercih ediyordu, yani
+   x86_64 host'ta yanlış split açılıyor, `libroblox.so` (136 MB) hiç
+   çıkarılmıyordu ve her native metod `UnsatisfiedLinkError` oluyordu.
+   Artık host ABI tercih ediliyor.
+
+### Şu anki tam durak noktası
+
+Splash'ta kalıyor: ~75 saniye sonra bile aynı "Loading..." karesi (frame 900 de
+aynı). Ama süreç ölü değil — **%22 CPU** ile meşgul. Ağ çalışıyor: HTTPS/2 ile
+2 istek gitti, 2 cevap geldi; `AndroidAppSettings: Network won the race` ve
+`fastflag_load_success` loglanıyor, sonra `ShellConfigurationContentProvider`
+kendi config'ini okuyor. Login/CoreScript/gamejoin izi **yok**.
+
+Sıradaki adım: %22 CPU'nun nereye gittiğini bulmak — splash sonrası hangi iş
+parçacığının döndüğünü `PENGUDROID_DEBUG_WRAP="/tmp/findclass_bp 0"` ile veya
+`/proc/<pid>/task/*/stat` örnekleyerek izlemek. Muhtemel adaylar: Lua/CoreScript
+payload'ının yüklenmesi, ya da bir WebView/servis bekleyişi.
+
+### Bu oturumdaki girdi düzeltmesi (önceki başlık)
 
 ### Girdi (tıklama / gezinme) — ÇÖZÜLDÜ
 
