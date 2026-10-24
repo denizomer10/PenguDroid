@@ -5,6 +5,8 @@
 // palette is deliberately dark and flat: the app is a launcher for games, and a
 // light theme fights with the game's own colours.
 
+import { ScrollView, CheckBox } from "std-widgets.slint";
+
 export struct AppEntry {
     package: string,
     label: string,
@@ -104,7 +106,7 @@ export component MainWindow inherits Window {
                             padding-left: 12px;
                             padding-right: 12px;
                             spacing: 10px;
-                            vertical-alignment: center;
+                            alignment: center;
 
                             Rectangle {
                                 width: 8px;
@@ -113,7 +115,7 @@ export component MainWindow inherits Window {
                                 background: app.running ? #3ddc84 : #3a404b;
                             }
                             VerticalLayout {
-                                vertical-alignment: center;
+                                alignment: center;
                                 spacing: 2px;
                                 Text {
                                     text: app.label;
@@ -170,7 +172,6 @@ export component MainWindow inherits Window {
 
                 HorizontalLayout {
                     spacing: 10px;
-                    enabled: root.selected >= 0;
 
                     Rectangle {
                         width: 120px;

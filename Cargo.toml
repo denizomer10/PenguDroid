@@ -4,6 +4,7 @@ members = [
     "crates/pengudroid-proto",
     "crates/pengudroid-socket",
     "crates/pengudroid-input",
+    "crates/pengudroid-gui",
     "crates/pengudroid-elf",
     "crates/pengudroid-hostgpu",
     "crates/pengudroid-gleshim",

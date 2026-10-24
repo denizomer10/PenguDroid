@@ -1,0 +1,10 @@
+# The GUI's dependency tree (Slint and its renderer) tracks recent rustc;
+# the rest of the workspace builds on 1.75+. Pinning one toolchain for the whole
+# tree keeps `cargo build --workspace` honest — otherwise the GUI would only
+# build with an explicit `+stable`.
+#
+# Install it with:
+#   rustup toolchain install stable --profile minimal
+[toolchain]
+channel = "stable"
+profile = "minimal"
