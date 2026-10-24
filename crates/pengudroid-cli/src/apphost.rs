@@ -1308,6 +1308,14 @@ fn spawn_input_pump(env: &JniEnv) {
             return;
         };
         let set_axis_value = env.method_id(motion_class, "setAxisValue", "(IF)V");
+        let Some(key_class) = env.find_class("android/view/KeyEvent") else {
+            return;
+        };
+        // `KeyEvent(int action, int code)` is the simplest public constructor and
+        // is enough for a text field: repeat/meta/scanCode only matter to games.
+        let Some(key_ctor) = env.method_id(key_class, "<init>", "(II)V") else {
+            return;
+        };
 
         const ACTION_DOWN: i32 = 0;
         const ACTION_UP: i32 = 1;
@@ -1432,6 +1440,41 @@ fn spawn_input_pump(env: &JniEnv) {
             // sign flips. This is what lets the user scroll a feed at all.
             if tag == 5 && a as u8 == 0 {
                 inject_scroll(last.0, last.1, -b);
+                continue;
+            }
+            // Keyboard: `a` is the Linux keycode, `b` is 1 for press.
+            if tag == 6 {
+                let Some(code) = android_keycode(a as u32) else {
+                    continue;
+                };
+                let action = if b != 0.0 { 0 } else { 1 }; // ACTION_DOWN / ACTION_UP
+                let Some(event) = env.new_object(
+                    key_class,
+                    key_ctor,
+                    &[JValue { i: action }, JValue { i: code }],
+                ) else {
+                    continue;
+                };
+                if event.is_null() {
+                    continue;
+                }
+                let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else {
+                    continue;
+                };
+                let roots = env.object_field(wmg, roots_field);
+                if roots.is_null() {
+                    continue;
+                }
+                let count = env.call_int(roots, size_m, &[]).unwrap_or(0);
+                for i in 0..count {
+                    let Some(root) = env.call_object(roots, get_m, &[JValue { i }]) else {
+                        continue;
+                    };
+                    if root.is_null() {
+                        continue;
+                    }
+                    env.call_void(root, dispatch, &[JValue { l: event }]);
+                }
                 continue;
             }
             let (action, x, y) = match tag {
@@ -3353,6 +3396,76 @@ pub fn attach_current_thread(vm: *mut c_void) -> Option<JniEnv> {
     } else {
         Some(JniEnv(env))
     }
+}
+
+/// Map a Linux input keycode (`KEY_*`) to an Android `KeyEvent` key code.
+///
+/// Only the keys a text field needs: letters, digits, space, enter, backspace,
+/// tab, escape and the arrows. Anything else returns `None` and is dropped, which
+/// is better than dispatching the wrong character.
+fn android_keycode(linux: u32) -> Option<i32> {
+    Some(match linux {
+        1 => 111, // KEY_ESC
+        2 => 8,   // KEY_1
+        3 => 9,
+        4 => 10,
+        5 => 11,
+        6 => 12,
+        7 => 13,
+        8 => 14,
+        9 => 15,
+        10 => 16,
+        11 => 7,  // KEY_0
+        12 => 69, // KEY_MINUS
+        13 => 70, // KEY_EQUAL
+        14 => 67, // KEY_BACKSPACE
+        15 => 61, // KEY_TAB
+        // q w e r t y u i o p
+        16 => 45,
+        17 => 51,
+        18 => 33,
+        19 => 46,
+        20 => 48,
+        21 => 53,
+        22 => 49,
+        23 => 37,
+        24 => 43,
+        25 => 44,
+        26 => 71, // KEY_LEFTBRACE
+        27 => 72, // KEY_RIGHTBRACE
+        28 => 66, // KEY_ENTER
+        // a s d f g h j k l
+        30 => 29,
+        31 => 47,
+        32 => 32,
+        33 => 34,
+        34 => 35,
+        35 => 36,
+        36 => 38,
+        37 => 39,
+        38 => 40,
+        39 => 74, // KEY_SEMICOLON
+        40 => 75, // KEY_APOSTROPHE
+        41 => 68, // KEY_GRAVE
+        43 => 73, // KEY_BACKSLASH
+        // z x c v b n m
+        44 => 54,
+        45 => 52,
+        46 => 31,
+        47 => 50,
+        48 => 30,
+        49 => 42,
+        50 => 41,
+        51 => 55,  // KEY_COMMA
+        52 => 56,  // KEY_DOT
+        53 => 76,  // KEY_SLASH
+        57 => 62,  // KEY_SPACE
+        103 => 19, // KEY_UP
+        105 => 21, // KEY_LEFT
+        106 => 22, // KEY_RIGHT
+        108 => 20, // KEY_DOWN
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
