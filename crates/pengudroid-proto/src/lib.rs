@@ -67,6 +67,13 @@ pub enum MsgKind {
     PresentFrame = 62,
     /// Present a GPU-rendered dma-buf on an existing surface (fd via SCM_RIGHTS).
     PresentDmabuf = 63,
+    /// Create a `wl_subsurface` of an existing surface, for a child layer such
+    /// as a `SurfaceView`'s video output.
+    CreateSubsurface = 64,
+    SubsurfaceCreated = 65,
+    /// Move a subsurface inside its parent (parent-local pixels).
+    SetSubsurfacePosition = 66,
+    DestroySurface = 67,
 
     GetProp = 70,
     PropValue = 71,
@@ -121,6 +128,10 @@ impl MsgKind {
             61 => SurfaceCreated,
             62 => PresentFrame,
             63 => PresentDmabuf,
+            64 => CreateSubsurface,
+            65 => SubsurfaceCreated,
+            66 => SetSubsurfacePosition,
+            67 => DestroySurface,
             70 => GetProp,
             71 => PropValue,
             72 => SetProp,
@@ -247,6 +258,15 @@ pub enum Message {
     CreateSurface { width: u32, height: u32, title: String },
     SurfaceCreated { surface_id: u32, shm_name: String, stride: u32, size: u64, format: u32 },
     PresentFrame { surface_id: u32 },
+    /// Ask for a child layer of the surface owned by `parent_pid`.
+    ///
+    /// This is how a `SurfaceView`'s video output reaches the screen: Android
+    /// composites it as a separate layer under the window, and the closest
+    /// Wayland equivalent is a `wl_subsurface` positioned inside the parent.
+    CreateSubsurface { parent_pid: i32, x: i32, y: i32, width: u32, height: u32 },
+    SubsurfaceCreated { surface_id: u32 },
+    SetSubsurfacePosition { surface_id: u32, x: i32, y: i32 },
+    DestroySurface { surface_id: u32 },
     /// Present a dma-buf (fd passed out-of-band) on an existing surface.
     PresentDmabuf {
         surface_id: u32,
@@ -329,6 +349,10 @@ impl Message {
             CreateSurface { .. } => MsgKind::CreateSurface,
             SurfaceCreated { .. } => MsgKind::SurfaceCreated,
             PresentFrame { .. } => MsgKind::PresentFrame,
+            CreateSubsurface { .. } => MsgKind::CreateSubsurface,
+            SubsurfaceCreated { .. } => MsgKind::SubsurfaceCreated,
+            SetSubsurfacePosition { .. } => MsgKind::SetSubsurfacePosition,
+            DestroySurface { .. } => MsgKind::DestroySurface,
             PresentDmabuf { .. } => MsgKind::PresentDmabuf,
             GetProp { .. } => MsgKind::GetProp,
             PropValue { .. } => MsgKind::PropValue,
@@ -444,6 +468,20 @@ impl Message {
                 e.u32(*format);
             }
             PresentFrame { surface_id } => e.u32(*surface_id),
+            CreateSubsurface { parent_pid, x, y, width, height } => {
+                e.i32(*parent_pid);
+                e.i32(*x);
+                e.i32(*y);
+                e.u32(*width);
+                e.u32(*height);
+            }
+            SubsurfaceCreated { surface_id } => e.u32(*surface_id),
+            SetSubsurfacePosition { surface_id, x, y } => {
+                e.u32(*surface_id);
+                e.i32(*x);
+                e.i32(*y);
+            }
+            DestroySurface { surface_id } => e.u32(*surface_id),
             PresentDmabuf { surface_id, width, height, stride, fourcc, modifier, offset } => {
                 e.u32(*surface_id);
                 e.u32(*width);
@@ -609,6 +647,20 @@ impl Message {
                 format: d.u32()?,
             },
             K::PresentFrame => PresentFrame { surface_id: d.u32()? },
+            K::CreateSubsurface => CreateSubsurface {
+                parent_pid: d.i32()?,
+                x: d.i32()?,
+                y: d.i32()?,
+                width: d.u32()?,
+                height: d.u32()?,
+            },
+            K::SubsurfaceCreated => SubsurfaceCreated { surface_id: d.u32()? },
+            K::SetSubsurfacePosition => SetSubsurfacePosition {
+                surface_id: d.u32()?,
+                x: d.i32()?,
+                y: d.i32()?,
+            },
+            K::DestroySurface => DestroySurface { surface_id: d.u32()? },
             K::PresentDmabuf => PresentDmabuf {
                 surface_id: d.u32()?,
                 width: d.u32()?,

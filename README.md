@@ -437,6 +437,10 @@ opt-in and cost nothing when unset.
 | `PENGUDROID_TRACE_GLESHIM`, `PENGUDROID_TRACE_GLES`, `PENGUDROID_TRACE_DRAW` | trace the EGL/GLES translation layer and hwui draw calls |
 | `PENGUDROID_DUMP_FRAME=<prefix>` / `_AT=<n>` / `_NOFLIP=1` | write frame *n* as a PPM (`tools/art/ppm2png.py` converts it) |
 | `PENGUDROID_NO_CODEC2_SERVICE=1` | fall back to the hand-written codec2 stub replies |
+| `PENGUDROID_PROBE_VIEWS=1` | walk the window hierarchy and print every view's class and measured size, plus the `SurfaceView` fields that decide whether the video layer exists (`mHaveFrame`, `mSurfaceControl`, `mBlastBufferQueue`, `mSurface`'s native pointer, `mSurfaceCreated`, `mVisible`) |
+| `PENGUDROID_FORCE_SURFACE=1` | give a zero-width `SurfaceView` a real frame (`PENGUDROID_VIDEO_W`/`_H`, default 720×405) and let the framework's own main-thread pre-draw listener create the surface. Never call `updateSurface()` yourself: it ends in `ExoPlayer.setVideoSurface`, which asserts the main thread |
+| `PENGUDROID_TRACE_VIDEO=1` | trace the `BLASTBufferQueue` consumer: created queue, geometry updates, the daemon subsurface, and every 30th presented frame |
+| `PENGUDROID_VIDEO_X` / `_Y` | where the video subsurface sits inside the app window (default `0,0`) |
 | `PENGUDROID_DEBUG_WRAP='gdb -x script.gdb --args'` | prefix the ART helper with a wrapper (`art-test` only) |
 
 `tools/make_h264.py <path> [width_mb] [height_mb]` generates the test stream:

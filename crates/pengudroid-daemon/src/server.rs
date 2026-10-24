@@ -69,6 +69,9 @@ pub struct Daemon {
     /// forwarded guest calls; the pid is kept so the entry can be dropped when
     /// that connection closes.
     input_sinks: Mutex<std::collections::HashMap<u32, (i32, Sender<Message>)>>,
+    /// Which process created each surface, so a guest can ask for a child layer
+    /// of "its" window without knowing the surface id (the GL shim owns that).
+    surface_owner: Mutex<std::collections::HashMap<u32, i32>>,
 }
 
 pub(crate) struct SpawnedRun {
@@ -127,6 +130,7 @@ impl Daemon {
             cli_path: find_cli_binary(),
             spawned: Mutex::new(Vec::new()),
             input_sinks: Mutex::new(std::collections::HashMap::new()),
+            surface_owner: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -595,6 +599,11 @@ fn handle(
             match gfx.create_toplevel(w, h, &title) {
                 Some(info) => {
                     let fd = gfx.surface_fd(info.id);
+                    daemon
+                        .surface_owner
+                        .lock()
+                        .unwrap()
+                        .insert(info.id, peer.pid);
                     crate::info!("created surface {} '{}' {}×{}", info.id, title, w, h);
                     let reply = Message::SurfaceCreated {
                         surface_id: info.id,
@@ -611,6 +620,81 @@ fn handle(
                     false,
                 ),
             }
+        }
+
+        Message::CreateSubsurface { parent_pid, x, y, width, height } => {
+            // The GL shim creates the window surface, so the guest asking for a
+            // child layer only knows its own pid. Pick the most recent surface
+            // that pid created (an app may have several windows).
+            let parent = {
+                let owners = daemon.surface_owner.lock().unwrap();
+                owners
+                    .iter()
+                    .filter(|(_, pid)| **pid == parent_pid)
+                    .map(|(id, _)| *id)
+                    .max()
+            };
+            let Some(parent) = parent else {
+                return (
+                    Some(Message::Error {
+                        code: -2,
+                        message: format!("pid {parent_pid} has no surface"),
+                    }),
+                    vec![],
+                    false,
+                );
+            };
+            let mut guard = daemon.graphics.lock().unwrap();
+            let created = match guard.as_mut() {
+                Some(gfx) => gfx.create_subsurface(parent, x, y, width, height),
+                None => None,
+            };
+            match created {
+                Some(surface_id) => {
+                    daemon
+                        .surface_owner
+                        .lock()
+                        .unwrap()
+                        .insert(surface_id, parent_pid);
+                    (Some(Message::SubsurfaceCreated { surface_id }), vec![], false)
+                }
+                None => (
+                    Some(Message::Error { code: -19, message: "subsurface creation failed".into() }),
+                    vec![],
+                    false,
+                ),
+            }
+        }
+
+        Message::SetSubsurfacePosition { surface_id, x, y } => {
+            let mut guard = daemon.graphics.lock().unwrap();
+            let ok = match guard.as_mut() {
+                Some(gfx) => gfx.set_subsurface_position(surface_id, x, y),
+                None => false,
+            };
+            if ok {
+                (Some(Message::Ack), vec![], false)
+            } else {
+                (
+                    Some(Message::Error {
+                        code: -19,
+                        message: format!("surface {surface_id} is not a subsurface"),
+                    }),
+                    vec![],
+                    false,
+                )
+            }
+        }
+
+        Message::DestroySurface { surface_id } => {
+            let mut guard = daemon.graphics.lock().unwrap();
+            let destroyed = match guard.as_mut() {
+                Some(gfx) => gfx.destroy_surface(surface_id),
+                None => false,
+            };
+            daemon.surface_owner.lock().unwrap().remove(&surface_id);
+            let _ = destroyed;
+            (Some(Message::Ack), vec![], false)
         }
 
         Message::PresentFrame { surface_id } => {
@@ -730,6 +814,7 @@ fn handle(
         | Message::ServiceRegistered { .. }
         | Message::BinderReply { .. }
         | Message::SurfaceCreated { .. }
+        | Message::SubsurfaceCreated { .. }
         | Message::PropValue { .. }
         | Message::PropList { .. }
         | Message::ServiceList { .. }

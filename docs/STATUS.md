@@ -3,6 +3,110 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
+## Bu oturum (9): BLASTBufferQueue gerçekten çalışıyor, kalan duvar `PlaceholderSurface`
+
+Bu oturumda `SurfaceView` yolu baştan sona kuruldu ve **çökmeden** çalışıyor;
+kalan tek adım decoder'ın bizim kuyruğa bağlanması.
+
+### Yapılanlar
+
+1. **`BLASTBufferQueue` artık gerçek bir `BufferQueue` üzerinde.**
+   `android::BufferQueue::createBufferQueue` + `BufferItemConsumer` ile
+   producer/consumer çifti bizim; `Surface` producer'ı sarıyor. Eski kod
+   `BLASTBufferQueue`'nun kendi kuyruğunu kullanıyordu ve consumer'ına
+   erişemiyordu.
+2. **`android.view.Surface.nativeGetFromBlastBufferQueue` host edildi.**
+   Framework uygulaması kuyruk işaretçisini gerçek bir `BLASTBufferQueue*`
+   sanıp `getIGraphicBufferProducer()` çağırıyordu; ölçüm:
+   `RefBase::incStrong` içinde SIGSEGV. Artık elimizdeki `Surface*`'ı
+   döndürüyor. Kayıt `register_android_view_Surface`'tan **sonra** tek satırlık
+   bir tablo ile yapılıyor (`__pengudroid_register_surface_overrides`).
+3. **Kare tüketicisi.** `blast.rs` bir iş parçacığı açıp
+   `BufferItemConsumer::acquireBuffer` ile kareleri alıyor ve daemon'a
+   `PresentDmabuf` olarak sunuyor.
+4. **Daemon'da `wl_subsurface`.** Yeni mesajlar: `CreateSubsurface`,
+   `SubsurfaceCreated`, `SetSubsurfacePosition`, `DestroySurface`.
+   `wl_subcompositor` bağlanıyor; video katmanı uygulama penceresinin
+   çocuk yüzeyi olarak konumlanıyor (SurfaceFlinger'ın ekstra katmanının
+   Wayland karşılığı). Alt yüzeyler dikey çevrilmiyor (decoder satırları
+   yukarıdan aşağı yazıyor).
+
+### Ölçülen: `updateSurface()` yanlış iş parçacığında çağrılamaz
+
+`PENGUDROID_FORCE_SURFACE` eskiden `layout()` + `mHaveFrame = true` +
+`updateSurface()` yapıyordu. Bu kod **input-pump iş parçacığında** koşuyor ve
+`updateSurface()` sonunda `SurfaceHolder.Callback.surfaceCreated` →
+`ExoPlayer.setVideoSurface()` çağrılıyor:
+
+```
+IllegalStateException: Player is accessed on the wrong thread.
+Current thread: 'Thread-2'  Expected thread: 'main'
+```
+
+Yani oynatıcı bizim yüzeyimizi hiç almadı. Aynı hata `SurfaceHolder.setFixedSize`
+için de geçerli (`requestLayout()` → `CalledFromWrongThreadException`).
+
+**Doğru yol:** `mRequestedWidth`/`mRequestedHeight` alanlarını yaz (thread
+kontrolü yok), `layout()` çağır (thread kontrolü yok; `mHaveFrame` hâlâ false
+olduğu için `updateSurface()` hemen dönüyor), sonra `postInvalidate()` — bu,
+`checkThread()` çağırmayan tek invalidation girişi, mesajı ana iş parçacığına
+postalıyor. Ana iş parçacığındaki `performDraw` `SurfaceView`'ın kendi
+`OnPreDrawListener`'ını çalıştırıyor; o da `mHaveFrame = true` yapıp
+`updateSurface()`'ı **doğru thread'de** çağırıyor.
+
+Sonuç (ölçüldü):
+
+```
+views:   requested 720x405 (laid out: true, postInvalidate: true)
+[blast] created 1x1 fmt=0x0 producer=0x58041332af60 surface=0x58041339b4e0
+[blast] update 720x405 fmt=0x4
+[blast] Surface.copyFrom(queue) -> 0x58041339b4e0
+```
+
+### Kalan duvar: decoder `PlaceholderSurface` alıyor
+
+Yüzey bizim, ama decoder başka bir yüzeye bağlanıyor:
+
+```
+SurfaceUtils: connecting to surface 0x778de81dfef0, reason connectToSurface
+BufferQueueProducer: [unnamed-…] connect: BufferQueue has been abandoned
+SurfaceUtils: Failed to connect to surface 0x778de81dfef0, err -19
+MediaCodec: nativeWindowConnect returned an error: No such device (-19)
+```
+
+`0x778de81dfef0` bizim yüzeyimiz değil. Kaynağı NewPipe'ın kendi kodu:
+`SurfaceHolderCallback.surfaceDestroyed()` bir `PlaceholderSurface` yaratıp
+`player.setVideoSurface(placeholder)` çağırıyor; `surfaceCreated()` ise
+`holder.getSurface()` (yani bizim yüzey) ile tekrar çağırmalı. Ölçümde son
+çağrı placeholder oldu, yani `surfaceCreated` bizim yüzeyle çalışmadı.
+`mSurfaceCreated`/`mVisible` alanlarını zorlayıp `surfaceCreated`'i yeniden
+tetiklemek **denendi ve işe yaramadı**.
+
+Sıradaki adım: `SurfaceView.updateSurface()`'ın bu sürümdeki tam gövdesini
+(sysroot'taki LineageOS 20 framework'ü) okuyup `surfaceCreated`'in neden
+atlandığını bulmak; alternatif olarak `PlaceholderSurface`'ı da bizim
+kuyruğumuza bağlamak.
+
+### Yan bulgu: pencere ağacı 0 genişlikte
+
+`PENGUDROID_PROBE_VIEWS` artık her görünümün ölçüsünü basıyor. Ana pencerenin
+`DecorView`'ı **0x0**, dolayısıyla `SurfaceView` de 0 genişlikte ölçülüyor —
+"SurfaceView 0 genişlikte" sorununun kökü bu. `mRequestedWidth` yazmak
+`SurfaceView.onMeasure`'un `super.onMeasure` çağrısını 720 yapıyor, ama
+`ExpandableSurfaceView.onMeasure` parent'ın spec'ini (0) okuyup erken dönüyor.
+
+### Yan bulgu: bayat `.so` protokolü bozuyor
+
+`libpengudroid_gleshim.so` yeniden derlenmemişse daemon ile mesaj numaraları
+kayıyor ve `eglSwapBuffers` "present rejected (-2): pid … has no surface"
+diyor (uygulama hiç kare sunmuyor). **Her zaman `cargo build --release
+--workspace`** — tek tek `-p` yetmiyor.
+
+### Durum
+
+198 test geçiyor. Uygulama çiziyor, `BLASTBufferQueue` oluşuyor,
+`Surface.copyFrom` bizim yüzeyi veriyor; video kareleri henüz ekrana gelmiyor.
+
 ## Bu oturum (8): BLASTBufferQueue gerçekten oluşuyor
 
 `PENGUDROID_FORCE_SURFACE=1` ile `updateSurface()` çalıştırıldığında artık:

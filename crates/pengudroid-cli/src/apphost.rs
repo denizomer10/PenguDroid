@@ -872,6 +872,143 @@ fn surface_dimension(var: &str, default: i32) -> i32 {
         .unwrap_or(default)
 }
 
+/// Print the `SurfaceView` fields that decide whether the video layer exists,
+/// once per call.
+///
+/// `PENGUDROID_TRACE_SURFACE=1` calls this every couple of seconds: the
+/// interesting question is *when* `mSurface` becomes valid, and that is only
+/// visible as a timeline (a single dump at the end cannot tell "the decoder got
+/// a stale surface" from "the decoder got ours").
+fn trace_surface_views(env: &JniEnv) {
+    let Some(wmg_class) = env.find_class("android/view/WindowManagerGlobal") else {
+        return;
+    };
+    let Some(get_instance) = env.static_method_id(
+        wmg_class,
+        "getInstance",
+        "()Landroid/view/WindowManagerGlobal;",
+    ) else {
+        return;
+    };
+    let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else {
+        return;
+    };
+    let Some(roots_field) = env.field_id(wmg_class, "mViews", "Ljava/util/ArrayList;") else {
+        return;
+    };
+    let roots = env.object_field(wmg, roots_field);
+    if roots.is_null() {
+        return;
+    }
+    let Some(list_class) = env.find_class("java/util/ArrayList") else {
+        return;
+    };
+    let (Some(size_m), Some(get_m)) = (
+        env.method_id(list_class, "size", "()I"),
+        env.method_id(list_class, "get", "(I)Ljava/lang/Object;"),
+    ) else {
+        return;
+    };
+    let Some(view_class) = env.find_class("android/view/View") else {
+        return;
+    };
+    let Some(get_class) = env.method_id(view_class, "getClass", "()Ljava/lang/Class;") else {
+        return;
+    };
+    let Some(class_class) = env.find_class("java/lang/Class") else {
+        return;
+    };
+    let Some(get_name) = env.method_id(class_class, "getName", "()Ljava/lang/String;") else {
+        return;
+    };
+
+    fn walk(
+        env: &JniEnv,
+        view: JObject,
+        depth: usize,
+        get_class: JMethodId,
+        get_name: JMethodId,
+    ) {
+        if view.is_null() || depth > 24 {
+            return;
+        }
+        let class = env.call_object(view, get_class, &[]).unwrap_or(std::ptr::null_mut());
+        if class.is_null() {
+            return;
+        }
+        let name = env
+            .call_object(class, get_name, &[])
+            .and_then(|s| env.get_string(s))
+            .unwrap_or_default();
+        if name.contains("SurfaceView") {
+            let native_of = |field: &str| -> i64 {
+                let Some(id) = env.field_id(class, field, "Landroid/view/Surface;") else {
+                    return -1;
+                };
+                let obj = env.object_field(view, id);
+                if obj.is_null() {
+                    return 0;
+                }
+                let Some(sc) = env.find_class("android/view/Surface") else {
+                    return -2;
+                };
+                let Some(f) = env.field_id(sc, "mNativeObject", "J") else {
+                    return -3;
+                };
+                env.long_field(obj, f)
+            };
+            let queue = env
+                .field_id(class, "mBlastBufferQueue", "Landroid/graphics/BLASTBufferQueue;")
+                .map(|id| env.object_field(view, id))
+                .unwrap_or(std::ptr::null_mut());
+            let queue_native = if queue.is_null() {
+                0
+            } else {
+                env.find_class("android/graphics/BLASTBufferQueue")
+                    .and_then(|c| env.field_id(c, "mNativeObject", "J"))
+                    .map(|f| env.long_field(queue, f))
+                    .unwrap_or(-1)
+            };
+            let have_frame = env
+                .field_id(class, "mHaveFrame", "Z")
+                .map(|f| env.boolean_field(view, f))
+                .unwrap_or(false);
+            let w = env
+                .method_id(class, "getWidth", "()I")
+                .and_then(|m| env.call_int(view, m, &[]))
+                .unwrap_or(-1);
+            let h = env
+                .method_id(class, "getHeight", "()I")
+                .and_then(|m| env.call_int(view, m, &[]))
+                .unwrap_or(-1);
+            println!(
+                "surface-trace: {name} {w}x{h} haveFrame={have_frame} surface={:#x} queue={queue_native:#x}",
+                native_of("mSurface") as usize
+            );
+        }
+        let Some(own_count) = env.method_id(class, "getChildCount", "()I") else {
+            return;
+        };
+        let count = env.call_int(view, own_count, &[]).unwrap_or(0);
+        let Some(get_child) = env.method_id(class, "getChildAt", "(I)Landroid/view/View;") else {
+            return;
+        };
+        for i in 0..count {
+            if let Some(child) = env.call_object(view, get_child, &[JValue { i }]) {
+                walk(env, child, depth + 1, get_class, get_name);
+            }
+        }
+    }
+
+    let root_count = env.call_int(roots, size_m, &[]).unwrap_or(0);
+    for i in 0..root_count {
+        env.describe_exception();
+        if let Some(root) = env.call_object(roots, get_m, &[JValue { i }]) {
+            walk(env, root, 0, get_class, get_name);
+        }
+    }
+}
+
 fn report_surface_views(env: &JniEnv) {
     let Some(wmg_class) = env.find_class("android/view/WindowManagerGlobal") else {
         return;
@@ -942,45 +1079,102 @@ fn report_surface_views(env: &JniEnv) {
             .and_then(|c| env.call_object(c, get_name, &[]))
             .and_then(|s| env.get_string(s))
             .unwrap_or_default();
-        println!("views: {:width$}{name}", "", width = depth * 2);
+        // The object's own `Class` is a valid `jclass`, so no class lookup is
+        // needed (and `FindClass` would not see app classes anyway).
+        let class = env.call_object(view, get_class, &[]).unwrap_or(std::ptr::null_mut());
+        // The measured size of every view is what shows where a zero-width
+        // measurement enters the tree. A null `jclass` must not reach JNI: ART
+        // faults on it.
+        let (vw, vh) = if class.is_null() {
+            (-1, -1)
+        } else {
+            (
+                env.method_id(class, "getWidth", "()I")
+                    .and_then(|m| env.call_int(view, m, &[]))
+                    .unwrap_or(-1),
+                env.method_id(class, "getHeight", "()I")
+                    .and_then(|m| env.call_int(view, m, &[]))
+                    .unwrap_or(-1),
+            )
+        };
+        println!("views: {:width$}{name} [{vw}x{vh}]", "", width = depth * 2);
         if name.contains("SurfaceView") || name.contains("TextureView") {
-            // The object's own `Class` is a valid `jclass`, so no class lookup
-            // is needed (and `FindClass` would not see app classes anyway).
-            let class = env.call_object(view, get_class, &[]).unwrap_or(std::ptr::null_mut());
             // A `SurfaceView` that measured 0 wide never sets `mHaveFrame`, so
             // `updateSurface()` returns immediately and neither the
             // `SurfaceControl` nor the `BLASTBufferQueue` is ever created — which
-            // is exactly what NewPipe hits. Re-laying it out at the window size
-            // is enough to make the framework take its normal path.
+            // is exactly what NewPipe hits.
+            //
+            // The fix must not call `updateSurface()` here: this walk runs on the
+            // input-pump thread, and `updateSurface()` ends in
+            // `SurfaceHolder.Callback.surfaceCreated`, where ExoPlayer asserts it
+            // is on the main thread (measured: "Player is accessed on the wrong
+            // thread", so the player kept its stale surface).
+            //
+            // `SurfaceHolder.setFixedSize` is the right lever instead: it makes
+            // `SurfaceView.onMeasure` ignore the parent's zero-width spec, and
+            // the framework's own `OnPreDrawListener` then sets `mHaveFrame` and
+            // calls `updateSurface()` on the main thread.
             if std::env::var_os("PENGUDROID_FORCE_SURFACE").is_some() && !class.is_null() {
-                if let Some(layout) = env.method_id(class, "layout", "(IIII)V") {
-                    let w = surface_dimension("PENGUDROID_SURFACE_W", 720);
-                    let h = env
-                        .method_id(class, "getHeight", "()I")
-                        .and_then(|m| env.call_int(view, m, &[]))
-                        .unwrap_or(405)
-                        .max(1);
-                    env.call_void(
-                        view,
-                        layout,
-                        &[
-                            JValue { i: 0 },
-                            JValue { i: 0 },
-                            JValue { i: w },
-                            JValue { i: h },
-                        ],
+                // `PENGUDROID_SURFACE_W`/`_H` are the *window* size (the CLI
+                // exports them for the guest), so the video layer needs its own
+                // pair.
+                let w = surface_dimension("PENGUDROID_VIDEO_W", 720);
+                let h = surface_dimension("PENGUDROID_VIDEO_H", 405);
+                // `SurfaceView.onMeasure` prefers `mRequestedWidth`/`Height`
+                // over the parent's spec, so writing those two fields is enough
+                // to make the view measure non-zero. They are written directly
+                // rather than through `SurfaceHolder.setFixedSize`, because that
+                // calls `requestLayout()`, which throws
+                // `CalledFromWrongThreadException` from this thread.
+                let mut fixed = false;
+                if let Some(f) = env.field_id(class, "mRequestedWidth", "I") {
+                    env.set_int_field(view, f, w);
+                    fixed = true;
+                }
+                if let Some(f) = env.field_id(class, "mRequestedHeight", "I") {
+                    env.set_int_field(view, f, h);
+                }
+                // Give the view its frame directly. `View.layout()` does not
+                // check the thread (unlike `requestLayout()`), and
+                // `SurfaceView.setFrame` calls `updateSurface()`, which returns
+                // immediately while `mHaveFrame` is still false — so nothing
+                // touches the player from here.
+                let laid_out = env
+                    .method_id(class, "layout", "(IIII)V")
+                    .map(|m| {
+                        env.call_void(
+                            view,
+                            m,
+                            &[
+                                JValue { i: 0 },
+                                JValue { i: 0 },
+                                JValue { i: w },
+                                JValue { i: h },
+                            ],
+                        )
+                    })
+                    .unwrap_or(false);
+                // NOTE: forcing `mSurfaceCreated`/`mVisible` here to make
+                // `surfaceCreated` fire again was tried and did **not** help —
+                // the decoder still ended up on NewPipe's `PlaceholderSurface`.
+                // See `docs/STATUS.md` for the measurement.
+                // `performDraw` only dispatches the pre-draw listeners when the
+                // dirty region is non-empty, and `SurfaceView`'s own pre-draw
+                // listener is what sets `mHaveFrame` and calls
+                // `updateSurface()` — on the main thread, which is what ExoPlayer
+                // requires. `postInvalidate()` is the one invalidation entry
+                // point that does not call `checkThread()`: it posts a message
+                // to the main thread's handler instead.
+                let invalidated = env
+                    .method_id(class, "postInvalidate", "()V")
+                    .map(|m| env.call_void(view, m, &[]))
+                    .unwrap_or(false);
+                if fixed {
+                    println!(
+                        "views:   requested {w}x{h} (laid out: {laid_out}, postInvalidate: {invalidated})"
                     );
-                    println!("views:   forced layout to {w}x{h}");
-                }
-                // `layout()` alone does not set `mHaveFrame` in this release, and
-                // `updateSurface()` returns on it. Set the flag and call the
-                // method the framework would have called.
-                if let Some(flag) = env.field_id(class, "mHaveFrame", "Z") {
-                    env.set_boolean_field(view, flag, true);
-                }
-                if let Some(update) = env.method_id(class, "updateSurface", "()V") {
-                    env.call_void(view, update, &[]);
-                    println!("views:   updateSurface() called");
+                } else {
+                    eprintln!("views:   mRequestedWidth not found");
                 }
             }
             for (field, sig) in [
@@ -988,6 +1182,9 @@ fn report_surface_views(env: &JniEnv) {
                 ("mSurfaceControl", "Landroid/view/SurfaceControl;"),
                 ("mBlastBufferQueue", "Landroid/graphics/BLASTBufferQueue;"),
                 ("mSurface", "Landroid/view/Surface;"),
+                ("mSurfaceCreated", "Z"),
+                ("mVisible", "Z"),
+                ("mRequestedVisible", "Z"),
                 ("mSurfaceWidth", "I"),
                 ("mSurfaceHeight", "I"),
                 ("mFormat", "I"),
@@ -1005,6 +1202,15 @@ fn report_surface_views(env: &JniEnv) {
                         let o = env.object_field(view, id);
                         if o.is_null() {
                             "null".to_string()
+                        } else if field == "mSurface" {
+                            // The native pointer is the only thing that says
+                            // *which* surface the app will hand the decoder.
+                            let native = env
+                                .find_class("android/view/Surface")
+                                .and_then(|c| env.field_id(c, "mNativeObject", "J"))
+                                .map(|f| env.long_field(o, f))
+                                .unwrap_or(-1);
+                            format!("set (native={native:#x})")
                         } else {
                             "set".to_string()
                         }
@@ -2757,14 +2963,29 @@ fn spawn_input_pump(env: &JniEnv) {
                 std::thread::sleep(std::time::Duration::from_millis(80));
                 inject(ACTION_UP, x, y, now);
                 println!("apphost: synthetic click at {x},{y} injected");
-                if std::env::var_os("PENGUDROID_PROBE_VIEWS").is_some() {
+                if std::env::var_os("PENGUDROID_PROBE_VIEWS").is_some()
+                    || std::env::var_os("PENGUDROID_FORCE_SURFACE").is_some()
+                {
                     std::thread::sleep(std::time::Duration::from_secs(12));
+                    report_surface_views(&env);
+                    // The forced size only takes effect on the *next* traversal,
+                    // which runs on the main thread. A second pass a few seconds
+                    // later shows whether it happened.
+                    std::thread::sleep(std::time::Duration::from_secs(4));
+                    println!("views: --- second pass ---");
                     report_surface_views(&env);
                 }
             }
         }
 
+        let mut last_trace = std::time::Instant::now();
         loop {
+            if std::env::var_os("PENGUDROID_TRACE_SURFACE").is_some()
+                && last_trace.elapsed() >= std::time::Duration::from_secs(2)
+            {
+                last_trace = std::time::Instant::now();
+                trace_surface_views(&env);
+            }
             if unsafe { poll(buf.as_mut_ptr()) } == 0 {
                 std::thread::sleep(std::time::Duration::from_millis(8));
                 continue;

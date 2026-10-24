@@ -987,6 +987,38 @@ pub unsafe extern "C" fn AHardwareBuffer_getNativeHandle(
     }
 }
 
+/// Offset of `ANativeWindowBuffer::handle` inside an `android::GraphicBuffer`.
+///
+/// `GraphicBuffer` derives from `ANativeWindowBuffer`, and in this release
+/// `toAHardwareBuffer()` is the identity, so a `GraphicBuffer*` *is* an
+/// `AHardwareBuffer*` — but not one of ours, so [`as_buf`] rejects it. The
+/// field offset was measured on the Android 13 x86_64 sysroot:
+/// `GraphicBuffer::unlock` loads the handle from `this+0x70`, and
+/// `needsReallocation` reads width/height/format/usage from
+/// `0x48`/`0x4c`/`0x54`/`0x78`.
+pub const GRAPHIC_BUFFER_HANDLE_OFFSET: usize = 0x70;
+
+/// The `native_handle_t` behind a real `android::GraphicBuffer`.
+///
+/// This is what the video path needs: the decoder hands us a `GraphicBuffer`
+/// from the `BufferQueue` and the daemon imports its dma-buf.
+pub unsafe fn graphicbuffer_handle(gb: *const c_void) -> *const NativeHandle {
+    if gb.is_null() {
+        return std::ptr::null();
+    }
+    let slot = (gb as *const u8).add(GRAPHIC_BUFFER_HANDLE_OFFSET) as *const *const NativeHandle;
+    let handle = *slot;
+    if handle.is_null() {
+        return std::ptr::null();
+    }
+    // A handle we did not allocate would be a layout mismatch; refuse rather
+    // than hand the daemon a garbage fd.
+    if (*handle).num_fds < 1 || (*handle).version != NATIVE_HANDLE_VERSION {
+        return std::ptr::null();
+    }
+    handle
+}
+
 /// `AHardwareBuffer_lock(buffer, usage, fence, rect, outVirtualAddress)`.
 #[no_mangle]
 pub unsafe extern "C" fn AHardwareBuffer_lock(

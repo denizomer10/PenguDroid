@@ -11,10 +11,12 @@
 //! that call is interposed and the table is patched entry by entry, so
 //! `BLASTBufferQueue.java` is untouched.
 //!
-//! What replaces the native object is deliberately small:
+//! # What replaces the native object
 //!
-//! * `android::BLASTBufferQueue::createBufferQueue` (exported by `libgui`) makes
-//!   a real `BufferQueue` — the same call the real class makes;
+//! * `android::BufferQueue::createBufferQueue` (exported by `libgui`) makes a
+//!   real producer/consumer pair — the same call the real class makes;
+//! * a `BufferItemConsumer` wraps the consumer end, which is what lets us
+//!   *pull* frames instead of dropping them;
 //! * `android::Surface` wraps the producer, and the Java `Surface(long)`
 //!   constructor wraps *that*, so the app gets a genuine `Surface` whose
 //!   `queueBuffer` lands in a queue we hold the consumer end of;
@@ -22,9 +24,19 @@
 //!   `Surface::setBuffersUserDimensions` are what `dequeueBuffer` passes down to
 //!   the consumer, so no SurfaceControl transaction is needed.
 //!
-//! The consumer end is kept in [`Blast::consumer`] for the compositor. Until the
-//! compositor pulls from it, frames are produced and dropped — which is still a
-//! large step up from "the app has no surface at all".
+//! # Where the frames go
+//!
+//! A consumer thread acquires each queued buffer and presents it to the daemon
+//! as a dma-buf on a **`wl_subsurface` of the app's window**. That is the
+//! Wayland equivalent of the extra layer SurfaceFlinger would composite: the
+//! video is a child surface positioned inside the parent, so the compositor
+//! blends it without any copy and without a GPU context in the daemon.
+//!
+//! `android.view.Surface.nativeGetFromBlastBufferQueue` is hosted too: the
+//! framework implementation casts the queue pointer back to a real
+//! `BLASTBufferQueue*` and calls `getIGraphicBufferProducer()` on it, which
+//! dereferences our struct as if it were one (measured: SIGSEGV in
+//! `RefBase::incStrong`).
 
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_void};
@@ -48,10 +60,7 @@ union JValue {
     l: *mut c_void,
 }
 
-unsafe fn jni_new_global_ref(
-    env: *mut c_void,
-    obj: *mut c_void,
-) -> *mut c_void {
+unsafe fn jni_new_global_ref(env: *mut c_void, obj: *mut c_void) -> *mut c_void {
     let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
         std::mem::transmute(jni_slot(env, SLOT_NEW_GLOBAL_REF));
     f(env, obj)
@@ -88,22 +97,32 @@ unsafe fn jni_new_object(
 }
 
 // ---------------------------------------------------------------------------
-// libgui entry points
+// libgui / libui entry points
 // ---------------------------------------------------------------------------
 
-/// `BLASTBufferQueue(const std::string& name, bool updateDestinationFrame)`.
-///
-/// The name is only used for tracing, so an empty `std::string` is passed: a
-/// zeroed 24-byte buffer is libc++'s short-string representation of `""`
-/// (`__size_ = 0`, short flag clear).
-type BlastCtor = unsafe extern "C" fn(*mut c_void, *const u8, bool);
-/// `sp<Surface> BLASTBufferQueue::getSurface(bool)` — 16-byte return, so the
-/// caller supplies the destination first.
-type GetSurface = unsafe extern "C" fn(*mut [u64; 2], *mut c_void, bool);
+/// `android::BufferQueue::createBufferQueue(sp<IGraphicBufferProducer>*,
+/// sp<IGraphicBufferConsumer>*, bool consumerIsSurfaceFlinger)`.
+type CreateBufferQueue = unsafe extern "C" fn(*mut [u64; 2], *mut [u64; 2], bool);
+/// `BufferItemConsumer(const sp<IGraphicBufferConsumer>&, uint64_t usage,
+/// int bufferCount, bool controlledByApp)`.
+type ItemConsumerCtor = unsafe extern "C" fn(*mut c_void, *const [u64; 2], u64, i32, bool);
+type BufferItemCtor = unsafe extern "C" fn(*mut c_void);
+type BufferItemDtor = unsafe extern "C" fn(*mut c_void);
+/// `BufferItemConsumer::acquireBuffer(BufferItem*, nsecs_t, bool)`.
+type AcquireBuffer = unsafe extern "C" fn(*mut c_void, *mut c_void, i64, bool) -> i32;
+/// `BufferItemConsumer::releaseBuffer(const BufferItem&, const sp<Fence>&)`.
+type ReleaseBuffer = unsafe extern "C" fn(*mut c_void, *const c_void, *const [u64; 2]) -> i32;
+type SetDefaultSize = unsafe extern "C" fn(*mut c_void, u32, u32) -> i32;
+type SetDefaultFormat = unsafe extern "C" fn(*mut c_void, i32) -> i32;
+type SetConsumerUsage = unsafe extern "C" fn(*mut c_void, u64) -> i32;
+type SetMaxAcquired = unsafe extern "C" fn(*mut c_void, i32) -> i32;
+/// `Surface(const sp<IGraphicBufferProducer>&, bool, const sp<IBinder>&)`.
 type SurfaceCtor =
     unsafe extern "C" fn(*mut c_void, *const [u64; 2], bool, *const [u64; 2]);
 type SurfaceIntSetter = unsafe extern "C" fn(*mut c_void, i32) -> i32;
 type SurfaceDimsSetter = unsafe extern "C" fn(*mut c_void, u32, u32) -> i32;
+/// `RefBase::incStrong(const void*) const`.
+type IncStrong = unsafe extern "C" fn(*mut c_void, *const c_void);
 
 /// Resolve a symbol from a guest library (bypassing our own interpositions).
 unsafe fn guest_sym(soname: &[u8], name: &[u8]) -> *mut c_void {
@@ -118,24 +137,59 @@ unsafe fn guest_sym(soname: &[u8], name: &[u8]) -> *mut c_void {
 }
 
 struct Gui {
-    blast_ctor: BlastCtor,
-    get_surface: GetSurface,
+    create_buffer_queue: CreateBufferQueue,
+    item_consumer_ctor: ItemConsumerCtor,
+    item_ctor: BufferItemCtor,
+    item_dtor: BufferItemDtor,
+    acquire: AcquireBuffer,
+    release: ReleaseBuffer,
+    set_default_size: SetDefaultSize,
+    set_default_format: SetDefaultFormat,
+    set_consumer_usage: SetConsumerUsage,
+    set_max_acquired: SetMaxAcquired,
     surface_ctor: SurfaceCtor,
     set_buffers_format: SurfaceIntSetter,
     set_user_dimensions: SurfaceDimsSetter,
+    inc_strong: IncStrong,
 }
 
 static GUI: std::sync::OnceLock<Option<Gui>> = std::sync::OnceLock::new();
 
 fn gui() -> Option<&'static Gui> {
     GUI.get_or_init(|| unsafe {
-        let blast_ctor = guest_sym(
+        let create_buffer_queue = guest_sym(
             b"libgui.so\0",
-            b"_ZN7android16BLASTBufferQueueC1ERKNSt3__112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEEb\0",
+            b"_ZN7android11BufferQueue17createBufferQueueEPNS_2spINS_22IGraphicBufferProducerEEEPNS1_INS_22IGraphicBufferConsumerEEEb\0",
         );
-        let get_surface = guest_sym(
+        let item_consumer_ctor = guest_sym(
             b"libgui.so\0",
-            b"_ZN7android16BLASTBufferQueue10getSurfaceEb\0",
+            b"_ZN7android18BufferItemConsumerC1ERKNS_2spINS_22IGraphicBufferConsumerEEEmib\0",
+        );
+        let item_ctor = guest_sym(b"libgui.so\0", b"_ZN7android10BufferItemC1Ev\0");
+        let item_dtor = guest_sym(b"libgui.so\0", b"_ZN7android10BufferItemD1Ev\0");
+        let acquire = guest_sym(
+            b"libgui.so\0",
+            b"_ZN7android18BufferItemConsumer13acquireBufferEPNS_10BufferItemElb\0",
+        );
+        let release = guest_sym(
+            b"libgui.so\0",
+            b"_ZN7android18BufferItemConsumer13releaseBufferERKNS_10BufferItemERKNS_2spINS_5FenceEEE\0",
+        );
+        let set_default_size = guest_sym(
+            b"libgui.so\0",
+            b"_ZN7android12ConsumerBase20setDefaultBufferSizeEjj\0",
+        );
+        let set_default_format = guest_sym(
+            b"libgui.so\0",
+            b"_ZN7android12ConsumerBase22setDefaultBufferFormatEi\0",
+        );
+        let set_consumer_usage = guest_sym(
+            b"libgui.so\0",
+            b"_ZN7android12ConsumerBase20setConsumerUsageBitsEm\0",
+        );
+        let set_max_acquired = guest_sym(
+            b"libgui.so\0",
+            b"_ZN7android12ConsumerBase25setMaxAcquiredBufferCountEi\0",
         );
         let surface_ctor = guest_sym(
             b"libgui.so\0",
@@ -149,21 +203,40 @@ fn gui() -> Option<&'static Gui> {
             b"libgui.so\0",
             b"_ZN7android7Surface24setBuffersUserDimensionsEjj\0",
         );
-        if blast_ctor.is_null()
-            || get_surface.is_null()
+        let inc_strong = guest_sym(b"libutils.so\0", b"_ZNK7android7RefBase9incStrongEPKv\0");
+        if create_buffer_queue.is_null()
+            || item_consumer_ctor.is_null()
+            || item_ctor.is_null()
+            || item_dtor.is_null()
+            || acquire.is_null()
+            || release.is_null()
+            || set_default_size.is_null()
+            || set_default_format.is_null()
+            || set_consumer_usage.is_null()
+            || set_max_acquired.is_null()
             || surface_ctor.is_null()
             || set_buffers_format.is_null()
             || set_user_dimensions.is_null()
+            || inc_strong.is_null()
         {
-            eprintln!("[blast] libgui is missing a required entry point");
+            eprintln!("[blast] libgui/libutils is missing a required entry point");
             return None;
         }
         Some(Gui {
-            blast_ctor: std::mem::transmute(blast_ctor),
-            get_surface: std::mem::transmute(get_surface),
+            create_buffer_queue: std::mem::transmute(create_buffer_queue),
+            item_consumer_ctor: std::mem::transmute(item_consumer_ctor),
+            item_ctor: std::mem::transmute(item_ctor),
+            item_dtor: std::mem::transmute(item_dtor),
+            acquire: std::mem::transmute(acquire),
+            release: std::mem::transmute(release),
+            set_default_size: std::mem::transmute(set_default_size),
+            set_default_format: std::mem::transmute(set_default_format),
+            set_consumer_usage: std::mem::transmute(set_consumer_usage),
+            set_max_acquired: std::mem::transmute(set_max_acquired),
             surface_ctor: std::mem::transmute(surface_ctor),
             set_buffers_format: std::mem::transmute(set_buffers_format),
             set_user_dimensions: std::mem::transmute(set_user_dimensions),
+            inc_strong: std::mem::transmute(inc_strong),
         })
     })
     .as_ref()
@@ -173,6 +246,13 @@ fn gui() -> Option<&'static Gui> {
 // The hosted object
 // ---------------------------------------------------------------------------
 
+/// Bytes reserved for a `libgui` object we construct ourselves.
+///
+/// `Surface` and `BufferItemConsumer` have no exported `sizeof`, and their
+/// constructors write through `this`, so the block must be comfortably larger
+/// than either. 8 KiB is far above both (a `BLASTBufferQueue` is 5 KiB).
+const OBJECT_SIZE: usize = 8192;
+
 /// One hosted `BLASTBufferQueue`.
 ///
 /// `producer`/`consumer` are `sp<>` pairs (object pointer + control block), the
@@ -180,6 +260,8 @@ fn gui() -> Option<&'static Gui> {
 struct Blast {
     producer: [u64; 2],
     consumer: [u64; 2],
+    /// `android::BufferItemConsumer*` — the consumer end, owned by us.
+    item_consumer: *mut c_void,
     /// `android::Surface*` — the native half of the Java `Surface` we hand out.
     surface: *mut c_void,
     /// Global reference to that Java `Surface`, created on first request.
@@ -187,6 +269,9 @@ struct Blast {
     width: u32,
     height: u32,
     format: i32,
+    /// The daemon surface the consumer thread presents frames on (0 until the
+    /// first frame).
+    video_surface: std::sync::atomic::AtomicU32,
 }
 
 // SAFETY: the pointers are only ever used from the thread that owns the object,
@@ -203,7 +288,11 @@ unsafe fn blast_at(ptr: i64) -> Option<&'static mut Blast> {
     if ptr == 0 {
         return None;
     }
-    Some(&mut *(ptr as *mut Blast))
+    let boxes = BLASTS.lock().unwrap_or_else(|e| e.into_inner());
+    if boxes.iter().any(|&b| b == ptr as usize) {
+        return Some(&mut *(ptr as *mut Blast));
+    }
+    None
 }
 
 /// `BLASTBufferQueue.nativeCreate(String name, boolean updateDestinationFrame)`
@@ -219,42 +308,57 @@ unsafe extern "C" fn native_create(
     _update_destination_frame: u8,
 ) -> i64 {
     // A 1x1 default keeps `dequeueBuffer` legal until `update` arrives.
-    let (width, height, format) = (1i32, 1i32, 0i32);
+    let (width, height, format) = (1u32, 1u32, 0i32);
     let Some(gui) = gui() else {
         return 0;
     };
-    // A real `android::BLASTBufferQueue`: its constructor builds the BufferQueue
-    // and the `Surface` for us. Calling `createBufferQueue` directly does not
-    // work — it is a member function, so the first argument is `this`, and
-    // calling it as if it were static dereferences the caller's out-parameter as
-    // an object (measured: SIGSEGV at `createBufferQueue+0x1b3`).
-    let queue = libc::calloc(1, 4096);
-    if queue.is_null() {
-        return 0;
-    }
-    // An empty libc++ `std::string` (short form: `__size_ = 0`).
-    let empty_name = [0u8; 24];
-    (gui.blast_ctor)(queue, empty_name.as_ptr(), true);
 
-    // `sp<Surface>` returned through the caller's storage.
-    let mut surface_sp = [0u64; 2];
-    (gui.get_surface)(&mut surface_sp, queue, false);
-    if surface_sp[0] == 0 {
-        eprintln!("[blast] BLASTBufferQueue::getSurface returned nothing");
+    // A real producer/consumer pair. `consumerIsSurfaceFlinger = false` keeps
+    // the queue in "app" mode (no SurfaceFlinger-only buffer accounting).
+    let mut producer = [0u64; 2];
+    let mut consumer = [0u64; 2];
+    (gui.create_buffer_queue)(&mut producer, &mut consumer, false);
+    if producer[0] == 0 || consumer[0] == 0 {
+        eprintln!("[blast] BufferQueue::createBufferQueue returned nothing");
         return 0;
     }
-    let surface = surface_sp[0] as *mut c_void;
+
+    // The consumer end is what we pull frames from. `USAGE_HW_TEXTURE |
+    // USAGE_HW_COMPOSER` is what SurfaceFlinger would ask for; the allocator
+    // ignores it, but the decoder reads it back.
+    let usage: u64 = 0x100 | 0x200; // GRALLOC_USAGE_HW_TEXTURE | HW_COMPOSER
+    // These are C++ objects whose real sizes are not exported. Over-allocating
+    // is the only safe option: an undersized block corrupts the heap when the
+    // constructor writes past it (measured: `sysmalloc: assertion failed`).
+    let item_consumer = libc::calloc(1, OBJECT_SIZE);
+    if item_consumer.is_null() {
+        return 0;
+    }
+    (gui.item_consumer_ctor)(item_consumer, &consumer, usage, 4, false);
+    (gui.set_default_size)(item_consumer, width, height);
+    (gui.set_default_format)(item_consumer, format);
+    (gui.set_consumer_usage)(item_consumer, usage);
+    (gui.set_max_acquired)(item_consumer, 2);
+
+    // The producer side, wrapped in a real `Surface`.
+    let surface = libc::calloc(1, OBJECT_SIZE);
+    if surface.is_null() {
+        return 0;
+    }
+    (gui.surface_ctor)(surface, &producer, true, &EMPTY_SP);
     (gui.set_buffers_format)(surface, format);
-    (gui.set_user_dimensions)(surface, width.max(1) as u32, height.max(1) as u32);
+    (gui.set_user_dimensions)(surface, width, height);
 
     let blast = Box::new(Blast {
-        producer: surface_sp,
-        consumer: [0u64; 2],
+        producer,
+        consumer,
+        item_consumer,
         surface,
         java_surface: std::ptr::null_mut(),
-        width: width.max(1) as u32,
-        height: height.max(1) as u32,
+        width,
+        height,
         format,
+        video_surface: std::sync::atomic::AtomicU32::new(0),
     });
     let ptr = Box::into_raw(blast);
     BLASTS
@@ -262,9 +366,10 @@ unsafe extern "C" fn native_create(
         .unwrap_or_else(|e| e.into_inner())
         .push(ptr as usize);
     eprintln!(
-        "[blast] created {width}x{height} fmt={format:#x} surface={:#x}",
-        surface as usize
+        "[blast] created {width}x{height} fmt={format:#x} producer={:#x} surface={:#x}",
+        producer[0] as usize, surface as usize
     );
+    start_consumer(ptr);
     ptr as i64
 }
 
@@ -294,6 +399,10 @@ unsafe extern "C" fn native_get_surface(
     if ctor.is_null() {
         eprintln!("[blast] Surface(long) constructor missing");
         return std::ptr::null_mut();
+    }
+    // `Surface(long)` does not take a reference; the Java object owns one.
+    if let Some(gui) = gui() {
+        (gui.inc_strong)(blast.surface, &OWNER_ID as *const u8 as *const c_void);
     }
     let args = [JValue {
         j: blast.surface as i64,
@@ -332,10 +441,12 @@ unsafe extern "C" fn native_update(
     let (w, h) = (width.max(1) as u32, height.max(1) as u32);
     if format != blast.format {
         (gui.set_buffers_format)(blast.surface, format);
+        (gui.set_default_format)(blast.item_consumer, format);
         blast.format = format;
     }
     if w != blast.width || h != blast.height {
         (gui.set_user_dimensions)(blast.surface, w, h);
+        (gui.set_default_size)(blast.item_consumer, w, h);
         blast.width = w;
         blast.height = h;
     }
@@ -370,6 +481,220 @@ unsafe extern "C" fn native_zero(
     0
 }
 
+/// `android.view.Surface.nativeGetFromBlastBufferQueue(long surfacePtr, long
+/// queuePtr)` → `long`.
+///
+/// `Surface.copyFrom(BLASTBufferQueue)` calls this and stores the result in
+/// `mNativeObject`. The framework implementation casts `queuePtr` to a real
+/// `BLASTBufferQueue*` and calls `getIGraphicBufferProducer()` on it; our
+/// object is not one, so the call is hosted and answers with the `Surface` we
+/// already built.
+unsafe extern "C" fn surface_from_blast(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    _surface_ptr: i64,
+    queue_ptr: i64,
+) -> i64 {
+    let Some(blast) = blast_at(queue_ptr) else {
+        eprintln!("[blast] nativeGetFromBlastBufferQueue: unknown queue {queue_ptr:#x}");
+        return 0;
+    };
+    // The Java `Surface` takes ownership of this reference and releases it in
+    // `nativeRelease`, so hand out a new one.
+    if let Some(gui) = gui() {
+        (gui.inc_strong)(blast.surface, &OWNER_ID as *const u8 as *const c_void);
+    }
+    eprintln!(
+        "[blast] Surface.copyFrom(queue) -> {:#x}",
+        blast.surface as usize
+    );
+    blast.surface as i64
+}
+
+/// Identity used for every `incStrong`/`decStrong` pair we make.
+static OWNER_ID: u8 = 0;
+
+
+
+// ---------------------------------------------------------------------------
+// Frame consumer → daemon
+// ---------------------------------------------------------------------------
+
+/// `DRM_FORMAT_*` fourcc for an Android `HAL_PIXEL_FORMAT_*`, plus bytes per
+/// pixel. The daemon imports the buffer as a linear dma-buf, so the fourcc has
+/// to describe the byte order the decoder actually wrote.
+fn fourcc_for(format: i32) -> (u32, u32) {
+    match format {
+        4 => (0x3631_4752, 2),          // RGB_565  -> DRM_FORMAT_RGB565
+        1 => (0x3432_4241, 4),          // RGBA_8888 -> DRM_FORMAT_ABGR8888
+        0x22 => (0x3432_4258, 4),       // RGBX_8888 -> DRM_FORMAT_XBGR8888
+        0x16 => (0x4834_4241, 8),       // RGBA_F16 -> DRM_FORMAT_ABGR16161616F
+        _ => (0x3432_4241, 4),
+    }
+}
+
+fn video_origin() -> (i32, i32) {
+    let read = |name: &str| -> i32 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    (read("PENGUDROID_VIDEO_X"), read("PENGUDROID_VIDEO_Y"))
+}
+
+/// Start the thread that drains the queue and presents to the daemon.
+unsafe fn start_consumer(blast: *mut Blast) {
+    let addr = blast as usize;
+    std::thread::Builder::new()
+        .name("pengudroid-video".into())
+        .spawn(move || consumer_loop(addr))
+        .ok();
+}
+
+fn consumer_loop(addr: usize) {
+    use pengudroid_proto::{default_socket_path, Message, Role, PROTO_VERSION};
+    use pengudroid_socket::Connection;
+
+    let trace = std::env::var_os("PENGUDROID_TRACE_VIDEO").is_some();
+    let Some(gui) = gui() else { return };
+    let blast = unsafe { &mut *(addr as *mut Blast) };
+
+    // The daemon may not be up yet when the first `SurfaceView` appears; retry
+    // for a while rather than giving up on the first refusal.
+    let mut conn = None;
+    for _ in 0..50 {
+        if let Ok(c) = Connection::connect(&default_socket_path()) {
+            let hello = Message::Hello {
+                version: PROTO_VERSION,
+                role: Role::Guest,
+                pid: std::process::id() as i32,
+            };
+            if c.send_message(&hello, &[]).is_ok() {
+                if let Ok((Message::Welcome { .. }, _)) = c.recv_message() {
+                    conn = Some(c);
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let Some(conn) = conn else {
+        eprintln!("[blast] video: daemon unavailable; frames will be dropped");
+        return;
+    };
+
+    // A `BufferItem` is a plain aggregate; 1 KiB is comfortably more than its
+    // size on LP64. It is constructed once and reused: `acquireBuffer` assigns
+    // over it.
+    let mut item = vec![0u64; 128];
+    let item_ptr = item.as_mut_ptr() as *mut c_void;
+    unsafe { (gui.item_ctor)(item_ptr) };
+
+    let (x, y) = video_origin();
+    let mut surface_id = 0u32;
+    let mut announced = false;
+    let mut presented = 0u64;
+
+    loop {
+        let rc = unsafe { (gui.acquire)(blast.item_consumer, item_ptr, 0, true) };
+        if rc != 0 {
+            // `NO_BUFFER_AVAILABLE`/`TIMED_OUT` — nothing queued yet.
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            continue;
+        }
+        // `BufferItem::mGraphicBuffer` is the first member.
+        let gb = unsafe { *(item.as_ptr() as *const *mut c_void) };
+
+        if !gb.is_null() {
+            let handle = unsafe { crate::ahardwarebuffer::graphicbuffer_handle(gb) };
+            if !handle.is_null() {
+                let h = unsafe { &*handle };
+                if h.num_fds >= 1 {
+                    let fd = h.data[0];
+                    let stride = h.data[1].max(1) as u32;
+                    let format = h.data[2];
+                    let width = h.data[3].max(1) as u32;
+                    let height = h.data[4].max(1) as u32;
+                    let (fourcc, bpp) = fourcc_for(format);
+
+                    if surface_id == 0 {
+                        let msg = Message::CreateSubsurface {
+                            parent_pid: std::process::id() as i32,
+                            x,
+                            y,
+                            width,
+                            height,
+                        };
+                        match conn.send_message(&msg, &[]).and_then(|_| conn.recv_message()) {
+                            Ok((Message::SubsurfaceCreated { surface_id: id }, _)) => {
+                                surface_id = id;
+                                blast
+                                    .video_surface
+                                    .store(id, std::sync::atomic::Ordering::Relaxed);
+                                eprintln!(
+                                    "[blast] video surface {id} at {x},{y} ({width}x{height} fmt={format})"
+                                );
+                            }
+                            Ok((other, _)) => {
+                                eprintln!("[blast] video: CreateSubsurface refused: {other:?}");
+                                std::thread::sleep(std::time::Duration::from_millis(500));
+                            }
+                            Err(e) => {
+                                eprintln!("[blast] video: CreateSubsurface failed: {e}");
+                                std::thread::sleep(std::time::Duration::from_millis(500));
+                            }
+                        }
+                    }
+
+                    if surface_id != 0 {
+                        let msg = Message::PresentDmabuf {
+                            surface_id,
+                            width,
+                            height,
+                            stride: stride * bpp,
+                            fourcc,
+                            modifier: 0,
+                            offset: 0,
+                        };
+                        match conn.send_message(&msg, &[fd]).and_then(|_| conn.recv_message()) {
+                            Ok((Message::Ack, _)) => {
+                                presented += 1;
+                                if !announced {
+                                    announced = true;
+                                    eprintln!(
+                                        "[blast] video: first frame presented ({width}x{height} fourcc={fourcc:#x})"
+                                    );
+                                } else if trace && presented % 30 == 0 {
+                                    eprintln!("[blast] video: {presented} frames");
+                                }
+                            }
+                            Ok((Message::Error { message, .. }, _)) => {
+                                eprintln!("[blast] video: present rejected: {message}");
+                                surface_id = 0;
+                            }
+                            Err(e) => {
+                                eprintln!("[blast] video: present failed: {e}");
+                                surface_id = 0;
+                            }
+                            Ok(_) => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        unsafe { (gui.release)(blast.item_consumer, item_ptr, &EMPTY_SP) };
+    }
+}
+
+/// An empty `sp<Fence>`: `releaseBuffer` accepts it and treats it as "no fence".
+static EMPTY_SP: [u64; 2] = [0, 0];
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
 /// The `class → method → implementation` entries this module owns.
 pub(crate) fn override_for(class: &str, method: &str) -> Option<*mut c_void> {
     if class != "android/graphics/BLASTBufferQueue" {
@@ -392,10 +717,6 @@ pub(crate) fn hosts(class: &str) -> bool {
     class == "android/graphics/BLASTBufferQueue"
 }
 
-// ---------------------------------------------------------------------------
-// Registration
-// ---------------------------------------------------------------------------
-//
 // `register_android_graphics_BLASTBufferQueue` lives *inside*
 // `libandroid_runtime`, and `RegisterMethodsOrDie` is statically linked into it,
 // so neither call goes through the PLT and the `registerNativeMethods` hook in
@@ -573,5 +894,35 @@ pub unsafe extern "C" fn __pengudroid_register_blast_buffer_queue(env: *mut c_vo
         std::mem::transmute(jni_slot(env, SLOT_REGISTER_NATIVES));
     let rc = register(env, class, table.as_ptr(), table.len() as i32);
     eprintln!("[blast] registered {} native(s) (rc={rc})", table.len());
+    rc
+}
+
+/// Override `android.view.Surface.nativeGetFromBlastBufferQueue`.
+///
+/// The real table is registered by `register_android_view_Surface` (which the
+/// CLI still calls, because every other `Surface` native is needed); this runs
+/// afterwards and replaces the single entry. `RegisterNatives` accepts a
+/// partial table and overwrites existing entries, so nothing else is touched.
+///
+/// # Safety
+/// `env` must be a valid `JNIEnv*` for the current thread.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_register_surface_overrides(env: *mut c_void) -> i32 {
+    let class = jni_find_class(env, c"android/view/Surface");
+    if class.is_null() {
+        eprintln!("[blast] android/view/Surface not found");
+        return -1;
+    }
+    let name = c"nativeGetFromBlastBufferQueue";
+    let sig = c"(JJ)J";
+    let table = [NativeMethod {
+        name: name.as_ptr(),
+        signature: sig.as_ptr(),
+        fn_ptr: surface_from_blast as *mut c_void,
+    }];
+    let register: unsafe extern "C" fn(*mut c_void, *mut c_void, *const NativeMethod, i32) -> i32 =
+        std::mem::transmute(jni_slot(env, SLOT_REGISTER_NATIVES));
+    let rc = register(env, class, table.as_ptr(), table.len() as i32);
+    eprintln!("[blast] hosted Surface.nativeGetFromBlastBufferQueue (rc={rc})");
     rc
 }

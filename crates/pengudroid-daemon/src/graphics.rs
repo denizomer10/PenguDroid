@@ -48,7 +48,7 @@ mod imp {
     use wayland_client::globals::{registry_queue_init, GlobalListContents};
     use wayland_client::protocol::{
         wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_registry,
-        wl_seat, wl_shm, wl_shm_pool, wl_surface,
+        wl_seat, wl_shm, wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface,
     };
     use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
     use wayland_protocols::wp::linux_dmabuf::zv1::client::{
@@ -63,8 +63,11 @@ mod imp {
     #[allow(dead_code)] // `configured`/`closed` are diagnostics today.
     pub struct Surface {
         pub wl_surface: wl_surface::WlSurface,
-        pub xdg_surface: xdg_surface::XdgSurface,
-        pub xdg_toplevel: xdg_toplevel::XdgToplevel,
+        /// `None` for a subsurface: only a toplevel has an `xdg_surface`.
+        pub xdg_surface: Option<xdg_surface::XdgSurface>,
+        pub xdg_toplevel: Option<xdg_toplevel::XdgToplevel>,
+        /// Set when this surface is a child layer of another one.
+        pub subsurface: Option<wl_subsurface::WlSubsurface>,
         pub buffer: wl_buffer::WlBuffer,
         /// Kept alive so the memfd is not closed while the compositor may read
         /// it, and so `present` can repaint.
@@ -111,6 +114,8 @@ mod imp {
         /// `zwp_linux_dmabuf_v1`, when the compositor advertises it (v3+, which
         /// carries format modifiers).
         pub dmabuf: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
+        /// `wl_subcompositor`, used for child layers (`SurfaceView` video).
+        pub subcompositor: Option<wl_subcompositor::WlSubcompositor>,
         /// How many `format`/`modifier` events the compositor sent (diagnostic).
         pub dmabuf_formats: u32,
         /// The `(fourcc, modifier)` pairs the compositor advertised. v1-v2 send
@@ -227,8 +232,9 @@ mod imp {
                 p.id,
                 Surface {
                     wl_surface: p.wl_surface,
-                    xdg_surface: p.xdg_surface,
-                    xdg_toplevel: self.toplevels.remove(&p.id).expect("toplevel stored at creation"),
+                    xdg_surface: Some(p.xdg_surface),
+                    xdg_toplevel: self.toplevels.remove(&p.id),
+                    subsurface: None,
                     buffer,
                     region: p.region,
                     dmabuf_fd: None,
@@ -294,6 +300,7 @@ mod imp {
             }
             // v3 adds format modifiers, which we need to import GPU buffers.
             state.dmabuf = globals.bind(&qh, 3..=4, ()).ok();
+            state.subcompositor = globals.bind(&qh, 1..=1, ()).ok();
             // Input: the seat gives us pointer and keyboard events, which are
             // forwarded to whichever guest owns the surface under the cursor.
             state.seat = globals.bind(&qh, 1..=7, ()).ok();
@@ -474,12 +481,103 @@ mod imp {
             self.conn.flush().is_ok()
         }
 
+        /// Create a child layer of `parent` at `(x, y)`.
+        ///
+        /// Android composites a `SurfaceView` as its own layer under the
+        /// window; the Wayland equivalent is a `wl_subsurface`. It is created in
+        /// desynchronised mode so the guest can commit frames without the
+        /// parent having to commit too (a video frame must not wait for the UI).
+        pub fn create_subsurface(
+            &mut self,
+            parent: u32,
+            x: i32,
+            y: i32,
+            width: u32,
+            height: u32,
+        ) -> Option<u32> {
+            let subcompositor = self.state.subcompositor.clone()?;
+            let compositor = self.state.compositor.clone()?;
+            let shm = self.state.shm.clone()?;
+            let parent_surface = self.state.surfaces.get(&parent)?.wl_surface.clone();
+            let qh = self.queue.handle();
+
+            let id = self.state.alloc_id();
+            let wl_surface = compositor.create_surface(&qh, ());
+            let subsurface = subcompositor.get_subsurface(&wl_surface, &parent_surface, &qh, ());
+            subsurface.set_position(x, y);
+            subsurface.set_desync();
+
+            // A subsurface still needs *a* buffer to be mapped; a 1x1
+            // transparent one is attached until the first dma-buf arrives.
+            let region = match AshmemRegion::create(&format!("pengudroid-sub-{id}"), 4) {
+                Ok(r) => r,
+                Err(e) => {
+                    crate::warn!("cannot allocate subsurface memory: {e}");
+                    subsurface.destroy();
+                    wl_surface.destroy();
+                    return None;
+                }
+            };
+            let dup = region.try_clone_fd().ok()?;
+            let pool = shm.create_pool(dup.as_fd(), region.size() as i32, &qh, ());
+            let buffer = pool.create_buffer(
+                0,
+                1,
+                1,
+                4,
+                wl_shm::Format::Argb8888,
+                &qh,
+                (),
+            );
+            pool.destroy();
+            wl_surface.attach(Some(&buffer), 0, 0);
+            wl_surface.damage(0, 0, 1, 1);
+            wl_surface.commit();
+
+            self.state.surfaces.insert(
+                id,
+                Surface {
+                    wl_surface,
+                    xdg_surface: None,
+                    xdg_toplevel: None,
+                    subsurface: Some(subsurface),
+                    buffer,
+                    region,
+                    dmabuf_fd: None,
+                    width: width.max(1),
+                    height: height.max(1),
+                    configured: true,
+                    closed: false,
+                },
+            );
+            let _ = self.conn.flush();
+            crate::info!("created subsurface {id} of {parent} at {x},{y}");
+            Some(id)
+        }
+
+        /// Move an existing subsurface inside its parent.
+        pub fn set_subsurface_position(&mut self, id: u32, x: i32, y: i32) -> bool {
+            let Some(s) = self.state.surfaces.get(&id) else { return false };
+            let Some(sub) = s.subsurface.as_ref() else { return false };
+            sub.set_position(x, y);
+            s.wl_surface.commit();
+            let _ = self.conn.flush();
+            true
+        }
+
         /// Destroy a surface and its Wayland objects (the compositor closed the
         /// window, or the guest went away). Idempotent.
         pub fn destroy_surface(&mut self, id: u32) -> bool {
             let Some(surface) = self.state.surfaces.remove(&id) else { return false };
-            surface.xdg_toplevel.destroy();
-            surface.xdg_surface.destroy();
+            if let Some(t) = surface.xdg_toplevel {
+                t.destroy();
+            }
+            if let Some(x) = surface.xdg_surface {
+                x.destroy();
+            }
+            if let Some(sub) = surface.subsurface {
+                sub.destroy();
+            }
             surface.buffer.destroy();
             surface.wl_surface.destroy();
             let _ = self.conn.flush();
@@ -663,7 +761,10 @@ mod imp {
             //
             // `PENGUDROID_NO_PRESENT_FLIP=1` turns it off, for a compositor that
             // ignores buffer transforms or a guest that already renders top-down.
-            if std::env::var_os("PENGUDROID_NO_PRESENT_FLIP").is_none() {
+            //
+            // A subsurface is fed by a decoder writing rows top-down, so it must
+            // not be flipped.
+            if s.subsurface.is_none() && std::env::var_os("PENGUDROID_NO_PRESENT_FLIP").is_none() {
                 s.wl_surface
                     .set_buffer_transform(wl_output::Transform::Flipped180);
             }
@@ -778,6 +879,8 @@ mod imp {
     ignore_events!(wl_buffer::WlBuffer, ());
     ignore_events!(wl_surface::WlSurface, ());
     ignore_events!(wl_callback::WlCallback, ());
+    ignore_events!(wl_subcompositor::WlSubcompositor, ());
+    ignore_events!(wl_subsurface::WlSubsurface, ());
 
     impl Dispatch<wl_seat::WlSeat, ()> for State {
         fn event(
@@ -985,6 +1088,19 @@ mod imp {
         }
         pub fn create_toplevel(&mut self, _w: u32, _h: u32, _t: &str) -> Option<SurfaceInfo> {
             None
+        }
+        pub fn create_subsurface(
+            &mut self,
+            _parent: u32,
+            _x: i32,
+            _y: i32,
+            _w: u32,
+            _h: u32,
+        ) -> Option<u32> {
+            None
+        }
+        pub fn set_subsurface_position(&mut self, _id: u32, _x: i32, _y: i32) -> bool {
+            false
         }
         pub fn present(&mut self, _id: u32) -> bool {
             false

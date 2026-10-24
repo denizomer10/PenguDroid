@@ -1491,6 +1491,24 @@ fn register_framework_natives(env: &crate::jni::JniEnv, path: &str, libs: Option
         } else {
             failed.push((name.clone(), rc));
         }
+        // `android.view.Surface` registers its whole table from inside
+        // `libandroid_runtime`, so the shim's `registerNativeMethods` hook never
+        // sees it. Every entry is needed except
+        // `nativeGetFromBlastBufferQueue`, which must be ours: the framework
+        // implementation casts the queue pointer to a real `BLASTBufferQueue*`.
+        // Registering a one-entry table afterwards replaces just that method.
+        if name.contains("register_android_view_SurfaceE") {
+            let ours = unsafe {
+                libc::dlsym(
+                    libc::RTLD_DEFAULT,
+                    c"__pengudroid_register_surface_overrides".as_ptr(),
+                )
+            };
+            if !ours.is_null() {
+                let f: Register = unsafe { std::mem::transmute(ours) };
+                let _ = unsafe { f(env.0) };
+            }
+        }
     }
     eprintln!(
         "art: registered {ok} of {} native groups from {real} ({missing} dlsym misses)",

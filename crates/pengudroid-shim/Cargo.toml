@@ -12,5 +12,6 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 pengudroid-proto.workspace = true
+pengudroid-socket.workspace = true
 libc.workspace = true
 miniz_oxide.workspace = true

@@ -3056,6 +3056,7 @@ dependencies = [
  "libc",
  "miniz_oxide 0.8.9",
  "pengudroid-proto",
+ "pengudroid-socket",
 ]
 
 [[package]]
