@@ -3301,3 +3301,35 @@ pub fn attach_current_thread(vm: *mut c_void) -> Option<JniEnv> {
         Some(JniEnv(env))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The dp fields must follow the pixel size and the density, not a stale
+    /// constant.
+    ///
+    /// They were once the landscape 1280x720 values (487x274 dp) while the
+    /// density was 420, which made a 720 px surface only 274 dp wide — narrower
+    /// than a Material `AlertDialog`'s 280 dp minimum, so dialogs overflowed the
+    /// window and lost their buttons.
+    #[test]
+    fn dp_matches_the_surface_and_density() {
+        assert_eq!(DENSITY_DPI, 320);
+        assert_eq!(SURFACE_W, 720);
+        assert_eq!(SURFACE_H, 1280);
+        assert_eq!(SURFACE_W_DP, 360);
+        assert_eq!(SURFACE_H_DP, 640);
+
+        // `dp = px * 160 / dpi` must round-trip back to the pixel size.
+        assert_eq!(SURFACE_W_DP * DENSITY_DPI / 160, SURFACE_W);
+        assert_eq!(SURFACE_H_DP * DENSITY_DPI / 160, SURFACE_H);
+    }
+
+    /// 360 dp is wide enough for the narrowest thing the framework will draw.
+    #[test]
+    fn the_screen_is_wide_enough_for_a_material_dialog() {
+        // `AlertDialog`'s minimum width is 280 dp.
+        assert!(SURFACE_W_DP >= 280, "{SURFACE_W_DP} dp is too narrow");
+    }
+}

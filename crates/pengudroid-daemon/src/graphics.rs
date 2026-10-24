@@ -585,8 +585,13 @@ mod imp {
             // which composes to a flip about the horizontal axis — a vertical flip,
             // exactly what is needed here. It is free: the compositor applies it
             // while sampling, so nothing is copied.
-            s.wl_surface
-                .set_buffer_transform(wl_output::Transform::Flipped180);
+            //
+            // `PENGUDROID_NO_PRESENT_FLIP=1` turns it off, for a compositor that
+            // ignores buffer transforms or a guest that already renders top-down.
+            if std::env::var_os("PENGUDROID_NO_PRESENT_FLIP").is_none() {
+                s.wl_surface
+                    .set_buffer_transform(wl_output::Transform::Flipped180);
+            }
             s.wl_surface.attach(Some(&buffer), 0, 0);
             s.wl_surface.damage(0, 0, width as i32, height as i32);
             s.wl_surface.commit();
