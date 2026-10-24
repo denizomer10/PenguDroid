@@ -408,9 +408,16 @@ normal app reaches through `TelephonyManager`; the rest of the ~250-method
 interface returns `-ENOSYS`. The transaction codes are the AIDL declaration
 order for a given AOSP release and can shift when methods are inserted.
 
-The camera reports "zero cameras"; `AudioFlinger` returns empty replies; the
-OpenSL ES **buffer-queue player** is implemented (`Enqueue` → `pw-cat`), but
-recorders, prefetch and effects are still `SL_RESULT_FEATURE_UNSUPPORTED`;
+The camera reports "zero cameras"; `AudioFlinger` returns empty replies.
+**`AudioTrack` no longer goes through it**: the Java class is hosted at the JNI
+boundary (`crates/pengudroid-shim/src/audiotrack.rs` interposes
+`AndroidRuntime::registerNativeMethods` and replaces the native table
+`libmedia_jni` installs), so playback is a bounded queue drained into `pw-cat`.
+What that does *not* provide is mixing, effects, volume scaling or routing —
+those were `AudioFlinger`'s job and there is no replacement. `AudioRecord`, the
+`AudioEffect`s and audio routing are therefore still unimplemented. The OpenSL ES
+**buffer-queue player** is implemented (`Enqueue` → `pw-cat`), but recorders,
+prefetch and effects are still `SL_RESULT_FEATURE_UNSUPPORTED`;
 `PackageManager` and `ActivityManager` answer minimally. These are honest
 placeholders, not partial implementations.
 
@@ -482,11 +489,13 @@ hanging forever, so a wedged guest cannot freeze its peers.
    loop, and `fixtures/native-game` renders a playable game on the host GPU.
 10. ~~Vulkan.~~ **Done**: the Bionic soname maps to the host loader;
     `fixtures/native-vulkan` enumerates the GPU and creates a device.
-11. `AHardwareBuffer`/`gralloc` on dma-buf, then hardware composition.
-12. ~~`MediaCodec` (codec2), so video decodes.~~ **Done for ByteBuffer mode**:
+11. `AHardwareBuffer`/`gralloc` on dma-buf, then hardware composition.12. ~~`MediaCodec` (codec2), so video decodes.~~ **Done for ByteBuffer mode**:
     the in-process codec2 service decodes H.264 and the frame reaches Java with
-    the right pixels. Surface (`SurfaceView`) output and
-    `AudioTrack`/`AudioFlinger` are still missing.
+    the right pixels. Surface (`SurfaceView`) output works for an `ImageReader`
+    consumer. ~~`AudioTrack`~~ **Done**: the class is hosted at the JNI boundary
+    and streams into `pw-cat`, so ExoPlayer plays. **Next**: `SurfaceView` —
+    decoded frames still have no `BLASTBufferQueue` to be composited from, which
+    is what keeps the picture off the window.
 13. Input dispatch (touch/key) from the Wayland seat into the app's window.
 14. Guest ARM code execution, so arm64-only apps (Beach Buggy Racing 2,
     Genshin Impact) can run at all — see §2.1.

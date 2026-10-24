@@ -3,6 +3,185 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
+## Bu oturum (5): ses yolu — `AudioTrack` gerçek PCM çıkarıyor
+
+4. oturumun sonunda oynatma ses yüzünden duruyordu:
+
+```
+AudioSink$InitializationException: AudioTrack init failed 0 Config(44100, 12, 44100)
+Caused by: IllegalArgumentException: Invalid audio session ID -1
+```
+
+İki ayrı eksik vardı: `AudioManager.generateAudioSessionId()` (yani
+`AudioSystem.newAudioSessionId()`) bir türlü sayı üretmiyordu ve `AudioTrack`'ın
+native tarafı `AudioFlinger`'a bağlanıyordu; ikisi de yok.
+
+### Çözüm: sınıfı JNI sınırında barındırmak
+
+`libmedia_jni` native metotlarını
+`AndroidRuntime::registerNativeMethods(env, "android/media/AudioTrack", …)` ile
+yayınlıyor. Shim bu çağrıyı ele geçiriyor (`src/audiotrack.rs`) ve o tabloyu
+**isim isim** değiştiriyor: imzalar framework'ün verdiği imzalar, sadece fonksiyon
+işaretçileri bizim. Yani `AudioTrack.java` hiç değişmiyor; `libaudioclient`
+(`AudioFlinger` + `BitTube` + `ClientProxy`) tamamen devre dışı kalıyor.
+
+Aynı kanca `android/media/AudioSystem`'in `newAudioSessionId` /
+`newAudioPlayerId` metotlarını da sayaca bağlıyor. Kayıt sırasında:
+
+```
+audio: hosted 51 native(s) of android/media/AudioTrack (rc=0)
+audio: hosted 2 native(s) of android/media/AudioSystem (rc=0)
+```
+
+PCM, OpenSL ES yolunun kullandığı `pw-cat`/`aplay` hattına gidiyor
+([`spawn_sink`](crates/pengudroid-shim/src/lib.rs)): `native_setup` bir kuyruk ve
+bir yazıcı iş parçacığı kuruyor, `write` kuyruğa sığdığı kadarını kabul edip
+geri kalanını reddediyor (ExoPlayer `WRITE_NON_BLOCKING` kullanıyor ve kısa
+yazmayı "sonra gel" diye okuyor), `getPlaybackHeadPosition` ise sink'in
+gerçekten tükettiği kare sayısını veriyor. `getLatency` milisaniye döndürüyor
+(önce kare döndürüyordu; ExoPlayer "Ignoring impossibly large audio latency:
+10775000" diye uyarıyordu).
+
+### Kanıt: `PENGUDROID_PROBE_AUDIO=1`
+
+Uygulamaya girmeden, doğrudan framework üzerinden:
+
+```
+$ PENGUDROID_PROBE_AUDIO=1 pengudroid art-test --sysroot .toolchain/sysroot \
+    --classpath NewPipe_v0.29.1.apk --bind-app --main android.app.ActivityThread --vm-option -Xint
+audio: hosted 51 native(s) of android/media/AudioTrack (rc=0)
+audio: state=Some(1) (1 = STATE_INITIALIZED)
+audio: write() accepted Some(44100) of 44100 bytes
+audio: playback head 0 -> 22050 frames (22050 advanced)
+```
+
+440 Hz sinüsün yarım saniyesi yazıldı, oynatma kafası 400 ms'de tam 22050 kare
+(0.5 s @ 44.1 kHz) ilerledi — yani PCM süreçten çıkıp sink tarafından gerçek
+zamanda tüketildi. NewPipe'ta da oynatma sırasında `pw-cat -p -a --rate 44100
+--channels 2 --format s16 -` süreci çalışıyor.
+
+### Yol boyunca çıkan bir hata: `native_handle` çift serbest bırakma
+
+Ses düzelince oynatma daha ileri gitti ve bu kez süreç `double free or
+corruption (!prev)` ile öldü. gdb yığını (`crash.gdb` artık `SIGABRT`'ta da
+duruyor):
+
+```
+#10 native_handle_delete () from libcutils.so
+#11 hidl_handle::~hidl_handle () from libhidlbase.so
+#12 C2AllocationGralloc::~C2AllocationGralloc () from libcodec2_vndk.so
+#21 CCodecBufferChannel::discardBuffer ...
+```
+
+Sebep `GraphicBufferMapper::importBuffer`'ın **girdiğinin aynı işaretçisini**
+geri vermesiydi. `GraphicBuffer` kendisine verilen handle'ı kendi sahipleniyor
+(`~GraphicBuffer` → `freeBuffer` → `native_handle_delete`), yani aynı bloğu
+saran iki buffer aynı handle'ı iki kez serbest bırakıyordu. Artık
+`importBuffer` bir kopya üretiyor ve dosya tanıtıcılarını `dup` ile ayırıyor
+(`import_buffer_copies_the_handle` testi bunu sabitliyor).
+
+### Şu an nerede duruyor
+
+Oynatma gerçekten başlıyor: `ExoPlayerImpl` kuruluyor, ses decoderi PCM üretiyor,
+`pw-cat` çalıyor, video decoder kare üretiyor. NewPipe koşusu artık **ses**
+yüzünden değil, akış yüzünden duruyor:
+
+* bir koşuda `BehindLiveWindowException` (trending listesi tamamen canlı yayın;
+  `-Xint` altında emülasyon canlı pencereyi yakalayamıyor),
+* bir koşuda googlevideo'dan `Response code: 403`.
+
+Görüntünün pencereye çizildiği doğrulanmadı: koşuda `BLASTBufferQueue` yolu hiç
+görünmedi, yani oynatıcının yüzeyi hâlâ eksik (`docs/LIMITATIONS.md` §4).
+Sıradaki iş o: kareler çözülüyor, ama `SurfaceView`'ın buffer kuyruğuna
+bağlanması gerekiyor.
+
+## Bu oturum (4): servisler gerçekten oluşturuluyor, oynatma yolu açıldı
+
+Önceki oturumun bıraktığı adım tamamlandı: `apphost` artık borsanın kaydettiği
+`startService`/`bindService` isteklerini tüketiyor ve servisi kendisi kuruyor
+(`ServiceHost`, `crates/pengudroid-cli/src/apphost.rs`).
+
+Akış, `ActiveServices`'in küçük bir kopyası:
+
+1. İstek parcel'inden `Intent`, framework'ün kendi `Parcel.unmarshall`'ı ile
+   kuruluyor (istek sırasında yakalanan buffer + offset), yani `onBind`'in
+   baktığı action ve `onStartCommand`'ın okuduğu extras kaybolmuyor.
+2. `ActivityThread$CreateServiceData` doldurulup `ActivityThread$H`'a
+   `CREATE_SERVICE` mesajı olarak **ana thread'e** gönderiliyor — servis
+   `onCreate`'te `Handler` kurduğu için doğrudan çağrı ölümcül.
+3. `handleCreateService` servisi kuruyor; `onBind` çağrılıp dönen `IBinder`
+   `publishService` ile yayınlanıyor, sonra bekleyen `IServiceConnection`'lara
+   `connected(name, service)` gidiyor.
+
+Ölçüm (NewPipe, `PlayerService`):
+
+```
+[binder] service request: bind org.schabi.newpipe/org.schabi.newpipe.player.PlayerService
+service: org.schabi.newpipe.player.PlayerService intent = Intent { act=bind_player_holder_action cmp=org.schabi.newpipe/.player.PlayerService }
+service: creating org.schabi.newpipe.player.PlayerService
+service: created org.schabi.newpipe.player.PlayerService
+service: org.schabi.newpipe.player.PlayerService.onBind returned a binder
+service: connected 1 pending binding(s) for org.schabi.newpipe.player.PlayerService
+```
+
+`startService` (kod 27) de aynı örneği kullanıyor; video açıldığında ikinci bir
+`start`/`bind` çifti geliyor ve servis yeniden kurulmuyor.
+
+### Yol boyunca çıkan dört hata
+
+1. **`media.metrics` ≠ `media_metrics`.** `MediaMetricsManager` servisi
+   `ServiceManager`'da `media.metrics` adıyla duruyor ama istemciler
+   `Context.MEDIA_METRICS_SERVICE` ile, yani `media_metrics` ile istiyor. Cevap
+   noktalı ada bağlanmıştı: handle eşleşmiyor, boş reply dönüyor,
+   `Parcel.readString16` null veriyor ve `PlaybackSession`'ın `@NonNull`
+   doğrulaması NPE fırlatıyordu (ExoPlayer 2.18+ API 31'de bunu koşulsuz
+   kuruyor). Artık handle adı üzerinden eşleşiyor (`is_media_metrics_handle`).
+2. **`ISession.getBinderForSetQueue`** cevaplanmıyordu.
+   `MediaSession.setQueue` bu binder'ı `ParcelableListBinder.send`'e veriyor ve
+   o null kontrolü yapmadan `transact` çağırıyor → oynatıcı açılırken NPE. Kod
+   12 artık sahte bir handle döndürüyor.
+3. **`AndroidRuntime::getJNIEnv` detached thread'de null dönüyordu.**
+   `MediaCodec`'in callback thread'i (`MediaCodec_loop`) `CallVoidMethod`'a null
+   env ile girip SIGSEGV alıyordu. gdb (`PENGUDROID_DEBUG_WRAP` +
+   `.toolchain/crash.gdb`) `_JNIEnv::CallVoidMethod` içinde `rdi=0` gösterdi.
+   Cihazda bu thread'leri `canCallJava` yolu (yani `app_process`'in runtime'ı)
+   attach ediyor; burada o yok, o yüzden shim artık `GetEnv` detached derse
+   `AttachCurrentThread` çağırıyor.
+4. **Daemon ölü girdiye dokunuyordu.** `input_sinks` bağlantı kapanınca
+   temizlenmiyordu; `pengudroid tap` (`surface_id: 0`) eski bir guest'in
+   yüzeyine gidiyor ve yeni pencere hiç dokunuş görmüyordu. Artık sink'ler
+   bağlantıyla birlikte düşüyor ve odaklı yüzeyin canlı dinleyicisi yoksa en
+   yeni yüzeye düşülüyor.
+
+### Şu an nerede duruyor
+
+NewPipe'ta bir video açılıyor: `ExoPlayerImpl` kuruluyor, video decoder kare
+üretiyor (`onVideoSizeChanged`), sonra oynatma **ses** yüzünden duruyor:
+
+```
+ExoPlaybackException: MediaCodecAudioRenderer error ...
+Caused by: AudioSink$InitializationException: AudioTrack init failed 0 Config(44100, 12, 44100)
+Caused by: java.lang.IllegalArgumentException: Invalid audio session ID -1
+```
+
+Yani sıradaki iş `AudioTrack`/`AudioFlinger`: `AudioManager.generateAudioSessionId`
+(`AudioSystem::newAudioSessionId`) ve `AudioTrack` sink'i. Ses çıkışı olmadan da
+oynatmayı sürdürmek için `AudioSink`'i devre dışı bırakmak yeterli olabilir,
+ama doğru çözüm audio HAL yerine daemon'un PipeWire hattını bağlamak.
+
+Yeniden üretmek için (daemon çalışırken):
+
+```sh
+PENGUDROID_LAUNCH_ACTIVITY=org.schabi.newpipe.MainActivity \
+  ./target/debug/pengudroid art-test --sysroot .toolchain/sysroot \
+  --register-natives libandroid_runtime.so,libhwui.so \
+  --classpath NewPipe_v0.29.1.apk --bind-app --main android.app.ActivityThread \
+  --vm-option -Xint > /tmp/np.log 2>&1 &
+# “Keep Android Open” diyaloğunu kapat, sonra akıştaki ilk videoya dokun
+./target/debug/pengudroid tap 660 684     # OK
+./target/debug/pengudroid tap 200 400     # ilk thumbnail
+```
+
 ## Bu oturum (3): servis çağrıları artık tanınıyor ve cevaplanıyor
 
 NewPipe'ın oynatıcısı kendi sürecinde bir `PlayerService`; hiçbir `system_server`
@@ -40,7 +219,7 @@ takılıyor (ölçüm: `parsed=["android.app.IActivityManager", ""]`). Bu yüzde
 topluyor, sonra "paket + altındaki sınıf" çiftini arıyor
 (`binder::string16_candidates`).
 
-### Sıradaki adım (bu oturumda yapılmadı)
+### Sıradaki adım (4. oturumda yapıldı)
 
 Host tarafında servisi gerçekten oluşturmak: `ActivityThread$CreateServiceData`
 (`info`, `compatInfo`, `token`, `intent` alanları) kurup

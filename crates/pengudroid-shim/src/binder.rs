@@ -476,6 +476,30 @@ const IAM_START_SERVICE: u32 = 27;
 /// Same component as [`IAM_START_SERVICE`] but without the intent extras.
 const IAM_BIND_SERVICE: u32 = 30;
 
+/// `ISessionManager` transaction code for `createSession`.
+///
+/// From `android-13.0.0_r1`'s `ISessionManager.aidl`: `createSession` is the
+/// first method, so it is `FIRST_CALL_TRANSACTION` (1).
+const ISM_CREATE_SESSION: u32 = 1;
+
+/// `ISession` transaction code for `getController`.
+///
+/// Second method in `ISession.aidl` (`sendEvent` comes first).
+const ISESSION_GET_CONTROLLER: u32 = 2;
+
+/// `ISession` transaction code for `getBinderForSetQueue`.
+///
+/// Twelfth method in `ISession.aidl` (`sendEvent`, `getController`, then nine
+/// setters). `MediaSession.setQueue` calls `ParcelableListBinder.send` on the
+/// binder it returns, and that helper dereferences it without a null check.
+const ISESSION_GET_BINDER_FOR_SET_QUEUE: u32 = 12;
+
+/// `IMediaMetricsManager` transaction code for `getPlaybackSessionId(int)`.
+///
+/// Second method in `android-13.0.0_r1`'s `IMediaMetricsManager.aidl`
+/// (`reportPlaybackMetrics` comes first).
+const IMM_GET_PLAYBACK_SESSION_ID: u32 = 2;
+
 /// `IUserManager` transaction code for `isUserUnlocked(int)`.
 const IUM_IS_USER_UNLOCKED: u32 = 79;
 
@@ -1386,6 +1410,16 @@ fn parcel_contains_utf16(data: &[u8], s: &str) -> bool {
 }
 
 /// Reverse lookup of a handle, for diagnostics.
+/// Whether `handle` is the media metrics service, under either of the two
+/// names it is known by (`media.metrics` is the servicemanager name,
+/// `media_metrics` the one clients request through `Context`).
+fn is_media_metrics_handle(handle: u32) -> bool {
+    matches!(
+        name_for_handle(handle).as_deref(),
+        Some("media.metrics") | Some("media_metrics")
+    )
+}
+
 fn name_for_handle(handle: u32) -> Option<String> {
     let map = SERVICE_HANDLES.lock().unwrap_or_else(|e| e.into_inner());
     map.iter().find(|(_, h)| **h == handle).map(|(n, _)| n.clone())
@@ -1439,21 +1473,118 @@ fn string16_candidates(data: &[u8]) -> Vec<(usize, String)> {
 ///
 /// Uses the first plausible package-like string followed by a class-like string
 /// that lives under it. An `Intent` writes `package` right before its
-/// `ComponentName`, so this pair identifies the target service.
-fn service_component(data: &[u8]) -> Option<(String, String)> {
+/// `ComponentName`, so this pair identifies the target service. The package's
+/// offset is returned too: the `Intent` is unmarshalled from that point.
+fn service_component(data: &[u8]) -> Option<(String, String, usize)> {
     let candidates = string16_candidates(data);
-    for (i, (_, package)) in candidates.iter().enumerate() {
+    for (i, (offset, package)) in candidates.iter().enumerate() {
         if !package.contains('.') || package.starts_with("android.") {
             continue;
         }
         let prefix = format!("{package}.");
         for (_, class) in candidates.iter().skip(i + 1) {
             if class.starts_with(&prefix) {
-                return Some((package.clone(), class.clone()));
+                return Some((package.clone(), class.clone(), *offset));
             }
         }
     }
     None
+}
+
+/// Find the `string16` that ends exactly at `end`, returning its start.
+///
+/// Parcel strings are either a 4-byte `-1` (null) or `[u32 len][utf16][nul]`
+/// padded to 4 bytes, and every field is 4-byte aligned, so stepping back in
+/// 4-byte steps finds the length word unambiguously.
+fn string16_start_ending_at(data: &[u8], end: usize) -> Option<usize> {
+    if end < 4 || end > data.len() {
+        return None;
+    }
+    let word = u32::from_ne_bytes([data[end - 4], data[end - 3], data[end - 2], data[end - 1]]);
+    if word == u32::MAX {
+        return Some(end - 4);
+    }
+    let lowest = end.saturating_sub(4 + 2 * 1024 + 8);
+    let mut start = (end - 4) & !3;
+    loop {
+        if start + 4 <= end {
+            let len = u32::from_ne_bytes([
+                data[start],
+                data[start + 1],
+                data[start + 2],
+                data[start + 3],
+            ]) as usize;
+            if (1..=1024).contains(&len) {
+                let payload_end = start + 4 + len * 2;
+                if (payload_end + 2 + 3) & !3 == end && payload_end + 2 <= data.len() {
+                    return Some(start);
+                }
+            }
+        }
+        if start < lowest || start < 4 {
+            return None;
+        }
+        start -= 4;
+    }
+}
+
+/// Find the `string8` that ends exactly at `end`, returning its start.
+///
+/// Android 13's `Intent.writeToParcel` writes its strings with `writeString8`
+/// (`[u32 len including NUL][bytes][pad to 4]`), and a null is either `-1` or
+/// `0` depending on the field. All writes are 4-byte aligned, so stepping back
+/// in 4-byte steps finds the length word.
+fn string8_start_ending_at(data: &[u8], end: usize) -> Option<usize> {
+    if end < 4 || end > data.len() {
+        return None;
+    }
+    let word = u32::from_ne_bytes([data[end - 4], data[end - 3], data[end - 2], data[end - 1]]);
+    if word == u32::MAX || word == 0 {
+        return Some(end - 4);
+    }
+    let lowest = end.saturating_sub(4 + 1024 + 8);
+    let mut start = (end - 4) & !3;
+    loop {
+        if start + 4 <= end {
+            let len = u32::from_ne_bytes([
+                data[start],
+                data[start + 1],
+                data[start + 2],
+                data[start + 3],
+            ]) as usize;
+            if (1..=1024).contains(&len) && start + 4 + len <= data.len() {
+                if (start + 4 + len + 3) & !3 == end {
+                    return Some(start);
+                }
+            }
+        }
+        if start < lowest || start < 4 {
+            return None;
+        }
+        start -= 4;
+    }
+}
+
+/// Offset of the `Intent` that contains the component package at
+/// `package_offset`.
+///
+/// `Intent.writeToParcel` (Android 13) writes, in order:
+/// `action` (string8), `data` (`Uri`, either a string8 or an int `0`), `type`
+/// (string8), `identifier` (string8), `flags` (int), `package` (string8), then
+/// the `ComponentName` as two `string16`s. The package this function is given is
+/// the second of those (the component's), so walking back over the six fields
+/// before it lands on `action` — the first byte of the `Intent`, and therefore
+/// the offset `Parcel.unmarshall` wants.
+fn intent_start(data: &[u8], package_offset: usize) -> Option<usize> {
+    let package = string8_start_ending_at(data, package_offset)?;
+    let flags = package.checked_sub(4)?;
+    if flags == 0 {
+        return None;
+    }
+    let identifier = string8_start_ending_at(data, flags)?;
+    let ty = string8_start_ending_at(data, identifier)?;
+    let uri = string8_start_ending_at(data, ty)?;
+    string8_start_ending_at(data, uri)
 }
 
 /// Decode the AIDL interface token of a request parcel.
@@ -1956,7 +2087,7 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         }
         if tr.code == IAM_START_SERVICE {
             match &component {
-                Some((pkg, cls)) => {
+                Some((pkg, cls, _)) => {
                     parcel.extend_from_slice(&1u32.to_ne_bytes()); // present
                     parcel.extend_from_slice(&string16(pkg));
                     parcel.extend_from_slice(&string16(cls));
@@ -1966,8 +2097,26 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         } else {
             parcel.extend_from_slice(&0u32.to_ne_bytes()); // 0 = accepted
         }
-        if let Some((pkg, cls)) = component {
-            note_service_request(&pkg, &cls, tr.code);
+        if let Some((pkg, cls, package_offset)) = component {
+            // The host needs the *real* `Intent`, not just the component: the
+            // action is what `Service.onBind` branches on, and the extras are
+            // what `onStartCommand` checks (`should_start_foreground_extra`).
+            // The whole transaction buffer plus the Intent's offset lets it
+            // unmarshall the framework object with `Parcel.unmarshall`, so no
+            // per-app guess about either is needed.
+            let maybe_offset = intent_start(data, package_offset);
+            if trace_enabled() {
+                diag(&format!(
+                    "[binder]   package_offset={package_offset} intent_offset={maybe_offset:?}\n"
+                ));
+                let mut hex = String::new();
+                for b in data.iter().take(320) {
+                    hex.push_str(&format!("{b:02x}"));
+                }
+                diag(&format!("[binder]   request hex={hex}\n"));
+            }
+            let intent_offset = maybe_offset.unwrap_or(0);
+            note_service_request(&pkg, &cls, tr.code, data, intent_offset);
         }
     }
     if tr.target_handle == handle_for("activity") && tr.code == IAM_GET_CONTENT_PROVIDER {
@@ -1986,6 +2135,71 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             if trace_enabled() {
                 diag(&format!("[binder]   -> ContentProviderHolder ({} bytes)\n", info.len()));
             }
+        }
+    }
+    if is_media_metrics_handle(tr.target_handle) && tr.code == IMM_GET_PLAYBACK_SESSION_ID {
+        // `MediaMetricsManager.createPlaybackSession` wraps this reply in a
+        // `PlaybackSession`, whose constructor 
+        // `AnnotationValidations.validate(NonNull.class, null, id)` rejects a null
+        // id with an NPE. ExoPlayer 2.18 registers such a listener unconditionally
+        // on API 31+, so without an id `Player.initPlayback` dies and no playback
+        // session is ever created.
+        //
+        // The handle has to be matched by *name* and not by
+        // `handle_for("media.metrics")`: ServiceManager registers the service as
+        // `media.metrics` but every Java client asks for it through
+        // `Context.MEDIA_METRICS_SERVICE`, which is `media_metrics` — the handle
+        // the app transacts with is the one the service manager minted for the
+        // underscore name. Keying the reply on the dotted name silently produced
+        // an empty reply, and `Parcel.readString16` then returned null.
+        parcel.extend_from_slice(&string16(&format!(
+            "pengudroid-playback-{}",
+            NEXT_HANDLE.fetch_add(1, Ordering::Relaxed)
+        )));
+        if trace_enabled() {
+            diag("[binder]   -> media.metrics playback session id\n");
+        }
+    }
+    if tr.target_handle == handle_for("media_session") && tr.code == ISM_CREATE_SESSION {
+        // `MediaSessionManager.createSession` mints the framework session that
+        // every `MediaSessionCompat` on API 29+ wraps; `MediaSession`'s
+        // constructor immediately dereferences it (`ISession.getController`),
+        // so returning nothing makes NewPipe's `PlayerService.onCreate` die
+        // with an NPE. A pair of empty binder handles is enough for the
+        // constructor and for every later `setFlags`/`setMetadata`/... call,
+        // which are void and succeed with no result.
+        push_flat_handle(&mut parcel, &mut objects, handle_for("media_session_session"));
+        if trace_enabled() {
+            diag("[binder]   -> createSession (fake ISession)\n");
+        }
+    }
+    if tr.target_handle == handle_for("media_session_session")
+        && tr.code == ISESSION_GET_CONTROLLER
+    {
+        push_flat_handle(
+            &mut parcel,
+            &mut objects,
+            handle_for("media_session_controller"),
+        );
+        if trace_enabled() {
+            diag("[binder]   -> ISession.getController (fake ISessionController)\n");
+        }
+    }
+    if tr.target_handle == handle_for("media_session_session")
+        && tr.code == ISESSION_GET_BINDER_FOR_SET_QUEUE
+    {
+        // `MediaSession.setQueue` hands this binder to
+        // `ParcelableListBinder.send`, which calls `binder.transact(...)` with
+        // no null check, so a null result is an NPE in the middle of
+        // `MediaSessionConnector.onEvents`. The transaction it sends is
+        // fire-and-forget for our purposes: an empty reply satisfies libbinder.
+        push_flat_handle(
+            &mut parcel,
+            &mut objects,
+            handle_for("media_session_queue"),
+        );
+        if trace_enabled() {
+            diag("[binder]   -> ISession.getBinderForSetQueue (fake queue binder)\n");
         }
     }
     if tr.target_handle == handle_for("media.resource_manager") {
@@ -2823,58 +3037,78 @@ pub unsafe extern "C" fn __pengudroid_binder_set_window_reply(ptr: *const u8, le
 #[no_mangle]
 /// A service the app asked the (absent) system server to start or bind.
 ///
-/// Nothing schedules these yet — that is the next piece of `ActivityThread`
-/// host-side work (`handleCreateService`/`handleBindService`) — so the request
-/// is recorded here for the host to pick up instead of being dropped.
+/// Nothing schedules these inside the app, so the request is recorded here for
+/// the host to pick up; `apphost` turns it into an `ActivityThread` call.
 #[derive(Clone)]
 pub struct ServiceRequest {
     pub package: String,
     pub class: String,
     /// `true` for `bindService`, `false` for `startService`.
     pub bind: bool,
+    /// The transaction's data buffer, verbatim, so the host can unmarshall the
+    /// `Intent` with the framework's own `Parcel.unmarshall`.
+    pub parcel: Vec<u8>,
+    /// Offset of the `Intent` inside `parcel`, or 0 when it was not located.
+    pub intent_offset: usize,
 }
+
+/// Cap on one recorded request, including the raw transaction buffer.
+///
+/// `bindService`/`startForegroundService` requests are a few hundred bytes and
+/// their extras are small; anything bigger is not a request this host can use.
+pub const SERVICE_REQUEST_CAP: usize = 8192;
 
 static SERVICE_REQUESTS: Mutex<Vec<ServiceRequest>> = Mutex::new(Vec::new());
 
-fn note_service_request(package: &str, class: &str, code: u32) {
+fn note_service_request(package: &str, class: &str, code: u32, data: &[u8], intent_offset: usize) {
     let bind = code == IAM_BIND_SERVICE;
     let mut queue = SERVICE_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
-    if queue
+    // Log each distinct request once, but *queue every occurrence*: a rebind
+    // after `unbindService` is a real new bind the host has to answer, and the
+    // first `connected` callback does not carry over to it.
+    if !queue
         .iter()
         .any(|r| r.package == package && r.class == class && r.bind == bind)
     {
-        return;
-    }
-    unsafe {
-        diag(&format!(
-            "[binder] service request: {} {package}/{class}\n",
-            if bind { "bind" } else { "start" }
-        ));
+        unsafe {
+            diag(&format!(
+                "[binder] service request: {} {package}/{class}\n",
+                if bind { "bind" } else { "start" }
+            ));
+        }
     }
     queue.push(ServiceRequest {
         package: package.to_string(),
         class: class.to_string(),
         bind,
+        parcel: data[..data.len().min(SERVICE_REQUEST_CAP)].to_vec(),
+        intent_offset,
     });
 }
 
 /// Pop the oldest recorded service request.
 ///
-/// Returns `0` and fills `out_*` when a request was queued. The host calls this
-/// from its UI loop; see `apphost::drive_service_requests`.
+/// Writes one record into `out` and returns `0`; `-1` when the queue is empty
+/// or the record does not fit `cap`.
+///
+/// Record layout (all integers little-endian):
+/// ```text
+/// [u32 bind][u32 pkg_len][u32 cls_len][u32 intent_offset][u32 parcel_len]
+/// [pkg bytes][class bytes][parcel bytes]
+/// ```
+/// The host calls this from its service thread; see
+/// `apphost::spawn_service_host`.
 ///
 /// # Safety
-/// `out_package`/`out_class` must point at `cap` writable bytes, and
-/// `out_len` at a writable `usize`.
+/// `out` must point at `cap` writable bytes and `out_len` at a writable
+/// `usize`.
 #[no_mangle]
 pub unsafe extern "C" fn __pengudroid_binder_take_service_request(
-    out_package: *mut u8,
-    out_class: *mut u8,
+    out: *mut u8,
     cap: usize,
     out_len: *mut usize,
-    out_bind: *mut i32,
 ) -> i32 {
-    if out_package.is_null() || out_class.is_null() || out_len.is_null() || out_bind.is_null() {
+    if out.is_null() || out_len.is_null() {
         return -1;
     }
     let request = {
@@ -2886,13 +3120,27 @@ pub unsafe extern "C" fn __pengudroid_binder_take_service_request(
     };
     let pkg = request.package.as_bytes();
     let cls = request.class.as_bytes();
-    if pkg.len() > cap || cls.len() > cap {
+    let total = 20 + pkg.len() + cls.len() + request.parcel.len();
+    if total > cap {
+        unsafe {
+            diag(&format!(
+                "[binder] dropping an oversized service request: {}/{}\n",
+                request.package, request.class
+            ));
+        }
         return -1;
     }
-    std::ptr::copy_nonoverlapping(pkg.as_ptr(), out_package, pkg.len());
-    std::ptr::copy_nonoverlapping(cls.as_ptr(), out_class, cls.len());
-    *out_len = pkg.len().max(cls.len());
-    *out_bind = i32::from(request.bind);
+    let mut record = Vec::with_capacity(total);
+    record.extend_from_slice(&u32::from(request.bind).to_ne_bytes());
+    record.extend_from_slice(&(pkg.len() as u32).to_ne_bytes());
+    record.extend_from_slice(&(cls.len() as u32).to_ne_bytes());
+    record.extend_from_slice(&(request.intent_offset as u32).to_ne_bytes());
+    record.extend_from_slice(&(request.parcel.len() as u32).to_ne_bytes());
+    record.extend_from_slice(pkg);
+    record.extend_from_slice(cls);
+    record.extend_from_slice(&request.parcel);
+    std::ptr::copy_nonoverlapping(record.as_ptr(), out, record.len());
+    *out_len = record.len();
     0
 }
 
@@ -3119,6 +3367,62 @@ mod tests {
         let reply = unsafe { make_reply(&tr, 1) };
         assert_eq!(reply.parcel.len(), 8);
         assert_eq!(&reply.parcel[4..8], &0u32.to_ne_bytes());
+    }
+
+    /// `MediaSession.setQueue` passes `ISession.getBinderForSetQueue()`'s result
+    /// straight to `ParcelableListBinder.send`, which calls `transact` on it with
+    /// no null check: an empty reply is an NPE while the player is being built.
+    #[test]
+    fn media_session_answers_a_queue_binder() {
+        let tr = TransactionData {
+            target_handle: handle_for("media_session_session"),
+            code: ISESSION_GET_BINDER_FOR_SET_QUEUE,
+            ..TransactionData::default()
+        };
+        // SAFETY: `make_reply` only reads the transaction descriptor; this one
+        // carries no parcel payload.
+        let reply = unsafe { make_reply(&tr, 1) };
+        assert_eq!(&reply.parcel[0..4], &0u32.to_ne_bytes(), "status word");
+        assert_eq!(
+            u32::from_ne_bytes(reply.parcel[4..8].try_into().unwrap()),
+            BINDER_TYPE_HANDLE
+        );
+        assert_eq!(reply.objects.len(), 1, "one flat_binder_object");
+    }
+
+    /// `MediaMetricsManager.createPlaybackSession` turns the reply to
+    /// `getPlaybackSessionId` into a `PlaybackSession`, whose `@NonNull`
+    /// validation throws an NPE on a null id — and ExoPlayer 2.18 builds such a
+    /// listener on API 31+, so an empty reply kills `Player.initPlayback`.
+    ///
+    /// Both names have to be recognised: clients request the service through
+    /// `Context.MEDIA_METRICS_SERVICE` (`media_metrics`) while the service
+    /// manager knows it as `media.metrics`.
+    #[test]
+    fn media_metrics_answers_a_session_id_under_both_names() {
+        for name in ["media_metrics", "media.metrics"] {
+            let tr = TransactionData {
+                target_handle: handle_for(name),
+                code: IMM_GET_PLAYBACK_SESSION_ID,
+                ..TransactionData::default()
+            };
+            // SAFETY: `make_reply` only reads the transaction descriptor; this
+            // one carries no parcel payload.
+            let reply = unsafe { make_reply(&tr, 1) };
+            assert_eq!(&reply.parcel[0..4], &0u32.to_ne_bytes(), "status word");
+            let len =
+                u32::from_ne_bytes(reply.parcel[4..8].try_into().unwrap()) as usize;
+            assert!(len > 0, "{name}: the session id must not be null");
+            let text: Vec<u16> = reply.parcel[8..8 + len * 2]
+                .chunks(2)
+                .map(|c| u16::from_ne_bytes([c[0], c[1]]))
+                .collect();
+            let id = String::from_utf16(&text).unwrap();
+            let suffix = id
+                .strip_prefix("pengudroid-playback-")
+                .unwrap_or_else(|| panic!("{name}: unexpected id {id:?}"));
+            assert!(suffix.parse::<u32>().is_ok(), "{name}: {id:?}");
+        }
     }
 
     /// `Settings.NameValueCache` reads `Bundle.getString(key)` from the

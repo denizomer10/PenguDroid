@@ -66,8 +66,9 @@ pub struct Daemon {
     pub(crate) spawned: Mutex<Vec<SpawnedRun>>,
     /// Connections that asked for input on a surface, keyed by surface id.
     /// The sender is the peer's inbox, so input travels the same path as
-    /// forwarded guest calls.
-    input_sinks: Mutex<std::collections::HashMap<u32, Sender<Message>>>,
+    /// forwarded guest calls; the pid is kept so the entry can be dropped when
+    /// that connection closes.
+    input_sinks: Mutex<std::collections::HashMap<u32, (i32, Sender<Message>)>>,
 }
 
 pub(crate) struct SpawnedRun {
@@ -241,7 +242,7 @@ impl Daemon {
         }
         let sinks = self.input_sinks.lock().unwrap();
         for (surface_id, event) in events {
-            if let Some(tx) = sinks.get(&surface_id) {
+            if let Some((_, tx)) = sinks.get(&surface_id) {
                 let _ = tx.send(Message::InputEvent { surface_id, event });
             }
         }
@@ -416,6 +417,16 @@ fn forget_peer(daemon: &Arc<Daemon>, peer: &Peer) {
             removed.len()
         );
     }
+    // A guest's surface outlives its connection in the graphics table until the
+    // compositor destroys it, so a dead sink would keep `surface_id: 0` input
+    // pointing at a window nobody draws into — the next guest then never sees a
+    // tap that was meant for it.
+    let mut sinks = daemon.input_sinks.lock().unwrap();
+    let before = sinks.len();
+    sinks.retain(|_, (pid, _)| *pid != peer.pid);
+    if sinks.len() != before {
+        crate::info!("connection pid {} closed; dropped its input sink", peer.pid);
+    }
 }
 
 /// Dispatch one message. Returns `(reply, fds_to_send, should_close)`.
@@ -435,7 +446,7 @@ fn handle(
                 .input_sinks
                 .lock()
                 .unwrap()
-                .insert(surface_id, inbox.clone());
+                .insert(surface_id, (peer.pid, inbox.clone()));
             crate::info!("pid {} subscribed to input on surface {surface_id}", peer.pid);
             (Some(Message::Ack), vec![], false)
         }
@@ -444,22 +455,25 @@ fn handle(
         // send these (the compositor feeds them), so the two directions do not
         // collide. `surface_id == 0` means "the surface under the pointer".
         Message::InputEvent { surface_id, event } => {
+            let sinks = daemon.input_sinks.lock().unwrap();
             let target = if surface_id != 0 {
-                Some(surface_id)
+                Some(surface_id).filter(|id| sinks.contains_key(id))
             } else {
-                let mut guard = daemon.graphics.lock().unwrap();
-                guard.as_ref().and_then(|g| g.focused_surface())
-                    .or_else(|| {
-                        guard.as_ref().and_then(|g| g.surface_ids().first().copied())
-                    })
+                let focused = {
+                    let mut guard = daemon.graphics.lock().unwrap();
+                    guard.as_ref().and_then(|g| g.focused_surface())
+                };
+                // Prefer the surface the compositor says is focused, but only if
+                // a live connection is listening: a surface whose guest is gone
+                // still sits in the graphics table and would swallow the event.
+                focused
+                    .filter(|id| sinks.contains_key(id))
+                    .or_else(|| sinks.keys().max().copied())
             };
             if let Some(id) = target {
-                let sinks = daemon.input_sinks.lock().unwrap();
-                if let Some(tx) = sinks.get(&id) {
+                if let Some((_, tx)) = sinks.get(&id) {
                     let _ = tx.send(Message::InputEvent { surface_id: id, event });
                     crate::info!("injected {:?} on surface {id}", event);
-                } else {
-                    crate::warn!("input injected for surface {id} with no subscriber");
                 }
             } else {
                 crate::warn!("input injected but no surface is known");

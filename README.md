@@ -92,6 +92,8 @@ milestone. Nothing below is overstated.
 | OpenSL ES (audio) | **Working** | engine/output-mix/buffer-queue player implemented; `Enqueue` forwards PCM to `pw-cat`; `fixtures/opensl-app` verifies PLAYING + callbacks against the canonical headers |
 | `LD_PRELOAD` Bionic→glibc shim (`libashmem`, logging, props, API level) | **Working** | interposes real Bionic symbol names; `__android_log_print` formats with the host `vsnprintf` |
 | Service registry + `phone`/`media.camera`/AMS/PMS/SurfaceFlinger stubs | **Stub** | correctly-named interfaces, minimal replies |
+| **`AudioTrack` playback** | **Working (playback only)** | `AndroidRuntime::registerNativeMethods` is interposed and `android.media.AudioTrack`'s native table is replaced, so PCM goes through a bounded queue into `pw-cat`/`aplay` instead of `AudioFlinger`. `PENGUDROID_PROBE_AUDIO=1` writes half a second of a 440 Hz tone and shows the playback head advance; ExoPlayer plays through it. No mixing, effects, volume scaling or routing |
+| **App services (`startService`/`bindService`)** | **Working** | the host answers both `IActivityManager` transactions and plays `ActiveServices`: it builds `CreateServiceData`, posts `ActivityThread$H.CREATE_SERVICE` on the main thread, calls `handleCreateService`/`onBind`, publishes the binder and delivers `IServiceConnection.connected`. NewPipe's `PlayerService` comes up and ExoPlayer starts |
 | Audio: PipeWire | **Working** | the daemon owns a shared ring and drains it into `pw-cat` (or `aplay`); `audio-test [--via-daemon]` streams PCM |
 | Telephony (`ITelephony`) | **Working (no-SIM model)** | real AIDL transaction codes and `Parcel`-marshalled replies for the methods apps reach through `TelephonyManager`; `pengudroid telephony` transacts and decodes them |
 | **Running real DEX bytecode (ART)** | **Working (VM + DEX)** | `JNI_CreateJavaVM` now returns `JNI_OK` against an extracted LineageOS 20 (Android 13) tree: ART's whole startup path completes and Java code executes. Classes from a real APK's `classes.dex` load and link through the system class loader |
@@ -429,6 +431,7 @@ opt-in and cost nothing when unset.
 | `PENGUDROID_TRACE_AHB` | trace the gralloc shim: `AHardwareBuffer` allocations, `GraphicBufferAllocator` allocations (with `fd`, stride, format), mapper `lock`/`unlock` and any rejection reason |
 | `PENGUDROID_DUMP_GBUF=<dir>` | write every graphic block's contents to `<dir>/gbuf-<fd>.bin` on `unlock`; shows which block actually received pixels |
 | `PENGUDROID_PROBE_MEDIA=1` | drive `MediaCodecList` + decode a stream through `MediaCodec` and report the decoded bytes (`PENGUDROID_H264` picks the stream, default `/tmp/test.h264`); add `PENGUDROID_PROBE_SURFACE=1` to decode into an `ImageReader` surface instead of a ByteBuffer |
+| `PENGUDROID_PROBE_AUDIO=1` | build an `AudioTrack`, play half a second of a 440 Hz tone and report the playback head twice — a non-zero delta means the PCM really reached `pw-cat` |
 | `PENGUDROID_TRACE_CODEC2` | dump every codec2 HIDL transaction (request, reply, object offsets) |
 | `PENGUDROID_TRACE_BINDER` | trace broker transactions by interface and code |
 | `PENGUDROID_TRACE_GLESHIM`, `PENGUDROID_TRACE_GLES`, `PENGUDROID_TRACE_DRAW` | trace the EGL/GLES translation layer and hwui draw calls |

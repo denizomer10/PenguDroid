@@ -722,6 +722,12 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
     // display's size, which goes through `IDisplayManager.getDisplayInfo`.
     install_display_replies(env);
     install_window_replies(env);
+    // `MediaSessionManager` resolves the `media_session` binder through
+    // `MediaFrameworkPlatformInitializer`, whose `MediaServiceManager` is
+    // installed by `system_server` during boot. Without it, the constructor of
+    // `MediaSession` NPEs and NewPipe's `PlayerService.onCreate` dies with
+    // "Unable to create service ... on a null object reference".
+    install_platform_service_managers(env);
     // `handleBindApplication` calls `Typeface.loadPreinstalledSystemFontMap()`
     // itself, and that now works: the shim rewrites `stat64`/`lstat64` too, so
     // `FontListParser` accepts the font files and the map is built from
@@ -837,6 +843,9 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         if std::env::var_os("PENGUDROID_PROBE_MEDIA").is_some() {
             probe_media_codecs(env);
         }
+        if std::env::var_os("PENGUDROID_PROBE_AUDIO").is_some() {
+            probe_audio_track(env);
+        }
         if let Ok(name) = std::env::var("PENGUDROID_LAUNCH_ACTIVITY") {
             launch_activity(env, thread, data, spec, &name);
         }
@@ -844,6 +853,102 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         eprintln!("apphost: handleBindApplication threw");
     }
     ok
+}
+
+/// `PENGUDROID_PROBE_AUDIO=1`: build an `AudioTrack`, play half a second of PCM
+/// and report whether the playback head advanced.
+///
+/// This is the audio path end to end without an app: `AudioTrack`'s Java side
+/// (constructor, `native_setup`, buffer sizes), the shim's JNI host
+/// (`crates/pengudroid-shim/src/audiotrack.rs`) and the `pw-cat` sink behind
+/// it. `getPlaybackHeadPosition` only moves when the sink really consumes the
+/// PCM, so a non-zero delta is proof that samples left the process.
+fn probe_audio_track(env: &JniEnv) {
+    let Some(track_class) = env.find_class("android/media/AudioTrack") else {
+        eprintln!("audio: AudioTrack not found");
+        return;
+    };
+    let rate = 44_100i32;
+    let mono = 0x4i32; // AudioFormat.CHANNEL_OUT_MONO
+    let pcm16 = 2i32; // AudioFormat.ENCODING_PCM_16BIT
+    let buffer_bytes = rate * 2; // one second of mono s16
+    let Some(ctor) = env.method_id(
+        track_class,
+        "<init>",
+        "(IIIIII)V",
+    ) else {
+        eprintln!("audio: AudioTrack(int,int,int,int,int,int) constructor missing");
+        return;
+    };
+    // The deprecated stream-type constructor is the shortest path to a live
+    // track; it builds the same AudioAttributes the `Builder` would.
+    let Some(track) = env.new_object(
+        track_class,
+        ctor,
+        &[
+            JValue { i: 3 }, // STREAM_MUSIC
+            JValue { i: rate },
+            JValue { i: mono },
+            JValue { i: pcm16 },
+            JValue { i: buffer_bytes },
+            JValue { i: 1 }, // MODE_STREAM
+        ],
+    ) else {
+        eprintln!("audio: new AudioTrack threw");
+        env.describe_exception();
+        return;
+    };
+    let (Some(get_state), Some(play), Some(write), Some(position)) = (
+        env.method_id(track_class, "getState", "()I"),
+        env.method_id(track_class, "play", "()V"),
+        env.method_id(track_class, "write", "([BII)I"),
+        env.method_id(track_class, "getPlaybackHeadPosition", "()I"),
+    ) else {
+        eprintln!("audio: AudioTrack methods missing");
+        return;
+    };
+    println!(
+        "audio: state={:?} (1 = STATE_INITIALIZED)",
+        env.call_int(track, get_state, &[])
+    );
+    if !env.call_void(track, play, &[]) {
+        eprintln!("audio: play() threw");
+        env.describe_exception();
+        return;
+    }
+    // Half a second of a 440 Hz sine, in s16 mono.
+    let frames = rate / 2;
+    let mut pcm = Vec::with_capacity(frames as usize * 2);
+    for n in 0..frames {
+        let t = n as f32 / rate as f32;
+        let sample = ((t * 440.0 * std::f32::consts::TAU).sin() * 12_000.0) as i16;
+        pcm.extend_from_slice(&sample.to_le_bytes());
+    }
+    let Some(array) = env.new_byte_array(pcm.len() as i32) else {
+        eprintln!("audio: cannot allocate the PCM array");
+        return;
+    };
+    env.set_byte_array_region(array, 0, &pcm);
+    let written = env.call_int(
+        track,
+        write,
+        &[JValue { l: array }, JValue { i: 0 }, JValue { i: pcm.len() as i32 }],
+    );
+    println!("audio: write() accepted {written:?} of {} bytes", pcm.len());
+    let first = env.call_int(track, position, &[]).unwrap_or(-1);
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let second = env.call_int(track, position, &[]).unwrap_or(-1);
+    println!(
+        "audio: playback head {first} -> {second} frames ({} advanced)",
+        second - first
+    );
+    let Some(stop) = env.method_id(track_class, "stop", "()V") else {
+        return;
+    };
+    env.call_void(track, stop, &[]);
+    if let Some(release) = env.method_id(track_class, "release", "()V") {
+        env.call_void(track, release, &[]);
+    }
 }
 
 /// `PENGUDROID_PROBE_MEDIA=1`: ask the framework how many codecs it sees.
@@ -1491,6 +1596,7 @@ pub fn prepare_main_thread(env: &JniEnv) -> bool {
 pub fn loop_forever(env: &JniEnv) {
     spawn_draw_monitor(env);
     spawn_input_pump(env);
+    spawn_service_host(env);
     let Some(looper_class) = env.find_class("android/os/Looper") else {
         return;
     };
@@ -1500,6 +1606,680 @@ pub fn loop_forever(env: &JniEnv) {
     println!("apphost: entering Looper.loop()");
     let _ = env.call_static_void(looper_class, loop_fn, &[]);
     eprintln!("apphost: Looper.loop() returned");
+}
+
+/// How long the service thread sleeps between queue polls.
+const SERVICE_POLL_MS: u64 = 100;
+/// One broker record: a 20-byte header, two names, and the raw transaction.
+const SERVICE_RECORD_CAP: usize = 8192;
+
+/// Which lifecycle the app asked for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ServiceOp {
+    Start,
+    Bind,
+}
+
+/// One `startService`/`bindService` request popped from the binder broker.
+struct ServiceRequest {
+    package: String,
+    class: String,
+    op: ServiceOp,
+    /// The transaction's data buffer, and where the `Intent` starts in it.
+    ///
+    /// The Intent is what carries the action (`Service.onBind` branches on it)
+    /// and the extras (`onStartCommand` reads `should_start_foreground_extra`),
+    /// so it is unmarshalled with the framework's own `Parcel.unmarshall`
+    /// rather than rebuilt from the component name.
+    parcel: Vec<u8>,
+    intent_offset: usize,
+}
+
+/// `__pengudroid_binder_take_service_request`'s signature.
+type TakeServiceRequest = unsafe extern "C" fn(*mut u8, usize, *mut usize) -> i32;
+
+/// The host's miniature `ActiveServices`.
+///
+/// On a device the sequence is: `ActivityManagerService.startService` registers
+/// the service, "bring up" posts `ActivityThread$H.CREATE_SERVICE`, the app
+/// calls `handleCreateService`, and `ActiveServices` later publishes the
+/// `IServiceConnection` callback (`connected`) after the app's `publishService`.
+/// There is no system server here, so the two `IActivityManager` transactions the
+/// app makes are answered and recorded by the binder broker
+/// (`binder::note_service_request`); this type does the rest in-process over JNI.
+struct ServiceHost {
+    env: JniEnv,
+    thread: JObject,
+    thread_class: JClass,
+    loaded_apk: JObject,
+    app_info: JObject,
+    compat: JObject,
+    take: TakeServiceRequest,
+    /// Services created here, keyed by class name, with the `IBinder` token
+    /// `handleCreateService` filed them under. The references are local refs on
+    /// the service thread, which stays attached to the VM for its whole life, so
+    /// they remain valid.
+    created: Vec<(String, JObject, JObject)>,
+}
+
+impl ServiceHost {
+    fn new(env: JniEnv, thread: JObject, take: TakeServiceRequest) -> Option<Self> {
+        let thread_class = env.find_class("android/app/ActivityThread")?;
+        let data_field = env.field_id(
+            thread_class,
+            "mBoundApplication",
+            "Landroid/app/ActivityThread$AppBindData;",
+        )?;
+        let data = env.object_field(thread, data_field);
+        if data.is_null() {
+            eprintln!("service: ActivityThread.mBoundApplication is null");
+            return None;
+        }
+        let bind_class = env.find_class("android/app/ActivityThread$AppBindData")?;
+        let loaded_apk = env.object_field(
+            data,
+            env.field_id(bind_class, "info", "Landroid/app/LoadedApk;")?,
+        );
+        let compat = env.object_field(
+            data,
+            env.field_id(
+                bind_class,
+                "compatInfo",
+                "Landroid/content/res/CompatibilityInfo;",
+            )?,
+        );
+        if loaded_apk.is_null() {
+            eprintln!("service: AppBindData.info is null (no LoadedApk)");
+            return None;
+        }
+        let apk_class = env.find_class("android/app/LoadedApk")?;
+        let app_info = env.object_field(
+            loaded_apk,
+            env.field_id(
+                apk_class,
+                "mApplicationInfo",
+                "Landroid/content/pm/ApplicationInfo;",
+            )?,
+        );
+        if app_info.is_null() {
+            eprintln!("service: LoadedApk.mApplicationInfo is null");
+            return None;
+        }
+        Some(Self {
+            env,
+            thread,
+            thread_class,
+            loaded_apk,
+            app_info,
+            compat,
+            take,
+            created: Vec::new(),
+        })
+    }
+
+    /// Pop one request; `None` when the queue is empty.
+    fn take_request(&self) -> Option<ServiceRequest> {
+        let mut buf = vec![0u8; SERVICE_RECORD_CAP];
+        let mut len = 0usize;
+        let rc = unsafe { (self.take)(buf.as_mut_ptr(), buf.len(), &mut len) };
+        if rc != 0 {
+            return None;
+        }
+        let len = len.min(buf.len());
+        let record = &buf[..len];
+        if record.len() < 20 {
+            return None;
+        }
+        let word = |i: usize| -> usize {
+            u32::from_ne_bytes([
+                record[i * 4],
+                record[i * 4 + 1],
+                record[i * 4 + 2],
+                record[i * 4 + 3],
+            ]) as usize
+        };
+        let bind = word(0) != 0;
+        let package_len = word(1);
+        let class_len = word(2);
+        let intent_offset = word(3);
+        let parcel_len = word(4);
+        let mut at = 20usize;
+        if at + package_len + class_len + parcel_len > record.len() {
+            return None;
+        }
+        let package = String::from_utf8_lossy(&record[at..at + package_len]).into_owned();
+        at += package_len;
+        let class = String::from_utf8_lossy(&record[at..at + class_len]).into_owned();
+        at += class_len;
+        let parcel = record[at..at + parcel_len].to_vec();
+        if package.is_empty() || class.is_empty() {
+            return None;
+        }
+        Some(ServiceRequest {
+            package,
+            class,
+            op: if bind {
+                ServiceOp::Bind
+            } else {
+                ServiceOp::Start
+            },
+            parcel,
+            intent_offset,
+        })
+    }
+
+    fn dispatch(&mut self, request: ServiceRequest) {
+        let Some(intent) = self.request_intent(&request) else {
+            return;
+        };
+        let Some((service, token)) = self.ensure_service(&request, intent) else {
+            return;
+        };
+        let Some(service_class) = self.env.find_class("android/app/Service") else {
+            return;
+        };
+        match request.op {
+            ServiceOp::Start => {
+                // `onStartCommand` is `H.SERVICE_ARGS` on a device. It has to run
+                // on the main thread for the same reason `onCreate` does: NewPipe
+                // builds its `Player` there, and that creates `Handler`s.
+                if self.post_service_args(token, intent) {
+                    println!("service: posted SERVICE_ARGS for {}", request.class);
+                } else {
+                    eprintln!("service: could not post SERVICE_ARGS for {}", request.class);
+                }
+            }
+            ServiceOp::Bind => {
+                let Some(on_bind) = self.env.method_id(
+                    service_class,
+                    "onBind",
+                    "(Landroid/content/Intent;)Landroid/os/IBinder;",
+                ) else {
+                    eprintln!("service: Service.onBind not found");
+                    return;
+                };
+                // `onBind` runs on a device's main thread too, but unlike
+                // `onCreate` it is not allowed to block on anything here, and the
+                // binder it returns is needed *now* to call `connected`. NewPipe's
+                // `onBind` only inspects the action and returns a field.
+                let binder = match self.env.call_object(service, on_bind, &[JValue { l: intent }]) {
+                    Some(b) => b,
+                    None => {
+                        eprintln!("service: {}.onBind threw", request.class);
+                        return;
+                    }
+                };
+                if binder.is_null() {
+                    // A null binder is "this service does not support binding",
+                    // so a real system server never calls `connected`.
+                    println!("service: {}.onBind returned null", request.class);
+                    return;
+                }
+                println!("service: {}.onBind returned a binder", request.class);
+                self.connect_dispatchers(&request, binder);
+            }
+        }
+    }
+
+    /// The `Intent` the app sent with the request, unmarshalled from the
+    /// transaction's own bytes.
+    ///
+    /// Rebuilding it from the component name loses the action (`onBind` returns
+    /// null for an unknown action — which is exactly what NewPipe did) and the
+    /// extras (`onStartCommand` would take its "useless intent" path).
+    fn request_intent(&self, request: &ServiceRequest) -> Option<JObject> {
+        if !request.parcel.is_empty()
+            && request.intent_offset > 0
+            && request.intent_offset < request.parcel.len()
+        {
+            if let Some(intent) = self.unmarshall_intent(request) {
+                return Some(intent);
+            }
+            eprintln!(
+                "service: cannot unmarshall the Intent of {}; using a bare one",
+                request.class
+            );
+        }
+        self.component_intent(request)
+    }
+
+    fn unmarshall_intent(&self, request: &ServiceRequest) -> Option<JObject> {
+        let parcel_class = self.env.find_class("android/os/Parcel")?;
+        // `unmarshall` is an *instance* method in this framework (`obtain()`
+        // first, then `unmarshall(bytes, offset, length)`); there is no static
+        // `Parcel.unmarshall(...)` overload.
+        let obtain = self
+            .env
+            .static_method_id(parcel_class, "obtain", "()Landroid/os/Parcel;")?;
+        let parcel = self.env.call_static_object(parcel_class, obtain, &[])?;
+        if parcel.is_null() {
+            return None;
+        }
+        let unmarshall = self
+            .env
+            .method_id(parcel_class, "unmarshall", "([BII)V")?;
+        let bytes = self.env.new_byte_array(request.parcel.len() as i32)?;
+        self.env.set_byte_array_region(bytes, 0, &request.parcel);
+        let offset = request.intent_offset as i32;
+        let length = (request.parcel.len() - request.intent_offset) as i32;
+        if !self.env.call_void(
+            parcel,
+            unmarshall,
+            &[JValue { l: bytes }, JValue { i: offset }, JValue { i: length }],
+        ) {
+            return None;
+        }
+        if let Some(reset) = self.env.method_id(parcel_class, "setDataPosition", "(I)V") {
+            self.env.call_void(parcel, reset, &[JValue { i: 0 }]);
+        }
+        let intent_class = self.env.find_class("android/content/Intent")?;
+        let creator_field = self.env.static_field_id(
+            intent_class,
+            "CREATOR",
+            "Landroid/os/Parcelable$Creator;",
+        )?;
+        let creator = self.env.static_object_field(intent_class, creator_field);
+        if creator.is_null() {
+            eprintln!("service: Intent.CREATOR is null");
+            return None;
+        }
+        let creator_class = self.env.find_class("android/os/Parcelable$Creator")?;
+        let create = self.env.method_id(
+            creator_class,
+            "createFromParcel",
+            "(Landroid/os/Parcel;)Ljava/lang/Object;",
+        )?;
+        let intent = self.env.call_object(creator, create, &[JValue { l: parcel }])?;
+        if intent.is_null() {
+            return None;
+        }
+        if let Some(to_string) = self.env.method_id(intent_class, "toString", "()Ljava/lang/String;") {
+            if let Some(text) = self
+                .env
+                .call_object(intent, to_string, &[])
+                .and_then(|s| self.env.get_string(s))
+            {
+                let shown: String = text.chars().take(400).collect();
+                println!("service: {} intent = {}", request.class, shown.replace('\n', " "));
+            }
+        }
+        Some(intent)
+    }
+
+    /// Create the service once and return its instance and token.
+    fn ensure_service(
+        &mut self,
+        request: &ServiceRequest,
+        intent: JObject,
+    ) -> Option<(JObject, JObject)> {
+        if let Some((_, service, token)) = self
+            .created
+            .iter()
+            .find(|(name, _, _)| name == &request.class)
+        {
+            return Some((*service, *token));
+        }
+        let info = self.service_info(request)?;
+        // A token only has to be a stable `IBinder`; `handleCreateService` uses it
+        // as the key in `ActivityThread.mServices`.
+        let token = new_instance(&self.env, "android/os/Binder").map(|(_, b)| b)?;
+        let (data_class, data) = new_instance(&self.env, "android/app/ActivityThread$CreateServiceData")?;
+        self.set_field(data_class, data, "info", "Landroid/content/pm/ServiceInfo;", info);
+        self.set_field(
+            data_class,
+            data,
+            "compatInfo",
+            "Landroid/content/res/CompatibilityInfo;",
+            self.compat,
+        );
+        self.set_field(data_class, data, "token", "Landroid/os/IBinder;", token);
+        self.set_field(data_class, data, "intent", "Landroid/content/Intent;", intent);
+
+        println!("service: creating {}", request.class);
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        if !self.post_create_service(data) {
+            return None;
+        }
+        // `handleCreateService` runs on the main thread now, so wait for it to
+        // publish the instance in `mServices`. It is quick (no I/O), but the
+        // main thread may be busy with a traversal, so allow a few seconds.
+        for _ in 0..250 {
+            if let Some(service) = self.service_for_token(token) {
+                if !service.is_null() {
+                    println!("service: created {}", request.class);
+                    self.created
+                        .push((request.class.clone(), service, token));
+                    return Some((service, token));
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        eprintln!(
+            "service: {} never appeared in ActivityThread.mServices",
+            request.class
+        );
+        None
+    }
+
+    /// Send `ActivityThread$H.CREATE_SERVICE` so the framework creates the
+    /// service on the main thread.
+    ///
+    /// This is not optional: `handleCreateService` instantiates the service (and
+    /// runs `onCreate`), and a `Service` that touches `new Handler()` there needs
+    /// a `Looper`. NewPipe's `PlayerService` does exactly that through
+    /// `MediaBrowserServiceCompat`, so calling `handleCreateService` from this
+    /// thread fails with "Can't create handler inside thread that has not called
+    /// Looper.prepare()". `H` is the message the app's own binder thread posts.
+    fn post_create_service(&self, data: JObject) -> bool {
+        self.post_to_h("CREATE_SERVICE", 114, data)
+    }
+
+    /// `ActivityThread$H.SERVICE_ARGS`: run `Service.onStartCommand` on the main
+    /// thread with the intent the app asked for.
+    fn post_service_args(&self, token: JObject, intent: JObject) -> bool {
+        let Some((data_class, data)) = new_instance(&self.env, "android/app/ActivityThread$ServiceArgsData")
+        else {
+            eprintln!("service: ActivityThread$ServiceArgsData not found");
+            return false;
+        };
+        self.set_field(data_class, data, "token", "Landroid/os/IBinder;", token);
+        self.set_field(data_class, data, "args", "Landroid/content/Intent;", intent);
+        // Nothing here calls `stopSelfResult`, the only caller of these two.
+        if let Some(id) = self.env.field_id(data_class, "startId", "I") {
+            self.env.set_int_field(data, id, 1);
+        }
+        if let Some(id) = self.env.field_id(data_class, "flags", "I") {
+            self.env.set_int_field(data, id, 0);
+        }
+        self.post_to_h("SERVICE_ARGS", 115, data)
+    }
+
+    /// Post a `Message` to `ActivityThread.mH`, the app's main-thread handler.
+    fn post_to_h(&self, what_field: &str, fallback: i32, data: JObject) -> bool {
+        let Some(handler_class) = self.env.find_class("android/app/ActivityThread$H") else {
+            eprintln!("service: ActivityThread$H not found");
+            return false;
+        };
+        let Some(handler_field) = self.env.field_id(
+            self.thread_class,
+            "mH",
+            "Landroid/app/ActivityThread$H;",
+        ) else {
+            eprintln!("service: ActivityThread.mH not found");
+            return false;
+        };
+        let handler = self.env.object_field(self.thread, handler_field);
+        if handler.is_null() {
+            eprintln!("service: ActivityThread.mH is null");
+            return false;
+        }
+        // Read the message code out of the framework instead of hardcoding it:
+        // it is a `static final int` on `H` and stable, but the value is not part
+        // of any public API.
+        let what = self
+            .env
+            .static_field_id(handler_class, what_field, "I")
+            .map(|id| self.env.static_int_field(handler_class, id))
+            .unwrap_or(fallback);
+        let Some(message_class) = self.env.find_class("android/os/Message") else {
+            return false;
+        };
+        let Some(obtain) = self.env.static_method_id(
+            message_class,
+            "obtain",
+            "(Landroid/os/Handler;ILjava/lang/Object;)Landroid/os/Message;",
+        ) else {
+            eprintln!("service: Message.obtain(Handler,int,Object) not found");
+            return false;
+        };
+        let Some(send) = self.env.method_id(message_class, "sendToTarget", "()V") else {
+            eprintln!("service: Message.sendToTarget not found");
+            return false;
+        };
+        let Some(message) = self.env.call_static_object(
+            message_class,
+            obtain,
+            &[JValue { l: handler }, JValue { i: what }, JValue { l: data }],
+        ) else {
+            eprintln!("service: Message.obtain threw");
+            return false;
+        };
+        if message.is_null() {
+            eprintln!("service: Message.obtain returned null");
+            return false;
+        }
+        self.env.call_void(message, send, &[])
+    }
+
+    fn set_field(&self, class: JClass, obj: JObject, field: &str, sig: &str, value: JObject) {
+        match self.env.field_id(class, field, sig) {
+            Some(id) => self.env.set_object_field(obj, id, value),
+            None => eprintln!("service: field {field} not found"),
+        }
+    }
+
+    /// Build the `ServiceInfo` `handleCreateService` needs.
+    ///
+    /// There is no package manager to ask (`IPackageManager.getServiceInfo` is
+    /// not answered by the broker), so only the fields the lifecycle actually
+    /// reads are filled in: the class name, the package, and the same
+    /// `ApplicationInfo` the bound `LoadedApk` holds — which is what makes
+    /// `getPackageInfoNoCheck` reuse the app's existing `LoadedApk` instead of
+    /// building a second one with no class loader.
+    fn service_info(&self, request: &ServiceRequest) -> Option<JObject> {
+        let (class, info) = new_instance(&self.env, "android/content/pm/ServiceInfo")?;
+        self.set_field(
+            class,
+            info,
+            "name",
+            "Ljava/lang/String;",
+            self.env.new_string(&request.class),
+        );
+        self.set_field(
+            class,
+            info,
+            "packageName",
+            "Ljava/lang/String;",
+            self.env.new_string(&request.package),
+        );
+        self.set_field(
+            class,
+            info,
+            "applicationInfo",
+            "Landroid/content/pm/ApplicationInfo;",
+            self.app_info,
+        );
+        if let Some(id) = self.env.field_id(class, "exported", "Z") {
+            self.env.set_boolean_field(info, id, true);
+        }
+        if let Some(id) = self.env.field_id(class, "enabled", "Z") {
+            self.env.set_boolean_field(info, id, true);
+        }
+        Some(info)
+    }
+
+    fn component_intent(&self, request: &ServiceRequest) -> Option<JObject> {
+        let (class, intent) = new_instance(&self.env, "android/content/Intent")?;
+        let set = self.env.method_id(
+            class,
+            "setClassName",
+            "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;",
+        )?;
+        let package = self.env.new_string(&request.package);
+        let name = self.env.new_string(&request.class);
+        let out = self
+            .env
+            .call_object(intent, set, &[JValue { l: package }, JValue { l: name }])?;
+        if out.is_null() {
+            return None;
+        }
+        Some(intent)
+    }
+
+    fn component_name(&self, request: &ServiceRequest) -> Option<JObject> {
+        let class = self.env.find_class("android/content/ComponentName")?;
+        let ctor = self.env.method_id(class, "<init>", "(Ljava/lang/String;Ljava/lang/String;)V")?;
+        let package = self.env.new_string(&request.package);
+        let name = self.env.new_string(&request.class);
+        self.env
+            .new_object(class, ctor, &[JValue { l: package }, JValue { l: name }])
+    }
+
+    fn service_for_token(&self, token: JObject) -> Option<JObject> {
+        let field = self.env.field_id(
+            self.thread_class,
+            "mServices",
+            "Landroid/util/ArrayMap;",
+        )?;
+        let map = self.env.object_field(self.thread, field);
+        if map.is_null() {
+            return None;
+        }
+        let map_class = self.env.find_class("android/util/ArrayMap")?;
+        let get = self
+            .env
+            .method_id(map_class, "get", "(Ljava/lang/Object;)Ljava/lang/Object;")?;
+        self.env.call_object(map, get, &[JValue { l: token }])
+    }
+
+    /// Fire the connection callbacks the app registered before `bindService`.
+    ///
+    /// `ContextImpl.bindServiceCommon` puts the `IServiceConnection` into
+    /// `LoadedApk.mServices` *before* transacting with the activity manager, and
+    /// keeps it there because the broker's reply says the bind was accepted. The
+    /// value is a `LoadedApk$ServiceDispatcher`, whose `connected` posts the
+    /// app's `ServiceConnection.onServiceConnected` onto the main thread — the
+    /// same thing `ActiveServices` does after `publishService`.
+    fn connect_dispatchers(&self, request: &ServiceRequest, binder: JObject) {
+        let Some(component) = self.component_name(request) else {
+            return;
+        };
+        let Some(apk_class) = self.env.find_class("android/app/LoadedApk") else {
+            return;
+        };
+        let Some(field) = self.env.field_id(apk_class, "mServices", "Landroid/util/ArrayMap;") else {
+            eprintln!("service: LoadedApk.mServices not found");
+            return;
+        };
+        let outer = self.env.object_field(self.loaded_apk, field);
+        if outer.is_null() {
+            eprintln!("service: LoadedApk.mServices is null");
+            return;
+        }
+        let Some(map_class) = self.env.find_class("android/util/ArrayMap") else {
+            return;
+        };
+        let (Some(size_m), Some(value_at)) = (
+            self.env.method_id(map_class, "size", "()I"),
+            self.env.method_id(map_class, "valueAt", "(I)Ljava/lang/Object;"),
+        ) else {
+            return;
+        };
+        let Some(dispatcher_class) = self.env.find_class("android/app/LoadedApk$ServiceDispatcher") else {
+            eprintln!("service: LoadedApk$ServiceDispatcher not found");
+            return;
+        };
+        let Some(connected) = self.env.method_id(
+            dispatcher_class,
+            "connected",
+            "(Landroid/content/ComponentName;Landroid/os/IBinder;Z)V",
+        ) else {
+            eprintln!("service: LoadedApk$ServiceDispatcher.connected not found");
+            return;
+        };
+        // `mServices` is `ArrayMap<Context, ArrayMap<IServiceConnection,
+        // ServiceDispatcher>>`; the inner maps hold the dispatchers.
+        let contexts = self.env.call_int(outer, size_m, &[]).unwrap_or(0);
+        let mut dispatched = 0;
+        for i in 0..contexts {
+            let Some(inner) = self.env.call_object(outer, value_at, &[JValue { i }]) else {
+                continue;
+            };
+            if inner.is_null() {
+                continue;
+            }
+            let bindings = self.env.call_int(inner, size_m, &[]).unwrap_or(0);
+            for j in 0..bindings {
+                let Some(dispatcher) = self
+                    .env
+                    .call_object(inner, value_at, &[JValue { i: j }])
+                else {
+                    continue;
+                };
+                if dispatcher.is_null() {
+                    continue;
+                }
+                if self.env.call_void(
+                    dispatcher,
+                    connected,
+                    &[JValue { l: component }, JValue { l: binder }, JValue { z: 0 }],
+                ) {
+                    dispatched += 1;
+                }
+            }
+        }
+        println!(
+            "service: connected {dispatched} pending binding(s) for {}",
+            request.class
+        );
+        if dispatched == 0 {
+            eprintln!(
+                "service: no ServiceDispatcher was registered for {}",
+                request.class
+            );
+        }
+    }
+}
+
+/// Act on the `startService`/`bindService` requests the binder broker records.
+///
+/// The app makes those calls while the main thread is inside `Looper.loop()`, so
+/// they cannot be handled inline; this thread owns the service lifecycle the way
+/// `system_server` would, and the framework posts the `ServiceConnection`
+/// callbacks back to the main thread itself.
+fn spawn_service_host(env: &JniEnv) {
+    let Some(vm) = env.get_java_vm() else {
+        return;
+    };
+    let Some(sym) = shim_symbol("__pengudroid_binder_take_service_request") else {
+        eprintln!("service: the binder broker has no service request queue");
+        return;
+    };
+    // SAFETY: the shim exports the function with exactly this signature.
+    let take: TakeServiceRequest = unsafe { std::mem::transmute(sym) };
+    let vm_addr = vm as usize;
+    std::thread::spawn(move || {
+        let vm = vm_addr as *mut c_void;
+        let Some(env) = attach_current_thread(vm) else {
+            return;
+        };
+        // `loop_forever` runs right after the bind, but `ActivityThread` publishes
+        // itself before then; poll briefly so a race cannot lose every request.
+        let mut thread = std::ptr::null_mut();
+        for _ in 0..100 {
+            if let Some(current) = current_activity_thread(&env) {
+                if !current.is_null() {
+                    thread = current;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if thread.is_null() {
+            eprintln!("service: ActivityThread.currentActivityThread() is null");
+            return;
+        }
+        let Some(mut host) = ServiceHost::new(env, thread, take) else {
+            return;
+        };
+        println!("service: watching the binder broker for startService/bindService");
+        loop {
+            while let Some(request) = host.take_request() {
+                host.dispatch(request);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(SERVICE_POLL_MS));
+        }
+    });
 }
 
 /// Forward compositor input into the app's window.
@@ -2944,6 +3724,37 @@ fn install_package_manager_replies(env: &JniEnv, app_info: JObject, package: &st
     if let Some(id) = env.field_id(pi_class, "versionCode", "I") {
         env.set_int_field(pi, id, 1);
     }
+    // NewPipe's `PackageValidator` (the media3 `MediaBrowserServiceCompat`
+    // caller check) reads `PackageInfo.signatures` for the `"android"` package
+    // while its `PlayerService` is being created and throws "Platform signature
+    // not found" when the array is null; `PlayerService` then never starts.
+    // There is no signing certificate here, so install one fixed placeholder.
+    // The validator only compares this signature with the caller's, and both
+    // answers come from this same reply, so their SHA-256 hashes match.
+    if let Some(signature_class) = env.find_class("android/content/pm/Signature") {
+        if let Some(signature_ctor) = env.method_id(signature_class, "<init>", "([B)V") {
+            if let Some(bytes) = env.new_byte_array(32) {
+                let digest: Vec<u8> = (0u8..32).map(|b| b.wrapping_mul(7)).collect();
+                env.set_byte_array_region(bytes, 0, &digest);
+                if let Some(signature) =
+                    env.new_object(signature_class, signature_ctor, &[JValue { l: bytes }])
+                {
+                    if let Some(array) =
+                        env.new_object_array(1, signature_class, std::ptr::null_mut())
+                    {
+                        env.set_object_array_element(array, 0, signature);
+                        if let Some(id) = env.field_id(
+                            pi_class,
+                            "signatures",
+                            "[Landroid/content/pm/Signature;",
+                        ) {
+                            env.set_object_field(pi, id, array);
+                        }
+                    }
+                }
+            }
+        }
+    }
     // `PackageInfo.signingInfo` is null unless a package manager fills it in,
     // and signature checks (`org.acra`, Play Integrity, ...) dereference it
     // without a null check. A default `SigningInfo` reports "no signatures",
@@ -2959,6 +3770,63 @@ fn install_package_manager_replies(env: &JniEnv, app_info: JObject, package: &st
     }
     if let Some(data) = marshal_object(env, app_info, "android/content/pm/ApplicationInfo") {
         install_reply(&data, "__pengudroid_binder_set_application_info");
+    }
+}
+
+/// Install the platform singletons `system_server` normally creates.
+///
+/// Both `MediaFrameworkPlatformInitializer` and `TelephonyFrameworkInitializer`
+/// only *hold* their manager object; `SystemServer` sets it once during boot and
+/// nothing creates it lazily. The framework dereferences them unconditionally,
+/// so without this a `MediaSession` cannot be constructed (NewPipe's
+/// `PlayerService.onCreate` dies) and `TelephonyManager.getITelephony` NPEs
+/// (ExoPlayer's `DefaultBandwidthMeter` dies in `onStartCommand`).
+fn install_platform_service_managers(env: &JniEnv) {
+    install_platform_singleton(
+        env,
+        "android/media/MediaFrameworkPlatformInitializer",
+        "android/media/MediaServiceManager",
+        "setMediaServiceManager",
+    );
+    install_platform_singleton(
+        env,
+        "android/telephony/TelephonyFrameworkInitializer",
+        "android/os/TelephonyServiceManager",
+        "setTelephonyServiceManager",
+    );
+}
+
+fn install_platform_singleton(
+    env: &JniEnv,
+    initializer_name: &str,
+    manager_name: &str,
+    setter: &str,
+) {
+    let Some(initializer) = env.find_class(initializer_name) else {
+        eprintln!("apphost: {initializer_name} not found");
+        return;
+    };
+    let Some(manager_class) = env.find_class(manager_name) else {
+        eprintln!("apphost: {manager_name} not found");
+        return;
+    };
+    let Some(ctor) = env.method_id(manager_class, "<init>", "()V") else {
+        eprintln!("apphost: {manager_name}() missing");
+        return;
+    };
+    let Some(manager) = env.new_object(manager_class, ctor, &[]) else {
+        eprintln!("apphost: new {manager_name}() threw");
+        return;
+    };
+    let Some(set) = env.static_method_id(initializer, setter, &format!("(L{manager_name};)V"))
+    else {
+        eprintln!("apphost: {setter} not found");
+        return;
+    };
+    if env.call_static_void(initializer, set, &[JValue { l: manager }]) {
+        println!("apphost: installed {manager_name}");
+    } else {
+        eprintln!("apphost: {setter} threw");
     }
 }
 

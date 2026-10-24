@@ -52,6 +52,7 @@ use libc::{c_char, c_int, c_void};
 
 mod ahardwarebuffer;
 mod android_native;
+mod audiotrack;
 mod binder;
 mod codec2;
 mod netdb;
@@ -2943,6 +2944,13 @@ pub unsafe extern "C" fn _ZN7android14AndroidRuntime9getJavaVMEv() -> *mut c_voi
 /// Same story: the real one goes through `getJavaVM()`. Several framework
 /// natives call it from destructors (e.g. `NativeDisplayEventReceiver`), where
 /// there is no `JNIEnv` argument to fall back on.
+///
+/// A detached thread is attached on demand. On a device every thread that ends
+/// up here was created with `canCallJava`, so `libutils` had already attached
+/// it; that attaching code lives in `app_process`'s runtime, which PenguDroid
+/// does not have, so a framework callback thread (MediaCodec's
+/// `MediaCodec_loop`, which delivers `onInputBufferAvailable`) would otherwise
+/// get a null env and fault on the first `CallVoidMethod`.
 #[no_mangle]
 pub unsafe extern "C" fn _ZN7android14AndroidRuntime9getJNIEnvEv() -> *mut c_void {
     let vm = created_java_vm();
@@ -2958,7 +2966,15 @@ pub unsafe extern "C" fn _ZN7android14AndroidRuntime9getJNIEnvEv() -> *mut c_voi
     let get_env: unsafe extern "C" fn(*mut c_void, *mut *mut c_void, i32) -> i32 =
         std::mem::transmute(*table.add(6));
     let mut env: *mut c_void = std::ptr::null_mut();
-    if get_env(vm, &mut env, 0x0001_0004) != 0 {
+    if get_env(vm, &mut env, 0x0001_0004) == 0 {
+        return env;
+    }
+    // Slot 4 is `AttachCurrentThread`. The thread stays attached for its whole
+    // life, exactly like a Java thread: the callers here are framework native
+    // threads that live as long as the object they serve.
+    let attach: unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut c_void) -> i32 =
+        std::mem::transmute(*table.add(4));
+    if attach(vm, &mut env, std::ptr::null_mut()) != 0 {
         return std::ptr::null_mut();
     }
     env

@@ -267,8 +267,17 @@ unsafe fn allocate_buffer(
 /// usage, bufferId, generationNumber, out)`.
 ///
 /// The real implementation goes to the gralloc mapper HAL. Our handles are
-/// memfd-backed and we are their only producer, so the handle doubles as the
-/// mapper handle and `lock` maps it directly.
+/// memfd-backed and we are their only producer, so `lock` maps the returned
+/// handle directly.
+///
+/// The returned handle is a **copy**: `GraphicBuffer` frees whichever handle
+/// `importBuffer` handed it (`~GraphicBuffer` → `freeBuffer` →
+/// `native_handle_delete`), so two buffers wrapping the same block each need
+/// their own. Returning the input pointer made the second free a double free —
+/// glibc aborted with `double free or corruption (!prev)` from
+/// `hidl_handle::~hidl_handle` while codec2 released a decoded frame's output
+/// buffer. The descriptors are duplicated with it, so closing one copy cannot
+/// pull the fd out from under the other.
 #[no_mangle]
 pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper12importBufferEPK13native_handlejjjimjPS3_(
     _this: *mut c_void,
@@ -284,7 +293,25 @@ pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper12importBufferEPK13nati
     if handle.is_null() || out.is_null() {
         return -22;
     }
-    *out = handle;
+    let src = &*handle;
+    let mut copy = NativeHandle {
+        version: src.version,
+        num_fds: src.num_fds,
+        num_ints: src.num_ints,
+        data: src.data,
+    };
+    let fds = src.num_fds.clamp(0, copy.data.len() as i32);
+    for i in 0..fds as usize {
+        let dup = libc::dup(src.data[i]);
+        if dup < 0 {
+            for j in 0..i {
+                libc::close(copy.data[j]);
+            }
+            return -12;
+        }
+        copy.data[i] = dup;
+    }
+    *out = Box::into_raw(Box::new(copy));
     0
 }
 
@@ -1070,5 +1097,55 @@ mod tests {
         assert_eq!(h.data[4], 240);
         unsafe { libc::close(h.data[0]) };
         unsafe { drop(Box::from_raw(out as *mut NativeHandle)) };
+    }
+
+    /// `importBuffer` must hand back a handle its caller owns outright.
+    ///
+    /// `GraphicBuffer` frees whatever it got from `importBuffer`
+    /// (`~GraphicBuffer` → `freeBuffer`), so returning the input pointer means
+    /// the block's original owner and the importer both free the same handle —
+    /// the double free that aborted playback inside
+    /// `hidl_handle::~hidl_handle`. The copy also gets its own descriptor, so
+    /// the two owners can be closed independently.
+    #[test]
+    fn import_buffer_copies_the_handle() {
+        let mut out: *const NativeHandle = std::ptr::null();
+        let mut stride = 0u32;
+        let status = unsafe { allocate_buffer(64, 64, 1, 1, 0, &mut out, &mut stride) };
+        assert_eq!(status, 0);
+        let mut imported: *const NativeHandle = std::ptr::null();
+        let status = unsafe {
+            _ZN7android19GraphicBufferMapper12importBufferEPK13native_handlejjjimjPS3_(
+                std::ptr::null_mut(),
+                out,
+                64,
+                64,
+                1,
+                0,
+                0,
+                0,
+                &mut imported,
+            )
+        };
+        assert_eq!(status, 0);
+        assert!(!imported.is_null());
+        assert_ne!(imported, out, "the importer must own its own handle");
+        let original = unsafe { &*out };
+        let copy = unsafe { &*imported };
+        assert_eq!(copy.version, original.version);
+        assert_eq!(copy.num_fds, original.num_fds);
+        assert_eq!(copy.num_ints, original.num_ints);
+        assert_ne!(copy.data[0], original.data[0], "the fd is duplicated");
+        assert_eq!(copy.data[1..7], original.data[1..7], "metadata is copied");
+        // Both descriptors must be live: closing one leaves the other usable.
+        let dup = copy.data[0];
+        unsafe { libc::close(dup) };
+        let size = unsafe { libc::lseek(original.data[0], 0, libc::SEEK_END) };
+        assert!(size > 0, "closing the copy must not close the original");
+        unsafe { libc::close(original.data[0]) };
+        unsafe {
+            drop(Box::from_raw(out as *mut NativeHandle));
+            drop(Box::from_raw(imported as *mut NativeHandle));
+        }
     }
 }
