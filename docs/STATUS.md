@@ -87,6 +87,32 @@ Sıradaki adım: `SurfaceView.updateSurface()`'ın bu sürümdeki tam gövdesini
 atlandığını bulmak; alternatif olarak `PlaceholderSurface`'ı da bizim
 kuyruğumuza bağlamak.
 
+### Ölçülen: `RefBase` nesneleri `calloc` bloğunu `free` ediyor
+
+`BufferItemConsumer` ve `Surface` birer `RefBase`. Son `decStrong`
+`delete this` çağırıyor, yani `calloc` ile aldığımız bloğu `free` ediyor ve
+`Blast`'taki ham işaretçi sarkıyor. Ölçüm (gdb):
+
+```
+#0 main_arena+1800
+#1 android::BufferItemConsumer::acquireBuffer(BufferItem*, long, bool)
+#2 pengudroid_shim::blast::start_consumer::{closure#0}
+```
+
+Yani `acquireBuffer` içindeki sanal çağrı, ilk 8 baytı `main_arena` işaretçisine
+dönmüş (serbest bırakılmış) bir blok üzerinden gidiyordu. Düzeltme: kurucudan
+sonra `RefBase::incStrong` ile kendi referansımızı almak.
+
+### Ölçülen: probe iş parçacığından `layout()` çağırmak yarışıyor
+
+`layout()` thread kontrolü yapmıyor, ama ana iş parçacığının kendi traversal'ıyla
+yarışıyor ve ölçülen sonuç `art: helper killed by signal 11` (yığın izi probe
+gezintisinin içinde). Bu yüzden `PENGUDROID_FORCE_SURFACE` artık `layout()`
+çağırmıyor; sadece `mRequestedWidth`/`mRequestedHeight`, `mStopped = false`,
+`mAppVisible = true`, `mLayoutRequested = true` yazıp `scheduleTraversals()` ve
+`postInvalidate()` çağırıyor. **Bu haliyle çökme yok, ama traversal ölçümü de
+henüz yapmıyor** (`size = 0x405` kalıyor) — sıradaki iş bu.
+
 ### Yan bulgu: pencere ağacı 0 genişlikte
 
 `PENGUDROID_PROBE_VIEWS` artık her görünümün ölçüsünü basıyor. Ana pencerenin

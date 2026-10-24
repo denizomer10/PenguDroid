@@ -335,6 +335,22 @@ unsafe extern "C" fn native_create(
         return 0;
     }
     (gui.item_consumer_ctor)(item_consumer, &consumer, usage, 4, false);
+    // `ConsumerBase` is a `RefBase`, and `decStrong` on the last reference runs
+    // `delete this` — which would `free()` a block we got from `calloc` and
+    // leave `Blast::item_consumer` dangling (measured: SIGSEGV inside
+    // `BufferItemConsumer::acquireBuffer`, jumping into `main_arena`). Take a
+    // reference of our own so the object outlives every consumer of it.
+    (gui.inc_strong)(item_consumer, &OWNER_ID as *const u8 as *const c_void);
+    if std::env::var_os("PENGUDROID_TRACE_VIDEO").is_some() {
+        // The vtable pointer is the cheapest proof that the constructor really
+        // ran: `BufferItemConsumer::acquireBuffer` calls through it, and a
+        // garbage value there is a SIGSEGV inside libgui.
+        let vtable = *(item_consumer as *const usize);
+        eprintln!(
+            "[blast] item_consumer={:#x} vtable={vtable:#x} consumer={:#x}",
+            item_consumer as usize, consumer[0] as usize
+        );
+    }
     (gui.set_default_size)(item_consumer, width, height);
     (gui.set_default_format)(item_consumer, format);
     (gui.set_consumer_usage)(item_consumer, usage);
@@ -346,6 +362,10 @@ unsafe extern "C" fn native_create(
         return 0;
     }
     (gui.surface_ctor)(surface, &producer, true, &EMPTY_SP);
+    // Same reason as `item_consumer`: `Surface` is a `RefBase`, so the last
+    // `decStrong` would `delete this` on a `calloc` block. The reference we take
+    // here is the one `Blast::surface` relies on.
+    (gui.inc_strong)(surface, &OWNER_ID as *const u8 as *const c_void);
     (gui.set_buffers_format)(surface, format);
     (gui.set_user_dimensions)(surface, width, height);
 
@@ -587,9 +607,16 @@ fn consumer_loop(addr: usize) {
     // A `BufferItem` is a plain aggregate; 1 KiB is comfortably more than its
     // size on LP64. It is constructed once and reused: `acquireBuffer` assigns
     // over it.
-    let mut item = vec![0u64; 128];
+    let mut item = vec![0u64; 512];
     let item_ptr = item.as_mut_ptr() as *mut c_void;
     unsafe { (gui.item_ctor)(item_ptr) };
+    if trace {
+        let vtable = unsafe { *(blast.item_consumer as *const usize) };
+        eprintln!(
+            "[blast] video: consumer thread sees item_consumer={:#x} vtable={vtable:#x}",
+            blast.item_consumer as usize
+        );
+    }
 
     let (x, y) = video_origin();
     let mut surface_id = 0u32;

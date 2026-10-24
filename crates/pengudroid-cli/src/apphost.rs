@@ -1082,22 +1082,7 @@ fn report_surface_views(env: &JniEnv) {
         // The object's own `Class` is a valid `jclass`, so no class lookup is
         // needed (and `FindClass` would not see app classes anyway).
         let class = env.call_object(view, get_class, &[]).unwrap_or(std::ptr::null_mut());
-        // The measured size of every view is what shows where a zero-width
-        // measurement enters the tree. A null `jclass` must not reach JNI: ART
-        // faults on it.
-        let (vw, vh) = if class.is_null() {
-            (-1, -1)
-        } else {
-            (
-                env.method_id(class, "getWidth", "()I")
-                    .and_then(|m| env.call_int(view, m, &[]))
-                    .unwrap_or(-1),
-                env.method_id(class, "getHeight", "()I")
-                    .and_then(|m| env.call_int(view, m, &[]))
-                    .unwrap_or(-1),
-            )
-        };
-        println!("views: {:width$}{name} [{vw}x{vh}]", "", width = depth * 2);
+        println!("views: {:width$}{name}", "", width = depth * 2);
         if name.contains("SurfaceView") || name.contains("TextureView") {
             // A `SurfaceView` that measured 0 wide never sets `mHaveFrame`, so
             // `updateSurface()` returns immediately and neither the
@@ -1134,30 +1119,35 @@ fn report_surface_views(env: &JniEnv) {
                 if let Some(f) = env.field_id(class, "mRequestedHeight", "I") {
                     env.set_int_field(view, f, h);
                 }
-                // Give the view its frame directly. `View.layout()` does not
-                // check the thread (unlike `requestLayout()`), and
-                // `SurfaceView.setFrame` calls `updateSurface()`, which returns
-                // immediately while `mHaveFrame` is still false — so nothing
-                // touches the player from here.
-                let laid_out = env
-                    .method_id(class, "layout", "(IIII)V")
-                    .map(|m| {
-                        env.call_void(
-                            view,
-                            m,
-                            &[
-                                JValue { i: 0 },
-                                JValue { i: 0 },
-                                JValue { i: w },
-                                JValue { i: h },
-                            ],
-                        )
+                // Ask for a real traversal instead of laying the view out here.
+                // `View.layout()` does not check the thread, but calling it from
+                // this thread races the main thread's own traversal and was
+                // measured to SIGSEGV inside the walk (`art: helper killed by
+                // signal 11`). `mLayoutRequested` is what
+                // `ViewRootImpl.requestLayout()` sets before scheduling, and
+                // `scheduleTraversals()` does not check the thread.
+                let scheduled = env
+                    .method_id(class, "getViewRootImpl", "()Landroid/view/ViewRootImpl;")
+                    .and_then(|m| env.call_object(view, m, &[]))
+                    .filter(|vri| !vri.is_null())
+                    .and_then(|vri| {
+                        let vri_class = env.find_class("android/view/ViewRootImpl")?;
+                        // `layoutRequested` is `mLayoutRequested && (!mStopped ||
+                        // mReportNextDraw)`, so a stopped window silently drops
+                        // the request.
+                        if let Some(f) = env.field_id(vri_class, "mStopped", "Z") {
+                            env.set_boolean_field(vri, f, false);
+                        }
+                        if let Some(f) = env.field_id(vri_class, "mAppVisible", "Z") {
+                            env.set_boolean_field(vri, f, true);
+                        }
+                        if let Some(f) = env.field_id(vri_class, "mLayoutRequested", "Z") {
+                            env.set_boolean_field(vri, f, true);
+                        }
+                        let m = env.method_id(vri_class, "scheduleTraversals", "()V")?;
+                        env.call_void(vri, m, &[]).then_some(())
                     })
-                    .unwrap_or(false);
-                // NOTE: forcing `mSurfaceCreated`/`mVisible` here to make
-                // `surfaceCreated` fire again was tried and did **not** help —
-                // the decoder still ended up on NewPipe's `PlaceholderSurface`.
-                // See `docs/STATUS.md` for the measurement.
+                    .is_some();
                 // `performDraw` only dispatches the pre-draw listeners when the
                 // dirty region is non-empty, and `SurfaceView`'s own pre-draw
                 // listener is what sets `mHaveFrame` and calls
@@ -1171,7 +1161,7 @@ fn report_surface_views(env: &JniEnv) {
                     .unwrap_or(false);
                 if fixed {
                     println!(
-                        "views:   requested {w}x{h} (laid out: {laid_out}, postInvalidate: {invalidated})"
+                        "views:   requested {w}x{h} (traversal: {scheduled}, postInvalidate: {invalidated})"
                     );
                 } else {
                     eprintln!("views:   mRequestedWidth not found");
