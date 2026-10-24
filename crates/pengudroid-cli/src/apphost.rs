@@ -948,45 +948,127 @@ fn probe_codec_configure(env: &JniEnv, codec: JObject) {
     };
     // `CCodec` logs "ByteBuffer mode decoder w/o color format set: using default
     // planar color format", and then the store hands the decoder a *graphic*
-    // gralloc block while CCodec expects linear output — the frame then comes
-    // back with size 0. Asking for flexible YUV makes CCodec request a linear
-    // block pool instead.
-    if let Some(set_int) = env.method_id(fmt_class, "setInteger", "(Ljava/lang/String;I)V") {
-        let key = env.new_string("color-format");
-        let ok = env.call_void(format, set_int, &[JValue { l: key }, JValue { i: 21 }]);
-        println!("media: set color-format=21 (flexible YUV) = {ok}");
+    // gralloc block while CCodec expects linear output. Asking for flexible YUV
+    // makes CCodec request a linear block pool instead.
+    //
+    // In surface mode the opposite is true: setting a colour format forces CCodec
+    // to keep ByteBuffer output (`2D-BB-Output`), which makes MediaCodec copy
+    // every frame through `SoftwareRenderer` instead of rendering straight into
+    // the surface. So the key is only set for the ByteBuffer probe.
+    let surface_mode = std::env::var_os("PENGUDROID_PROBE_SURFACE").is_some();
+    if !surface_mode {
+        if let Some(set_int) = env.method_id(fmt_class, "setInteger", "(Ljava/lang/String;I)V") {
+            let key = env.new_string("color-format");
+            let ok = env.call_void(format, set_int, &[JValue { l: key }, JValue { i: 21 }]);
+            println!("media: set color-format=21 (flexible YUV) = {ok}");
+        }
+    } else {
+        println!("media: surface mode, leaving color-format unset");
     }
     if let Some(configure) = env.method_id(
         mc_class,
         "configure",
         "(Landroid/media/MediaFormat;Landroid/view/Surface;Landroid/media/MediaCrypto;I)V",
     ) {
+        // In surface mode the decoder writes straight into the consumer's
+        // BufferQueue, so neither a colour format nor a ByteBuffer copy is
+        // involved. `ImageReader` is the smallest in-process consumer that can
+        // hand the planes back to us without a GL context, which makes it the
+        // cheapest way to prove the surface path end to end.
+        let mut reader: Option<JObject> = None;
+        let mut surface: JObject = std::ptr::null_mut();
+        if std::env::var_os("PENGUDROID_PROBE_SURFACE").is_some() {
+            match make_image_reader(env, 320, 240, 2) {
+                Some((r, s)) => {
+                    reader = Some(r);
+                    surface = s;
+                    println!("media: ImageReader surface ready");
+                }
+                None => eprintln!("media: ImageReader setup failed; falling back to ByteBuffer"),
+            }
+        }
         let ok = env.call_void(
             codec,
             configure,
             &[
                 JValue { l: format },
-                JValue { l: std::ptr::null_mut() },
+                JValue { l: surface },
                 JValue { l: std::ptr::null_mut() },
                 JValue { i: 0 },
             ],
         );
-        println!("media: MediaCodec.configure = {ok}");
-    }
-    if let Some(start) = env.method_id(mc_class, "start", "()V") {
-        let ok = env.call_void(codec, start, &[]);
-        println!("media: MediaCodec.start = {ok}");
-        if ok {
-            probe_codec_decode(env, mc_class, fmt_class, codec);
+        println!(
+            "media: MediaCodec.configure = {ok} ({} mode)",
+            if reader.is_some() { "surface" } else { "bytebuffer" }
+        );
+        if let Some(start) = env.method_id(mc_class, "start", "()V") {
+            let ok = env.call_void(codec, start, &[]);
+            println!("media: MediaCodec.start = {ok}");
+            if ok {
+                probe_codec_decode(env, mc_class, fmt_class, codec, reader);
+            }
         }
+        return;
     }
+}
+
+/// Build an `ImageReader` in `ImageFormat.YUV_420_888` and its `Surface`.
+fn make_image_reader(env: &JniEnv, width: i32, height: i32, max_images: i32) -> Option<(JObject, JObject)> {
+    let Some(reader_class) = env.find_class("android/media/ImageReader") else {
+        eprintln!("media: ImageReader class not found");
+        return None;
+    };
+    let Some(new_instance) = env.static_method_id(
+        reader_class,
+        "newInstance",
+        "(IIII)Landroid/media/ImageReader;",
+    ) else {
+        eprintln!("media: ImageReader.newInstance(IIII) missing");
+        return None;
+    };
+    const IMAGE_FORMAT_YUV_420_888: i32 = 35;
+    // `MediaCodec` renders ByteBuffer output through `SoftwareRenderer`, which
+    // calls `Surface::setBuffersFormat(HAL_PIXEL_FORMAT_RGB_565)` before
+    // queueing — so the consumer has to be configured for that format, or it
+    // rejects every buffer with "Producer output buffer format 0x4 doesn't match
+    // the ImageReader's configured buffer format 0x23".
+    const PIXEL_FORMAT_RGB_565: i32 = 4;
+    let _ = IMAGE_FORMAT_YUV_420_888;
+    let Some(reader) = env.call_static_object(
+        reader_class,
+        new_instance,
+        &[
+            JValue { i: width },
+            JValue { i: height },
+            JValue { i: PIXEL_FORMAT_RGB_565 },
+            JValue { i: max_images },
+        ],
+    ) else {
+        eprintln!("media: ImageReader.newInstance threw");
+        return None;
+    };
+    let Some(get_surface) = env.method_id(reader_class, "getSurface", "()Landroid/view/Surface;") else {
+        eprintln!("media: ImageReader.getSurface missing");
+        return None;
+    };
+    let Some(surface) = env.call_object(reader, get_surface, &[]) else {
+        eprintln!("media: ImageReader.getSurface threw");
+        return None;
+    };
+    Some((reader, surface))
 }
 
 /// Feed one H.264 access unit through the decoder and report what comes out.
 ///
 /// `tools/make_h264.py` writes the stream: SPS + PPS + one IDR frame coded as a
 /// single I_PCM macroblock, so no encoder is needed on the host.
-fn probe_codec_decode(env: &JniEnv, mc_class: JClass, fmt_class: JClass, codec: JObject) {
+fn probe_codec_decode(
+    env: &JniEnv,
+    mc_class: JClass,
+    fmt_class: JClass,
+    codec: JObject,
+    reader: Option<JObject>,
+) {
     let path = std::env::var("PENGUDROID_H264").unwrap_or_else(|_| "/tmp/test.h264".to_string());
     let Ok(data) = std::fs::read(&path) else {
         eprintln!("media: cannot read {path}");
@@ -1101,8 +1183,118 @@ fn probe_codec_decode(env: &JniEnv, mc_class: JClass, fmt_class: JClass, codec: 
             break;
         }
         if let Some(index) = out.filter(|&i| i >= 0) {
-            report_output_bytes(env, mc_class, codec, index, size);
+            if let Some(reader) = reader {
+                // Surface mode: hand the buffer to the consumer, then pull the
+                // planes back through `ImageReader`. That is what proves the
+                // decoder really rendered into the surface's BufferQueue.
+                if let Some(release) = env.method_id(mc_class, "releaseOutputBuffer", "(IZ)V") {
+                    env.call_void(
+                        codec,
+                        release,
+                        &[JValue { i: index }, JValue { i: 1 }],
+                    );
+                }
+                report_surface_image(env, reader, index);
+            } else {
+                report_output_bytes(env, mc_class, codec, index, size);
+            }
         }
+    }
+}
+
+/// Pull the frame the decoder just queued to an `ImageReader` and summarise it.
+///
+/// Uses `acquireLatestImage` with a short retry loop: the queue and the app run
+/// on different threads, so the first attempt after `releaseOutputBuffer` can
+/// legitimately find the image not yet available.
+fn report_surface_image(env: &JniEnv, reader: JObject, index: i32) {
+    let Some(reader_class) = env.find_class("android/media/ImageReader") else {
+        return;
+    };
+    let Some(acquire) = env.method_id(reader_class, "acquireLatestImage", "()Landroid/media/Image;") else {
+        eprintln!("media: acquireLatestImage missing");
+        return;
+    };
+    let mut image: Option<JObject> = None;
+    for _ in 0..40 {
+        if let Some(img) = env.call_object(reader, acquire, &[]) {
+            if !img.is_null() {
+                image = Some(img);
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let Some(image) = image else {
+        println!("media: surface[{index}] no image available");
+        return;
+    };
+    let Some(image_class) = env.find_class("android/media/Image") else {
+        return;
+    };
+    let width = env
+        .method_id(image_class, "getWidth", "()I")
+        .and_then(|m| env.call_int(image, m, &[]))
+        .unwrap_or(0);
+    let height = env
+        .method_id(image_class, "getHeight", "()I")
+        .and_then(|m| env.call_int(image, m, &[]))
+        .unwrap_or(0);
+    let planes = env
+        .method_id(image_class, "getPlanes", "()[Landroid/media/Image$Plane;")
+        .and_then(|m| env.call_object(image, m, &[]));
+    let mut plane_stats = Vec::new();
+    if let Some(planes) = planes {
+        let count = env.array_length(planes);
+        let plane_class = env.find_class("android/media/Image$Plane");
+        if let (Some(plane_class), Some(get_buffer)) = (
+            plane_class,
+            plane_class.and_then(|c| env.method_id(c, "getBuffer", "()Ljava/nio/ByteBuffer;")),
+        ) {
+            for i in 0..count {
+                let plane = env.array_get(planes, i);
+                if plane.is_null() {
+                    continue;
+                }
+                let Some(buf) = env.call_object(plane, get_buffer, &[]) else {
+                    continue;
+                };
+                let addr = env.direct_buffer_address(buf);
+                if addr.is_null() {
+                    plane_stats.push(format!("p{i}:not-direct"));
+                    continue;
+                }
+                // Plane 0 is the whole frame: `width * height` bytes for a YUV
+                // Y plane, twice that for RGB_565 (2 bytes per pixel).
+                let len = if count == 1 {
+                    (width * height * 2) as usize
+                } else if i == 0 {
+                    (width * height) as usize
+                } else {
+                    ((width / 2) * (height / 2)) as usize
+                };
+                if len == 0 {
+                    continue;
+                }
+                let bytes = unsafe { std::slice::from_raw_parts(addr as *const u8, len) };
+                let sum: u64 = bytes.iter().map(|&b| b as u64).sum();
+                let head: Vec<String> = bytes.iter().take(8).map(|b| format!("{b:02x}")).collect();
+                plane_stats.push(format!(
+                    "p{i}:{}B mean={:.1} head={}",
+                    len,
+                    sum as f64 / len as f64,
+                    head.join(" ")
+                ));
+            }
+        }
+    }
+    println!(
+        "media: surface[{index}] {width}x{height} planes={} | {}",
+        env.array_length(planes.unwrap_or(std::ptr::null_mut())).max(0),
+        plane_stats.join(" | ")
+    );
+    if let Some(close) = env.method_id(image_class, "close", "()V") {
+        env.call_void(image, close, &[]);
     }
 }
 

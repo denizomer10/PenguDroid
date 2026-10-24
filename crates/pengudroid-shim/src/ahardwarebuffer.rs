@@ -257,6 +257,9 @@ unsafe fn allocate_buffer(
     if std::env::var_os("PENGUDROID_TRACE_AHB").is_some() {
         eprintln!("[ahb] allocated {width}x{height} fmt={format} stride={stride} ({size} bytes) fd={fd}");
     }
+    if std::env::var_os("PENGUDROID_TRACE_AHB_BT").is_some() {
+        eprintln!("[ahb] allocate caller:\n{}", std::backtrace::Backtrace::force_capture());
+    }
     0
 }
 
@@ -348,12 +351,13 @@ pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper4lockEPK13native_handle
 
 /// `android::GraphicBufferMapper::unlock(handle)`.
 ///
-/// Nothing to do for this mapper: `lock` is a plain `mmap` of the block's memfd
-/// and the mapping stays valid until `freeBuffer`. When `PENGUDROID_DUMP_GBUF`
-/// names a directory the block's *current contents* are written out here — the
-/// only point where "did anyone actually write pixels into this block?" can be
-/// answered. A decoded frame that never reaches the client shows up as one file
-/// holding the expected gradient and another still holding zeros.
+/// Nothing to undo for this mapper: `lock` is a plain `mmap` of the block's
+/// memfd and the mapping stays valid until `freeBuffer`. When
+/// `PENGUDROID_DUMP_GBUF` names a directory the block's *current contents* are
+/// written out here — the only point where "did anyone actually write pixels
+/// into this block?" can be answered. A decoded frame that never reaches the
+/// client shows up as one file holding the expected gradient and another still
+/// holding zeros.
 #[no_mangle]
 pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper6unlockEPK13native_handle(
     _this: *mut c_void,
@@ -432,6 +436,298 @@ pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper10freeBufferEPK13native
     }
     drop(Box::from_raw(handle as *mut NativeHandle));
     0
+}
+
+/// Resolve a symbol from a guest library, bypassing our own interpositions.
+///
+/// `dlsym` on a specific handle searches that library first, so forwarding from
+/// an interposed symbol reaches the implementation we replaced instead of
+/// recursing into ourselves.
+unsafe fn guest_sym(soname: &[u8], name: &[u8]) -> *mut c_void {
+    let handle = libc::dlopen(soname.as_ptr() as *const libc::c_char, libc::RTLD_NOW | libc::RTLD_GLOBAL);
+    if handle.is_null() {
+        return std::ptr::null_mut();
+    }
+    libc::dlsym(handle, name.as_ptr() as *const libc::c_char)
+}
+
+/// `android::ConsumerBase::setDefaultBufferFormat(int)`.
+///
+/// Interposed only to trace: something in the player path sets the surface's
+/// buffer format to `HAL_PIXEL_FORMAT_RGB_565` (0x4) while `ImageReader` expects
+/// `HAL_PIXEL_FORMAT_YCbCr_420_888` (0x23), and the buffer is then rejected by
+/// the consumer.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android12ConsumerBase22setDefaultBufferFormatEi(
+    this: *mut c_void,
+    format: i32,
+) -> i32 {
+    if std::env::var_os("PENGUDROID_TRACE_AHB").is_some() {
+        eprintln!("[ahb] setDefaultBufferFormat({format:#x}) this={this:p}");
+    }
+    type F = unsafe extern "C" fn(*mut c_void, i32) -> i32;
+    static REAL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let f = *REAL.get_or_init(|| {
+        guest_sym(b"libgui.so\0", b"_ZN7android12ConsumerBase22setDefaultBufferFormatEi\0") as usize
+    });
+    if f == 0 {
+        return 0;
+    }
+    let real: F = std::mem::transmute(f);
+    real(this, format)
+}
+
+/// `android::Surface::setBuffersFormat(int)`.
+///
+/// Traced because `MediaCodec` overrides the surface's request format before
+/// queueing: the buffer comes out as `HAL_PIXEL_FORMAT_RGB_565` (0x4) even
+/// though the consumer asked for `YCbCr_420_888` (0x23), and the consumer then
+/// rejects the buffer.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android7Surface16setBuffersFormatEi(
+    this: *mut c_void,
+    format: i32,
+) -> i32 {
+    if std::env::var_os("PENGUDROID_TRACE_AHB").is_some() {
+        eprintln!("[ahb] Surface::setBuffersFormat({format:#x}) this={this:p}");
+    }
+    type F = unsafe extern "C" fn(*mut c_void, i32) -> i32;
+    static REAL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let f = *REAL.get_or_init(|| {
+        guest_sym(b"libgui.so\0", b"_ZN7android7Surface16setBuffersFormatEi\0") as usize
+    });
+    if f == 0 {
+        return 0;
+    }
+    let real: F = std::mem::transmute(f);
+    real(this, format)
+}
+
+// ---------------------------------------------------------------------------
+// GraphicBufferMapper metadata setters and the YCbCr lock
+// ---------------------------------------------------------------------------
+// `Surface::queueBuffer` calls `Surface::applyGrallocMetadataLocked`, which
+// pushes the buffer's colour metadata into the gralloc mapper through these
+// setters (`libgui.so` `0xf8040`..`0xf814e`, all PLT calls). If they fall through
+// to the real `libui`, the mapper tries to `preloadHal()` and dereferences the
+// NULL gralloc HAL — measured as SIGSEGV in
+// `GraphicBufferMapper::setDataspace`. Metadata is a gralloc4 concept we do not
+// implement (our buffers are plain memfds), so accepting and dropping it is both
+// safe and sufficient.
+//
+// The `dataspace` argument is a `Dataspace` enum (an `int`) and the SMPTE/Cta
+// arguments are `std::optional` of small structs; none of them is inspected.
+
+/// `GraphicBufferMapper::setDataspace(handle, Dataspace)`.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper12setDataspaceEPK13native_handleNS_8hardware8graphics6common4V1_29DataspaceE(
+    _this: *mut c_void,
+    _handle: *const NativeHandle,
+    _dataspace: i32,
+) -> i32 {
+    0
+}
+
+/// `GraphicBufferMapper::setSmpte2086(handle, optional<Smpte2086>)`.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper12setSmpte2086EPK13native_handleNSt3__18optionalIN4aidl7android8hardware8graphics6common9Smpte2086EEE(
+    _this: *mut c_void,
+    _handle: *const NativeHandle,
+    _smpte: *const c_void,
+) -> i32 {
+    0
+}
+
+/// `GraphicBufferMapper::setCta861_3(handle, optional<Cta861_3>)`.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper11setCta861_3EPK13native_handleNSt3__18optionalIN4aidl7android8hardware8graphics6common8Cta861_3EEE(
+    _this: *mut c_void,
+    _handle: *const NativeHandle,
+    _cta: *const c_void,
+) -> i32 {
+    0
+}
+
+/// `GraphicBufferMapper::setSmpte2094_10(handle, optional<vector<uint8_t>>)`.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper15setSmpte2094_10EPK13native_handleNSt3__18optionalINS4_6vectorIhNS4_9allocatorIhEEEEEE(
+    _this: *mut c_void,
+    _handle: *const NativeHandle,
+    _data: *const c_void,
+) -> i32 {
+    0
+}
+
+/// `GraphicBufferMapper::setSmpte2094_40(handle, optional<vector<uint8_t>>)`.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper15setSmpte2094_40EPK13native_handleNSt3__18optionalINS4_6vectorIhNS4_9allocatorIhEEEEEE(
+    _this: *mut c_void,
+    _handle: *const NativeHandle,
+    _data: *const c_void,
+) -> i32 {
+    0
+}
+
+/// `android_ycbcr`: three plane pointers plus their strides.
+#[repr(C)]
+pub struct AndroidYcbcr {
+    pub y: *mut c_void,
+    pub cb: *mut c_void,
+    pub cr: *mut c_void,
+    pub ystride: usize,
+    pub cstride: usize,
+    pub chroma_step: usize,
+}
+
+/// `GraphicsBufferMapper::lockYCbCr(handle, usage, bounds, android_ycbcr*)`.
+///
+/// The YUV consumer side of a surface (`ImageReader`, `MediaCodec`'s
+/// `SoftwareRenderer`) locks planes rather than a single pointer. Our buffers are
+/// one memfd, so the planes are just offsets into it; the layout depends on the
+/// pixel format the allocator recorded in `data[2]`.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper9lockYCbCrEPK13native_handlejRKNS_4RectEP13android_ycbcr(
+    _this: *mut c_void,
+    handle: *const NativeHandle,
+    _usage: u32,
+    _bounds: *const c_void,
+    out: *mut AndroidYcbcr,
+) -> i32 {
+    if handle.is_null() || out.is_null() {
+        return -22;
+    }
+    let h = &*handle;
+    if h.num_fds < 1 || h.data.is_empty() {
+        return -22;
+    }
+    let fd = h.data[0];
+    let size = libc::lseek(fd, 0, libc::SEEK_END);
+    if size <= 0 {
+        return -22;
+    }
+    let p = libc::mmap(
+        std::ptr::null_mut(),
+        size as usize,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_SHARED,
+        fd,
+        0,
+    );
+    if p == libc::MAP_FAILED {
+        return -12;
+    }
+    let base = p as *mut u8;
+    let stride = h.data[1].max(0) as usize;
+    let height = h.data[4].max(0) as usize;
+    let format = h.data[2] as u32;
+    let y = base;
+    // Half the chroma planes: `stride/2` per row, `height/2` rows each.
+    let cstride = stride / 2;
+    let chroma_base = y.add(stride * height);
+    // HAL_PIXEL_FORMAT_YCbCr_420_888 (0x23) and _YCrCb_420_SP (0x21) interleave
+    // the chroma samples; YV12 (0x32315659) keeps them planar in V,U order.
+    let (cb, cr, chroma_step) = match format {
+        0x23 => (chroma_base, chroma_base.add(1), 2), // NV12: Cb first
+        0x21 => (chroma_base.add(1), chroma_base, 2), // NV21: Cr first
+        _ => (chroma_base.add(cstride * (height / 2)), chroma_base, 1), // YV12: V then U
+    };
+    *out = AndroidYcbcr {
+        y: y as *mut c_void,
+        cb: cb as *mut c_void,
+        cr: cr as *mut c_void,
+        ystride: stride,
+        cstride,
+        chroma_step,
+    };
+    if std::env::var_os("PENGUDROID_TRACE_AHB").is_some() {
+        eprintln!("[ahb] lockYCbCr fmt={format:#x} stride={stride} cstride={cstride} step={chroma_step}");
+    }
+    0
+}
+
+/// `GraphicBufferMapper::lockAsync(handle, usage, bounds, addr, fenceFd, bpp, stride)`.
+///
+/// Note the `int fenceFd` between `addr` and `bytesPerPixel`: the mangled name
+/// is `...PPviPiS9_` (`void**`, `int`, `int*`, `int*`). Omitting it shifts every
+/// later argument by one slot, which is not a compile error but writes through
+/// the fence descriptor and then dereferences a stride as a pointer (measured as
+/// SIGSEGV in our own `lock`).
+///
+/// Asynchronous locking only matters for fencing; there is no GPU writer to wait
+/// for here, so this is `lock`.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper9lockAsyncEPK13native_handlejRKNS_4RectEPPviPiS9_(
+    this: *mut c_void,
+    handle: *const NativeHandle,
+    usage: u32,
+    bounds: *const c_void,
+    addr: *mut *mut c_void,
+    _fence_fd: i32,
+    bytes_per_pixel: *mut i32,
+    stride: *mut i32,
+) -> i32 {
+    _ZN7android19GraphicBufferMapper4lockEPK13native_handlejRKNS_4RectEPPvPiS9_(
+        this,
+        handle,
+        usage,
+        bounds,
+        addr,
+        bytes_per_pixel,
+        stride,
+    )
+}
+
+/// `GraphicBufferMapper::lockAsync(handle, producerUsage, consumerUsage, bounds,
+/// addr, fenceFd, bpp, stride)`.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper9lockAsyncEPK13native_handlemmRKNS_4RectEPPviPiS9_(
+    this: *mut c_void,
+    handle: *const NativeHandle,
+    _producer_usage: u64,
+    _consumer_usage: u64,
+    bounds: *const c_void,
+    addr: *mut *mut c_void,
+    _fence_fd: i32,
+    bytes_per_pixel: *mut i32,
+    stride: *mut i32,
+) -> i32 {
+    _ZN7android19GraphicBufferMapper4lockEPK13native_handlejRKNS_4RectEPPvPiS9_(
+        this,
+        handle,
+        0,
+        bounds,
+        addr,
+        bytes_per_pixel,
+        stride,
+    )
+}
+
+/// `GraphicBufferMapper::unlockAsync(handle, int* fence)`.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper11unlockAsyncEPK13native_handlePi(
+    _this: *mut c_void,
+    _handle: *const NativeHandle,
+    fence: *mut i32,
+) -> i32 {
+    if !fence.is_null() {
+        *fence = -1;
+    }
+    0
+}
+
+/// `GraphicBufferMapper::lockAsyncYCbCr(handle, usage, bounds, ycbcr*, fenceFd)`.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper14lockAsyncYCbCrEPK13native_handlejRKNS_4RectEP13android_ycbcri(
+    this: *mut c_void,
+    handle: *const NativeHandle,
+    usage: u32,
+    bounds: *const c_void,
+    out: *mut AndroidYcbcr,
+    _fence_fd: i32,
+) -> i32 {
+    _ZN7android19GraphicBufferMapper9lockYCbCrEPK13native_handlejRKNS_4RectEP13android_ycbcr(
+        this, handle, usage, bounds, out,
+    )
 }
 
 /// `AHardwareBuffer_allocate(desc, out)`.

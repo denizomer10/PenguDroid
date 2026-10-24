@@ -3,6 +3,55 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
+## Bu oturum (2): Surface yolu da çalışıyor
+
+`MediaCodec.configure(fmt, surface, …)` + `releaseOutputBuffer(index, true)` artık
+gerçek bir tüketiciye kare teslim ediyor. Probe: `PENGUDROID_PROBE_MEDIA=1
+PENGUDROID_PROBE_SURFACE=1` — `ImageReader` (tamamen Java tarafında bir BufferQueue
+tüketicisi, GL bağlamı gerekmiyor) ile:
+
+```
+media: ImageReader surface ready
+media: MediaCodec.configure = true (surface mode)
+media: surface[0] 320x240 planes=1 | p0:153600B mean=152.3 head=27 98 27 98 27 a0 27 a0
+```
+
+`153600 = 320*240*2` (RGB_565). Pikseller doğru: kaynak Y=`0x40`, U=`0x80`,
+V=`0xc0` → BT.601 ile R≈154, G≈46, B≈64, yani RGB565'te yüksek bayt `0x98` —
+ölçülen değer de bu. Yani zincir: decoder → `SoftwareRenderer` →
+`Surface::queueBuffer` → `BufferQueue` → tüketici.
+
+### Bu yolda çıkan üç hata
+
+1. **`GraphicBufferMapper::setDataspace` çöküyordu** (SIGSEGV).
+   `Surface::queueBuffer` → `Surface::applyGrallocMetadataLocked`
+   (`libgui.so` `0xf8040`..`0xf814e`) renk metadatasını gralloc mapper'a
+   `setDataspace`/`setSmpte2086`/`setCta861_3`/`setSmpte2094_{10,40}` ile
+   yazıyor. Bunlar shim'de yoktu, gerçek `libui` sürümü çalışıp
+   `preloadHal()` üzerinden NULL gralloc HAL'ine gidiyordu. Hepsi artık no-op
+   (metadata gralloc4 kavramı; bizim buffer'lar düz memfd).
+2. **`lockAsync` ABI'si bir argüman kaymış.** Mangled ad `...PPviPiS9_`
+   (`void**`, **`int fenceFd`**, `int*`, `int*`) — `fenceFd` atlanınca
+   `bytesPerPixel` olarak fence değeri yazılıyor ve sonra stride yerine bir
+   pointer okunuyordu (SIGSEGV kendi `lock`'umuzun içinde).
+   `lockAsyncYCbCr`'de de `fenceFd` değer olarak geçiyor, pointer değil.
+3. **`ImageReader` formatı uyuşmuyordu:**
+   `Producer output buffer format: 0x4, ImageReader configured format: 0x23`.
+   Sebep: `MediaCodec`'in `SoftwareRenderer`ı `Surface::setBuffersFormat(0x4
+   /*RGB_565*/)` çağırıyor (shim'e `Surface::setBuffersFormat` ve
+   `ConsumerBase::setDefaultBufferFormat` trace'i eklendi, bu ikisiyle ölçüldü).
+   Yani CPU render yolu **RGB_565** üretir; tüketici de o formatta olmalı.
+
+### Not: bu hâlâ kopyalı (kopyasız değil) yol
+
+`CCodec` bu kurulumda **ByteBuffer** çıkışı kullanıyor (`CCodecBuffers:
+[…:2D-BB-Output]`) ve `MediaCodec` kareyi `SoftwareRenderer` ile surface'e
+kopyalıyor. Kopyasız (zero-copy) surface yolu için `CCodecBufferChannel::start`
+(`libsfplugin_ccodec.so` `0x5ee4d`) `createBlockPool(allocatorID=17 /*GRALLOC*/)`
+yolunu seçmeli; bunun için bileşenin `output.buffers.allocator-ids` maskesinde
+17. bitin olması gerekiyor (`bt %esi,%eax`), yoksa `poolId = (mod==3) ? 1 : 0`
+fallback'i devreye giriyor. Sıradaki iş bu maske.
+
 ## Bu oturum: KARE ÇIKIYOR — video zinciri tamam
 
 Kök neden tek bir alandı ve `ahardwarebuffer.rs` içinde düzeltildi:
