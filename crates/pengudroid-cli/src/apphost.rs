@@ -1809,6 +1809,79 @@ fn force_window_frame(env: &JniEnv, root: JObject, width: i32, height: i32) {
     }
 }
 
+/// `PENGUDROID_DUMP_ROOTS=<ms>`: print every window's real frame after a delay.
+///
+/// The `dump_draw_state` call in `force_visible` runs *before* the first
+/// traversal, so it only sees the pre-traversal sentinels (`w=-1`,
+/// `mViewVisibility=GONE`). This attaches to the VM on a timer and reports what
+/// `ViewRootImpl` actually settled on, which is the only way to see the frame a
+/// second window (a dialog) was given.
+fn schedule_roots_dump(env: &JniEnv) {
+    let Some(ms) = std::env::var("PENGUDROID_DUMP_ROOTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    else {
+        return;
+    };
+    let Some(vm) = env.get_java_vm() else { return };
+    let vm_addr = vm as usize;
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        let vm = vm_addr as *mut c_void;
+        let Some(env) = attach_current_thread(vm) else { return };
+        let (Some(wmg_class), Some(root_class)) = (
+            env.find_class("android/view/WindowManagerGlobal"),
+            env.find_class("android/view/ViewRootImpl"),
+        ) else {
+            return;
+        };
+        let (Some(get_instance), Some(roots_field)) = (
+            env.static_method_id(wmg_class, "getInstance", "()Landroid/view/WindowManagerGlobal;"),
+            env.field_id(wmg_class, "mRoots", "Ljava/util/ArrayList;"),
+        ) else {
+            return;
+        };
+        let Some(list_class) = env.find_class("java/util/ArrayList") else { return };
+        let (Some(list_get), Some(list_size)) = (
+            env.method_id(list_class, "get", "(I)Ljava/lang/Object;"),
+            env.method_id(list_class, "size", "()I"),
+        ) else {
+            return;
+        };
+        let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else { return };
+        let roots = env.object_field(wmg, roots_field);
+        let count = env.call_int(roots, list_size, &[]).unwrap_or(0);
+        let int = |name: &str, obj: JObject| -> Option<i32> {
+            let f = env.field_id(root_class, name, "I")?;
+            Some(env.int_field(obj, f))
+        };
+        for i in 0..count {
+            let Some(root) = env.call_object(roots, list_get, &[JValue { i }]) else { continue };
+            if root.is_null() {
+                continue;
+            }
+            let mut frame = String::from("none");
+            let rect_source = env
+                .field_id(root_class, "mWinFrame", "Landroid/graphics/Rect;")
+                .map(|f| env.object_field(root, f))
+                .filter(|r| !r.is_null());
+            if let (Some(rect), Some(rect_class)) = (rect_source, env.find_class("android/graphics/Rect")) {
+                if let Some(desc) = env.method_id(rect_class, "toString", "()Ljava/lang/String;") {
+                    frame = env
+                        .call_object(rect, desc, &[])
+                        .and_then(|s| env.get_string(s))
+                        .unwrap_or_else(|| "?".into());
+                }
+            }
+            println!(
+                "apphost: root {i} settled w={:?} h={:?} mWinFrame={frame}",
+                int("mWidth", root),
+                int("mHeight", root),
+            );
+        }
+    });
+}
+
 /// `Object.getClass().getName()` for diagnostics.
 fn class_name_of(env: &JniEnv, obj: JObject) -> Option<String> {
     if obj.is_null() {
@@ -2119,6 +2192,7 @@ fn force_visible(env: &JniEnv, record: JObject) {
         }
         force_window_frame(env, root, SURFACE_W, SURFACE_H);
         dump_draw_state(env, root, index as usize);
+        schedule_roots_dump(env);
         // `performTraversals` must run inside a Choreographer frame callback:
         // calling it directly makes `Choreographer.getFrameTimeNanos()` throw
         // "must only be called as part of a callback while a frame is in

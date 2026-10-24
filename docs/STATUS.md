@@ -239,6 +239,20 @@ Kalan kusur: dialog kendi penceresi içinde hâlâ (96,96) noktasından başlıy
 sağdan 96 px taşıyor (`content x: 96..719`), yani tam ortalı değil. İçerik ve
 üç düğme görünür.
 
+`PENGUDROID_DUMP_ROOTS=<ms>` ile pencere çerçeveleri ölçüldü — **ikisi de
+doğru**:
+
+```
+apphost: root 0 settled w=Some(720) h=Some(1280) mWinFrame=Rect(0, 0 - 720, 1280)
+apphost: root 1 settled w=Some(720) h=Some(1280) mWinFrame=Rect(0, 0 - 720, 1280)
+```
+
+Yani `mWinFrame` doğru, sorun **layout/render offset'inde**: dialog kutusu 720
+px genişliğinde ama +96 px ötelenmiş çiziliyor (96..816, 720'de kırpılıyor).
+Sonraki adım: `Surface`/`BLASTBufferQueue` yolunda bir `position`/`transform`
+uygulanıp uygulanmadığına bakmak — `relayout` ile verdiğimiz `SurfaceControl`
+`layerId=1, transformHint=0` ve (0,0) konumunda.
+
 ### Bilinen artıklar
 
 1. **`EGL_BAD_DISPLAY` seli — ÇÖZÜLDÜ (`26ce279`).** Sebep `eglBeginFrame`.
@@ -272,6 +286,12 @@ sağdan 96 px taşıyor (`content x: 96..719`), yani tam ortalı değil. İçeri
 1280x720'lik bir FBO'ya çiziyor, pencere frame'i 720x1280 diyordu. Artık
 `apphost::SURFACE_W/H` tek kaynak, `art-test` da
 `PENGUDROID_SURFACE_W/H`'yi açıkça set ediyor, geri kalan her şey onu okuyor.
+
+- `PENGUDROID_DUMP_ROOTS=<ms>`: gecikmeden sonra her pencerenin gerçek
+  `mWinFrame`/`mWidth`/`mHeight` değerlerini basar (`force_visible` içindeki
+  `dump_draw_state` ilk traversal'dan *önce* çalıştığı için sadece `-1`/`GONE`
+  görüyordu).
+- `tools/art/ppmbbox.py`: bir PPM karesinde içeriğin sınır kutusunu verir.
 
 ### Bu oturumda eklenen teşhis araçları
 
