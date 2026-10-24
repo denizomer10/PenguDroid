@@ -102,6 +102,20 @@ hiç çağırmamış. Bir callback hiç yayınlanmıyor.
 * `Settings` provider'ımız her anahtara boş `Bundle` dönüyor; Roblox
   `Settings.Secure.getString` çağırıyor ve `ClassCastException` alıp yutuyor
   (ölümcül değil, `AppManager.initialize` sonrası `Completed OK` diyor).
+  Sorgulanan anahtarlar (parcel'dan okundu — `tools/art/parcelstr.py`):
+  `roblox_channel_override`, `sqlite_compatibility_wal_flags`,
+  `render_shadows_in_compositor`. Üçü de zararsız; varsayılana düşüyor.
+
+### Elenenler (bu oturumda ölçüldü)
+
+* **`startActivity` hiç çağrılmıyor.** `PENGUDROID_TRACE_BINDER=1` ile bir koşuda
+  `activity_task`'a **tek bir** transaction bile gitmiyor; en yoğun trafik
+  `display_event_connection` (1728), `display` (30), `user` (11),
+  `package` (11). Yani splash `ActivityNativeMain`'ı başlatmayı denemiyor
+  bile — bekleyen kişi o değil.
+* **Ayar (`Settings`) sorguları** yukarıdaki üç anahtar, hepsi opsiyonel.
+* **Ağ** çalışıyor: HTTPS/2 istek+cevap, DNS pre-warm'lar tamam.
+* **Kilit/soket beklemesi yok**: 38 thread'in tamamı normal idle.
 
 ### Bu oturumdaki girdi düzeltmesi (önceki başlık)
 
