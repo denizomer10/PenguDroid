@@ -9,14 +9,37 @@
 mod registry;
 mod runner;
 
+use pengudroid_input::keymap;
+use pengudroid_input::mapper::KeyMapper;
+use pengudroid_input::uinput::{keyboards, VirtualTouch};
 use registry::Registry;
 use slint::{ModelRc, VecModel};
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+
+/// The keymapper for the app that is currently running.
+///
+/// One at a time: the panel is a single virtual touchscreen, so two mappers
+/// would fight over the same finger. Starting a second app replaces the first.
+struct ActiveMapper {
+    mapper: KeyMapper,
+    /// Kept alive for the mapper's threads.
+    _touch: Arc<Mutex<VirtualTouch>>,
+}
+
+impl ActiveMapper {
+    fn stop(self) {
+        self.mapper.stop();
+    }
+}
 
 slint::include_modules!();
 
 fn main() -> Result<(), slint::PlatformError> {
     let ui = MainWindow::new()?;
     let mut registry = Registry::load();
+    let mapper: Rc<RefCell<Option<ActiveMapper>>> = Rc::new(RefCell::new(None));
 
     // Anything passed on the command line is installed first, so
     // `pengudroid-gui game.apk` works as a one-shot installer (and as the
@@ -57,13 +80,30 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let ui_weak = ui.as_weak();
         let mut registry = registry.clone();
+        let mapper = Rc::clone(&mapper);
         ui.on_launch_requested(move |index| {
             let Some(ui) = ui_weak.upgrade() else { return };
             let Some(entry) = registry.get(index as usize).cloned() else { return };
             match runner::launch(&entry) {
                 Ok(pid) => {
                     registry.set_running(&entry.package, Some(pid));
-                    ui.set_status(format!("Started {} (pid {pid})", entry.label).into());
+                    let mut status = format!("Started {} (pid {pid})", entry.label);
+                    // The keymapper is per app: its bindings are that app's
+                    // layout, so it starts with the app and dies with it.
+                    if registry.setting("keymapper", true) {
+                        if let Some(previous) = mapper.borrow_mut().take() {
+                            previous.stop();
+                        }
+                        match start_keymapper(&entry.package) {
+                            Ok(active) => {
+                                let bindings = active.mapper.binding_count();
+                                *mapper.borrow_mut() = Some(active);
+                                status.push_str(&format!(", keymapper on ({bindings} binding(s))"));
+                            }
+                            Err(e) => status.push_str(&format!(", keymapper off: {e}")),
+                        }
+                    }
+                    ui.set_status(status.into());
                 }
                 Err(e) => ui.set_status(format!("Launch failed: {e}").into()),
             }
@@ -75,9 +115,13 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let ui_weak = ui.as_weak();
         let mut registry = registry.clone();
+        let mapper = Rc::clone(&mapper);
         ui.on_stop_requested(move |index| {
             let Some(ui) = ui_weak.upgrade() else { return };
             let Some(entry) = registry.get(index as usize).cloned() else { return };
+            if let Some(active) = mapper.borrow_mut().take() {
+                active.stop();
+            }
             match runner::stop(&entry) {
                 Ok(()) => ui.set_status(format!("Stopped {}", entry.label).into()),
                 Err(e) => ui.set_status(format!("Stop failed: {e}").into()),
@@ -91,9 +135,13 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let ui_weak = ui.as_weak();
         let mut registry = registry.clone();
+        let mapper = Rc::clone(&mapper);
         ui.on_uninstall_requested(move |index| {
             let Some(ui) = ui_weak.upgrade() else { return };
             let Some(entry) = registry.get(index as usize).cloned() else { return };
+            if let Some(active) = mapper.borrow_mut().take() {
+                active.stop();
+            }
             let _ = runner::stop(&entry);
             match registry.uninstall(&entry.package) {
                 Ok(()) => {
@@ -140,8 +188,12 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let ui_weak = ui.as_weak();
         let mut registry = registry.clone();
+        let mapper = Rc::clone(&mapper);
         ui.on_confirm_close_yes(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
+            if let Some(active) = mapper.borrow_mut().take() {
+                active.stop();
+            }
             for entry in registry.apps().to_vec() {
                 if entry.running {
                     let _ = runner::stop(&entry);
@@ -171,6 +223,23 @@ fn main() -> Result<(), slint::PlatformError> {
     }
 
     ui.run()
+}
+
+/// Create the virtual panel and start mapping this package's keys onto it.
+fn start_keymapper(package: &str) -> Result<ActiveMapper, String> {
+    let touch = VirtualTouch::create("pengudroid-touch", 720, 1280)
+        .map_err(|e| format!("cannot create the touch panel: {e}"))?;
+    let touch = Arc::new(Mutex::new(touch));
+    let map = keymap::load(package);
+    let devices = keyboards();
+    if devices.is_empty() {
+        return Err("no readable keyboard device".into());
+    }
+    let mapper = KeyMapper::start(devices, Arc::clone(&touch), &map);
+    Ok(ActiveMapper {
+        mapper,
+        _touch: touch,
+    })
 }
 
 /// Push the registry into the UI model.

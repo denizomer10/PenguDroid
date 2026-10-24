@@ -98,6 +98,14 @@ impl KeyMapper {
         }
     }
 
+    /// How many keys are currently bound (for status messages).
+    pub fn binding_count(&self) -> usize {
+        self.bindings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
     /// Replace the bindings without restarting the threads.
     pub fn set_keymap(&self, keymap: &Keymap) {
         *self.bindings.lock().unwrap_or_else(|e| e.into_inner()) = crate::keymap::index(keymap);

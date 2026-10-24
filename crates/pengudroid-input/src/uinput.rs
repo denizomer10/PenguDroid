@@ -466,26 +466,29 @@ impl EventReader {
 }
 
 /// Every readable keyboard-like device under `/dev/input`.
+///
+/// The capability mask lives in sysfs, not in `/dev`: a keyboard sets bits well
+/// past the pointer range, so a mask longer than 32 bits means "this device has
+/// keys we can map". Devices whose mask cannot be read are skipped rather than
+/// guessed at.
 pub fn keyboards() -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/dev/input") else {
+    let Ok(entries) = std::fs::read_dir("/sys/class/input") else {
         return out;
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let name = name.to_string_lossy();
+        let name = name.to_string_lossy().into_owned();
         if !name.starts_with("event") {
             continue;
         }
-        let caps = std::fs::read_to_string(
-            entry.path().with_file_name(format!("../{}", name)).join("device/capabilities/key"),
-        );
-        // A device with the keyboard bit range set reports a long hex mask; a
-        // pointer reports a short one. Anything unreadable is skipped.
-        if let Ok(mask) = caps {
-            if mask.trim().len() > 8 {
-                out.push(entry.path());
-            }
+        let caps = entry.path().join("device/capabilities/key");
+        let Ok(mask) = std::fs::read_to_string(&caps) else {
+            continue;
+        };
+        // 32 bits of mask = 8 hex digits; a keyboard always sets more.
+        if mask.trim().len() > 8 {
+            out.push(PathBuf::from("/dev/input").join(&name));
         }
     }
     out.sort();
