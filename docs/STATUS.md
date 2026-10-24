@@ -75,6 +75,34 @@ Sıradaki adım: `AsyncTask #5`'in hangi işi yaptığını bulmak (Java yığı
 ama `--dump-class` + `AsyncTask` alanlarıyla veya `PENGUDROID_DEBUG_WRAP` ile o
 thread'in futex'ini kimin tuttuğunu görmek).
 
+### Java yığın dökümü: Roblox gerçekten hiçbir şey beklemiyor
+
+`kill -QUIT <pid>` ART'de tüm Java thread yığınlarını döktü (315 satır) — bu
+oturumun en işe yarar teşhis aracı. Sonuç:
+
+* `main`: `MessageQueue.nativePollOnce` → `Looper.loopOnce` → **Looper'da tek bir
+  mesaj bile yok.**
+* 38 thread'in tamamı normal idle: `DefaultDispatcher-worker-*` `parkNanos`,
+  `HeapTaskDaemon`/`FinalizerDaemon` `Object.wait`, OkHttp
+  `clientsettingscdn.roblox.com` keep-alive soketinde `socketRead0`.
+* Roblox'a ait tek ilginç thread `m.roblox.client` ve **"not attached"** (yani
+  Java thread'i değil, native bir thread; `nanosleep` döngüsünde).
+* Yığınlarda `ActivitySplash`/`ActivityNativeMain`/`startActivity` **yok**.
+
+Yani Java tarafı startup'ı bitirmiş ve `startActivity(ActivityNativeMain)`'ı
+hiç çağırmamış. Bir callback hiç yayınlanmıyor.
+
+Ölçülen diğer şeyler:
+
+* `PlayCore: SplitInstallInfoProvider: No splits are found` ve
+  `SplitInstallService: onError(-14)`: APKMirror bundle'ı yalnızca `base` +
+  üç `split_config.<abi>` içeriyor, **feature split yok**. Manifest'te
+  `uses-split` de yok, ama `gmasdk` provider'ı da yok — yani bu APK bir feature
+  modülü olmadan üretilmiş. Roblox dinamik modül kurmaya çalışıp başaramıyor.
+* `Settings` provider'ımız her anahtara boş `Bundle` dönüyor; Roblox
+  `Settings.Secure.getString` çağırıyor ve `ClassCastException` alıp yutuyor
+  (ölümcül değil, `AppManager.initialize` sonrası `Completed OK` diyor).
+
 ### Bu oturumdaki girdi düzeltmesi (önceki başlık)
 
 ### Girdi (tıklama / gezinme) — ÇÖZÜLDÜ
