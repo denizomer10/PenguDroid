@@ -1341,7 +1341,13 @@ fn spawn_input_pump(env: &JniEnv) {
             eprintln!("apphost: input pump: dispatchInputEvent not found");
             return;
         };
-        let set_axis_value = env.method_id(motion_class, "setAxisValue", "(IF)V");
+        // `MotionEvent.setAxisValue` does not exist in this framework (only the
+        // `getAxisValue` accessors do), so a wheel delta cannot be attached to a
+        // synthesized event. `PointerAxis` is therefore dropped instead of
+        // dispatching a scroll with a zero delta — which would look like the app
+        // ignoring the wheel anyway. A real fix needs either that hidden setter or
+        // an `InputManager.injectInputEvent` path.
+        let set_axis_value: Option<JMethodId> = None;
         let Some(key_class) = env.find_class("android/view/KeyEvent") else {
             return;
         };
