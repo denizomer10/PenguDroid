@@ -3,6 +3,53 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
+## Bu oturum (3): servis çağrıları artık tanınıyor ve cevaplanıyor
+
+NewPipe'ın oynatıcısı kendi sürecinde bir `PlayerService`; hiçbir `system_server`
+olmadığı için servisi kimse oluşturmuyor. İlk adım: **hangi transaction'lar**
+ve **ne cevap** gerektiğini ölçmek.
+
+`PENGUDROID_TRACE_BINDER=1` ile istek parcel'ındaki UTF-16 metinleri döktüm:
+
+```
+activity code=27 data=428 strings=android.app.IActivityManager|org.schabi.newpipe|org.schabi.newpipe.player.PlayerService|should_start_foreground_extra|org.schabi.newpipe
+activity code=30 data=432 strings=android.app.IActivityManager|org.schabi.newpipe|org.schabi.newpipe.player.PlayerService|org.schabi.newpipe
+```
+
+Yani:
+
+| Kod | Metot | Cevap şekli |
+| --- | --- | --- |
+| **27** | `startService` / `startForegroundService` | `ComponentName` = `[status][present=1][pkg][cls]`; null dönmek "bulunamadı" demek ve uygulama pes ediyor |
+| **30** | `bindService` / `bindIsolatedService` | `int`, negatif değer `SecurityException` fırlatıyor → `0` |
+
+İkisi de artık doğru şekilde cevaplanıyor ve istek `__pengudroid_binder_take_service_request`
+ile host'a veriliyor (`apphost` bunu bir sonraki adımda tüketecek). Ölçüm:
+
+```
+[binder] service request: bind org.schabi.newpipe/org.schabi.newpipe.player.PlayerService
+[binder] service request: start org.schabi.newpipe/org.schabi.newpipe.player.PlayerService
+```
+
+### Neden basit bir "component name bul" işe yaramadı
+
+İstek parcel'i düz bir string listesi değil: descriptor'dan hemen sonra bir
+`IApplicationThread` **binder nesnesi** var, yani alan alan yürümek nesnede
+takılıyor (ölçüm: `parsed=["android.app.IActivityManager", ""]`). Bu yüzden
+çözümleyici her 2 baytlık ofsette bir `string16` denemesi yapıp makul olanları
+topluyor, sonra "paket + altındaki sınıf" çiftini arıyor
+(`binder::string16_candidates`).
+
+### Sıradaki adım (bu oturumda yapılmadı)
+
+Host tarafında servisi gerçekten oluşturmak: `ActivityThread$CreateServiceData`
+(`info`, `compatInfo`, `token`, `intent` alanları) kurup
+`ActivityThread.handleCreateService` çağırmak, sonra bind için
+`handleBindService` ve uygulamanın `publishService` cevabını yakalayıp
+`IServiceConnection.connected(...)` callback'ini tetiklemek. Bu, `ActiveServices`'in
+küçük bir kopyası; `ServiceInfo`'yu `IPackageManager.getServiceInfo` yerine elle
+kurmak gerekiyor (proxy'nin o kodu cevaplanmıyor).
+
 ## Bu oturum (2): Surface yolu da çalışıyor
 
 `MediaCodec.configure(fmt, surface, …)` + `releaseOutputBuffer(index, true)` artık

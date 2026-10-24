@@ -464,6 +464,18 @@ const ATM_GET_ACTIVITY_CLIENT_CONTROLLER: u32 = 18;
 /// provider and NPEs on a null `IContentProvider` without it.
 const IAM_GET_CONTENT_PROVIDER: u32 = 23;
 
+/// `IActivityManager` transaction code for `startService` / `startForegroundService`.
+///
+/// Measured from a live transaction: the parcel carries the app package and
+/// `org.schabi.newpipe.player.PlayerService` (plus the
+/// `should_start_foreground_extra` key for the foreground variant).
+const IAM_START_SERVICE: u32 = 27;
+
+/// `IActivityManager` transaction code for `bindService`/`bindIsolatedService`.
+///
+/// Same component as [`IAM_START_SERVICE`] but without the intent extras.
+const IAM_BIND_SERVICE: u32 = 30;
+
 /// `IUserManager` transaction code for `isUserUnlocked(int)`.
 const IUM_IS_USER_UNLOCKED: u32 = 79;
 
@@ -1393,6 +1405,57 @@ fn is_surface_flinger(handle: u32) -> bool {
     )
 }
 
+/// Every plausible `string16` in a parcel, as `(offset, text)`.
+///
+/// A request parcel is not a flat list of strings: `bindService`/`startService`
+/// put an `IApplicationThread` binder object between the interface descriptor and
+/// the `Intent`, so walking field by field stops at the object. Trying a
+/// `string16` parse at every 2-byte offset and keeping the plausible ones
+/// sidesteps the layout entirely.
+fn string16_candidates(data: &[u8]) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos + 6 <= data.len() {
+        let len = u32::from_ne_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        if (1..=256).contains(&len) && pos + 4 + len * 2 <= data.len() {
+            let text = decode_utf16le(&data[pos + 4..pos + 4 + len * 2]);
+            let plausible = !text.is_empty()
+                && text
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '/' | '_' | '-' | ':'));
+            if plausible {
+                out.push((pos, text));
+                // The payload plus the NUL terminator, aligned to 4 bytes.
+                pos += ((len + 1) * 2 + 3) & !3;
+                continue;
+            }
+        }
+        pos += 2;
+    }
+    out
+}
+
+/// Component name carried by a `startService`/`bindService` request.
+///
+/// Uses the first plausible package-like string followed by a class-like string
+/// that lives under it. An `Intent` writes `package` right before its
+/// `ComponentName`, so this pair identifies the target service.
+fn service_component(data: &[u8]) -> Option<(String, String)> {
+    let candidates = string16_candidates(data);
+    for (i, (_, package)) in candidates.iter().enumerate() {
+        if !package.contains('.') || package.starts_with("android.") {
+            continue;
+        }
+        let prefix = format!("{package}.");
+        for (_, class) in candidates.iter().skip(i + 1) {
+            if class.starts_with(&prefix) {
+                return Some((package.clone(), class.clone()));
+            }
+        }
+    }
+    None
+}
+
 /// Decode the AIDL interface token of a request parcel.
 ///
 /// libbinder prefixes the token with a 12-byte header (`[u32][i32 -1]["TSYS"]`)
@@ -1831,6 +1894,80 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         );
         if trace_enabled() {
             diag("[binder]   -> activity_client_controller handle\n");
+        }
+    }
+    if tr.target_handle == handle_for("activity") && trace_enabled() {
+        // Identify service calls by the UTF-16 strings they carry: an
+        // `Intent`'s component name is plain UTF-16, so dumping the text of the
+        // request parcel says which AIDL method a transaction code is far
+        // faster than guessing transaction numbers.
+        let mut text = String::new();
+        if tr.data_size > 0 && tr.data_ptr != 0 {
+            let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
+            let mut run: Vec<u16> = Vec::new();
+            let mut i = 0usize;
+            while i + 1 < data.len() {
+                let unit = u16::from_ne_bytes([data[i], data[i + 1]]);
+                if (0x20..0x7f).contains(&unit) {
+                    run.push(unit);
+                } else {
+                    if run.len() >= 4 {
+                        if !text.is_empty() {
+                            text.push('|');
+                        }
+                        text.push_str(&String::from_utf16_lossy(&run));
+                    }
+                    run.clear();
+                }
+                i += 2;
+            }
+            if run.len() >= 4 {
+                if !text.is_empty() {
+                    text.push('|');
+                }
+                text.push_str(&String::from_utf16_lossy(&run));
+            }
+        }
+        diag(&format!(
+            "[binder]   activity code={} data={} strings={}\n",
+            tr.code, tr.data_size, text
+        ));
+    }
+    if tr.target_handle == handle_for("activity")
+        && (tr.code == IAM_START_SERVICE || tr.code == IAM_BIND_SERVICE)
+    {
+        // The player lives in the app's own process (`PlayerService`), and with
+        // no system_server nothing schedules its creation, so these two calls
+        // are the whole reason a service never starts. The reply shapes matter:
+        // `startService` returns a `ComponentName` (`[status][present][pkg][cls]`)
+        // and returns **null** to mean "not found", which is what makes the app
+        // give up; `bindService` returns an `int` where a negative value throws.
+        let data = if tr.data_size > 0 && tr.data_ptr != 0 {
+            std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize)
+        } else {
+            &[][..]
+        };
+        let component = service_component(data);
+        if trace_enabled() {
+            diag(&format!(
+                "[binder]   -> {} component={component:?}\n",
+                if tr.code == IAM_START_SERVICE { "startService" } else { "bindService" }
+            ));
+        }
+        if tr.code == IAM_START_SERVICE {
+            match &component {
+                Some((pkg, cls)) => {
+                    parcel.extend_from_slice(&1u32.to_ne_bytes()); // present
+                    parcel.extend_from_slice(&string16(pkg));
+                    parcel.extend_from_slice(&string16(cls));
+                }
+                None => parcel.extend_from_slice(&0u32.to_ne_bytes()), // null
+            }
+        } else {
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // 0 = accepted
+        }
+        if let Some((pkg, cls)) = component {
+            note_service_request(&pkg, &cls, tr.code);
         }
     }
     if tr.target_handle == handle_for("activity") && tr.code == IAM_GET_CONTENT_PROVIDER {
@@ -2683,6 +2820,82 @@ pub unsafe extern "C" fn __pengudroid_binder_set_window_reply(ptr: *const u8, le
 ///
 /// # Safety
 /// `ptr` must point to `len` readable bytes.
+#[no_mangle]
+/// A service the app asked the (absent) system server to start or bind.
+///
+/// Nothing schedules these yet — that is the next piece of `ActivityThread`
+/// host-side work (`handleCreateService`/`handleBindService`) — so the request
+/// is recorded here for the host to pick up instead of being dropped.
+#[derive(Clone)]
+pub struct ServiceRequest {
+    pub package: String,
+    pub class: String,
+    /// `true` for `bindService`, `false` for `startService`.
+    pub bind: bool,
+}
+
+static SERVICE_REQUESTS: Mutex<Vec<ServiceRequest>> = Mutex::new(Vec::new());
+
+fn note_service_request(package: &str, class: &str, code: u32) {
+    let bind = code == IAM_BIND_SERVICE;
+    let mut queue = SERVICE_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+    if queue
+        .iter()
+        .any(|r| r.package == package && r.class == class && r.bind == bind)
+    {
+        return;
+    }
+    unsafe {
+        diag(&format!(
+            "[binder] service request: {} {package}/{class}\n",
+            if bind { "bind" } else { "start" }
+        ));
+    }
+    queue.push(ServiceRequest {
+        package: package.to_string(),
+        class: class.to_string(),
+        bind,
+    });
+}
+
+/// Pop the oldest recorded service request.
+///
+/// Returns `0` and fills `out_*` when a request was queued. The host calls this
+/// from its UI loop; see `apphost::drive_service_requests`.
+///
+/// # Safety
+/// `out_package`/`out_class` must point at `cap` writable bytes, and
+/// `out_len` at a writable `usize`.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_take_service_request(
+    out_package: *mut u8,
+    out_class: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+    out_bind: *mut i32,
+) -> i32 {
+    if out_package.is_null() || out_class.is_null() || out_len.is_null() || out_bind.is_null() {
+        return -1;
+    }
+    let request = {
+        let mut queue = SERVICE_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+        if queue.is_empty() {
+            return -1;
+        }
+        queue.remove(0)
+    };
+    let pkg = request.package.as_bytes();
+    let cls = request.class.as_bytes();
+    if pkg.len() > cap || cls.len() > cap {
+        return -1;
+    }
+    std::ptr::copy_nonoverlapping(pkg.as_ptr(), out_package, pkg.len());
+    std::ptr::copy_nonoverlapping(cls.as_ptr(), out_class, cls.len());
+    *out_len = pkg.len().max(cls.len());
+    *out_bind = i32::from(request.bind);
+    0
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn __pengudroid_binder_set_activity_info(ptr: *const u8, len: usize) {
     if ptr.is_null() || len == 0 {
