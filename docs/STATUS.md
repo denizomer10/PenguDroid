@@ -3,6 +3,40 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
+## Bu oturum (7): GUI derleniyor, keymapper GUI'den, FPS sayacı, süslemeler
+
+### GUI artık derleniyor ve açılıyor
+
+İki şey gerekti: `rust-toolchain.toml` ile **stable (1.99.1)** sabitlemek
+(Slint'in ağacı 1.85'te zbus/icu'da, 1.87'de image/parley'de takılıyor) ve sistem
+kütüphaneleri `libfontconfig1-dev`, `libfreetype-dev`, `libxkbcommon-dev`.
+`.slint` dosyası gerçek API'ye göre düzeltildi: `std-widgets` importu
+(`ScrollView`, `CheckBox`) ve layout'larda `alignment`.
+
+### Keymapper GUI'den yönetiliyor
+
+Başlat'a basınca o paketin keymap'i ile `VirtualTouch` + `KeyMapper` kuruluyor;
+Stop / Uninstall / Quit-all hepsini durduruyor. Aynı anda tek mapper var (tek
+panel, iki mapper aynı parmağa yazardı).
+
+Yol boyunca bir hata: `uinput::keyboards()` yetenek maskesini `/dev/input`
+altında arıyordu; doğrusu `/sys/class/input/eventN/device/capabilities/key`.
+Düzeltildi, 32 bitten uzun maske = klavye.
+
+### FPS sayacı
+
+`PENGUDROID_FPS_METER=1`: daemon her sunulan kareyi sayar ve saniyede bir
+`xdg_toplevel` başlığına `PenguDroid — NN fps` yazar. Başlık her compositor'da
+görünür ve overlay çizmek gerekmez; sayacın doğru yeri de orası, çünkü kareleri
+sunan tek bileşen daemon.
+
+### Pencere süslemeleri
+
+`zxdg_decoration_manager_v1` bağlanıp her toplevel için **ServerSide**
+isteniyor. Ölçüm: bu makinede Mutter protokolü duyurmuyor (GNOME kendi başlık
+çubuğunu çizer), log bunu söylüyor; XFCE/KDE'de istek geçerli. Kapatma isteği
+zaten yüzeyin sahibi guest'e SIGTERM olarak gidiyor.
+
 ## Bu oturum (6): gerçek native input — `uinput` + keymapper
 
 Yeni crate: **`crates/pengudroid-input`**. Android `MotionEvent`'i taklit etmek
