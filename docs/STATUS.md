@@ -3,6 +3,75 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
+## Bu oturum: girdi çalışıyor; Roblox bind+launch+resume'a ulaştı
+
+### Girdi (tıklama / gezinme) — ÇÖZÜLDÜ
+
+Belirti: pencere görünüyor ama tıklamak hiçbir şey yapmıyordu.
+
+Kök neden: **daemon Wayland soketini hiç okumuyordu.** `poll_input` yalnızca
+`dispatch_pending` çağırıyordu; o da yalnızca *daha önce okunmuş* olayları
+tekrar oynatır. Soketi okuyan bir kod yoktu, yani hiçbir `wl_pointer` olayı
+state machine'e ulaşmıyordu → `pointer_focus` hep `None` → `push_input` her
+şeyi düşürüyordu.
+
+Düzeltme: `drain_wayland()` önce `poll(2)` ile fd'yi kontrol ediyor, sonra
+`prepare_read()` + `read()` yapıyor; böylece daemon istemci soketinde asla
+bloklanmıyor. Hem `poll_input` hem `poll` bunu kullanıyor. Ayrıca accept
+loop'unun boşta beklemesi 50 ms → **8 ms**: o döngü aynı zamanda Wayland
+kuyruğunu sürdüğü için gecikmenin kendisi.
+
+Doğrulama (fiziksel işaretçi olmadan): yeni `pengudroid tap <x> <y>` komutu
+compositor'ın ürettiği `InputEvent` mesajlarının aynısını yollar.
+
+```
+$ pengudroid tap 400 500
+[pengudroid-daemon I] injected PointerButton { button: 272, pressed: true } on surface 2
+→ NewPipe: Op #0: REPLACE VideoDetailFragment
+```
+
+Yani daemon → gleshim kuyruğu → input pump → `dispatchInputEvent` →
+`View.onClick` zincirinin tamamı çalışıyor. Test edilemeyen tek halka
+compositor'ın kendi hit-testing'i (oturumda işaretçi cihazı yok).
+
+Ek olarak: tekerlek kaydırma (`PointerAxis` → `ACTION_SCROLL`) ve klavye
+(`Key` → `KeyEvent`, harf/rakam/boşluk/enter/backspace/tab/ok tuşları) eklendi;
+şimdiye kadar ikisi de tamamen yok sayılıyordu.
+
+### Roblox — bu oturumda iki duvar daha yıkıldı
+
+Öncesi: `handleBindApplication` hiç çalışmıyordu. Artık:
+
+```
+handleBindApplication  → returned normally
+handleLaunchActivity   → returned an Activity
+handleResumeActivity   → returned
+Looper.loop()
+→ SIGSEGV (libroblox.so, "Setting default app policy file" sonrası)
+```
+
+Düzeltilenler:
+
+1. **`ApplicationInfo.splitSourceDirs` hiç set edilmiyordu.** `LoadedApk`'ın
+   `PathClassLoader`'ı yalnızca `base.apk`'ı görüyordu; split'ler native
+   kütüphane sanılıyordu. Artık ilk `--classpath` dışındakiler oraya da yazılıyor.
+2. **`installContentProviders` eksik sınıfta ölümcül.** 3arch bundle, manifestte
+   adı geçen `GmaWebViewInitializerProvider`'ı (GMA feature split) içermiyor ve
+   bu, tüm bind'ı düşürüyordu. `apk::contains_class` dex type descriptor'ını
+   arıyor; bulunamayan provider uyarıyla atlanıyor.
+
+Kalan durak değişmedi: `libroblox.so` içinde `AppConfiguration` haritası boş
+olduğu için null deref. Önceki oturumun notu hâlâ geçerli — asset'leri elle
+`<data>/content/` altına çıkarmak çöküşü değiştirmiyor, yani sorun dosya erişimi
+değil.
+
+### Beach Buggy Racing 2
+
+Depoda **yok**. `find` ile tüm sistemde arandı (`*buggy*`, `*cobalt*`,
+`*vectorunit*`) — hiçbir sonuç yok, sadece `NewPipe_v0.29.1.apk` ve
+`com.roblox.client_*.apkm` var. BBR2 açılamaz çünkü APK mevcut değil.
+
+
 ## Bu oturum: kare neden dusuyor (kesin)
 
 `ERROR Codec2-Component: Component::Listener::onWorkDone_nb -- received corrupted work items.`
