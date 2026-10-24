@@ -645,6 +645,25 @@ static PROVIDER_INFO: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
 static EMPTY_BUNDLE: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
+/// `IThermalService` transaction codes, read out of the framework's own
+/// `android.os.IThermalService$Stub` static fields (`--dump-class`).
+///
+/// `PowerManager.addThermalStatusListener` throws
+/// `RuntimeException("Listener failed to set")` when the boolean reply is
+/// false, and `ActivityNativeMain.onCreate` treats that as fatal: Roblox asks
+/// for a thermal listener unconditionally, so an empty reply (which reads back
+/// as false) kills the activity before it ever lays out.
+const ITHERMAL_REGISTER_THERMAL_EVENT_LISTENER: u32 = 1;
+const ITHERMAL_REGISTER_THERMAL_EVENT_LISTENER_WITH_TYPE: u32 = 2;
+const ITHERMAL_GET_CURRENT_TEMPERATURES: u32 = 4;
+const ITHERMAL_GET_CURRENT_TEMPERATURES_WITH_TYPE: u32 = 5;
+const ITHERMAL_REGISTER_THERMAL_STATUS_LISTENER: u32 = 6;
+const ITHERMAL_UNREGISTER_THERMAL_STATUS_LISTENER: u32 = 7;
+const ITHERMAL_GET_CURRENT_THERMAL_STATUS: u32 = 8;
+const ITHERMAL_GET_CURRENT_COOLING_DEVICES: u32 = 9;
+const ITHERMAL_GET_CURRENT_COOLING_DEVICES_WITH_TYPE: u32 = 10;
+const ITHERMAL_GET_THERMAL_HEADROOM: u32 = 11;
+
 /// `IDisplayManager` transaction code for `getDisplayInfo(int)`.
 const IDM_GET_DISPLAY_INFO: u32 = 1;
 
@@ -1966,6 +1985,36 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             diag("[binder]   -> empty LocaleList\n");
         }
     }
+    if tr.target_handle == handle_for("thermalservice") {
+        // A handheld that is never throttled is the honest model here: there is
+        // no thermal zone to read on the host, and a "none" status is what a
+        // cool device reports. The listener registrations must answer `true` or
+        // the framework throws instead of returning.
+        match tr.code {
+            ITHERMAL_REGISTER_THERMAL_EVENT_LISTENER
+            | ITHERMAL_REGISTER_THERMAL_EVENT_LISTENER_WITH_TYPE
+            | ITHERMAL_REGISTER_THERMAL_STATUS_LISTENER
+            | ITHERMAL_UNREGISTER_THERMAL_STATUS_LISTENER => {
+                parcel.extend_from_slice(&1u32.to_ne_bytes());
+            }
+            ITHERMAL_GET_CURRENT_THERMAL_STATUS => {
+                parcel.extend_from_slice(&0u32.to_ne_bytes()); // THERMAL_STATUS_NONE
+            }
+            ITHERMAL_GET_CURRENT_TEMPERATURES
+            | ITHERMAL_GET_CURRENT_TEMPERATURES_WITH_TYPE
+            | ITHERMAL_GET_CURRENT_COOLING_DEVICES
+            | ITHERMAL_GET_CURRENT_COOLING_DEVICES_WITH_TYPE => {
+                parcel.extend_from_slice(&0u32.to_ne_bytes()); // empty typed array
+            }
+            ITHERMAL_GET_THERMAL_HEADROOM => {
+                parcel.extend_from_slice(&0.0f32.to_ne_bytes());
+            }
+            _ => {}
+        }
+        if trace_enabled() {
+            diag(&format!("[binder]   -> thermal code {}\n", tr.code));
+        }
+    }
     if tr.target_handle == handle_for("package") && tr.code == IPM_GET_PROVIDER_INFO {
         // The request is `[interface token][ComponentName][flags][userId]`, so
         // the class name is not the last thing in the parcel. Match the parcel
@@ -2760,6 +2809,37 @@ mod tests {
         let b = handle_for("activity");
         assert_eq!(a, b);
         assert!(a >= 1);
+    }
+
+    /// `PowerManager.addThermalStatusListener` throws
+    /// `RuntimeException("Listener failed to set")` unless
+    /// `IThermalService.registerThermalStatusListener` answers `true`, and
+    /// Roblox's `ActivityNativeMain.onCreate` treats that as fatal. An empty
+    /// reply reads back as `false`, so the boolean has to be written.
+    #[test]
+    fn thermal_listeners_register_successfully() {
+        let tr = TransactionData {
+            target_handle: handle_for("thermalservice"),
+            code: ITHERMAL_REGISTER_THERMAL_STATUS_LISTENER,
+            ..TransactionData::default()
+        };
+        // SAFETY: `make_reply` only reads the transaction descriptor; this one
+        // carries no parcel payload.
+        let reply = unsafe { make_reply(&tr, 1) };
+        assert_eq!(reply.parcel.len(), 8, "status word plus the boolean");
+        assert_eq!(&reply.parcel[0..4], &0u32.to_ne_bytes());
+        assert_eq!(&reply.parcel[4..8], &1u32.to_ne_bytes());
+
+        // The status query must answer "not throttled" rather than nothing.
+        let tr = TransactionData {
+            target_handle: handle_for("thermalservice"),
+            code: ITHERMAL_GET_CURRENT_THERMAL_STATUS,
+            ..TransactionData::default()
+        };
+        // SAFETY: as above.
+        let reply = unsafe { make_reply(&tr, 1) };
+        assert_eq!(reply.parcel.len(), 8);
+        assert_eq!(&reply.parcel[4..8], &0u32.to_ne_bytes());
     }
 
     /// A one-way transaction must still be acknowledged.

@@ -373,18 +373,23 @@ pub fn launch(args: &[String]) -> i32 {
             // which hardware drawing cannot start.
             cmd.arg("--register-natives")
                 .arg("libandroid_runtime.so,libhwui.so");
-            let main = component.clone().unwrap_or_else(|| {
-                // An Activity has no `main(String[])`; the closest honest entry
-                // point is the app_process one, `ActivityThread.main`, which is
-                // what a device's zygote calls for every app.
-                "android.app.ActivityThread".to_string()
-            });
+            // An Activity has no `main(String[])`; the closest honest entry
+            // point is the app_process one, `ActivityThread.main`, which is
+            // what a device's zygote calls for every app. `--component` only
+            // picks *which* activity the host launches, never the entry point.
+            let main = "android.app.ActivityThread".to_string();
             // With `--bind-app` the host plays the part `system_server` plays on
             // a device: it calls `handleBindApplication` and then
             // `handleLaunchActivity` for the manifest's launcher activity. That
             // is the only path that reaches `ViewRootImpl.performTraversals` and
             // therefore the only one that draws.
-            let activity = info.main_activity_name().map(|s| s.to_string());
+            // `--component` overrides the manifest's launcher activity. Roblox
+            // keeps the useful activity behind its splash, and the splash only
+            // starts it after a native callback that never arrives here; naming
+            // `ActivityNativeMain` directly is the only way in.
+            let activity = component
+                .clone()
+                .or_else(|| info.main_activity_name().map(|s| s.to_string()));
             if let Some(activity) = &activity {
                 cmd.arg("--bind-app");
                 cmd.env("PENGUDROID_LAUNCH_ACTIVITY", activity);

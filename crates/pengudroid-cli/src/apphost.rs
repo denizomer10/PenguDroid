@@ -2791,8 +2791,14 @@ fn install_display_replies(env: &JniEnv) {
     set_int("type", 1);
     set_int("rotation", 0);
     set_int("modeId", 1);
-    // `Choreographer` asks the display for its refresh rate, which resolves
-    // `modeId` against `supportedModes`; an empty array makes `findMode` throw
+    // `DisplayInfo.getDefaultMode()` resolves `defaultModeId`, *not* `modeId`.
+    // Leaving it at 0 makes `findMode(0)` throw "Unable to locate mode 0" the
+    // first time an app asks `Display.getSupportedRefreshRates()` — which is
+    // exactly what Roblox's lifecycle observer does on activity post-create.
+    set_int("defaultModeId", 1);
+    set_int("userPreferredModeId", 1);
+    // `DisplayInfo.getDefaultMode()` reads
+    // `supportedModes`; an empty array makes `findMode` throw
     // "Unable to locate mode 1".
     if let Some(mode_class) = env.find_class("android/view/Display$Mode") {
         let mut made = false;

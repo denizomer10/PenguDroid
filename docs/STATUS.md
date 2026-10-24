@@ -3,6 +3,150 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
+## Bu oturum: splash atlandı, native motor çalıştı, `stage = 4`'te takıldı
+
+Bu oturumun en büyük ilerlemesi: **`ActivitySplash` tamamen atlanıp doğrudan
+gerçek activity başlatılıyor** ve Roblox'un native motoru (`libroblox.so`)
+gerçekten ayağa kalkıyor — EGL penceresi, TLS, client-settings fetch dahil.
+
+```
+$ pengudroid launch com.roblox.client_*.apkm --sysroot .toolchain/sysroot \
+      --component com.roblox.client.ActivityNativeMain
+  activity: com.roblox.client.ActivityNativeMain
+handleBindApplication  → returned normally
+handleLaunchActivity   → returned an Activity
+handleResumeActivity   → returned
+ActivityNativeMain.onCreate → createGlAppsFrame()
+InitHelper.startAppBridge → APP_STARTED {"result":1,...}
+→ retry UI (`docs/assets/rbx-retry.png`)
+```
+
+### Yeni giriş noktası: `--component`
+
+`launch --component C` artık manifestteki launcher yerine `C`'yi başlatıyor
+(`PENGUDROID_LAUNCH_ACTIVITY`). `--main` her zaman `android.app.ActivityThread`
+olur; `--component` yalnızca *hangi* activity'nin başlatılacağını seçer.
+
+Neden önemli: splash `startActivity`'yi hiç çağırmıyordu (önceki oturumun ölçümü),
+artık ona hiç ihtiyaç yok.
+
+### Bu oturumda yıkılan iki duvar
+
+1. **`IThermalService` cevaplanmıyordu.** `PowerManager.addThermalStatusListener`
+cevabı `false` (boş parcel) okuyup `RuntimeException("Listener failed to set")`
+atıyordu ve `ActivityNativeMain.onCreate` bunu ölümcül sayıyordu. Artık
+`thermalservice` kodu 1/2/6/7 → `true`, 8 → 0 (`THERMAL_STATUS_NONE`),
+4/5/9/10 → boş dizi, 11 → 0.0f. Kodlar framework'ün kendi
+`android.os.IThermalService$Stub` statik alanlarından okundu (`--dump-class`).
+Regresyon testi: `thermal_listeners_register_successfully`.
+2. **`DisplayInfo.defaultModeId` hiç yazılmıyordu.** `modeId = 1` vardı ama
+`getDefaultMode()` `defaultModeId`'yi çözüyor; 0 kalınca
+`IllegalStateException: Unable to locate mode 0`
+(`DisplayInfo.findMode` → `getDefaultRefreshRates` → `Display.getSupportedRefreshRates`)
+atılıyordu. Roblox bunu post-create lifecycle observer'ında çağırıyor.
+`defaultModeId` ve `userPreferredModeId` de 1'e çekildi.
+
+### Roblox'un kendi native log dosyası (bu oturumun en değerli bulgusu)
+
+Native `DFLog` **logcat'e hiçbir şey yazmıyor** (log grupları kapalı) ama kendi
+dosyasına yazıyor:
+
+```
+<prefix>/assets/appData/logs/<version>_<UTC>_Player_<id>_last.log
+```
+
+Prefix varsayılanı `~/.local/share/pengudroid/prefixes/<pkg>/`. Dosya her koşuda
+yeniden oluşur, 2 satır içerir — ama işe yarayan 2 satır:
+
+```
+[FLog::Output] All use of Roblox services must comply with …
+… Info [FLog::JNIAppBridge] ... StartupController finished starting:
+        stage = 4, BTID = -1, upgradeStatus = 0.
+```
+
+`ps` ile 30 sn sonra `/proc/<pid>/fd` okumak dosyayı bulmanın en hızlı yolu
+(fd'lerde `appData/logs/…log` görünür).
+
+### JSON'un anlamı çözüldü: `result == (stage != 2)`
+
+`classes2.dex` içindeki `Lak/k0$b;.run:()V` (dexdump ile) şunu yapıyor:
+
+```
+int r = json.getInt("result");
+if (r != 0) { /* FAILURE: log "AppBridgeNotification: JSON Result failure", retry UI */ }
+long btid = json.getLong("btid");
+int up = json.getInt("upgradeStatus");
+```
+
+Yani **başarı için `result == 0` şart**. Native tarafı (`libroblox.so`
+`0x24916a3` çevresi) JSON'u şöyle üretiyor:
+
+```
+writeName("result", 6);  value = (stage != 2) ? 1 : 0;
+writeName("btid", 4);    value = controller->btid;
+writeName("upgradeStatus", 13); value = controller->upgradeStatus;
+```
+
+`stage`, `StartupController` nesnesinin `+0x30` alanı. `startApp`
+(`0x61400f0` çevresi) bu değere göre 5 girişli bir jump table kullanıyor
+(`0xd313f8`):
+
+| stage | hedef | anlamı |
+|---|---|---|
+| 0 | `0x6140188` | — |
+| 1 | `0x61402c7` | `"The initialization must be in progress. Do nothing."` |
+| **2** | `0x61401f4` | `"StartupController has been started successfully. Done."` → bildirime **2** yazılır → **başarı** |
+| 3 | `0x6140196` | upgrade yolu (`0x23a4e88(this, 1)`) |
+| 4 | `0x6140255` | bizim durumumuz → `result = 1` |
+
+### Şu anki tam durak: `stage = 4` (beklenen 2)
+
+Native motor çalışıyor ve `StartupController` ~2.5 sn'de bitiyor, ama **4** ile.
+`result = (stage != 2)` olduğu için Java "failure" deyip retry UI gösteriyor.
+
+### Bu oturumda ölçülen/elenen şeyler
+
+* **Ağ sorunsuz.** Native TLS tamamlanıyor: `secureConnectEnd`,
+  `responseHeadersEnd`, `responseBodyEnd`, `responseBodyDictCompressed`,
+  `fastflag_load_success`. Proxy yok, DNS çözülüyor. Ama **tek** native istek
+  var (clientsettingscdn); BTID ve app-version istekleri hiç gitmiyor — yani
+  device-init görevleri istek atacak kadar bile ilerlemiyor.
+* **`HpInterface: No HAL token was created`** Hyperion değil: mesaj `libgui.so`
+  içinde, yani gralloc HIDL HAL'i yok — beklenen ve zararsız.
+* **"Background process detected"** bir dal değil: `RobloxApplication.onCreate`
+  içinde telemetri/crash-context etiketi olarak geçiyor
+  (`"foreground"`, `"application_oncreate"` ile birlikte).
+* **GL çalışıyor**: gleshim iki `eglCreateWindowSurface` görüyor (720x1280),
+  `ANativeWindow` geçerli. Kare sayısı düşük (tek swap) çünkü activity ilk
+  kareden sonra yeniden çizmiyor; retry fragment'i ekleniyor ama traversal
+  swap üretmiyor.
+* **Daemon şart.** Daemon yoksa `eglSwapBuffers: cannot connect to the daemon`
+  olur ve hiçbir şey sunulmaz; `(setsid ./target/release/pengudroid-daemon &)`.
+* **`appData/ClientSettings/ClientAppSettings.json` yazmak işe yaramadı**:
+  Roblox onu okumadı (`[FLog::Output] LoadClientSettingsFromLocal` satırı
+  log dosyasına düşmedi). Flag cache imzalı/derlenmiş bir dosya
+  (`[DFLog::FlagCache]`) — yolunu bulmak ayrı bir iş.
+
+### Sıradaki adım (öncelik sırasıyla)
+
+1. **`stage = 4`'ü 2 yapan koşulu bulmak.** En kısa yol: `ptrace` tabanlı küçük
+   bir araç (depoda `tools/art/findclass_bp.c` örneği var) ile `0x614016b`
+   (switch) adresine breakpoint koyup `StartupController` nesnesini
+   (`rbx`) yakalamak, sonra `*(int*)(rbx+0x30)` üzerine watchpoint kurup
+   değeri **4 yazan** yeri bulmak. ASLR yüzünden `libroblox.so` tabanını
+   `/proc/<pid>/maps`'ten okumak gerekir.
+2. **Native log gruplarını açmak** (dolaylı ama çok işe yarar). `DFLog`
+   grupları client-settings flag'leriyle açılıyor; flag cache dosyasının yolunu
+   bulmak `[DFLog::FlagCache]` kodundan çıkarılabilir.
+3. **`Settings` sağlayıcısına gerçek değerler** (`android_id`, `device_name`,
+   `device_provisioned`, `user_setup_complete`). Şu an her anahtara boş
+   `Bundle` dönüyor; device-init bir kimlik okuyorsa bu yüzden düşüyor olabilir.
+   Kalıp: `PROVIDER_ENTRIES` + `__pengudroid_binder_set_*`.
+
+### Beach Buggy Racing 2
+
+Depoda **yok**; `find` ile tüm sistemde arandı. APK eklenmeden açılamaz.
+
 ## Bu oturum: Roblox AÇILIYOR (splash'ı çiziyor)
 
 ```
