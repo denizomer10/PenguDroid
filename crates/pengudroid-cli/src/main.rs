@@ -28,7 +28,7 @@ mod runner;
 mod sysroot;
 mod telephony;
 
-use pengudroid_proto::{default_socket_path, Message, Role, PROTO_VERSION};
+use pengudroid_proto::{default_socket_path, InputKind, Message, Role, PROTO_VERSION};
 
 use crate::client::Client;
 
@@ -58,6 +58,8 @@ fn real_main() -> i32 {
         "demo" => cmd_demo(&args[2..]),
         "start" => cmd_start(&args[2..]),
         "ps" => cmd_ps(),
+        "tap" => cmd_tap(&args[2..]),
+        "input" => cmd_tap(&args[2..]),
         "info" | "inspect" => cmd_info(&args[2..]),
         "deps" => deps::run(&args[2..]),
         "doctor" => doctor::run(&args[2..]),
@@ -224,6 +226,62 @@ fn cmd_ps() -> i32 {
         Ok((other, _)) => fail(&format!("unexpected reply: {other:?}")),
         Err(e) => fail(&e),
     }
+}
+
+/// `pengudroid tap <x> <y>` — inject a click at surface pixel `<x>,<y>`.
+///
+/// The daemon relays exactly the `InputEvent` messages the compositor would
+/// produce, so this exercises everything below the compositor's hit-testing:
+/// the protocol, the gleshim's queue, and the app's `ViewRootImpl`. It is how
+/// the guest-side input path is verified without a pointer device, and it is
+/// also the only way to drive an app from a script.
+fn cmd_tap(args: &[String]) -> i32 {
+    let (Some(x), Some(y)) = (
+        args.first().and_then(|v| v.parse::<f32>().ok()),
+        args.get(1).and_then(|v| v.parse::<f32>().ok()),
+    ) else {
+        eprintln!("usage: pengudroid tap <x> <y>");
+        return 2;
+    };
+    let client = match connect() {
+        Ok(c) => c,
+        Err(e) => return fail(&e),
+    };
+    // Enter, move, press, release: the same order a pointer produces, because
+    // `MotionEvent` needs a down and an up with matching coordinates.
+    let steps = [
+        Message::InputEvent {
+            surface_id: 0,
+            event: InputKind::PointerEnter { x, y },
+        },
+        Message::InputEvent {
+            surface_id: 0,
+            event: InputKind::PointerMotion { x, y },
+        },
+        Message::InputEvent {
+            surface_id: 0,
+            event: InputKind::PointerButton {
+                button: 0x110, // BTN_LEFT
+                pressed: true,
+            },
+        },
+        Message::InputEvent {
+            surface_id: 0,
+            event: InputKind::PointerButton {
+                button: 0x110,
+                pressed: false,
+            },
+        },
+    ];
+    for step in steps {
+        match client.request(&step) {
+            Ok((Message::Ack, _)) => {}
+            Ok((other, _)) => return fail(&format!("unexpected reply: {other:?}")),
+            Err(e) => return fail(&e),
+        }
+    }
+    println!("tapped {x},{y}");
+    0
 }
 
 fn cmd_info(args: &[String]) -> i32 {

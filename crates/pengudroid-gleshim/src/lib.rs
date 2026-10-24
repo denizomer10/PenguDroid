@@ -877,6 +877,9 @@ fn subscribe_input(surface_id: u32) {
             match conn.recv_message() {
                 Ok((Message::InputEvent { surface_id, event }, fds)) => {
                     close_fds(&fds);
+                    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+                        eprintln!("[gleshim] queued {event:?} for surface {surface_id}");
+                    }
                     let mut q = INPUT_QUEUE.lock().unwrap();
                     if q.len() < 256 {
                         q.push((surface_id, event));

@@ -167,8 +167,12 @@ impl Daemon {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     self.reap_children();
                     self.reap_surfaces();
+                    // This loop is also what reads the compositor's events, so the
+                    // sleep is the input latency: 50 ms was noticeable when
+                    // dragging. 8 ms keeps a click feeling immediate without
+                    // burning CPU.
                     self.pump_input();
-                    std::thread::sleep(Duration::from_millis(50));
+                    std::thread::sleep(Duration::from_millis(8));
                 }
                 Err(e) => {
                     crate::warn!("accept failed: {e}");
@@ -435,8 +439,33 @@ fn handle(
             crate::info!("pid {} subscribed to input on surface {surface_id}", peer.pid);
             (Some(Message::Ack), vec![], false)
         }
-        // Guests never send these; ignore rather than error.
-        Message::InputEvent { .. } => (None, vec![], false),
+        // A *client* sending `InputEvent` is an injection request: the daemon
+        // broadcasts it to whatever subscribed for that surface. Guests never
+        // send these (the compositor feeds them), so the two directions do not
+        // collide. `surface_id == 0` means "the surface under the pointer".
+        Message::InputEvent { surface_id, event } => {
+            let target = if surface_id != 0 {
+                Some(surface_id)
+            } else {
+                let mut guard = daemon.graphics.lock().unwrap();
+                guard.as_ref().and_then(|g| g.focused_surface())
+                    .or_else(|| {
+                        guard.as_ref().and_then(|g| g.surface_ids().first().copied())
+                    })
+            };
+            if let Some(id) = target {
+                let sinks = daemon.input_sinks.lock().unwrap();
+                if let Some(tx) = sinks.get(&id) {
+                    let _ = tx.send(Message::InputEvent { surface_id: id, event });
+                    crate::info!("injected {:?} on surface {id}", event);
+                } else {
+                    crate::warn!("input injected for surface {id} with no subscriber");
+                }
+            } else {
+                crate::warn!("input injected but no surface is known");
+            }
+            (Some(Message::Ack), vec![], false)
+        }
 
         Message::GetProp { name } => {
             let props = daemon.props.lock().unwrap();

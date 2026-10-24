@@ -298,11 +298,59 @@ mod imp {
         /// Called from the daemon's accept loop; the events are then pushed to
         /// the connection that subscribed for the surface.
         pub fn poll_input(&mut self) -> Vec<(u32, pengudroid_proto::InputKind)> {
-            // A blocking read would stall the daemon, so only drain what is
-            // already queued.
+            self.drain_wayland();
+            std::mem::take(&mut self.state.input)
+        }
+
+        /// Read whatever the compositor has already sent, without blocking.
+        ///
+        /// `dispatch_pending` alone only replays events that a *previous* read
+        /// put in the queue, so on its own it never sees anything new: the socket
+        /// has to be read first. That was why pointer clicks did nothing — no
+        /// `wl_pointer::Enter`/`Button` event ever reached the state machine, so
+        /// `pointer_focus` stayed `None` and `push_input` dropped everything.
+        ///
+        /// The read is non-blocking: the daemon loop must stay responsive, and a
+        /// `WouldBlock` simply means there was nothing to read.
+        fn drain_wayland(&mut self) {
+            // Never block: `poll(2)` first, so a blocking client socket cannot
+            // stall the daemon loop.
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&self.conn.backend().poll_fd());
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut pfd, 1, 0) };
+            if ready > 0 && pfd.revents & libc::POLLIN != 0 {
+                if let Some(guard) = self.queue.prepare_read() {
+                    if let Err(e) = guard.read() {
+                        let would_block = matches!(
+                            &e,
+                            wayland_client::backend::WaylandError::Io(io)
+                                if io.kind() == std::io::ErrorKind::WouldBlock
+                        );
+                        if !would_block {
+                            crate::warn!("wayland read: {e}");
+                        }
+                    }
+                }
+            }
             let _ = self.queue.dispatch_pending(&mut self.state);
             let _ = self.conn.flush();
-            std::mem::take(&mut self.state.input)
+        }
+
+        /// The surface that currently has pointer focus, if any.
+        ///
+        /// Input injection needs it: the compositor is the only thing that
+        /// normally decides which surface a pointer event belongs to.
+        pub fn focused_surface(&self) -> Option<u32> {
+            self.state.pointer_focus
+        }
+
+        /// The ids of every toplevel the compositor knows about.
+        pub fn surface_ids(&self) -> Vec<u32> {
+            self.state.surfaces.keys().copied().collect()
         }
 
         /// Create a toplevel-backed surface `width`×`height` with `title`.
@@ -414,8 +462,7 @@ mod imp {
         /// Process any queued events (non-blocking). Call periodically to learn
         /// about close requests.
         pub fn poll(&mut self) {
-            let _ = self.queue.dispatch_pending(&mut self.state);
-            let _ = self.conn.flush();
+            self.drain_wayland();
         }
 
         pub fn close_requests(&mut self) -> Vec<u32> {
