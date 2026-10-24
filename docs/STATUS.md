@@ -46,15 +46,34 @@ o dizinde çalıştırıyor; misafire verilen tüm yollar da mutlaklaştırılı
 ### Şu anki tam durak noktası
 
 Splash'ta kalıyor: ~75 saniye sonra bile aynı "Loading..." karesi (frame 900 de
-aynı). Ama süreç ölü değil — **%22 CPU** ile meşgul. Ağ çalışıyor: HTTPS/2 ile
-2 istek gitti, 2 cevap geldi; `AndroidAppSettings: Network won the race` ve
-`fastflag_load_success` loglanıyor, sonra `ShellConfigurationContentProvider`
-kendi config'ini okuyor. Login/CoreScript/gamejoin izi **yok**.
+aynı).
 
-Sıradaki adım: %22 CPU'nun nereye gittiğini bulmak — splash sonrası hangi iş
-parçacığının döndüğünü `PENGUDROID_DEBUG_WRAP="/tmp/findclass_bp 0"` ile veya
-`/proc/<pid>/task/*/stat` örnekleyerek izlemek. Muhtemel adaylar: Lua/CoreScript
-payload'ının yüklenmesi, ya da bir WebView/servis bekleyişi.
+**CPU yanıltıcı:** `ps` %22-24 gösteriyor ama bu *başlangıçtan beri ortalama*.
+Thread bazında 6 saniyelik örnekleme ( `/proc/<pid>/task/*/stat` alan 14+15 ):
+`Main` 20 tick, `RenderThread` 16 tick — yani saniyede ~%3. Roblox dönmüyor.
+
+**Asıl durum boşta bekleme:** `Main` `do_epoll_wait` içinde (Looper boş),
+`RenderThread`/`AsyncTask #5`/OkHttp havuzu futex'te, `m.roblox.client`
+`nanosleep`'te.
+
+Java tarafında ilerleme kaydedilmiş:
+
+```
+AppManager: initialize: Start...
+AppManager: initialize: Completed OK. elapsedTime(ms) = 44
+ActivitySplash.onCreate: startedForResult=false, appRestarted=false
+rbx.splash: startup:
+→ (config dökümü) → HTTPS/2 stream 5 cevabı geldi → DNS pre-warm'lar → SESSİZLİK
+```
+
+Yani splash kendi startup görevlerini bitirmiş, bir **callback** bekliyor ama o
+callback hiç gelmiyor: `ActivityNativeMain`/`startActivity` izi yok. En güçlü
+aday `AsyncTask #5` (futex'te asılı) — `doInBackground` bitmiş, `onPostExecute`
+yayınlanmamış olabilir; bir diğer aday bir Service/BroadcastReceiver cevabı.
+
+Sıradaki adım: `AsyncTask #5`'in hangi işi yaptığını bulmak (Java yığını yok,
+ama `--dump-class` + `AsyncTask` alanlarıyla veya `PENGUDROID_DEBUG_WRAP` ile o
+thread'in futex'ini kimin tuttuğunu görmek).
 
 ### Bu oturumdaki girdi düzeltmesi (önceki başlık)
 
