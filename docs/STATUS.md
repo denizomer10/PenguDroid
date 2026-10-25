@@ -3372,3 +3372,60 @@ launcher.
    ardından `ProcessState` binder hatası (yani ART tarafı sağlam).
 5. Sıradaki iş: binder köprüsü (yukarıdaki NewPipe bölümü).
 6. Çevirici için: `docs/LIMITATIONS.md` §2.2 komutu, sonra misafir ARM ART sorunu.
+
+## 12. NewPipe penceresi açılıyor, video katmanı boş (2026-10-25)
+
+Bu oturumda NewPipe **gerçekten açıldı**: `MainActivity` başlıyor, pencere
+720×1280 olarak layout ediliyor, çekmece/tablar/akış listesi çiziliyor. Video
+katmanı hâlâ boş; sebebi **içerik**, çizim yolu değil.
+
+### Ölçülen zincir (kanıtlı)
+
+| Adım | Kanıt |
+|---|---|
+| `relayout` (kod 5) yanıtlanıyor | `mWidth=720 mHeight=1280 mWinFrame=(0,0)-(720,1280) mRelayoutSeq=1` |
+| `relayoutAsync` (kod 6) bu uygulamada **hiç gönderilmiyor** | 0 occurrence; senkron `relayout` yeterli (STATUS §10–11'deki "deadlock" varsayımı böylece çürüdü) |
+| Pencere ağacı çiziliyor | `views: root 0 … DecorView → LinearLayout → TabLayout → NewPipeRecyclerView` + `itemRoot` satırları, `bounds` gerçek koordinatlarla |
+| Piksel çıktısı doğrulandı | `PENGUDROID_DUMP_FRAME` → PPM → PNG: kırmızı toolbar "Live", 4 kiosk sekmesi, akış satırları, `LIVE` çipleri, "58K watching" |
+| Dekoder yüzeyi alıyor | `MediaCodec: [c2.android.avc.decoder] setting surface generation to 279542785`, `MediaCodec will operate in async mode` |
+| Kare üretimi | `Codec2-InputBufferManager … frameIndex = 1294` |
+
+### Videoyu engelleyen şey
+
+Bu makinedeki akış içeriği **canlı yayın**: Kiosk "Live" sekmesi tümüyle live
+stream. ExoPlayer bunlarda ölüyor:
+
+```
+ExoPlaybackException: Source error
+Caused by: HttpDataSource$InvalidResponseCodeException: Response code: 403
+Caused by: com.google.android.exoplayer2.source.BehindLiveWindowException
+```
+
+Ses yolu çalışmaya devam ettiği için kullanıcı **"ses geliyor, görüntü yok"**
+diyor — bu tarif tam olarak bu hatanın sonucu. 403/dash-live bir akış hiçbir
+BLAST/surface iyileştirmesiyle görüntü vermez; önce **oynatılabilir (VOD) bir
+akış** gerekiyor.
+
+### Bu oturumda eklenen değişiklikler
+
+- `PENGUDROID_BLAST=1` — `mForceDisableBLAST := true` artık varsayılan değil,
+  BLAST açık bırakılabiliyor. Doğrulandı: uygulama açılıyor,
+  `mSurface.isValid() = true`, çökme yok (`apphost.rs`, `force_visible`).
+- `PENGUDROID_INTENT_DATA=<uri>` — başlatma `Intent`'ine `Uri` + `ACTION_VIEW`
+  ekleniyor; `pengudroid launch … --component org.schabi.newpipe.RouterActivity`
+  ile URL verilebiliyor. Doğrulandı (`launch intent data = …`), ancak
+  `RouterActivity` `FetcherService`'i başlatmadığı için oynatıcıya geçmiyor.
+- Girdi izleme — `input: tap DOWN/UP`, `input: key …` satırları. **Kullanıcının
+  gerçek mouse/kalvye girdisi uygulamaya ulaşıyor** (tap → `PlayerService`,
+  uzun basma → `showInfoItemDialog`). Önceden "tıklama çalışmıyor" görünmesinin
+  sebebi daemon'ın kapalı olmasıydı.
+- `relayoutAsync` ham parcel dökümü (`PENGUDROID_TRACE_BINDER=1`).
+
+### Bilinen kısıtlar
+
+- Arama alanına **yazı girilemiyor**: `InputMethodManager: Ignoring
+  showSoftInput() … is not served` (IME yok), yani UI'dan VOD aramayı
+  otomatikleştirmek mümkün değil.
+- `crates/pengudroid-shim/fixtures/relayout_async.hex` bu oturumda doğrulanmadı
+  (canlı `relayoutAsync` hiç yakalanmadığı için kökeni belirsiz; commit'e
+  alınmadı).

@@ -445,6 +445,9 @@ opt-in and cost nothing when unset.
 | `PENGUDROID_CLICK_TEXT="<text>[@ms]"` | click the first `TextView` whose text contains `<text>`, using its global visible rectangle. Deterministic where coordinates are not: a feed scrolls and rows move as items load |
 | `PENGUDROID_PROBE_DELAY=<ms>` | how long the view probe waits before it walks (default 12000). A playing screen can die within seconds |
 | `PENGUDROID_TRACE_ROOTS=<ms>` | print every window's `mWidth`/`mWinFrame`/`mTraversalScheduled`/`mIsInTraversal` on a timer — a timeline says *when* state changed, which a single dump cannot |
+| `PENGUDROID_BLAST=1` | leave BLAST enabled on the window root instead of forcing `mForceDisableBLAST := true`, so `relayoutWindow` builds a `BLASTBufferQueue` the way a device does. The default stays on the legacy `Surface.copyFrom` path |
+| `PENGUDROID_INTENT_DATA=<uri>` | attach a `Uri` and `ACTION_VIEW` to the launch intent, the way a share/opener intent arrives. With `--component org.schabi.newpipe.RouterActivity` this points an URL-handling activity at a specific link |
+| `PENGUDROID_DUMP_FRAME=/path/f.ppm` (+ `_AT`, `_EVERY`) | read the swapped FBO back with `glReadPixels` and write it as a binary PPM. Without a screenshot tool this is how the render output is inspected; `_EVERY=<n>` dumps every n-th frame (a playing video needs a sequence, one frame cannot tell "the video is on screen" from "the last frame was static") |
 | `PENGUDROID_PUMP_RESIZED=1` | play the window manager's `IWindow.resized` by calling `ViewRootImpl.dispatchResized` directly (experimental; replaying it through the emulated binder returns `UNKNOWN_TRANSACTION` in this tree) |
 | `PENGUDROID_TRACE_OPEN=1` | log every failed `open`/`openat` once, with `errno` and the path after rootfs rewriting — the fastest way to see which resource a guest gave up on |
 | `PENGUDROID_TRACE_ROOTFS` | log every Android→host path rewrite (`/system/…` → `<sysroot>/system/…`) |

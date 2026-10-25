@@ -2493,6 +2493,29 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         static RELAYOUT_TICK: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(1);
         let mut relayout_tick: Option<(u64, u64)> = None;
+        if trace_enabled()
+            && tr.code == IWS_RELAYOUT_ASYNC
+            && tr.data_size > 0
+            && tr.data_ptr != 0
+        {
+            // Dump the raw `relayoutAsync` parcel so its field layout can be read
+            // off real bytes instead of being reconstructed by hand. Offset 0 is
+            // the `TSYS` header, so the window's `seq` sits right after the
+            // `IWindow` object; with this the *actual* requested width/height are
+            // known and can be replayed to the window manager side.
+            let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
+            let win = find_local_binder(data).map(|(_, cookie, _)| cookie).unwrap_or(0);
+            let mut dump = format!(
+                "[binder]   relayoutAsync dump win={win:#x} data={} offsets={}\n",
+                data.len(),
+                tr.offsets_size
+            );
+            for (i, chunk) in data.chunks(32).enumerate() {
+                let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+                dump.push_str(&format!("      {:04x}: {}\n", i * 32, hex.join(" ")));
+            }
+            diag(&dump);
+        }
         if trace_enabled() && tr.code == IWS_RELAYOUT && tr.data_size > 0 && tr.data_ptr != 0 {
             let data =
                 std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);

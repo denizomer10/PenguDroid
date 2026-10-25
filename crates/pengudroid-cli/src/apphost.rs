@@ -3767,6 +3767,7 @@ fn spawn_input_pump(env: &JniEnv) {
             }
             // Keyboard: `a` is the Linux keycode, `b` is 1 for press.
             if tag == 6 {
+                println!("input: key tag=6 code={} pressed={} (mapped={:?})", a, b != 0.0, android_keycode(a as u32));
                 let Some(code) = android_keycode(a as u32) else {
                     continue;
                 };
@@ -3810,13 +3811,20 @@ fn spawn_input_pump(env: &JniEnv) {
                     if b != 0.0 {
                         pressed = true;
                         down_time = env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
+                        println!("input: tap DOWN at {:.0},{:.0}", last.0, last.1);
                         (ACTION_DOWN, last.0, last.1)
                     } else {
                         pressed = false;
+                        println!("input: tap UP at {:.0},{:.0}", last.0, last.1);
                         (ACTION_UP, last.0, last.1)
                     }
                 }
-                _ => continue,
+                _ => {
+                    if tag != 2 {
+                        println!("input: unhandled tag={tag} a={a} b={b}");
+                    }
+                    continue;
+                }
             };
             inject(action, x, y, down_time);
         }
@@ -4080,6 +4088,41 @@ fn launch_activity(
     {
         eprintln!("apphost: Intent.setClassName threw");
         return false;
+    }
+    // `PENGUDROID_INTENT_DATA=<uri>`: give the launch intent a data URI and the
+    // `VIEW` action, the way a share/opener intent arrives on a device. That is
+    // how an activity that handles external URLs (NewPipe's `RouterActivity`)
+    // can be pointed at a specific stream without any UI interaction.
+    if let Ok(uri) = std::env::var("PENGUDROID_INTENT_DATA") {
+        let text = env.new_string(&uri);
+        let uri_class = env.find_class("android/net/Uri");
+        let parse = uri_class.and_then(|c| {
+            env.static_method_id(c, "parse", "(Ljava/lang/String;)Landroid/net/Uri;")
+        });
+        let set_data = env.method_id(
+            intent_class,
+            "setData",
+            "(Landroid/net/Uri;)Landroid/content/Intent;",
+        );
+        let set_action = env.method_id(
+            intent_class,
+            "setAction",
+            "(Ljava/lang/String;)Landroid/content/Intent;",
+        );
+        if let (Some(uri_class), Some(parse), Some(set_data)) = (uri_class, parse, set_data) {
+            if let Some(parsed) = env.call_static_object(uri_class, parse, &[JValue { l: text }]) {
+                env.call_object(intent, set_data, &[JValue { l: parsed }]);
+                if let Some(set_action) = set_action {
+                    let view = env.new_string("android.intent.action.VIEW");
+                    env.call_object(intent, set_action, &[JValue { l: view }]);
+                }
+                println!("apphost: launch intent data = {uri}");
+            } else {
+                eprintln!("apphost: Uri.parse returned null for {uri}");
+            }
+        } else {
+            eprintln!("apphost: cannot attach a data URI to the launch intent");
+        }
     }
 
     // ActivityClientRecord
@@ -4576,9 +4619,17 @@ fn force_visible(env: &JniEnv, record: JObject) {
                     // With BLAST enabled `relayoutWindow` builds a `BLASTBufferQueue`
                     // (which needs a real consumer); disabling it makes the same
                     // method take the plain `mSurface.copyFrom(mSurfaceControl)` path.
-                    if let Some(blast_field) = env.field_id(root_class, "mForceDisableBLAST", "Z") {
-                        env.set_boolean_field(root, blast_field, true);
-                        println!("apphost: root {index} mForceDisableBLAST := true");
+                    // `PENGUDROID_BLAST=1` keeps BLAST enabled so the window root
+                    // builds a `BLASTBufferQueue` like a device does; the default
+                    // stays on the legacy `copyFrom` path, which is what the
+                    // window has been validated on so far.
+                    if std::env::var_os("PENGUDROID_BLAST").is_none() {
+                        if let Some(blast_field) = env.field_id(root_class, "mForceDisableBLAST", "Z") {
+                            env.set_boolean_field(root, blast_field, true);
+                            println!("apphost: root {index} mForceDisableBLAST := true");
+                        }
+                    } else {
+                        println!("apphost: root {index} BLAST left enabled (PENGUDROID_BLAST)");
                     }
                     if let Some(surface_field) =
                         env.field_id(root_class, "mSurface", "Landroid/view/Surface;")
