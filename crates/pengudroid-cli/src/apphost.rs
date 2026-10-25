@@ -3072,7 +3072,11 @@ fn spawn_input_pump(env: &JniEnv) {
         // `@delayMs` is the wait *before* that tap (default 8000 ms), so
         // `"665,682;145,300@12000"` means "tap OK after 8 s, then open the first
         // feed item 12 s later".
-        if let Ok(spec) = std::env::var("PENGUDROID_SYNTH_CLICK") {
+        let spec = std::env::var("PENGUDROID_SYNTH_CLICK").unwrap_or_default();
+        if !spec.is_empty()
+            || std::env::var_os("PENGUDROID_PROBE_VIEWS").is_some()
+            || std::env::var_os("PENGUDROID_FORCE_SURFACE").is_some()
+        {
             let mut taps: Vec<(f32, f32, u64)> = Vec::new();
             for item in spec.split(';') {
                 let (coords, delay) = match item.split_once('@') {
@@ -3092,9 +3096,10 @@ fn spawn_input_pump(env: &JniEnv) {
                 inject(ACTION_UP, *x, *y, now);
                 println!("apphost: synthetic click {step} at {x},{y} injected");
             }
-            if !taps.is_empty()
-                && (std::env::var_os("PENGUDROID_PROBE_VIEWS").is_some()
-                    || std::env::var_os("PENGUDROID_FORCE_SURFACE").is_some())
+            // The probe runs even without a tap, so a baseline ("how many
+            // windows exist with no interaction at all") is obtainable.
+            if std::env::var_os("PENGUDROID_PROBE_VIEWS").is_some()
+                || std::env::var_os("PENGUDROID_FORCE_SURFACE").is_some()
             {
                 std::thread::sleep(std::time::Duration::from_secs(12));
                 report_surface_views(&env);

@@ -145,23 +145,62 @@ sonrası ART'nin içinde ve elimizde debugger yok.
 `onCreate`'te ekleniyor, activity sonra. `mAdded` ikisinde de true. Pencere
 başına fark yaratan alan bulunursa çözüm de oradadır.
 
+### Kırılma noktası bulundu: **etkileşim olmadan iki pencere de doğru**
+
+Bu, işi tersine çeviren ölçüm. `PENGUDROID_PROBE_VIEWS` artık tıklama olmadan da
+çalışıyor (aşağıdaki araç notu) ve **hiç tıklamadan**:
+
+```
+views: 2 window root(s)
+views: root 0 mWidth=720 mHeight=1280 mRelayoutSeq=2 mWinFrame=(0,0)-(720,1280)
+views: root 1 mWidth=720 mHeight=1280 mRelayoutSeq=1 mWinFrame=(0,0)-(720,1280)   ← DOĞRU!
+```
+
+Aynı ikili, bir tıklama enjekte edilince:
+
+```
+views: root 0 mWidth=720 … mRelayoutSeq=2  mWinFrame=(0,0)-(720,1280)
+views: root 1 mWidth=0   … mRelayoutSeq=3  mWinFrame=(0,0)-(0,0)        ← bozuldu
+```
+
+Yani pencere boyutlandırma mekanizması **temel durumda çalışıyor**; ikinci
+pencereyi 0×0 yapan şey **etkileşim yolu** (tıklama → daha çok thread, daha çok
+relayout). `mRelayoutSeq` 1'den 3'e çıkıyor: ilk relayout'ta çerçeve doğru geliyor,
+sonraki biri onu sıfırlıyor.
+
+### Düzeltildi (gerçek hata): relayout yanıtları ortak bump pointer kullanıyordu
+
+`place_reply` tüm thread'ler için **tek** bir `REPLY_OFFSET` kullanıyordu ve
+okuma/yazma atomik değildi: iki thread aynı offset'i alıp birbirinin yanıtını
+ezebiliyordu (ve wrap olunca hâlâ okunmakta olan baytların üzerine yazıyordu).
+Ezen yanıt "ClientWindowFrames yok" gibi okunur → istemci `mWinFrame`'i
+güncellemez → `mWidth = 0` → `SurfaceView` 0×0 → BLAST yok. Semptomla birebir
+uyuşuyor.
+
+Artık her thread kendi bölgesini alıyor (`REPLY_SLOTS = 16`, transfer alanı 16'ya
+bölünüyor). Bu yeterli, çünkü emülasyon **çağıranın thread'inde** koşuyor: yanıt,
+o thread `ioctl`'dan çıkmadan yazılıp okunuyor.
+
+Ölçüm: bu düzeltme tek başına tıklama sonrası 0×0'yı **düzeltmedi** — yani
+semptomun tek sebebi bu değil, ama yarış gerçek ve kalması yanlış olurdu.
+
 ### Sıradaki adım
 
-1. **Tüketiciyi forced-surface yolunda da başlatmak.** Decoder bağlanıyor ve
-   ~1300 kare çözüyor, ama `mBlastBufferQueue == null` olduğu için `blast.rs`
-   tüketicisi hiç başlamıyor. `FORCE_SURFACE` yolunda `SurfaceView`'ın kendi
-   pre-draw listener'ı `updateSurface()`'ı çağırmıyor (mHaveFrame false kaldığı
-   için); ya o listener'ı tetiklemenin temiz bir yolu bulunmalı ya da
-   `mHaveFrame`/`mSurfaceControl` alanları ana thread'de yazılmalı.
-2. **Ana thread pompası** — *denendi ve yetmedi* (yukarı bkz.): pompa çalışıyor ama
-   `mWinFrame`'e yazmak ART'yi bozuyor. Yani “alanı zorla” yaklaşımı kapalı;
-   çözüm framework'ün kendi yolunu çalıştırmak olmalı.
-3. **İkinci pencerenin `mWinFrame`'i neden boş (ve neden null okunuyor)?**
-   Ölçülen: üç relayout'un da yanıtı birebir aynı, üçü de farklı `IWindow`
-   cookie'si taşıyor, istek argümanları farklı (`data=528/508/132`,
-   `requestedWidth=-2/-1/…`). Önce şu ayrımı yap: probe yanlış nesneyi mi okuyor
-   (`mViews` = DecorView mi, `mRoots` = ViewRootImpl mi?), yoksa ikinci pencerenin
-   `ViewRootImpl`'i gerçekten yarı kurulmuş mu.
+1. **Tıklamadan sonra ikinci pencereyi 0×0 yapan şeyi bulmak.** Artık tam olarak
+   bilinen: etkileşimsiz durumda iki pencere de 720×1280; sadece bir tıklama
+   ikinciyi bozuyor ve `mRelayoutSeq` 1 → 3 oluyor. Yani **ikinci/üçüncü
+   relayout'un yanıtı** sorunlu. Sıradaki ölçüm: üç relayout'u sıra/thread
+   bazında ayırt etmek (shim zaten `relayout win=` ve
+   `-> relayout reply: frames prefix …` basıyor; ikisini aynı satıra koyup
+   *hangi* relayout'un hangi pencereye gittiğini eşlemek) ve tıklama sırasında
+   iki relayout'un **paralel** koşup koşmadığını görmek.
+2. **Tüketiciyi başlatmak.** Decoder bağlanıyor ve ~1300 kare çözüyor, ama
+   `mBlastBufferQueue == null` olduğu için `blast.rs` tüketicisi hiç başlamıyor.
+   Bu, 1. madde çözülünce kendiliğinden gelecek (mHaveFrame → updateSurface →
+   BLAST), o yüzden önce 1.
+3. **Ana thread'de alan yazma** — *denendi, kapalı*: `mWinFrame`'e yazmak ART'yi
+   bozuyor (SIGSEGV / GC çökmesi). Framework'ün kendi yolunu çalıştırmak
+   gerekiyor; alan zorlamak değil.
 
 ## Bu oturum (9): BLASTBufferQueue gerçekten çalışıyor, kalan duvar `PlaceholderSurface`
 

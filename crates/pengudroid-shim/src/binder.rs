@@ -126,8 +126,29 @@ static APP_THREAD_PROBE: AtomicBool = AtomicBool::new(false);
 /// Transaction flag: no reply is expected.
 const TF_ONE_WAY: u32 = 0x1;
 
-/// Offset of the transfer area used for reply parcels.
-static REPLY_OFFSET: AtomicUsize = AtomicUsize::new(0);
+/// Number of reply regions carved out of the transfer area.
+///
+/// Replies used to come from one shared bump pointer (`REPLY_OFFSET`) that was
+/// read and written non-atomically. Two threads transacting at the same time
+/// therefore got the **same** offset and overwrote each other's reply, and when
+/// the pointer wrapped it could reuse bytes another thread was still reading.
+/// The symptom was window state that never arrived: a clobbered relayout reply
+/// reads back as "no ClientWindowFrames", and `ViewRootImpl` then keeps its
+/// empty frame (`mWidth = 0`, `SurfaceView` 0×0, no BLAST queue).
+///
+/// Each thread now owns a region. That is sufficient because the emulated
+/// transaction runs on the *caller's* thread: the reply is written and consumed
+/// before that thread leaves `ioctl`. The region still bumps, so a thread never
+/// overwrites its own not-yet-read reply ordering.
+const REPLY_SLOTS: usize = 16;
+
+/// Next region to hand out (wraps around `REPLY_SLOTS`).
+static NEXT_REPLY_SLOT: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// `(slot, next free offset inside the slot)`, `usize::MAX` until assigned.
+    static REPLY_SLOT: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((usize::MAX, 0)) };
+}
 
 /// Handles handed out to the guest for brokered services.
 static SERVICE_HANDLES: std::sync::LazyLock<std::sync::Mutex<std::collections::BTreeMap<String, u32>>> =
@@ -2632,10 +2653,24 @@ unsafe fn place_reply(reply: &Reply) -> Option<(u64, u64)> {
     let parcel_span = (parcel_len + 7) & !7;
     let offsets_span = (offsets_len + 7) & !7;
     let total = parcel_span + offsets_span;
-    let mut off = REPLY_OFFSET.load(Ordering::Relaxed);
-    if off + total > len {
-        off = 0;
+    // Each thread gets its own region so two concurrent transactions cannot
+    // clobber each other's reply (see `REPLY_SLOTS`).
+    let region = ((len / REPLY_SLOTS) & !7).max(64);
+    if total > region {
+        return None;
     }
+    let (slot, mut used) = REPLY_SLOT.with(|c| c.get());
+    let slot = if slot == usize::MAX {
+        let s = NEXT_REPLY_SLOT.fetch_add(1, Ordering::Relaxed) % REPLY_SLOTS;
+        REPLY_SLOT.with(|c| c.set((s, 0)));
+        s
+    } else {
+        slot
+    };
+    if used + total > region {
+        used = 0;
+    }
+    let off = slot * region + used;
     let p = (base + off) as *mut u8;
     std::ptr::copy_nonoverlapping(reply.parcel.as_ptr(), p, parcel_len);
     let offsets_addr = if offsets_len > 0 {
@@ -2647,7 +2682,7 @@ unsafe fn place_reply(reply: &Reply) -> Option<(u64, u64)> {
     } else {
         0
     };
-    REPLY_OFFSET.store(off + total, Ordering::Relaxed);
+    REPLY_SLOT.with(|c| c.set((slot, used + total)));
     if trace_enabled() {
         let mut verify = String::from("[binder]   verify:");
         for i in 0..parcel_len.min(32) {
