@@ -52,6 +52,25 @@ destekleniyor.
   `SurfaceView` kendiliğinden 720 genişlikte ölçülmüyor.
 - Canlı yayın 403'ü aralıklı: bir koşuda akış açıldı ve 360+ kare aktı, bir
   sonrakinde hiç açılmadı. Yani video yolu kanıtlanmış, akışın kendisi oynak.
+### Kararlılık: zorlama artık tekrarlanıyor
+
+Ölçüm: ilk geçişte `SurfaceView` hâlâ `0x405` ve `mHaveFrame=false`, ama birkaç
+saniye sonra gelen geçişte `720x405` ve `mHaveFrame=true`. Yani zorlama
+"tutuyor", sadece ilk traversal'a yetişmiyor. Probe bu yüzden artık
+`MAX_FORCE_PASSES = 4` kez, 1.5 sn arayla tekrar ediyor. Tekrarlamak güvenli:
+`updateSurface()` kontrolleri yalnızca `mSurfaceControl == null` iken kuruyor.
+
+Ölçülen sonuç (kararlı):
+
+```
+[blast] created 1x1 fmt=0x0 producer=0x… surface=0x…
+views:   size = 720x405      (2., 3. ve 4. geçişte de)
+21 × [blast] video: …        (kare akışı)
+```
+
+Doğrulama karesi: canlı bir futbol yayını (Man United 0–2 B'Mouth, 45:39) —
+yani hem video hem de canlı grafikler gerçekten çözülüp subsurface'e gidiyor.
+
 - `PENGUDROID_PUMP_RESIZED=1` artık pencere başına en fazla 3 kez dürtüyor
   (`MAX_NUDGES`). Öncesinde her `mRelayoutSeq` değişiminde dürtüyordu ve
   `dispatchResized` → `requestLayout` → yeni seq → yeni dürtü döngüsü sonsuza

@@ -1735,6 +1735,10 @@ fn click_text(env: &JniEnv, needle: &str, inject: &dyn Fn(i32, f32, f32, i64)) -
 /// How many times the `resized` pump nudges one window before giving up.
 const MAX_NUDGES: u32 = 3;
 
+/// How many times the forced-surface probe repeats, so a slow first traversal
+/// still ends with a measured `SurfaceView`.
+const MAX_FORCE_PASSES: u32 = 4;
+
 fn spawn_resized_pump(env: &JniEnv) {
     if std::env::var_os("PENGUDROID_PUMP_RESIZED").is_none() {
         return;
@@ -1865,40 +1869,27 @@ fn pump_resized(env: &JniEnv, seen: &mut std::collections::HashMap<usize, (i32, 
         {
             continue;
         }
-        for (field, value) in [
-            ("mMeasuredWidth", SURFACE_W),
-            ("mMeasuredHeight", SURFACE_H),
-            ("mWidth", SURFACE_W),
-            ("mHeight", SURFACE_H),
-        ] {
-            if let Some(f) = env.field_id(vri_class, field, "I") {
-                env.set_int_field(root, f, value);
-            }
+        // Force the *synchronous* relayout path instead of writing frames.
+        //
+        // `relayoutAsync` (oneway) means the client keeps the frames it computed
+        // locally, and those come from `mMeasuredWidth`, which is 0 once the
+        // window has collapsed. `mForceNextWindowRelayout` makes
+        // `performTraversals` call `IWindowSession.relayout` (code 5), whose
+        // reply this host fills with the real 720x1280 frames — so the client
+        // reads a correct frame without us touching any `Rect`.
+        if let Some(f) = env.field_id(vri_class, "mForceNextWindowRelayout", "Z") {
+            env.set_boolean_field(root, f, true);
         }
-        let Some(frames) = build_client_window_frames(env) else {
-            continue;
-        };
-        let merged = env.object_field(root, merged_field);
-        let insets = new_instance(env, "android/view/InsetsState")
-            .map(|(_, obj)| obj)
-            .unwrap_or(std::ptr::null_mut());
-        let ok = env.call_void(
-            root,
-            dispatch,
-            &[
-                JValue { l: frames },
-                JValue { z: 1 }, // reportDraw
-                JValue { l: merged },
-                JValue { l: insets },
-                JValue { z: 1 }, // forceLayout
-                JValue { z: 0 }, // alwaysConsumeSystemBars
-                JValue { i: 0 }, // displayId
-                JValue { i: 0 }, // syncSeqId
-                JValue { i: 0 }, // syncInputSeqId
-            ],
-        );
+        if let Some(f) = env.field_id(vri_class, "mLayoutRequested", "Z") {
+            env.set_boolean_field(root, f, true);
+        }
+        let ok = env
+            .method_id(vri_class, "scheduleTraversals", "()V")
+            .map(|m| env.call_void(root, m, &[]))
+            .unwrap_or(false);
+        let _ = (&dispatch, &merged_field, &seq_field);
         println!(
-            "apphost: dispatchResized root {index} seq={seq} ok={ok} at +{} ms",
+            "apphost: nudge relayout root {index} seq={seq} ok={ok} at +{} ms",
             monotonic_ms()
         );
     }
@@ -3735,12 +3726,17 @@ fn spawn_input_pump(env: &JniEnv) {
                     .unwrap_or(12_000);
                 std::thread::sleep(std::time::Duration::from_millis(delay));
                 report_surface_views(&env);
-                // The forced size only takes effect on the *next* traversal,
-                // which runs on the main thread. A second pass a few seconds
-                // later shows whether it happened.
-                std::thread::sleep(std::time::Duration::from_secs(4));
-                println!("views: --- second pass ---");
-                report_surface_views(&env);
+                // The forced size only takes effect on a *later* traversal, which
+                // runs on the main thread; measured, the view goes from 0x405 to
+                // 720x405 between the first and the second pass. Repeat so a slow
+                // first traversal cannot leave the video layer uncreated.
+                // `updateSurface()` only builds the controls while
+                // `mSurfaceControl == null`, so repeated passes are safe.
+                for pass in 2..=MAX_FORCE_PASSES {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    println!("views: --- pass {pass} ---");
+                    report_surface_views(&env);
+                }
             }
         }
 
