@@ -58,18 +58,30 @@ Sonuç (ölçüldü): kilit kalktı, traversal çalışıyor, `SurfaceView` **0�
 ### Binder replay'i neden çalışmıyor (ölçüldü)
 
 `IWindow.resized`'ı emüle edilen binder üzerinden göndermek **her kodda**
-`UNKNOWN_TRANSACTION` dönüyor — `INTERFACE_TRANSACTION` (1598968902) dahil:
+`UNKNOWN_TRANSACTION` dönüyor. Bunu iki kanıtla sıkıştırdık:
 
-```
-INFO : oneway function results for code 1598968902 on binder at 0x… will be
-       dropped but finished with status UNKNOWN_TRANSACTION
-```
+1. **Senkron `INTERFACE_TRANSACTION` (1598968902)** gönderildi; her `Binder` bu
+   kodu kendi tanıtıcısıyla yanıtlar. Gelen yanıt 4 baytlık tek bir durum sözcüğü:
+   `b6 ff ff ff` = **-74 = UNKNOWN_TRANSACTION** (tanıtıcı metni yok).
+2. **`PING_TRANSACTION` (1599098439)** gönderildi; bunu `BBinder::transact`
+   Java'ya hiç inmeden yanıtlar. Sonuç yine **-74**.
 
-`IWindow$Stub.onTransact` decompile edildi; `case 2` gerçekten `resized` ve
-`parcel.enforceNoDataAvail()` ile bitiyor. Yani kod eşlemesi doğru; hedef düğüm
-`ViewRootImpl$W`'nin stub'ına ulaşmıyor. Bu, emülatörün "yerel binder düğümü"
-modelinde açık bir sorun olarak duruyor. Host yolu (`dispatchResized`) bu yüzden
-geçici ama çalışan çözüm.
+İstenen parcel'i elle çözdük: arabirim belirteci 27 karakter, `flat_binder_object`
+tam offset 72'de (`85 2a 62 73` = `BINDER_TYPE_BINDER`, `weak=0x…a960`,
+`cookie=0x…f670`) ve offset tablosu da `72`. Yani **kod ve parcel doğru**;
+`executeCommand` bir yere gidiyor ama orası `IWindow.Stub`'ın Java tarafı değil —
+çünkü `Binder.onTransact` PING ve INTERFACE'i koşulsuz yanıtlar. `ViewRootImpl.W`
+sınıfında `onTransact` override'ı da yok (JADX ile doğrulandı).
+
+Sonuç: kusur kuyruk/parcel üretiminde değil, **emülatörün "yerel binder düğümü"
+kimliğinde**. `flat_binder_object.cookie`'yi `BBinder*` olarak teslim etmek bu
+ağaçta Java stub'ına bağlanmıyor. Bu yüzden host yolu (`dispatchResized`)
+kullanılıyor; binder replay'i `PENGUDROID_BINDER_RESIZED=1` +
+`PENGUDROID_INTERFACE_PROBE=1` (+ `PENGUDROID_RESIZED_CODE`) arkasında, tanı
+amaçlı duruyor.
+
+Ek düzeltme: `BC_REPLY` görüldüğünde artık `BR_TRANSACTION_COMPLETE` üretiliyor;
+`sendReply` bunu beklediği için senkron geri çağrılar aksi hâlde kilitleniyordu.
 
 ### Kalan duvar (dürüst)
 

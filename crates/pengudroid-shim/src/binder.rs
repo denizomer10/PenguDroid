@@ -127,6 +127,10 @@ static APP_THREAD_PROBE: AtomicBool = AtomicBool::new(false);
 /// an asynchronous relayout.
 const IWINDOW_RESIZED: u32 = 2;
 
+/// `IBinder.INTERFACE_TRANSACTION`: answered by every `Binder` with its
+/// descriptor, so it is the cheapest proof that a delivery reached a Java stub.
+const IBINDER_INTERFACE_TRANSACTION: u32 = 0x5F4E_5446;
+
 /// AIDL descriptor of the app's `IWindow`, which `IWindow.Stub.onTransact`
 /// enforces as the parcel's interface token.
 const IWINDOW_DESCRIPTOR: &str = "android.view.IWindow";
@@ -145,6 +149,7 @@ struct PendingAppTransaction {
     weak: u64,
     cookie: u64,
     code: u32,
+    flags: u32,
     parcel: Vec<u8>,
 }
 
@@ -2542,7 +2547,9 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             // directly (`PENGUDROID_PUMP_RESIZED` calls
             // `ViewRootImpl.dispatchResized` through JNI); this path stays behind
             // an opt-in flag for whoever wants to keep digging.
-            if std::env::var_os("PENGUDROID_BINDER_RESIZED").is_none() {
+            let interface_probe = std::env::var_os("PENGUDROID_INTERFACE_PROBE").is_some();
+            let binder_resized = std::env::var_os("PENGUDROID_BINDER_RESIZED").is_some();
+            if !interface_probe && !binder_resized {
                 if trace_enabled() {
                     diag("[binder]   relayoutAsync: host-side resized pump is authoritative\n");
                 }
@@ -2555,19 +2562,29 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .clone();
-                        if payload.is_empty() {
+                        if payload.is_empty() && !interface_probe {
                             diag("[binder]   relayoutAsync: no IWindow.resized payload installed\n");
                         } else {
                             let mut body = string16(IWINDOW_DESCRIPTOR);
-                            body.extend_from_slice(&payload);
-                            // `PENGUDROID_RESIZED_CODE` exists to prove the
-                            // delivery path itself: `1598968902` is
-                            // `INTERFACE_TRANSACTION`, which every `IWindow.Stub`
-                            // answers without touching the payload.
-                            let code = std::env::var("PENGUDROID_RESIZED_CODE")
+                            if !interface_probe {
+                                body.extend_from_slice(&payload);
+                            }
+                            // `PENGUDROID_RESIZED_CODE` and
+                            // `PENGUDROID_INTERFACE_PROBE` exist to prove the
+                            // delivery path itself. `INTERFACE_TRANSACTION`
+                            // (1598968902) is answered by every `Binder` with its
+                            // descriptor, so a *synchronous* delivery of it either
+                            // returns "android.view.IWindow" (the node is the
+                            // app's window stub and delivery works) or an
+                            // exception (it is not).
+                            let override_code = std::env::var("PENGUDROID_RESIZED_CODE")
                                 .ok()
-                                .and_then(|v| v.trim().parse::<u32>().ok())
-                                .unwrap_or(IWINDOW_RESIZED);
+                                .and_then(|v| v.trim().parse::<u32>().ok());
+                            let (code, flags) = if interface_probe {
+                                (override_code.unwrap_or(IBINDER_INTERFACE_TRANSACTION), 0)
+                            } else {
+                                (override_code.unwrap_or(IWINDOW_RESIZED), TF_ONE_WAY)
+                            };
                             APP_TX_QUEUE
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
@@ -2575,11 +2592,12 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                                     weak,
                                     cookie,
                                     code,
+                                    flags,
                                     parcel: body,
                                 });
                             if trace_enabled() {
                                 diag(&format!(
-                                    "[binder]   relayoutAsync win={cookie:#x} (object at {at}): queued IWindow.resized\n"
+                                    "[binder]   relayoutAsync win={cookie:#x} (object at {at}): queued code {code} flags={flags:#x}\n"
                                 ));
                             }
                         }
@@ -2715,7 +2733,17 @@ fn find_local_binder(data: &[u8]) -> Option<(u64, u64, usize)> {
 ///
 /// `code` is the AIDL transaction the caller wants to invoke and `parcel` its
 /// body. Returns the command bytes and the object-offset table.
-unsafe fn incoming_transaction(target_weak: u64, cookie: u64, code: u32, parcel: &[u8]) -> Option<Vec<u8>> {
+///
+/// `flags` carries `TF_ONE_WAY` for oneway AIDL methods. A synchronous delivery
+/// makes the client call `sendReply`, which waits for `BR_TRANSACTION_COMPLETE`;
+/// the broker emits that when it parses the resulting `BC_REPLY`.
+unsafe fn incoming_transaction(
+    target_weak: u64,
+    cookie: u64,
+    code: u32,
+    flags: u32,
+    parcel: &[u8],
+) -> Option<Vec<u8>> {
     let reply = Reply {
         parcel: parcel.to_vec(),
         objects: Vec::new(),
@@ -2726,12 +2754,7 @@ unsafe fn incoming_transaction(target_weak: u64, cookie: u64, code: u32, parcel:
         _pad0: (target_weak >> 32) as u32,
         cookie,
         code,
-        // `IWindow.resized` is `oneway`: the sender never waits for a reply, so
-        // the transaction must carry TF_ONE_WAY. Delivering it synchronously
-        // makes the client write a BC_REPLY from inside a call it is itself
-        // waiting on, which deadlocks the binder thread (measured: the main
-        // thread hung inside `relayoutAsync`).
-        flags: TF_ONE_WAY,
+        flags,
         sender_pid: libc::getpid(),
         sender_euid: 0,
         data_size: parcel.len() as u64,
@@ -2862,6 +2885,9 @@ unsafe fn handle_write_read(wr: *mut WriteRead) -> c_int {
     // but never for a `BR_REPLY`; emitting nothing leaves the caller spinning in
     // `talkWithDriver` forever.
     let mut pending: Vec<Option<Reply>> = Vec::new();
+    // Set when the app replied to a transaction we delivered; `sendReply` waits
+    // for a completion even though nobody reads the reply's contents.
+    let mut answered_transaction = false;
     let mut off = 0u64;
     while off + 4 <= wr.write_size {
         let cmd = *((wr.write_buffer + off) as *const u32);
@@ -2886,24 +2912,30 @@ unsafe fn handle_write_read(wr: *mut WriteRead) -> c_int {
                 pending.push(None);
             }
         }
-        if (cmd == BC_REPLY || cmd == BC_REPLY_SG) && trace_enabled() {
-            // The app answering a transaction we sent it: dump the parcel so the
-            // Java exception (if any) is readable.
-            let (ptr, size) = tr_reply_data(wr.write_buffer, off).unwrap_or((0, 0));
-            if ptr != 0 && size > 0 {
-                let n = (size as usize).min(120);
-                let bytes = std::slice::from_raw_parts(ptr as *const u8, n);
-                let mut hex = format!("[binder]   app reply ({size} bytes):");
-                for b in bytes {
-                    hex.push_str(&format!(" {b:02x}"));
+        if cmd == BC_REPLY || cmd == BC_REPLY_SG {
+            // The app answering a transaction we sent it. `sendReply` waits for
+            // `BR_TRANSACTION_COMPLETE` before it returns, so the reply must be
+            // acknowledged even though the broker has nothing to do with its
+            // contents.
+            answered_transaction = true;
+            if trace_enabled() {
+                // Dump the parcel so a Java exception (if any) is readable.
+                let (ptr, size) = tr_reply_data(wr.write_buffer, off).unwrap_or((0, 0));
+                if ptr != 0 && size > 0 {
+                    let n = (size as usize).min(120);
+                    let bytes = std::slice::from_raw_parts(ptr as *const u8, n);
+                    let mut hex = format!("[binder]   app reply ({size} bytes):");
+                    for b in bytes {
+                        hex.push_str(&format!(" {b:02x}"));
+                    }
+                    hex.push('\n');
+                    diag(&hex);
+                    let text: String = bytes
+                        .iter()
+                        .map(|b| if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '.' })
+                        .collect();
+                    diag(&format!("[binder]   app reply text: {text}\n"));
                 }
-                hex.push('\n');
-                diag(&hex);
-                let text: String = bytes
-                    .iter()
-                    .map(|b| if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '.' })
-                    .collect();
-                diag(&format!("[binder]   app reply text: {text}\n"));
             }
         }
         off += size;
@@ -2913,6 +2945,9 @@ unsafe fn handle_write_read(wr: *mut WriteRead) -> c_int {
     wr.write_consumed = wr.write_size;
 
     let mut out: Vec<u8> = Vec::new();
+    if answered_transaction {
+        push_u32(&mut out, BR_TRANSACTION_COMPLETE);
+    }
 
     // Deliver a queued transaction to the app's own binder node *before* the
     // reply that this call is waiting for.
@@ -2928,7 +2963,7 @@ unsafe fn handle_write_read(wr: *mut WriteRead) -> c_int {
         if weak != 0 && wr.read_size > 0 {
             // One code per read call; stop when the list is exhausted.
             if let Some(code) = next_probe_code() {
-                if let Some(bytes) = unsafe { incoming_transaction(weak, cookie, code, &probe_parcel()) } {
+                if let Some(bytes) = unsafe { incoming_transaction(weak, cookie, code, 0, &probe_parcel()) } {
                     if bytes.len() as u64 <= wr.read_size {
                         diag(&format!(
                             "[binder] delivering code={code:#x} to app node weak={weak:#x} cookie={cookie:#x} (read_size={}, cmd_len={}, before {} reply/replies)\n",
@@ -2968,7 +3003,7 @@ unsafe fn handle_write_read(wr: *mut WriteRead) -> c_int {
                 break;
             };
             let Some(bytes) =
-                (unsafe { incoming_transaction(tx.weak, tx.cookie, tx.code, &tx.parcel) })
+                (unsafe { incoming_transaction(tx.weak, tx.cookie, tx.code, tx.flags, &tx.parcel) })
             else {
                 if trace_enabled() {
                     diag("[binder]   queued callback could not be placed\n");
