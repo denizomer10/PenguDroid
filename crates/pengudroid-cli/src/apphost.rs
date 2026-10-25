@@ -1732,6 +1732,9 @@ fn click_text(env: &JniEnv, needle: &str, inject: &dyn Fn(i32, f32, f32, i64)) -
 /// probe's sleeps, so a window that collapses while the player opens would stay
 /// collapsed through the whole probe window. A separate thread also keeps the
 /// pump running while the main thread is inside a traversal it is waiting on.
+/// How many times the `resized` pump nudges one window before giving up.
+const MAX_NUDGES: u32 = 3;
+
 fn spawn_resized_pump(env: &JniEnv) {
     if std::env::var_os("PENGUDROID_PUMP_RESIZED").is_none() {
         return;
@@ -1743,7 +1746,7 @@ fn spawn_resized_pump(env: &JniEnv) {
         let Some(env) = attach_current_thread(vm) else {
             return;
         };
-        let mut seen: std::collections::HashMap<usize, i32> =
+        let mut seen: std::collections::HashMap<usize, (i32, u32)> =
             std::collections::HashMap::new();
         loop {
             pump_resized(&env, &mut seen);
@@ -1767,7 +1770,7 @@ fn spawn_resized_pump(env: &JniEnv) {
 /// calls `ViewRootImpl.dispatchResized` with the real surface frames. That is the
 /// same nudge `force_window_frame` makes, through the framework's own entry point
 /// and therefore on the main thread's message queue.
-fn pump_resized(env: &JniEnv, seen: &mut std::collections::HashMap<usize, i32>) {
+fn pump_resized(env: &JniEnv, seen: &mut std::collections::HashMap<usize, (i32, u32)>) {
     let Some(wmg_class) = env.find_class("android/view/WindowManagerGlobal") else {
         return;
     };
@@ -1837,10 +1840,19 @@ fn pump_resized(env: &JniEnv, seen: &mut std::collections::HashMap<usize, i32>) 
             continue;
         }
         let seq = env.int_field(root, seq_field);
-        let previous = seen.insert(index as usize, seq);
-        if previous == Some(seq) {
+        // A nudge makes the client relayout, which bumps `mRelayoutSeq`, which
+        // would nudge again — measured as an endless `dispatchResized` stream
+        // every 250 ms. Cap it so a window that refuses to take the frame does
+        // not spin forever.
+        // `-1` so the first sight of a window always counts as a change.
+        let (previous, nudges) = seen
+            .get(&(index as usize))
+            .copied()
+            .unwrap_or((-1, 0));
+        if previous == seq || nudges >= MAX_NUDGES {
             continue;
         }
+        seen.insert(index as usize, (seq, nudges + 1));
         // A window at width 0 is self-sustaining: `relayoutWindow` sends
         // `mMeasuredWidth` as the requested size, the local frames come back 0,
         // and the next measure is 0 again. Give the traversal the real size to

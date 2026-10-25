@@ -50,7 +50,14 @@ destekleniyor.
 - Hâlâ `PENGUDROID_FORCE_SURFACE=1` gerekiyor: activity penceresinin
   `mWinFrame`'i tıklama sonrası 0 kalıyor (oturum 10/11'in ölçümü), yani
   `SurfaceView` kendiliğinden 720 genişlikte ölçülmüyor.
-- Canlı yayın 403'ü aralıklı: bu koşuda akış açıldı.
+- Canlı yayın 403'ü aralıklı: bir koşuda akış açıldı ve 360+ kare aktı, bir
+  sonrakinde hiç açılmadı. Yani video yolu kanıtlanmış, akışın kendisi oynak.
+- `PENGUDROID_PUMP_RESIZED=1` artık pencere başına en fazla 3 kez dürtüyor
+  (`MAX_NUDGES`). Öncesinde her `mRelayoutSeq` değişiminde dürtüyordu ve
+  `dispatchResized` → `requestLayout` → yeni seq → yeni dürtü döngüsü sonsuza
+  kadar sürüyordu (ölçüldü: 250 ms'de bir). Dürtme yine de `mWidth`'i kalıcı
+  yapmıyor; root 1 `mWinFrame=(0,0)-(0,0)` kalıyor, o yüzden `FORCE_SURFACE=1`
+  şimdilik gerekli.
 
 ## Bu oturum (11): `relayoutAsync` — pencere 0×0'ya kilitlenmesinin gerçek nedeni
 
