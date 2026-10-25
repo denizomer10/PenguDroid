@@ -2431,6 +2431,13 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                 data.len()
             ));
         }
+        // Pair each relayout with its reply by a tick number. Two relayouts that
+        // overlap across threads then show up as a `begin` without a matching
+        // `end` before the next `begin` — which is what a shared reply buffer
+        // would break, and what the old non-atomic bump pointer allowed.
+        static RELAYOUT_TICK: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let mut relayout_tick: Option<(u64, u64)> = None;
         if trace_enabled() && tr.code == IWS_RELAYOUT && tr.data_size > 0 && tr.data_ptr != 0 {
             let data =
                 std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
@@ -2454,13 +2461,24 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                     ints.push(format!("@{off}:{v:?}"));
                 }
             }
+            let tick = RELAYOUT_TICK.fetch_add(1, Ordering::Relaxed);
+            relayout_tick = Some((tick, win));
             diag(&format!(
-                "[binder]   relayout win={win:#x} data={} {}\n",
+                "[binder]   relayout#{tick} begin win={win:#x} tid={:?} data={} {}\n",
+                std::thread::current().id(),
                 data.len(),
                 ints.join(" ")
             ));
         }
+        let reply_start = parcel.len();
         window_session_reply(tr.code, &mut parcel, &mut objects);
+        if let Some((tick, win)) = relayout_tick {
+            diag(&format!(
+                "[binder]   relayout#{tick} end win={win:#x} tid={:?} reply={} byte(s)\n",
+                std::thread::current().id(),
+                parcel.len() - reply_start
+            ));
+        }
     }
     if tr.target_handle == handle_for("locale")
         && (tr.code == ILM_GET_APPLICATION_LOCALES || tr.code == ILM_GET_SYSTEM_LOCALES)

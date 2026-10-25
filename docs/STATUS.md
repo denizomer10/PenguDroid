@@ -184,6 +184,41 @@ o thread `ioctl`'dan çıkmadan yazılıp okunuyor.
 Ölçüm: bu düzeltme tek başına tıklama sonrası 0×0'yı **düzeltmedi** — yani
 semptomun tek sebebi bu değil, ama yarış gerçek ve kalması yanlış olurdu.
 
+### Ölçüm turu 3: relayout'lar tıklamadan **önce**, hepsi tek thread'de, hepsi tam
+
+Relayout izleri artık `begin/end` olarak eşleşiyor (`relayout#N … reply=312 byte`):
+
+```
+relayout#1 begin win=0x…cab0 tid=ThreadId(1) data=528 …
+relayout#1 end   win=0x…cab0 tid=ThreadId(1) reply=312 byte(s)
+relayout#2 begin win=0x…6cd0 tid=ThreadId(1) data=508 …
+relayout#2 end   win=0x…6cd0 tid=ThreadId(1) reply=312 byte(s)
+relayout#3 begin win=0x…2780 tid=ThreadId(1) data=132 …
+relayout#3 end   win=0x…2780 tid=ThreadId(1) reply=312 byte(s)
+…
+apphost: synthetic click 0 at 145,300 injected      ← hepsinden SONRA
+```
+
+Üç önemli sonuç:
+
+* **Yarış yok**: üç relayout da sırayla, aynı thread'de, üst üste binmeden. Yani
+  ikinci pencerenin 0×0 olması yanıt tamponu yarışından değil. (Thread başına
+  bölge düzeltmesi yine de doğru bir düzeltme olarak kaldı.)
+* **Tıklamadan sonra hiç relayout yok.** Yani 0×0 kalan pencere, tıklamadan
+  **önce** relayout almış bir pencere.
+* Üç relayout **üç farklı** `IWindow` cookie'si taşıyor ama `addToDisplayAsUser`
+  sadece **iki** kez çağrılıyor → başlangıçta bir pencere açılıp kapanmış
+  (diyalog), geride üçüncü bir cookie bırakmış.
+
+Bu, “cookie ↔ root” eşlemesini zorunlu kılıyor ve o eşleme Java tarafından
+(identityHashCode) shim tarafındaki cookie ile **doğrudan** kurulamıyor: ikisi
+farklı kimlik uzayları. Aradaki boşluğu kapatmanın tek yolu bir debugger ya da
+`relayoutWindow`'a breakpoint koyan bir ptrace aracı.
+
+`DrawerLayout.onMeasure` yığın izi **StrictMode uyarısı**
+(`WrongFragmentContainerViolation`), ölümcül değil — measure devam ediyor; bu da
+elenmiş oldu.
+
 ### Sıradaki adım
 
 1. **Tıklamadan sonra ikinci pencereyi 0×0 yapan şeyi bulmak.** Artık tam olarak
