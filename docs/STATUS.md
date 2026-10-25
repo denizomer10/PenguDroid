@@ -3,6 +3,86 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
+## Bu oturum (10): video yüzeyinin kök nedeni ölçüldü — ikinci pencerenin `mWinFrame`'i boş
+
+NewPipe'ın gerçek oynatıcı ekranına (canlı listesinden bir öğeye tıklayarak)
+gidildi ve `SurfaceView`'ın neden hiç yüzey kurmadığı **sayıyla** görüldü:
+
+```
+views: root 0  mWidth=720 mHeight=1280  mWinFrame=(0,0)-(720,1280)   ← diyalog
+views: root 1  mWidth=0   mHeight=0     mWinFrame=(0,0)-(0,0)        ← activity
+
+org.schabi.newpipe.views.ExpandableSurfaceView
+  mHaveFrame = false   mSurfaceControl = null   mBlastBufferQueue = null
+  mSurfaceCreated = false   mSurfaceWidth = -1   mSurfaceHeight = -1
+```
+
+Zincir kesin: **root 1'in `mWinFrame`'i boş** → `mWidth/mHeight = 0` →
+`performMeasure` 0 genişlikli spec → `SurfaceView` 0×0 → `mHaveFrame=false` →
+`updateSurface()` hemen dönüyor → `SurfaceControl`/`BLASTBufferQueue` yok →
+decoder'a verilecek yüzey yok.
+
+### Yeni ölçüm: ilk eklenen pencere doğru, ikincisi değil
+
+`PENGUDROID_TRACE_BINDER=1` ile üç `relayout` görülüyor ve **üçü de farklı bir
+`IWindow` cookie'si** taşıyor:
+
+```
+[binder]   relayout win=0x…ede0
+[binder]   relayout win=0x…3be0
+[binder]   relayout win=0x…ca50
+```
+
+Üçüne de aynı 84 baytlık yanıt (frame 720×1280) gidiyor; buna rağmen ikinci
+pencere (activity) `mWinFrame`'i boş kalıyor. Yani yanıt *gönderiliyor* ama o
+pencereye *uygulanmıyor*.
+
+Sıra tesadüf değil: diyalog penceresi activity'den **önce** ekleniyor
+(NewPipe açılışta "Keep Android Open" diyaloğunu `onCreate`'te gösteriyor), yani
+`mViews` sırası `[diyalog, activity]`. **İlk eklenen pencere 720×1280 alıyor,
+ikincisi 0×0 kalıyor** — yani sorun pencere başına tutulan bir durumda
+(relayout yanıtının o pencereye bağlanması ya da `addToDisplayAsUser` sonrası
+kurulan oturum/kanal durumu).
+
+### `PENGUDROID_TEXTURE_VIEW` bu sürümde çıkmaz sokak
+
+NewPipe 0.29.1'de `TextureView` sınıfı **yok** (`classes*.dex` içinde
+`ExpandableTextureView`/`TextureView` geçmiyor); tercih `texture_view=true`
+olarak yazıldığı hâlde ( `org.schabi.newpipe_preferences.xml` içinde doğrulandı)
+oynatıcı yine `ExpandableSurfaceView` kuruyor. Yani video için `SurfaceView`
+yolu zorunlu, BLAST'ı atlamanın kısa yolu yok.
+
+### Bu oturumda eklenen araçlar
+
+* **`PENGUDROID_SYNTH_CLICK` artık sıra alıyor:**
+  `"x,y[@ms][;x,y[@ms]]…"`. Çok adımlı akış için şart: NewPipe'ta önce diyaloğu
+  kapatmak, sonra bir videoya tıklamak gerekiyor. Örnek (ölçülen, çalışıyor):
+
+  ```
+  PENGUDROID_SYNTH_CLICK="665,682;145,300@12000" PENGUDROID_PROBE_VIEWS=1 \
+    pengudroid launch NewPipe_v0.29.1.apk --sysroot .toolchain/sysroot
+  ```
+  0. tık diyaloğu kapatır, 1. tık ilk canlı yayını açar; probe 12 s sonra
+oğacı basar.
+* **`views: root N …` satırı artık `mWinFrame` de yazıyor** — `mWidth=0`
+  gördüğünde “yanıt gelmedi mi, sonra mı sıfırlandı” sorusunu ayırıyor.
+* **Shim, her `relayout`'ta `IWindow` cookie'sini basıyor**
+  (`PENGUDROID_TRACE_BINDER=1`) — pencere başına ayrım bununla görüldü.
+
+### Sıradaki adım
+
+İkinci pencerenin `relayout` yanıtı neden uygulanmıyor? İki yol:
+
+1. **Ana thread'i host'un pompalaması.** `apphost` şu an `Looper.loop()` çağırıp
+   bloklanıyor, bu yüzden UI alanlarına dokunmak zorunda kalan her kod başka bir
+   thread'de koşuyor (ve `mWinFrame` yazmak bu yüzden SIGSEGV veriyordu).
+   `Looper.loopOnce()` döngüsü host'a geçerse `mWinFrame`/`mWidth` **ana thread'de**
+   yazılabilir ve yarış kalmaz.
+2. **Pencere başına durumu bulmak.** `addToDisplayAsUser` iki kez çağrılıyor;
+   ikinci çağrıda dönen oturum/surface handle'ı birincisiyle çakışıyor olabilir
+   (shim her `add_to_display` çağrısında yeni fd çifti üretiyor mu, aynı handle'ı mı
+   tekrar veriyor — ölçülmedi).
+
 ## Bu oturum (9): BLASTBufferQueue gerçekten çalışıyor, kalan duvar `PlaceholderSurface`
 
 Bu oturumda `SurfaceView` yolu baştan sona kuruldu ve **çökmeden** çalışıyor;

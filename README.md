@@ -441,6 +441,7 @@ opt-in and cost nothing when unset.
 | `PENGUDROID_FORCE_SURFACE=1` | give a zero-width `SurfaceView` a real frame (`PENGUDROID_VIDEO_W`/`_H`, default 720×405) and let the framework's own main-thread pre-draw listener create the surface. Never call `updateSurface()` yourself: it ends in `ExoPlayer.setVideoSurface`, which asserts the main thread |
 | `PENGUDROID_TRACE_VIDEO=1` | trace the `BLASTBufferQueue` consumer: created queue, geometry updates, the daemon subsurface, and every 30th presented frame |
 | `PENGUDROID_VIDEO_X` / `_Y` | where the video subsurface sits inside the app window (default `0,0`) |
+| `PENGUDROID_SYNTH_CLICK="x,y[@ms][;x,y[@ms]]…"` | inject a timed sequence of taps into the app's own `ViewRootImpl` (there is no way to click a window from a sandboxed session). `@ms` is the wait before that tap, default 8000. Example: `"665,682;145,300@12000"` dismisses NewPipe's first-run dialog, then opens the first feed item. With `PENGUDROID_PROBE_VIEWS` the view tree is dumped 12 s after the last tap |
 | `PENGUDROID_TRACE_OPEN=1` | log every failed `open`/`openat` once, with `errno` and the path after rootfs rewriting — the fastest way to see which resource a guest gave up on |
 | `PENGUDROID_TRACE_ROOTFS` | log every Android→host path rewrite (`/system/…` → `<sysroot>/system/…`) |
 | `PENGUDROID_DEBUG_WRAP='gdb -x script.gdb --args'` | prefix the ART helper with a wrapper (`art-test` only) |

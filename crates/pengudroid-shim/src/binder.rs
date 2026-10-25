@@ -2383,6 +2383,16 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         }
     }
     if tr.target_handle == handle_for("window_session") {
+        // The first argument of `relayout` is the app's own `IWindow`, i.e. a
+        // local binder, so its cookie identifies the window. Two windows exist
+        // in a typical app (an activity and a dialog), and a reply that lands
+        // for one but not the other is invisible without this.
+        if trace_enabled() && tr.code == IWS_RELAYOUT && tr.data_size > 0 && tr.data_ptr != 0 {
+            let data =
+                std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
+            let win = find_local_binder(data).map(|(_, cookie, _)| cookie).unwrap_or(0);
+            diag(&format!("[binder]   relayout win={win:#x}\n"));
+        }
         window_session_reply(tr.code, &mut parcel, &mut objects);
     }
     if tr.target_handle == handle_for("locale")

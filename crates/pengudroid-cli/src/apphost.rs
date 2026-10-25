@@ -1341,6 +1341,27 @@ fn dump_root_state(env: &JniEnv, root: JObject, index: i32) {
         };
         parts.push(format!("{field}={value}"));
     }
+    // `mWidth`/`mHeight` are copied from `mWinFrame`, so when they are 0 the
+    // question is whether the relayout reply reached the window at all.
+    if let Some(id) = env.field_id(vri_class, "mWinFrame", "Landroid/graphics/Rect;") {
+        let rect = env.object_field(vri, id);
+        if !rect.is_null() {
+            if let Some(rect_class) = env.find_class("android/graphics/Rect") {
+                let read = |name: &str| {
+                    env.field_id(rect_class, name, "I")
+                        .map(|f| env.int_field(rect, f))
+                        .unwrap_or(-9999)
+                };
+                parts.push(format!(
+                    "mWinFrame=({},{})-({},{})",
+                    read("left"),
+                    read("top"),
+                    read("right"),
+                    read("bottom")
+                ));
+            }
+        }
+    }
     println!("views: root {index} {}", parts.join(" "));
 }
 
@@ -3033,30 +3054,48 @@ fn spawn_input_pump(env: &JniEnv) {
             }
         };
 
-        // `PENGUDROID_SYNTH_CLICK=x,y` injects one tap after the UI settles.
-        // There is no way to click a window from a sandboxed session, so this is
-        // how the input path is exercised end to end.
+        // `PENGUDROID_SYNTH_CLICK="x,y[@delayMs][;x,y[@delayMs]]…"` injects a
+        // sequence of taps. There is no way to click a window from a sandboxed
+        // session, so this is how the input path is exercised end to end; a
+        // sequence is needed because a real flow starts with a one-off dialog
+        // (NewPipe's "Keep Android Open") that has to be dismissed before the
+        // screen we actually want to inspect even exists.
+        //
+        // `@delayMs` is the wait *before* that tap (default 8000 ms), so
+        // `"665,682;145,300@12000"` means "tap OK after 8 s, then open the first
+        // feed item 12 s later".
         if let Ok(spec) = std::env::var("PENGUDROID_SYNTH_CLICK") {
-            let mut parts = spec.split(',').filter_map(|p| p.trim().parse::<f32>().ok());
-            if let (Some(x), Some(y)) = (parts.next(), parts.next()) {
-                std::thread::sleep(std::time::Duration::from_secs(8));
-                let now = env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
-                inject(ACTION_DOWN, x, y, now);
-                std::thread::sleep(std::time::Duration::from_millis(80));
-                inject(ACTION_UP, x, y, now);
-                println!("apphost: synthetic click at {x},{y} injected");
-                if std::env::var_os("PENGUDROID_PROBE_VIEWS").is_some()
-                    || std::env::var_os("PENGUDROID_FORCE_SURFACE").is_some()
-                {
-                    std::thread::sleep(std::time::Duration::from_secs(12));
-                    report_surface_views(&env);
-                    // The forced size only takes effect on the *next* traversal,
-                    // which runs on the main thread. A second pass a few seconds
-                    // later shows whether it happened.
-                    std::thread::sleep(std::time::Duration::from_secs(4));
-                    println!("views: --- second pass ---");
-                    report_surface_views(&env);
+            let mut taps: Vec<(f32, f32, u64)> = Vec::new();
+            for item in spec.split(';') {
+                let (coords, delay) = match item.split_once('@') {
+                    Some((c, d)) => (c, d.trim().parse::<u64>().unwrap_or(8000)),
+                    None => (item, 8000),
+                };
+                let mut parts = coords.split(',').filter_map(|p| p.trim().parse::<f32>().ok());
+                if let (Some(x), Some(y)) = (parts.next(), parts.next()) {
+                    taps.push((x, y, delay));
                 }
+            }
+            for (step, (x, y, delay)) in taps.iter().enumerate() {
+                std::thread::sleep(std::time::Duration::from_millis(*delay));
+                let now = env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
+                inject(ACTION_DOWN, *x, *y, now);
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                inject(ACTION_UP, *x, *y, now);
+                println!("apphost: synthetic click {step} at {x},{y} injected");
+            }
+            if !taps.is_empty()
+                && (std::env::var_os("PENGUDROID_PROBE_VIEWS").is_some()
+                    || std::env::var_os("PENGUDROID_FORCE_SURFACE").is_some())
+            {
+                std::thread::sleep(std::time::Duration::from_secs(12));
+                report_surface_views(&env);
+                // The forced size only takes effect on the *next* traversal,
+                // which runs on the main thread. A second pass a few seconds
+                // later shows whether it happened.
+                std::thread::sleep(std::time::Duration::from_secs(4));
+                println!("views: --- second pass ---");
+                report_surface_views(&env);
             }
         }
 
