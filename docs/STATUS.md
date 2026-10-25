@@ -95,6 +95,35 @@ yolu zorunlu, BLAST'ı atlamanın kısa yolu yok.
 * **Shim, her `relayout`'ta `IWindow` cookie'sini basıyor**
   (`PENGUDROID_TRACE_BINDER=1`) — pencere başına ayrım bununla görüldü.
 
+### Denendi ve **başarısız**: ana thread'de `mWinFrame` yazmak
+
+Ana looper'ı host'un pompalaması (`MessageQueue.next()` + `Handler.dispatchMessage()`
++ kendine gecikmeli mesaj) **çalışıyor** — “pumping the main looper … on thread
+ThreadId(1)” görüldü ve bu, `bind_application` ile **aynı** thread. Ama o
+thread'de bile `ViewRootImpl.mWinFrame`'e yazmak süreci öldürüyor:
+
+```
+apphost: force_window_frames: 2 root(s)
+apphost: force_window_frames: root 0 mWinFrame null=false
+→ art: helper killed by signal Some(11)
+```
+
+Bisect: Rect yazımı kapatılınca çökme kayboluyor ve bir sonraki adıma geçiyor,
+yani çökme tam olarak Rect'e dokunmakta. `Rect.set(IIII)` denemesi de çöktü,
+sonra ART'nin GC çıktısıyla (MemMap dökümü) yeniden çöktü — yani bu, ART
+nesnelerini host'tan kurcalamaktan kaynaklanan bir bozulma.
+
+**Ölçülen sürpriz:** ikinci pencerenin `mWinFrame` alanı **null** okunuyor
+(root 0'da dolu, root 1'de null). `ViewRootImpl`'de bu alan `final Rect` olarak
+başlatılır, yani null olmaması gerekir — iki anlamı olabilir: (a) ikinci
+pencerenin `ViewRootImpl`'i tam kurulmamış, (b) probe yanlış nesneyi okuyor.
+Hangisi olduğu ölçülmedi; **sıradaki adım tam olarak bu ayrımı yapmak**, çünkü
+(a) doğruysa kök neden `setView`/`addToDisplayAsUser` sırasında yutulan bir
+hatadır.
+
+Deney geri alındı (`git checkout -- crates/pengudroid-cli/src/apphost.rs`);
+ağaç temiz ve derleniyor.
+
 ### Sıradaki adım
 
 1. **Tüketiciyi forced-surface yolunda da başlatmak.** Decoder bağlanıyor ve
@@ -103,16 +132,15 @@ yolu zorunlu, BLAST'ı atlamanın kısa yolu yok.
    pre-draw listener'ı `updateSurface()`'ı çağırmıyor (mHaveFrame false kaldığı
    için); ya o listener'ı tetiklemenin temiz bir yolu bulunmalı ya da
    `mHaveFrame`/`mSurfaceControl` alanları ana thread'de yazılmalı.
-2. **Ana thread'i host'un pompalaması.** `apphost` şu an `Looper.loop()` çağırıp
-   bloklanıyor, bu yüzden UI alanlarına dokunmak zorunda kalan her kod başka bir
-   thread'de koşuyor (ve `mWinFrame` yazmak bu yüzden SIGSEGV veriyordu).
-   `Looper.loopOnce()` döngüsü host'a geçerse `mWinFrame`/`mWidth` **ana thread'de**
-   yazılabilir ve yarış kalmaz. Bu aynı zamanda 1. maddenin de temiz çözümü.
-3. **İkinci pencerenin `mWinFrame`'i neden boş?** Ölçülen: üç relayout'un da
-   yanıtı birebir aynı, üçü de farklı `IWindow` cookie'si taşıyor, istek
-   argümanları farklı (`data=528/508/132`, `requestedWidth=-2/-1/…`).
-   `addToDisplayAsUser`'ın ikinci çağrıda ne döndürdüğü (yeni fd çifti mi, aynı
-   handle mi) henüz ölçülmedi.
+2. **Ana thread pompası** — *denendi ve yetmedi* (yukarı bkz.): pompa çalışıyor ama
+   `mWinFrame`'e yazmak ART'yi bozuyor. Yani “alanı zorla” yaklaşımı kapalı;
+   çözüm framework'ün kendi yolunu çalıştırmak olmalı.
+3. **İkinci pencerenin `mWinFrame`'i neden boş (ve neden null okunuyor)?**
+   Ölçülen: üç relayout'un da yanıtı birebir aynı, üçü de farklı `IWindow`
+   cookie'si taşıyor, istek argümanları farklı (`data=528/508/132`,
+   `requestedWidth=-2/-1/…`). Önce şu ayrımı yap: probe yanlış nesneyi mi okuyor
+   (`mViews` = DecorView mi, `mRoots` = ViewRootImpl mi?), yoksa ikinci pencerenin
+   `ViewRootImpl`'i gerçekten yarı kurulmuş mu.
 
 ## Bu oturum (9): BLASTBufferQueue gerçekten çalışıyor, kalan duvar `PlaceholderSurface`
 
