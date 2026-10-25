@@ -151,6 +151,10 @@ struct Gui {
     set_buffers_format: SurfaceIntSetter,
     set_user_dimensions: SurfaceDimsSetter,
     inc_strong: IncStrong,
+    /// `android::Fence::NO_FENCE` — the `sp<Fence>` `releaseBuffer` expects.
+    /// Held as an address: raw pointers would make `Gui` neither `Send` nor
+    /// `Sync`, and the value never changes after load.
+    no_fence: usize,
 }
 
 static GUI: std::sync::OnceLock<Option<Gui>> = std::sync::OnceLock::new();
@@ -237,6 +241,7 @@ fn gui() -> Option<&'static Gui> {
             set_buffers_format: std::mem::transmute(set_buffers_format),
             set_user_dimensions: std::mem::transmute(set_user_dimensions),
             inc_strong: std::mem::transmute(inc_strong),
+            no_fence: guest_sym(b"libui.so\0", b"_ZN7android5Fence8NO_FENCEE\0") as usize,
         })
     })
     .as_ref()
@@ -770,7 +775,22 @@ fn consumer_loop(addr: usize) {
             }
         }
 
-        unsafe { (gui.release)(blast.item_consumer, item_ptr, &EMPTY_SP) };
+        // `releaseBuffer` reads the item's `mSlot` (offset 0xa0) and the
+        // `sp<GraphicBuffer>` at offset 0. An *empty* `sp<Fence>` is not the
+        // same as `Fence::NO_FENCE`: libgui's `addReleaseFenceLocked` dereferences
+        // the fence, so an empty one faults (measured). Pass the real static.
+        let no_fence: &[u64; 2] = if gui.no_fence == 0 {
+            &EMPTY_SP
+        } else {
+            unsafe { &*(gui.no_fence as *const [u64; 2]) }
+        };
+        if trace {
+            let slot = unsafe { *((item.as_ptr() as *const u8).add(0xa0) as *const i32) };
+            if presented < 3 {
+                eprintln!("[blast] video: releasing slot {slot}");
+            }
+        }
+        unsafe { (gui.release)(blast.item_consumer, item_ptr, no_fence) };
     }
 }
 
