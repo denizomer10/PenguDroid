@@ -95,14 +95,21 @@ pub fn resize(input: Vec<u8>, width: u32, height: u32, output_width: u32, output
         return Err("invalid video resize buffer size".into());
     }
     if (width, height) == (output_width, output_height) { return Ok(input); }
+    // Nearest-neighbour, with the source index of every output column and row
+    // computed once instead of twice per pixel. The mapping is identical to
+    // `x * width / output_width`, so the result is byte-for-byte the same; it
+    // just removes ~2 divisions per pixel from a path that runs per frame.
+    let (src_w, src_h) = (width as usize, height as usize);
+    let (dst_w, dst_h) = (output_width as usize, output_height as usize);
+    let x_map: Vec<usize> = (0..dst_w).map(|x| x * src_w / dst_w).collect();
+    let y_map: Vec<usize> = (0..dst_h).map(|y| y * src_h / dst_h).collect();
     let mut output = vec![0u8; size];
-    for y in 0..output_height as usize {
-        let source_y = y * height as usize / output_height as usize;
-        for x in 0..output_width as usize {
-            let source_x = x * width as usize / output_width as usize;
-            let from = (source_y * width as usize + source_x) * 4;
-            let to = (y * output_width as usize + x) * 4;
-            output[to..to + 4].copy_from_slice(&input[from..from + 4]);
+    for (y, &source_y) in y_map.iter().enumerate() {
+        let src_row = &input[source_y * src_w * 4..(source_y + 1) * src_w * 4];
+        let dst_row = &mut output[y * dst_w * 4..(y + 1) * dst_w * 4];
+        for (x, &source_x) in x_map.iter().enumerate() {
+            let from = source_x * 4;
+            dst_row[x * 4..x * 4 + 4].copy_from_slice(&src_row[from..from + 4]);
         }
     }
     Ok(output)
@@ -111,6 +118,49 @@ pub fn resize(input: Vec<u8>, width: u32, height: u32, output_width: u32, output
 #[cfg(test)]
 mod resize_tests {
     use super::resize;
+
+    /// The pre-optimisation implementation, kept as the reference the faster
+    /// one must match exactly.
+    fn resize_reference(
+        input: &[u8],
+        width: u32,
+        height: u32,
+        output_width: u32,
+        output_height: u32,
+    ) -> Vec<u8> {
+        let mut output = vec![0u8; output_width as usize * output_height as usize * 4];
+        for y in 0..output_height as usize {
+            let source_y = y * height as usize / output_height as usize;
+            for x in 0..output_width as usize {
+                let source_x = x * width as usize / output_width as usize;
+                let from = (source_y * width as usize + source_x) * 4;
+                let to = (y * output_width as usize + x) * 4;
+                output[to..to + 4].copy_from_slice(&input[from..from + 4]);
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn fast_resize_matches_the_reference_for_many_shapes() {
+        let (w, h) = (37u32, 23u32);
+        let input: Vec<u8> = (0..w * h * 4).map(|v| v as u8).collect();
+        for (ow, oh) in [
+            (37u32, 23u32),
+            (18, 11),
+            (74, 46),
+            (1, 1),
+            (37, 1),
+            (1, 23),
+            (100, 7),
+            (7, 100),
+            (13, 13),
+        ] {
+            let fast = resize(input.clone(), w, h, ow, oh).unwrap();
+            let reference = resize_reference(&input, w, h, ow, oh);
+            assert_eq!(fast, reference, "resize {w}x{h} -> {ow}x{oh} diverged");
+        }
+    }
     #[test]
     fn decoded_frame_fits_the_view_without_flipping_or_channel_changes() {
         let mut input = Vec::new();

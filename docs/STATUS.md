@@ -32,6 +32,11 @@ backpressure gibi görünüp ExoPlayer'ın ilerlemesini durduruyordu.
   21,9 kare/s). Son üç kare özeti farklı; tek donmuş kare tekrarından ibaret değil.
   PipeWire düğümü `running`, `Stream/Output/Audio`; pw-cat süreç ortamında guest
   loader değişkenleri yok, XDG_RUNTIME_DIR `/run/user/1000`.
+- Video ölçekleme hızlandırıldı: daemon'ın CPU `resize`'ı piksel başına iki
+  bölme yapıyordu; artık kaynak satır/kolon indeksleri kare başına bir kez
+  hesaplanıyor. Eşleme aynı (`x * width / output_width`), yani çıktı bayt bayt
+  aynı — `fast_resize_matches_the_reference_for_many_shapes` bunu 9 farklı
+  boyut için eski uygulamaya karşı doğruluyor.
 - Bu, bu VOD için sürdürülen video ve ses çıkış zinciri doğrulamasıdır.
   Duyulan ses kalitesi, tam A/V senkronu, tüm videolar veya tüm Android
   uygulamaları için garanti değildir. CPU video kopyalama/ölçekleme sürüyor.
