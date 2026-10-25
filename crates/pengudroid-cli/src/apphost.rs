@@ -1153,13 +1153,12 @@ fn report_surface_views(env: &JniEnv) {
                             if let Some(f) = env.field_id(vri_class, "mHeight", "I") {
                                 env.set_int_field(vri, f, 1280);
                             }
-                            // NOTE: forcing `mWinFrame` here as well was tried
-                            // and made the process SIGSEGV (it races the main
-                            // thread's own `relayoutWindow`). `mWidth` alone is
-                            // not enough either: `performTraversals` derives
-                            // `desiredWindowWidth` from `mWinFrame`, which
-                            // `relayoutWindow` resets to 0 for this window. See
-                            // `docs/STATUS.md`.
+                            // NOTE: writing `mWinFrame` here as well was tried
+                            // and SIGSEGVs — the main thread reads that `Rect`
+                            // in `relayoutWindow` at the same time. `mWidth`
+                            // alone does not stick either, because
+                            // `performTraversals` derives `desiredWindowWidth`
+                            // from `mWinFrame`. See `docs/STATUS.md`.
                             println!("views:   ViewRootImpl.mWidth {ww} -> 720");
                         }
                         // `layoutRequested` is `mLayoutRequested && (!mStopped ||

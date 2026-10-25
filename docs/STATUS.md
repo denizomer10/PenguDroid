@@ -136,9 +136,26 @@ views: root 1 mWidth=0   mHeight=0    mStopped=false mAppVisible=true mLayoutReq
 zorlamak denendi ve süreci SIGSEGV'e soktu (ana thread'in kendi
 `relayoutWindow`'u ile yarışıyor).
 
-Sıradaki adım: bu pencerenin `relayout` yanıtının neden 0 çerçeve döndürdüğünü
-bulmak (`PENGUDROID_TRACE_BINDER=1` ile `IWS_RELAYOUT` işlemini izlemek);
-root 0 aynı yanıtla 720 alıyor, yani fark pencerenin kendisinde.
+### Ölçülen: `relayout` yanıtı **doğru**
+
+`PENGUDROID_TRACE_BINDER=1` ile üç `IWS_RELAYOUT` işlemi de aynı yanıtı alıyor:
+
+```
+reply parcel: 00 00 00 00 | 00 00 00 00 | 01 00 00 00 | 00 00 00 00 | 00 00 00 00 |
+              d0 02 00 00 | 00 05 00 00 | ...
+              [status=0]   [result=0]   [frames present] [frame=(0,0,720,1280)] ...
+```
+
+Yani `ClientWindowFrames` **var** ve 720×1280 taşıyor. Buna rağmen o pencerede
+`mWidth` 0 kalıyor, yani sorun yanıtta değil: `ViewRootImpl` bu pencere için
+`relayoutWindow`'u ya hiç çağırmıyor ya da sonucu `mWidth`'e taşımıyor
+(`mFirst=false`, `mLayoutRequested=false`).
+
+Sıradaki adım: bu pencerenin `performTraversals`'ında `relayoutWindow`'un
+çağrılıp çağrılmadığını izlemek (`mFirst`, `windowShouldResize`,
+`mForceNextWindowRelayout` alanları) ve `mWinFrame`'i `mWidth`'e taşıyan yolu
+(sysroot'taki LineageOS 20 `ViewRootImpl`'i AOSP 13.0.0_r1'den farklı olabilir)
+okumak.
 
 ### Yan bulgu: bayat `.so` protokolü bozuyor
 
