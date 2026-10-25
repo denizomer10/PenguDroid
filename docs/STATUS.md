@@ -43,6 +43,11 @@ backpressure gibi görünüp ExoPlayer'ın ilerlemesini durduruyordu.
 - `cargo test --workspace --offline`: **219 geçti, 0 başarısız**.
   Yeni regresyonlar: soket seçimi, host yardımcı ortamı ve ölü ses kuyruğu.
 
+Duman testi (bu değişikliklerden sonra, daemon/GUI yolu üzerinden
+`pengudroid start NewPipe_v0.29.1.apk`): `[blast] created` 1, 44 kare raporu,
+0 çökme, 183 dmabuf, ses yolu etkin. Yani sink yeniden başlatma ve ölçekleme
+değişiklikleri mevcut akışı bozmadı.
+
 Yerel kanıtlar: `/tmp/pd-playback-gdb/debugger.log` ve
 `/tmp/pd-playback-host/{app.log,daemon.log,tests.log,video-*.ppm}`.
 Bu kayıt önceki “oynatma hâlâ tamamlanmadı” bölümünün devamıdır; aşağıdaki
