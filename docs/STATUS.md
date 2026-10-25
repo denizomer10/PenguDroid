@@ -3429,3 +3429,32 @@ akış** gerekiyor.
 - `crates/pengudroid-shim/fixtures/relayout_async.hex` bu oturumda doğrulanmadı
   (canlı `relayoutAsync` hiç yakalanmadığı için kökeni belirsiz; commit'e
   alınmadı).
+
+### Devir notu (başka makinede devam)
+
+Buradaki oturum burada kapatıldı; video hedefi **tamamlanmadı**. Yeni makinede
+sırayla:
+
+1. `cargo build --workspace && cargo test --workspace` (22 suite, hepsi ok).
+2. `.toolchain/sysroot` hazırla, sonra:
+   ```sh
+   PENGUDROID_ART_SYSROOT=.toolchain/sysroot \
+   PENGUDROID_DUMP_FRAME=/tmp/f.ppm PENGUDROID_DUMP_FRAME_EVERY=30 \
+   target/release/pengudroid launch NewPipe_v0.29.1.apk
+   ```
+   `views:`/`surface-trace:` satırları pencereyi, `/tmp/f.ppm` gerçek pikselleri
+   gösterir. PPM'i görmek için P6 başlığını PNG'ye çeviren küçük bir script
+   yeterli (STATUS §12'deki yöntem).
+3. Tıklama: `pengudroid tap <x> <y>` (daemon açık olmalı) veya
+   `PENGUDROID_SYNTH_CLICK="490,286@9000"`.
+4. **Kritik engel:** akışlar canlı yayın → `403` /
+   `BehindLiveWindowException`. İki çıkış yolu:
+   - IME yok (`InputMethodManager: Ignoring showSoftInput() … is not served`),
+     bu yüzden arama alanına yazı girilemiyor → VOD'a UI'dan geçilemiyor.
+     IME/`InputConnection` desteği eklenmesi ya da `EditText.setText` üzerinden
+     arama yapılması gerekir.
+   - Alternatif: oynatılabilir bir akışı doğrudan `PlayerService`'e veren bir
+     debug yolu (`PENGUDROID_INTENT_DATA` altyapısı hazır, `RouterActivity` ise
+     `FetcherService` başlatmadığı için oynatıcıya geçmiyor).
+5. Doğrulama ölçütü: `PENGUDROID_DUMP_FRAME` ile alınan karede video
+   dikdörtgeninde gerçek görüntü (düz arka plan değil) + çökme olmaması.
