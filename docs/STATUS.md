@@ -3,6 +3,113 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
+## Bu oturum (11): `relayoutAsync` — pencere 0×0'ya kilitlenmesinin gerçek nedeni
+
+REA (MCP) + JADX ile **bu sysroot'un kendi `framework.jar`'ı** decompile edildi;
+artık tahmin yok. Ölçülen zincir:
+
+```
+MainActivity -> VideoDetailFragment (oynatıcı açılır)
+  performTraversals -> relayoutWindow
+    LOCAL_LAYOUT açık: çerçeveler yerelde hesaplanır
+    çerçeve değişmediyse  ->  IWindowSession.relayoutAsync   (code 6, oneway)
+    çerçeve değiştiyse    ->  IWindowSession.relayout        (code 5, senkron)
+```
+
+`relayoutAsync` **cevap döndürmez**: pencere yöneticisi sonra `IWindow.resized`
+çağırır. Biz bu çağrıyı hiç yapmıyorduk; üstelik istemci `mMeasuredWidth`'i
+(son ölçülen genişlik) istek boyu olarak gönderdiği için, bir kez 0 ölçülen
+pencere kendini besliyordu: **0 ölçer → 0 çerçeve → 0 ölçer**. Oyuncağın
+`SurfaceView`'ı hiç `mHaveFrame` alamıyordu.
+
+### Ölçüm: Java yığını (bu, "kilit" iddiasını kanıtlayan şey)
+
+`kill -3 <vm-pid>` (52 thread dökümü) ana thread'i şurada yakaladı:
+
+```
+"main" prio=5 tid=1 Native
+  at android.os.BinderProxy.transactNative(Native method)
+  at android.view.IWindowSession$Stub$Proxy.relayoutAsync(IWindowSession.java:1461)
+  at android.view.ViewRootImpl.relayoutWindow(ViewRootImpl.java:8283)
+  at android.view.ViewRootImpl.performTraversals(...)
+  at android.view.Choreographer$FrameDisplayEventReceiver.run(...)
+  at android.os.Looper.loopOnce(...)
+```
+
+Yani ana thread `relayoutAsync`'in içinde kilitliydi ve `mIsInTraversal=true`
+sonsuza kadar kalıyordu; hiçbir traversal ölçüm/çizim yapamıyordu.
+
+### Yapılan düzeltmeler
+
+1. **Kuyruktaki `IWindow.resized` çağrısı artık aynı `BINDER_WRITE_READ` içinde
+   teslim edilmiyor.** Çağrıyı kendi üreten transaction'ın yanıtıyla aynı
+   tampona koymak, istemciyi kendi beklediği yanıtı işleyemez hale getiriyordu.
+   Teslimat yalnızca **saf okuma** (`write_size == 0`) çağrılarında yapılıyor.
+2. **Callback `TF_ONE_WAY` ile gönderiliyor.** `IWindow.resized` AIDL'de
+   `oneway`; senkron gönderince istemci kendi beklediği çağrının içinden
+   `BC_REPLY` yazmaya çalışıyordu.
+3. **Host, pencere yöneticisinin rolünü doğrudan oynuyor**:
+   `PENGUDROID_PUMP_RESIZED=1` ile `ViewRootImpl.dispatchResized(frames, ...)`
+   JNI'den çağrılıyor (binder replay'i bu ağaçta çalışmıyor, aşağıya bak).
+
+Sonuç (ölçüldü): kilit kalktı, traversal çalışıyor, `SurfaceView` **0×0 → 0×405**
+ölçüldü. Yani "hiç layout olmuyor" duvarı aşıldı.
+
+### Binder replay'i neden çalışmıyor (ölçüldü)
+
+`IWindow.resized`'ı emüle edilen binder üzerinden göndermek **her kodda**
+`UNKNOWN_TRANSACTION` dönüyor — `INTERFACE_TRANSACTION` (1598968902) dahil:
+
+```
+INFO : oneway function results for code 1598968902 on binder at 0x… will be
+       dropped but finished with status UNKNOWN_TRANSACTION
+```
+
+`IWindow$Stub.onTransact` decompile edildi; `case 2` gerçekten `resized` ve
+`parcel.enforceNoDataAvail()` ile bitiyor. Yani kod eşlemesi doğru; hedef düğüm
+`ViewRootImpl$W`'nin stub'ına ulaşmıyor. Bu, emülatörün "yerel binder düğümü"
+modelinde açık bir sorun olarak duruyor. Host yolu (`dispatchResized`) bu yüzden
+geçici ama çalışan çözüm.
+
+### Kalan duvar (dürüst)
+
+- `mWinFrame` hâlâ boş kalabiliyor: `relayoutAsync` sırasında `mMeasuredWidth` 0
+  ise yerel çerçeve de 0. İki nudge denendi ve **ikisi de yetmedi**:
+  `mLastLayoutFrame`'i bozarak senkron `relayout` yoluna sokmak (hâlâ 0 kaldı) ve
+  `mMeasuredWidth/mWidth` alanlarını 720/1280 yazıp `dispatchResized` çağırmak
+  (değerler tuttu ama `mWinFrame` boş kaldı ve pompa `mRelayoutSeq`'i sürekli
+  artıran bir geri besleme döngüsü yaptı). Sıradaki adım, bu döngüyü kurmadan
+  **tek seferlik** bir `dispatchResized` + ölçüm sırasını doğru kurmak; ya da
+  binder replay'inin neden stub'a ulaşmadığını çözmek.
+- Oynatıcı hâlâ **akış açamıyor**: NewPipe'ın hata paneli "Error / Retry / Open in
+  browser" gösteriyor ve `MediaCodec` hiç başlamıyor (YouTube tarafı; uygulama
+  düzeyinde bir duvar, uyumluluk katmanı değil). Bu yüzden bu oturumda
+  `SurfaceView`->`BLASTBufferQueue` halkası **hiç tetiklenmedi**; ölçülebilen en
+  ileri nokta `SurfaceView`'ın 0×405 ölçülmesi.
+
+### Bu oturumda eklenen araçlar
+
+| Araç | Ne yapar |
+|---|---|
+| `PENGUDROID_CLICK_TEXT="<metin>[@ms]"` | Görünüm ağacında metni bulup `getGlobalVisibleRect` merkezine dokunur. Koordinat tahmini bitti: akış kaydığında da "3. öğeyi aç" çalışıyor |
+| `PENGUDROID_PROBE_DELAY` | Probe'un kaç ms sonra çalışacağı (oynatıcı ekranı kısa ömürlü) |
+| `PENGUDROID_TRACE_ROOTS=<ms>` | Her pencerenin `mWidth/mWinFrame/mTraversalScheduled/mIsInTraversal` zaman çizgisi |
+| `PENGUDROID_PUMP_RESIZED=1` | Host tarafı `dispatchResized` pompası (deneysel) |
+| `PENGUDROID_RESIZED_CODE`, `PENGUDROID_BINDER_RESIZED` | Binder replay'i için tanı anahtarları |
+| `--dump-class` | Artık **parametre tiplerini** de yazıyor (`resized(ClientWindowFrames, boolean, MergedConfiguration, InsetsState, boolean, boolean, int, int, int)`) |
+| view probe | Her görünüm için `bounds [...] vis=… lp=WxH id=ad` ve `TextView` metni |
+| binder izi | `[+ms]` monotonik zaman damgası; vsync satırları 1/sn'ye seyreltildi |
+
+### REA entegrasyonu (bu makinede)
+
+- `rea-agents@6.7.0` global kurulu; DSH kaydı `~/.dsh/cordis.patch.yml` içinde
+  `rea-mcp` olarak duruyor, araçlar `mcp__rea__*`.
+- JADX sağlayıcısı açıldı: `REA_JADX_MCP_JAR=~/.local/share/rea/jadx-headless-mcp-0.7.1-all.jar`.
+- `framework.jar` JADX'e "APK" olarak veriliyor (`cp framework.jar /tmp/framework.apk`);
+  `inspect_android_method` ile `ViewRootImpl.relayoutWindow`,
+  `SurfaceView.updateSurface`, `IWindow$Stub.onTransact` okundu.
+- Derin native analiz (Ghidra/Hopper) hâlâ yok.
+
 ## Bu oturum (10): video yüzeyinin kök nedeni ölçüldü — ikinci pencerenin `mWinFrame`'i boş
 
 NewPipe'ın gerçek oynatıcı ekranına (canlı listesinden bir öğeye tıklayarak)

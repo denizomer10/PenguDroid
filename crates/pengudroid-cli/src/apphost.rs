@@ -872,6 +872,76 @@ fn surface_dimension(var: &str, default: i32) -> i32 {
         .unwrap_or(default)
 }
 
+/// Milliseconds on `CLOCK_MONOTONIC`, the same clock the binder trace stamps its
+/// lines with. Probe output and relayout traces come from one process, so this
+/// is what makes "which came first" answerable from a log.
+fn monotonic_ms() -> u128 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `ts` is a valid `timespec`.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u128 * 1000 + ts.tv_nsec as u128 / 1_000_000
+}
+
+/// Print the fields of a `SurfaceView` that decide whether the video layer
+/// exists at all.
+///
+/// `SurfaceView` only creates its `BLASTBufferQueue` once it has a frame
+/// (`mHaveFrame`), is visible, and its `ViewRootImpl` has a valid surface; it
+/// bails silently otherwise, so these fields are the only way to tell *which*
+/// precondition is missing.
+fn dump_surface_fields(env: &JniEnv, view: JObject, class: JClass) {
+    if class.is_null() {
+        return;
+    }
+    for (field, sig) in [
+        ("mHaveFrame", "Z"),
+        ("mSurfaceControl", "Landroid/view/SurfaceControl;"),
+        ("mBlastBufferQueue", "Landroid/graphics/BLASTBufferQueue;"),
+        ("mSurface", "Landroid/view/Surface;"),
+        ("mSurfaceCreated", "Z"),
+        ("mVisible", "Z"),
+        ("mRequestedVisible", "Z"),
+        ("mSurfaceWidth", "I"),
+        ("mSurfaceHeight", "I"),
+        ("mFormat", "I"),
+    ] {
+        let Some(id) = env.field_id(class, field, sig) else {
+            continue;
+        };
+        let value = match sig {
+            "Z" => format!("{}", env.boolean_field(view, id)),
+            "I" => format!("{}", env.int_field(view, id)),
+            _ => {
+                let o = env.object_field(view, id);
+                if o.is_null() {
+                    "null".to_string()
+                } else if field == "mSurface" {
+                    // The native pointer is the only thing that says *which*
+                    // surface the app will hand the decoder.
+                    let native = env
+                        .find_class("android/view/Surface")
+                        .and_then(|c| env.field_id(c, "mNativeObject", "J"))
+                        .map(|f| env.long_field(o, f))
+                        .unwrap_or(-1);
+                    format!("set (native={native:#x})")
+                } else {
+                    "set".to_string()
+                }
+            }
+        };
+        println!("views:   {field} = {value}");
+    }
+    let w = env
+        .method_id(class, "getWidth", "()I")
+        .and_then(|m| env.call_int(view, m, &[]))
+        .unwrap_or(-1);
+    let h = env
+        .method_id(class, "getHeight", "()I")
+        .and_then(|m| env.call_int(view, m, &[]))
+        .unwrap_or(-1);
+    println!("views:   size = {w}x{h}");
+}
+
 /// Print the `SurfaceView` fields that decide whether the video layer exists,
 /// once per call.
 ///
@@ -986,13 +1056,28 @@ fn trace_surface_views(env: &JniEnv) {
                 native_of("mSurface") as usize
             );
         }
-        let Some(own_count) = env.method_id(class, "getChildCount", "()I") else {
+        // `getChildCount` must not be looked up on the object's own class: a
+        // `SurfaceView` is not a `ViewGroup`, and the failed lookup leaves a
+        // pending `NoSuchMethodError` behind, after which every JNI call on this
+        // thread silently returns null. `Class.isInstance` is the safe test.
+        let Some(view_group) = env.find_class("android/view/ViewGroup") else {
             return;
         };
-        let count = env.call_int(view, own_count, &[]).unwrap_or(0);
-        let Some(get_child) = env.method_id(class, "getChildAt", "(I)Landroid/view/View;") else {
+        let is_group = env
+            .find_class("java/lang/Class")
+            .and_then(|c| env.method_id(c, "isInstance", "(Ljava/lang/Object;)Z"))
+            .map(|m| env.call_boolean(view_group, m, &[JValue { l: view }]) == Some(true))
+            .unwrap_or(false);
+        if !is_group {
+            return;
+        }
+        let (Some(count_m), Some(get_child)) = (
+            env.method_id(view_group, "getChildCount", "()I"),
+            env.method_id(view_group, "getChildAt", "(I)Landroid/view/View;"),
+        ) else {
             return;
         };
+        let count = env.call_int(view, count_m, &[]).unwrap_or(0);
         for i in 0..count {
             if let Some(child) = env.call_object(view, get_child, &[JValue { i }]) {
                 walk(env, child, depth + 1, get_class, get_name);
@@ -1095,6 +1180,116 @@ fn report_surface_views(env: &JniEnv) {
         // needed (and `FindClass` would not see app classes anyway).
         let class = env.call_object(view, get_class, &[]).unwrap_or(std::ptr::null_mut());
         println!("views: {:width$}{name}", "", width = depth * 2);
+        // Print a `TextView`'s text. A view tree only says *which* screen is
+        // up; its text is what says *why* (an error dialog's message, the
+        // player's state line). Without it a failure is just "a dialog".
+        if !class.is_null() {
+            if let Some(text_view) = env.find_class("android/widget/TextView") {
+                let is_text_view = env
+                    .find_class("java/lang/Class")
+                    .and_then(|c| env.method_id(c, "isInstance", "(Ljava/lang/Object;)Z"))
+                    .map(|m| env.call_boolean(text_view, m, &[JValue { l: view }]) == Some(true))
+                    .unwrap_or(false);
+                if is_text_view {
+                    let text = env
+                        .method_id(class, "getText", "()Ljava/lang/CharSequence;")
+                        .and_then(|m| env.call_object(view, m, &[]))
+                        .filter(|t| !t.is_null())
+                        .and_then(|t| {
+                            let tc = env.call_object(t, get_class, &[])?;
+                            let to_string =
+                                env.method_id(tc, "toString", "()Ljava/lang/String;")?;
+                            env.call_object(t, to_string, &[])
+                                .and_then(|s| env.get_string(s))
+                        })
+                        .unwrap_or_default();
+                    let text = text.replace('\n', " ");
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        let shown: String = text.chars().take(160).collect();
+                        println!("views: {:width$}text: {shown}", "", width = (depth + 1) * 2);
+                    }
+                }
+            }
+        }
+        // Where the view actually sits. This matters twice: a synthetic tap is
+        // a guess without it (the dialog window is real but its content is drawn
+        // from an offset, so display coordinates and window coordinates are not
+        // the same thing), and a `SurfaceView` that measures 0 is only
+        // explainable by looking at its parents.
+        {
+            let view_class = env.find_class("android/view/View").unwrap_or(std::ptr::null_mut());
+            let read = |method: &str, sig: &str| -> i32 {
+                if view_class.is_null() {
+                    return -1;
+                }
+                env.method_id(view_class, method, sig)
+                    .and_then(|m| env.call_int(view, m, &[]))
+                    .unwrap_or(-1)
+            };
+            let indent = (depth + 1) * 2;
+            // The view id names the widget (`exo_content_frame`, `exo_shutter`,
+            // `player_view`, ...) which is the difference between "a container
+            // that is legitimately empty" and "the video surface's parent".
+            let id = read("getId", "()I");
+            let mut id_name = String::new();
+            if id > 0 {
+                let resources = env
+                    .method_id(view_class, "getResources", "()Landroid/content/res/Resources;")
+                    .and_then(|m| env.call_object(view, m, &[]))
+                    .filter(|r| !r.is_null());
+                if let (Some(resources), Some(res_class)) =
+                    (resources, env.find_class("android/content/res/Resources"))
+                {
+                    if let Some(name) = env
+                        .method_id(res_class, "getResourceName", "(I)Ljava/lang/String;")
+                        .and_then(|m| env.call_object(resources, m, &[JValue { i: id }]))
+                        .and_then(|s| env.get_string(s))
+                    {
+                        id_name = format!(" ({name})");
+                    }
+                    // An unknown id throws `NotFoundException`; leaving it
+                    // pending would make every later JNI call on this thread
+                    // return null.
+                    env.describe_exception();
+                }
+            }
+            // The declared layout size explains a 0×0 measurement: a
+            // `wrap_content` parent with a 0×0 child collapses, and no amount of
+            // forcing the child's requested size helps until the container is
+            // given a size. `-1` is MATCH_PARENT, `-2` WRAP_CONTENT.
+            let lp = env
+                .method_id(
+                    view_class,
+                    "getLayoutParams",
+                    "()Landroid/view/ViewGroup$LayoutParams;",
+                )
+                .and_then(|m| env.call_object(view, m, &[]))
+                .filter(|o| !o.is_null());
+            let (mut lp_w, mut lp_h) = (-999, -999);
+            if let Some(lp) = lp {
+                if let Some(lp_class) = env.find_class("android/view/ViewGroup$LayoutParams") {
+                    if let Some(f) = env.field_id(lp_class, "width", "I") {
+                        lp_w = env.int_field(lp, f);
+                    }
+                    if let Some(f) = env.field_id(lp_class, "height", "I") {
+                        lp_h = env.int_field(lp, f);
+                    }
+                }
+            }
+            println!(
+                "views: {:indent$}bounds [{},{}] {}x{} vis={} lp={}x{}{}",
+                "",
+                read("getLeft", "()I"),
+                read("getTop", "()I"),
+                read("getWidth", "()I"),
+                read("getHeight", "()I"),
+                read("getVisibility", "()I"),
+                lp_w,
+                lp_h,
+                if id > 0 { format!(" id={id:#x}{id_name}") } else { String::new() },
+            );
+        }
         if name.contains("SurfaceView") || name.contains("TextureView") {
             // A `SurfaceView` that measured 0 wide never sets `mHaveFrame`, so
             // `updateSurface()` returns immediately and neither the
@@ -1185,6 +1380,36 @@ fn report_surface_views(env: &JniEnv) {
                         if let Some(f) = env.field_id(vri_class, "mLayoutRequested", "Z") {
                             env.set_boolean_field(vri, f, true);
                         }
+                        // `relayoutWindow` compares the frames it computed
+                        // locally against `mLastLayoutFrame` and takes the
+                        // *asynchronous* path when they are equal — one-way, so
+                        // the window manager has to call back `IWindow.resized`.
+                        // Making the remembered frame differ forces the
+                        // synchronous `relayout` on the next traversal, whose
+                        // reply this broker already answers correctly.
+                        if let Some(f) =
+                            env.field_id(vri_class, "mLastLayoutFrame", "Landroid/graphics/Rect;")
+                        {
+                            let rect = env.object_field(vri, f);
+                            if !rect.is_null() {
+                                if let Some(rect_class) = env.find_class("android/graphics/Rect") {
+                                    if let Some(set) =
+                                        env.method_id(rect_class, "set", "(IIII)V")
+                                    {
+                                        env.call_void(
+                                            rect,
+                                            set,
+                                            &[
+                                                JValue { i: -1 },
+                                                JValue { i: -1 },
+                                                JValue { i: 0 },
+                                                JValue { i: 0 },
+                                            ],
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         let m = env.method_id(vri_class, "scheduleTraversals", "()V")?;
                         env.call_void(vri, m, &[]).then_some(())
                     })
@@ -1204,64 +1429,18 @@ fn report_surface_views(env: &JniEnv) {
                     println!(
                         "views:   requested {w}x{h} (traversal: {scheduled}, postInvalidate: {invalidated})"
                     );
-                    // Stop here: the main thread is about to traverse, and
-                    // walking the tree while it does was measured to SIGSEGV.
+                    // Read the state *now*: the next traversal runs on the main
+                    // thread, and walking the tree while it does was measured to
+                    // SIGSEGV. Reading fields is safe.
+                    dump_surface_fields(env, view, class);
+                    // Stop here: the main thread is about to traverse.
                     *done = true;
                     return;
                 } else {
                     eprintln!("views:   mRequestedWidth not found");
                 }
             }
-            for (field, sig) in [
-                ("mHaveFrame", "Z"),
-                ("mSurfaceControl", "Landroid/view/SurfaceControl;"),
-                ("mBlastBufferQueue", "Landroid/graphics/BLASTBufferQueue;"),
-                ("mSurface", "Landroid/view/Surface;"),
-                ("mSurfaceCreated", "Z"),
-                ("mVisible", "Z"),
-                ("mRequestedVisible", "Z"),
-                ("mSurfaceWidth", "I"),
-                ("mSurfaceHeight", "I"),
-                ("mFormat", "I"),
-            ] {
-                if class.is_null() {
-                    continue;
-                }
-                let Some(id) = env.field_id(class, field, sig) else {
-                    continue;
-                };
-                let value = match sig {
-                    "Z" => format!("{}", env.boolean_field(view, id)),
-                    "I" => format!("{}", env.int_field(view, id)),
-                    _ => {
-                        let o = env.object_field(view, id);
-                        if o.is_null() {
-                            "null".to_string()
-                        } else if field == "mSurface" {
-                            // The native pointer is the only thing that says
-                            // *which* surface the app will hand the decoder.
-                            let native = env
-                                .find_class("android/view/Surface")
-                                .and_then(|c| env.field_id(c, "mNativeObject", "J"))
-                                .map(|f| env.long_field(o, f))
-                                .unwrap_or(-1);
-                            format!("set (native={native:#x})")
-                        } else {
-                            "set".to_string()
-                        }
-                    }
-                };
-                println!("views:   {field} = {value}");
-            }
-            let w = env
-                .method_id(class, "getWidth", "()I")
-                .and_then(|m| env.call_int(view, m, &[]))
-                .unwrap_or(-1);
-            let h = env
-                .method_id(class, "getHeight", "()I")
-                .and_then(|m| env.call_int(view, m, &[]))
-                .unwrap_or(-1);
-            println!("views:   size = {w}x{h}");
+            dump_surface_fields(env, view, class);
         }
         // `ViewGroup.getChildCount` must not be invoked on a plain `View`: JNI
         // does not check the receiver's class and ART faults on the mismatch.
@@ -1285,7 +1464,10 @@ fn report_surface_views(env: &JniEnv) {
     }
 
     let root_count = env.call_int(roots, size_m, &[]).unwrap_or(0);
-    println!("views: {root_count} window root(s)");
+    println!(
+        "views: {root_count} window root(s) at +{} ms",
+        monotonic_ms()
+    );
     for i in 0..root_count {
         // A failed reflective lookup leaves an exception pending, and every JNI
         // call after that silently returns null — which is exactly how a walk
@@ -1371,6 +1553,407 @@ fn dump_root_state(env: &JniEnv, root: JObject, index: i32) {
         }
     }
     println!("views: root {index} {}", parts.join(" "));
+}
+
+/// Tap the centre of the first `TextView` whose text contains `needle`.
+///
+/// Blind coordinates are fragile: a feed scrolls, rows move when more items load,
+/// and a dialog can eat the first tap. Finding the view by its text and using its
+/// *global* rectangle makes a navigation step deterministic — the "click item N"
+/// problem stops depending on how many rows the server returned.
+fn click_text(env: &JniEnv, needle: &str, inject: &dyn Fn(i32, f32, f32, i64)) -> bool {
+    let Some(wmg_class) = env.find_class("android/view/WindowManagerGlobal") else {
+        return false;
+    };
+    let (Some(get_instance), Some(roots_field)) = (
+        env.static_method_id(wmg_class, "getInstance", "()Landroid/view/WindowManagerGlobal;"),
+        env.field_id(wmg_class, "mViews", "Ljava/util/ArrayList;"),
+    ) else {
+        return false;
+    };
+    let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else {
+        return false;
+    };
+    let roots = env.object_field(wmg, roots_field);
+    if roots.is_null() {
+        return false;
+    }
+    let Some(list_class) = env.find_class("java/util/ArrayList") else {
+        return false;
+    };
+    let (Some(size_m), Some(get_m)) = (
+        env.method_id(list_class, "size", "()I"),
+        env.method_id(list_class, "get", "(I)Ljava/lang/Object;"),
+    ) else {
+        return false;
+    };
+    let Some(view_class) = env.find_class("android/view/View") else {
+        return false;
+    };
+    let Some(get_class) = env.method_id(view_class, "getClass", "()Ljava/lang/Class;") else {
+        return false;
+    };
+    let Some(class_class) = env.find_class("java/lang/Class") else {
+        return false;
+    };
+    let (Some(get_name), Some(is_instance)) = (
+        env.method_id(class_class, "getName", "()Ljava/lang/String;"),
+        env.method_id(class_class, "isInstance", "(Ljava/lang/Object;)Z"),
+    ) else {
+        return false;
+    };
+    let Some(text_view) = env.find_class("android/widget/TextView") else {
+        return false;
+    };
+    let Some(view_group) = env.find_class("android/view/ViewGroup") else {
+        return false;
+    };
+    let (Some(get_text), Some(global_rect)) = (
+        env.method_id(text_view, "getText", "()Ljava/lang/CharSequence;"),
+        env.method_id(view_class, "getGlobalVisibleRect", "(Landroid/graphics/Rect;)Z"),
+    ) else {
+        return false;
+    };
+    let Some(rect_class) = env.find_class("android/graphics/Rect") else {
+        return false;
+    };
+    let Some(rect_ctor) = env.method_id(rect_class, "<init>", "()V") else {
+        return false;
+    };
+    let Some(clock_class) = env.find_class("android/os/SystemClock") else {
+        return false;
+    };
+    let Some(uptime) = env.static_method_id(clock_class, "uptimeMillis", "()J") else {
+        return false;
+    };
+
+    // Returns the global rect of the first matching `TextView`, or `None`.
+    fn find(
+        env: &JniEnv,
+        view: JObject,
+        needle: &str,
+        depth: usize,
+        text_view: JClass,
+        view_group: JClass,
+        view_class: JClass,
+        get_class: JMethodId,
+        get_name: JMethodId,
+        is_instance: JMethodId,
+        get_text: JMethodId,
+        global_rect: JMethodId,
+        rect_class: JClass,
+        rect_ctor: JMethodId,
+    ) -> Option<(i32, i32, i32, i32)> {
+        if view.is_null() || depth > 24 {
+            return None;
+        }
+        env.describe_exception();
+        let class = env.call_object(view, get_class, &[]).unwrap_or(std::ptr::null_mut());
+        if class.is_null() {
+            return None;
+        }
+        if env.call_boolean(text_view, is_instance, &[JValue { l: view }]) == Some(true) {
+            let text = env
+                .call_object(view, get_text, &[])
+                .filter(|t| !t.is_null())
+                .and_then(|t| {
+                    let tc = env.call_object(t, get_class, &[])?;
+                    let to_string = env.method_id(tc, "toString", "()Ljava/lang/String;")?;
+                    env.call_object(t, to_string, &[]).and_then(|s| env.get_string(s))
+                })
+                .unwrap_or_default();
+            if text.contains(needle) {
+                // `getGlobalVisibleRect` clips to the visible part, which is
+                // exactly what a tap can reach.
+                if let Some(rect) = env.new_object(rect_class, rect_ctor, &[]) {
+                    if env.call_boolean(view, global_rect, &[JValue { l: rect }]) == Some(true) {
+                        let read = |name: &str| {
+                            env.field_id(rect_class, name, "I")
+                                .map(|f| env.int_field(rect, f))
+                                .unwrap_or(0)
+                        };
+                        return Some((read("left"), read("top"), read("right"), read("bottom")));
+                    }
+                }
+            }
+        }
+        if env.call_boolean(view_group, is_instance, &[JValue { l: view }]) != Some(true) {
+            return None;
+        }
+        let (Some(count_m), Some(get_child)) = (
+            env.method_id(view_group, "getChildCount", "()I"),
+            env.method_id(view_group, "getChildAt", "(I)Landroid/view/View;"),
+        ) else {
+            return None;
+        };
+        let count = env.call_int(view, count_m, &[]).unwrap_or(0);
+        for i in 0..count {
+            if let Some(child) = env.call_object(view, get_child, &[JValue { i }]) {
+                if let Some(found) = find(
+                    env, child, needle, depth + 1, text_view, view_group, view_class, get_class,
+                    get_name, is_instance, get_text, global_rect, rect_class, rect_ctor,
+                ) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    let count = env.call_int(roots, size_m, &[]).unwrap_or(0);
+    for i in 0..count {
+        let Some(root) = env.call_object(roots, get_m, &[JValue { i }]) else {
+            continue;
+        };
+        if let Some((left, top, right, bottom)) = find(
+            env, root, needle, 0, text_view, view_group, view_class, get_class, get_name,
+            is_instance, get_text, global_rect, rect_class, rect_ctor,
+        ) {
+            let x = (left + right) as f32 / 2.0;
+            let y = (top + bottom) as f32 / 2.0;
+            let now = env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
+            inject(0, x, y, now); // ACTION_DOWN
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            inject(1, x, y, now); // ACTION_UP
+            println!(
+                "apphost: click-text {:?} at {x},{y} (rect {left},{top}-{right},{bottom})"
+                , needle
+            );
+            return true;
+        }
+    }
+    false
+}
+
+/// `PENGUDROID_PUMP_RESIZED=1`: run the window-manager `resized` pump on its own
+/// thread.
+///
+/// It cannot live in the input-pump loop: that loop is entered only after the
+/// probe's sleeps, so a window that collapses while the player opens would stay
+/// collapsed through the whole probe window. A separate thread also keeps the
+/// pump running while the main thread is inside a traversal it is waiting on.
+fn spawn_resized_pump(env: &JniEnv) {
+    if std::env::var_os("PENGUDROID_PUMP_RESIZED").is_none() {
+        return;
+    }
+    let Some(vm) = env.get_java_vm() else { return };
+    let vm_addr = vm as usize;
+    std::thread::spawn(move || {
+        let vm = vm_addr as *mut c_void;
+        let Some(env) = attach_current_thread(vm) else {
+            return;
+        };
+        let mut seen: std::collections::HashMap<usize, i32> =
+            std::collections::HashMap::new();
+        loop {
+            pump_resized(&env, &mut seen);
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    });
+}
+
+/// `PENGUDROID_PUMP_RESIZED=1`: play the window manager's `IWindow.resized`.
+///
+/// An Android 13 window takes the `relayoutAsync` path whenever the frames it
+/// computed locally did not change. The window manager is then supposed to call
+/// `IWindow.resized` with the final frames; without it the client's
+/// `mRelayoutSeq` moves on and the window keeps whatever `mWinFrame` it computed
+/// from its *last measured size*. When that size is 0 the window is stuck: 0
+/// measures to 0, which relayouts to a 0 frame, which measures to 0.
+///
+/// Replaying the callback through the emulated binder does not work in this
+/// tree (the app's `IWindow.Stub.onTransact` answers `UNKNOWN_TRANSACTION`), so
+/// the host plays the window manager directly: whenever `mRelayoutSeq` moves, it
+/// calls `ViewRootImpl.dispatchResized` with the real surface frames. That is the
+/// same nudge `force_window_frame` makes, through the framework's own entry point
+/// and therefore on the main thread's message queue.
+fn pump_resized(env: &JniEnv, seen: &mut std::collections::HashMap<usize, i32>) {
+    let Some(wmg_class) = env.find_class("android/view/WindowManagerGlobal") else {
+        return;
+    };
+    let (Some(get_instance), Some(views_field)) = (
+        env.static_method_id(wmg_class, "getInstance", "()Landroid/view/WindowManagerGlobal;"),
+        env.field_id(wmg_class, "mViews", "Ljava/util/ArrayList;"),
+    ) else {
+        return;
+    };
+    let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else {
+        return;
+    };
+    let views = env.object_field(wmg, views_field);
+    if views.is_null() {
+        return;
+    }
+    let Some(list_class) = env.find_class("java/util/ArrayList") else {
+        return;
+    };
+    let (Some(size_m), Some(get_m)) = (
+        env.method_id(list_class, "size", "()I"),
+        env.method_id(list_class, "get", "(I)Ljava/lang/Object;"),
+    ) else {
+        return;
+    };
+    let Some(view_class) = env.find_class("android/view/View") else {
+        return;
+    };
+    let Some(get_root) = env.method_id(view_class, "getViewRootImpl", "()Landroid/view/ViewRootImpl;")
+    else {
+        return;
+    };
+    let Some(vri_class) = env.find_class("android/view/ViewRootImpl") else {
+        return;
+    };
+    let Some(seq_field) = env.field_id(vri_class, "mRelayoutSeq", "I") else {
+        return;
+    };
+    let Some(merged_field) = env.field_id(
+        vri_class,
+        "mLastReportedMergedConfiguration",
+        "Landroid/util/MergedConfiguration;",
+    ) else {
+        return;
+    };
+    let Some(dispatch) = env.method_id(
+        vri_class,
+        "dispatchResized",
+        "(Landroid/window/ClientWindowFrames;ZLandroid/util/MergedConfiguration;Landroid/view/InsetsState;ZZIII)V",
+    ) else {
+        eprintln!("apphost: resized pump: ViewRootImpl.dispatchResized not found");
+        return;
+    };
+    let count = env.call_int(views, size_m, &[]).unwrap_or(0);
+    for index in 0..count {
+        env.describe_exception();
+        let Some(view) = env.call_object(views, get_m, &[JValue { i: index as i32 }]) else {
+            continue;
+        };
+        if view.is_null() {
+            continue;
+        }
+        let Some(root) = env.call_object(view, get_root, &[]) else {
+            continue;
+        };
+        if root.is_null() {
+            continue;
+        }
+        let seq = env.int_field(root, seq_field);
+        let previous = seen.insert(index as usize, seq);
+        if previous == Some(seq) {
+            continue;
+        }
+        // A window at width 0 is self-sustaining: `relayoutWindow` sends
+        // `mMeasuredWidth` as the requested size, the local frames come back 0,
+        // and the next measure is 0 again. Give the traversal the real size to
+        // measure with, then hand it the frames the window manager would.
+        if env
+            .field_id(vri_class, "mWidth", "I")
+            .map(|f| env.int_field(root, f))
+            .unwrap_or(0)
+            > 0
+        {
+            continue;
+        }
+        for (field, value) in [
+            ("mMeasuredWidth", SURFACE_W),
+            ("mMeasuredHeight", SURFACE_H),
+            ("mWidth", SURFACE_W),
+            ("mHeight", SURFACE_H),
+        ] {
+            if let Some(f) = env.field_id(vri_class, field, "I") {
+                env.set_int_field(root, f, value);
+            }
+        }
+        let Some(frames) = build_client_window_frames(env) else {
+            continue;
+        };
+        let merged = env.object_field(root, merged_field);
+        let insets = new_instance(env, "android/view/InsetsState")
+            .map(|(_, obj)| obj)
+            .unwrap_or(std::ptr::null_mut());
+        let ok = env.call_void(
+            root,
+            dispatch,
+            &[
+                JValue { l: frames },
+                JValue { z: 1 }, // reportDraw
+                JValue { l: merged },
+                JValue { l: insets },
+                JValue { z: 1 }, // forceLayout
+                JValue { z: 0 }, // alwaysConsumeSystemBars
+                JValue { i: 0 }, // displayId
+                JValue { i: 0 }, // syncSeqId
+                JValue { i: 0 }, // syncInputSeqId
+            ],
+        );
+        println!(
+            "apphost: dispatchResized root {index} seq={seq} ok={ok} at +{} ms",
+            monotonic_ms()
+        );
+    }
+}
+
+/// `PENGUDROID_TRACE_ROOTS=<ms>`: a timeline of the window roots.
+///
+/// The one-shot probe says where the state *ended up*; a timeline says *when* it
+/// changed, which is what separates "the reply never landed" from "the frame was
+/// reset afterwards". It runs on the input-pump thread and only reads fields, so
+/// it does not race the main thread's layout the way calling `layout()` did.
+fn trace_roots(env: &JniEnv) {
+    let Some(wmg_class) = env.find_class("android/view/WindowManagerGlobal") else {
+        return;
+    };
+    let (Some(get_instance), Some(roots_field)) = (
+        env.static_method_id(wmg_class, "getInstance", "()Landroid/view/WindowManagerGlobal;"),
+        // `mViews` holds the decor views (one per window); `mRoots` holds the
+        // `ViewRootImpl`s. The state lives on the `ViewRootImpl`, and the decor
+        // view reaches it through `getViewRootImpl()`.
+        env.field_id(wmg_class, "mViews", "Ljava/util/ArrayList;"),
+    ) else {
+        return;
+    };
+    let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else {
+        return;
+    };
+    let roots = env.object_field(wmg, roots_field);
+    if roots.is_null() {
+        return;
+    }
+    let Some(list_class) = env.find_class("java/util/ArrayList") else {
+        return;
+    };
+    let (Some(size_m), Some(get_m)) = (
+        env.method_id(list_class, "size", "()I"),
+        env.method_id(list_class, "get", "(I)Ljava/lang/Object;"),
+    ) else {
+        return;
+    };
+    let count = env.call_int(roots, size_m, &[]).unwrap_or(0);
+    // The identity of the decor view is what tells "the same window lost its
+    // frame" apart from "a different window replaced it".
+    let identity = {
+        let system = env.find_class("java/lang/System");
+        let method = system.and_then(|c| {
+            env.static_method_id(c, "identityHashCode", "(Ljava/lang/Object;)I")
+        });
+        match (system, method) {
+            (Some(class), Some(method)) => env
+                .call_object(roots, get_m, &[JValue { i: 0 }])
+                .filter(|view| !view.is_null())
+                .and_then(|view| env.call_static_int(class, method, &[JValue { l: view }]))
+                .unwrap_or(0),
+            _ => 0,
+        }
+    };
+    println!(
+        "roots: {count} at +{} ms (view0={identity:#x})",
+        monotonic_ms()
+    );
+    for i in 0..count {
+        env.describe_exception();
+        if let Some(root) = env.call_object(roots, get_m, &[JValue { i }]) {
+            dump_root_state(env, root, i);
+        }
+    }
 }
 
 /// Turn on the app's "use `TextureView` for video" preference.
@@ -2194,6 +2777,7 @@ pub fn loop_forever(env: &JniEnv) {
     spawn_draw_monitor(env);
     spawn_input_pump(env);
     spawn_service_host(env);
+    spawn_resized_pump(env);
     let Some(looper_class) = env.find_class("android/os/Looper") else {
         return;
     };
@@ -3076,6 +3660,7 @@ fn spawn_input_pump(env: &JniEnv) {
         if !spec.is_empty()
             || std::env::var_os("PENGUDROID_PROBE_VIEWS").is_some()
             || std::env::var_os("PENGUDROID_FORCE_SURFACE").is_some()
+            || std::env::var_os("PENGUDROID_CLICK_TEXT").is_some()
         {
             let mut taps: Vec<(f32, f32, u64)> = Vec::new();
             for item in spec.split(';') {
@@ -3094,14 +3679,45 @@ fn spawn_input_pump(env: &JniEnv) {
                 inject(ACTION_DOWN, *x, *y, now);
                 std::thread::sleep(std::time::Duration::from_millis(80));
                 inject(ACTION_UP, *x, *y, now);
-                println!("apphost: synthetic click {step} at {x},{y} injected");
+                println!(
+                    "apphost: synthetic click {step} at {x},{y} injected at +{} ms",
+                    monotonic_ms()
+                );
+            }
+            // `PENGUDROID_CLICK_TEXT=<substring>[@delayMs]`: click a widget by its
+            // text instead of by guessed coordinates. This is what makes "open the
+            // third feed item" reproducible when the feed's contents change.
+            if let Ok(spec) = std::env::var("PENGUDROID_CLICK_TEXT") {
+                let (needle, delay) = match spec.split_once('@') {
+                    Some((n, d)) => (n, d.trim().parse::<u64>().unwrap_or(3000)),
+                    None => (spec.as_str(), 3000),
+                };
+                if !needle.trim().is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                    let clicked = click_text(&env, needle.trim(), &inject);
+                    println!(
+                        "apphost: click-text {:?} injected at +{} ms",
+                        needle.trim(),
+                        monotonic_ms()
+                    );
+                    if !clicked {
+                        println!("apphost: click-text {:?} found no match", needle.trim());
+                    }
+                }
             }
             // The probe runs even without a tap, so a baseline ("how many
             // windows exist with no interaction at all") is obtainable.
             if std::env::var_os("PENGUDROID_PROBE_VIEWS").is_some()
                 || std::env::var_os("PENGUDROID_FORCE_SURFACE").is_some()
             {
-                std::thread::sleep(std::time::Duration::from_secs(12));
+                // A playing stream can die within a few seconds, so the wait is
+                // adjustable: 12 s is right for a static screen, 2–3 s is what a
+                // live player leaves you.
+                let delay = std::env::var("PENGUDROID_PROBE_DELAY")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(12_000);
+                std::thread::sleep(std::time::Duration::from_millis(delay));
                 report_surface_views(&env);
                 // The forced size only takes effect on the *next* traversal,
                 // which runs on the main thread. A second pass a few seconds
@@ -3113,7 +3729,22 @@ fn spawn_input_pump(env: &JniEnv) {
         }
 
         let mut last_trace = std::time::Instant::now();
+        // `PENGUDROID_TRACE_ROOTS=<ms>`: a timeline of the window roots. The
+        // single probe pass only says where the state ended up; this says *when*
+        // it changed, which is what separates "the reply never landed" from
+        // "the frame was reset afterwards".
+        let root_trace_ms = std::env::var("PENGUDROID_TRACE_ROOTS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0);
+        let mut last_roots = std::time::Instant::now();
         loop {
+            if let Some(ms) = root_trace_ms {
+                if last_roots.elapsed().as_millis() >= ms as u128 {
+                    last_roots = std::time::Instant::now();
+                    trace_roots(&env);
+                }
+            }
             if std::env::var_os("PENGUDROID_TRACE_SURFACE").is_some()
                 && last_trace.elapsed() >= std::time::Duration::from_secs(2)
             {
@@ -4619,6 +5250,7 @@ fn install_window_replies(env: &JniEnv) {
         unsafe { f(size) };
     }
     install_relayout_frames_reply(env);
+    install_resized_payload(env);
 }
 
 /// Build the `ClientWindowFrames` half of the `relayout` reply.
@@ -4634,46 +5266,9 @@ fn install_window_replies(env: &JniEnv) {
 /// and a 0x0 frame makes every view measure to nothing and `performDraw` find
 /// an empty dirty region, so nothing is ever rendered.
 fn install_relayout_frames_reply(env: &JniEnv) {
-    let Some(rect_class) = env.find_class("android/graphics/Rect") else {
+    let Some(frames) = build_client_window_frames(env) else {
         return;
     };
-    let Some(frames_class) = env.find_class("android/window/ClientWindowFrames") else {
-        eprintln!("apphost: ClientWindowFrames not found");
-        return;
-    };
-    let Some(ctor) = env.method_id(frames_class, "<init>", "()V") else {
-        return;
-    };
-    let Some(frames) = env.new_object(frames_class, ctor, &[]) else {
-        return;
-    };
-    // `Rect(int left, int top, int right, int bottom)`.
-    let Some(rect_ctor) = env.method_id(rect_class, "<init>", "(IIII)V") else {
-        return;
-    };
-    for name in ["frame", "displayFrame", "parentFrame", "attachedFrame"] {
-        let Some(f) = env.field_id(frames_class, name, "Landroid/graphics/Rect;") else {
-            eprintln!("apphost: ClientWindowFrames.{name} not found");
-            return;
-        };
-        let Some(rect) = env.new_object(
-            rect_class,
-            rect_ctor,
-            &[
-                JValue { i: 0 },
-                JValue { i: 0 },
-                JValue { i: 720 },
-                JValue { i: 1280 },
-            ],
-        ) else {
-            return;
-        };
-        env.set_object_field(frames, f, rect);
-    }
-    if let Some(f) = env.field_id(frames_class, "compatScale", "F") {
-        env.set_float_field(frames, f, 1.0);
-    }
-
     let Some(parcel_class) = env.find_class("android/os/Parcel") else {
         return;
     };
@@ -4720,6 +5315,127 @@ fn install_relayout_frames_reply(env: &JniEnv) {
             words.join(", ")
         );
         install_reply(&data, "__pengudroid_binder_set_relayout_frames");
+    }
+}
+
+/// Build the `ClientWindowFrames` the window manager reports for a window.
+fn build_client_window_frames(env: &JniEnv) -> Option<JObject> {
+    let rect_class = env.find_class("android/graphics/Rect")?;
+    let frames_class = env.find_class("android/window/ClientWindowFrames")?;
+    let ctor = env.method_id(frames_class, "<init>", "()V")?;
+    let frames = env.new_object(frames_class, ctor, &[])?;
+    // `Rect(int left, int top, int right, int bottom)`.
+    let rect_ctor = env.method_id(rect_class, "<init>", "(IIII)V")?;
+    for name in ["frame", "displayFrame", "parentFrame", "attachedFrame"] {
+        let f = env.field_id(frames_class, name, "Landroid/graphics/Rect;")?;
+        let rect = env.new_object(
+            rect_class,
+            rect_ctor,
+            &[
+                JValue { i: 0 },
+                JValue { i: 0 },
+                JValue { i: SURFACE_W },
+                JValue { i: SURFACE_H },
+            ],
+        )?;
+        env.set_object_field(frames, f, rect);
+    }
+    if let Some(f) = env.field_id(frames_class, "compatScale", "F") {
+        env.set_float_field(frames, f, 1.0);
+    }
+    Some(frames)
+}
+
+/// Install the body of `IWindow.resized`, the callback that answers
+/// `IWindowSession.relayoutAsync`.
+///
+/// `ViewRootImpl` uses `relayoutAsync` when only the layout params changed
+/// (measured: NewPipe's player switching to immersive mode). It deliberately
+/// empties `mWinFrame` and waits for the window manager to send the new frame
+/// through this callback. Without it the window stays 0x0 forever, every
+/// `SurfaceView` measures to nothing and the decoder has no surface.
+///
+/// `IWindow.resized` in this framework is
+/// `(ClientWindowFrames, boolean reportDraw, MergedConfiguration, InsetsState,
+/// boolean forceLayout, boolean alwaysConsumeSystemBars, int displayId,
+/// int syncSeqId, int syncInputSeqId)`; the host marshals it because the first
+/// and fourth are framework types, and the shim prefixes the interface token.
+fn install_resized_payload(env: &JniEnv) {
+    let Some(frames) = build_client_window_frames(env) else {
+        eprintln!("apphost: IWindow.resized: no ClientWindowFrames");
+        return;
+    };
+    let Some(parcel_class) = env.find_class("android/os/Parcel") else {
+        return;
+    };
+    let Some(obtain) = env.static_method_id(parcel_class, "obtain", "()Landroid/os/Parcel;") else {
+        return;
+    };
+    let Some(parcel) = env.call_static_object(parcel_class, obtain, &[]) else {
+        return;
+    };
+    let (Some(write_typed), Some(write_int)) = (
+        env.method_id(
+            parcel_class,
+            "writeTypedObject",
+            "(Landroid/os/Parcelable;I)V",
+        ),
+        env.method_id(parcel_class, "writeInt", "(I)V"),
+    ) else {
+        eprintln!("apphost: IWindow.resized: Parcel writers missing");
+        return;
+    };
+    env.call_void(
+        parcel,
+        write_typed,
+        &[JValue { l: frames }, JValue { i: 0 }],
+    );
+    env.call_void(parcel, write_int, &[JValue { i: 1 }]); // reportDraw
+    // A null `MergedConfiguration` means "keep the current one".
+    env.call_void(
+        parcel,
+        write_typed,
+        &[JValue { l: std::ptr::null_mut() }, JValue { i: 0 }],
+    );
+    // An empty `InsetsState`: no system bars, which is what the app already
+    // sees, and the client only reads it to update `mAttachInfo`.
+    let insets = new_instance(env, "android/view/InsetsState")
+        .map(|(_, obj)| obj)
+        .filter(|o| !o.is_null());
+    env.call_void(
+        parcel,
+        write_typed,
+        &[
+            JValue {
+                l: insets.unwrap_or(std::ptr::null_mut()),
+            },
+            JValue { i: 0 },
+        ],
+    );
+    env.call_void(parcel, write_int, &[JValue { i: 1 }]); // forceLayout
+    env.call_void(parcel, write_int, &[JValue { i: 0 }]); // alwaysConsumeSystemBars
+    env.call_void(parcel, write_int, &[JValue { i: 0 }]); // displayId
+    env.call_void(parcel, write_int, &[JValue { i: 0 }]); // syncSeqId
+    env.call_void(parcel, write_int, &[JValue { i: 0 }]); // syncInputSeqId
+    let Some(marshall) = env.method_id(parcel_class, "marshall", "()[B") else {
+        return;
+    };
+    let Some(bytes) = env.call_object(parcel, marshall, &[]) else {
+        eprintln!("apphost: Parcel.marshall for IWindow.resized failed");
+        return;
+    };
+    if let Some(data) = env.byte_array_copy(bytes) {
+        let words: Vec<String> = data
+            .chunks_exact(4)
+            .map(|w| format!("{}", i32::from_ne_bytes([w[0], w[1], w[2], w[3]])))
+            .collect();
+        println!(
+            "apphost: IWindow.resized payload ({} bytes, insets={}) = [{}]",
+            data.len(),
+            if insets.is_some() { "set" } else { "null" },
+            words.join(", ")
+        );
+        install_reply(&data, "__pengudroid_binder_set_resized_payload");
     }
 }
 
@@ -5194,6 +5910,10 @@ pub fn dump_class(env: &JniEnv, name: &str) {
     }
 
     println!("--- methods of {name}");
+    // Parameter types, not just names: an AIDL parcel's field order *is* the
+    // parameter order, so a reply that is "shifted by one word" is really a
+    // question about this list.
+    let get_params = env.method_id(method_cls, "getParameterTypes", "()[Ljava/lang/Class;");
     if let Some(methods) = env.call_object(class, get_methods, &[]) {
         for i in 0..env.array_length(methods) {
             let m = env.array_get(methods, i);
@@ -5201,7 +5921,23 @@ pub fn dump_class(env: &JniEnv, name: &str) {
                 continue;
             }
             if let Some(n) = env.call_object(m, m_name, &[]).and_then(|s| env.get_string(s)) {
-                println!("  {n}");
+                let mut params = Vec::new();
+                if let Some(get_params) = get_params {
+                    if let Some(types) = env.call_object(m, get_params, &[]) {
+                        for j in 0..env.array_length(types) {
+                            let ty = env.array_get(types, j);
+                            if ty.is_null() {
+                                continue;
+                            }
+                            params.push(
+                                env.call_object(ty, get_name, &[])
+                                    .and_then(|s| env.get_string(s))
+                                    .unwrap_or_default(),
+                            );
+                        }
+                    }
+                }
+                println!("  {n}({})", params.join(", "));
             }
         }
     }

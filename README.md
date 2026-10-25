@@ -442,6 +442,10 @@ opt-in and cost nothing when unset.
 | `PENGUDROID_TRACE_VIDEO=1` | trace the `BLASTBufferQueue` consumer: created queue, geometry updates, the daemon subsurface, and every 30th presented frame |
 | `PENGUDROID_VIDEO_X` / `_Y` | where the video subsurface sits inside the app window (default `0,0`) |
 | `PENGUDROID_SYNTH_CLICK="x,y[@ms][;x,y[@ms]]…"` | inject a timed sequence of taps into the app's own `ViewRootImpl` (there is no way to click a window from a sandboxed session). `@ms` is the wait before that tap, default 8000. Example: `"665,682;145,300@12000"` dismisses NewPipe's first-run dialog, then opens the first feed item. With `PENGUDROID_PROBE_VIEWS` the view tree is dumped 12 s after the last tap |
+| `PENGUDROID_CLICK_TEXT="<text>[@ms]"` | click the first `TextView` whose text contains `<text>`, using its global visible rectangle. Deterministic where coordinates are not: a feed scrolls and rows move as items load |
+| `PENGUDROID_PROBE_DELAY=<ms>` | how long the view probe waits before it walks (default 12000). A playing screen can die within seconds |
+| `PENGUDROID_TRACE_ROOTS=<ms>` | print every window's `mWidth`/`mWinFrame`/`mTraversalScheduled`/`mIsInTraversal` on a timer — a timeline says *when* state changed, which a single dump cannot |
+| `PENGUDROID_PUMP_RESIZED=1` | play the window manager's `IWindow.resized` by calling `ViewRootImpl.dispatchResized` directly (experimental; replaying it through the emulated binder returns `UNKNOWN_TRANSACTION` in this tree) |
 | `PENGUDROID_TRACE_OPEN=1` | log every failed `open`/`openat` once, with `errno` and the path after rootfs rewriting — the fastest way to see which resource a guest gave up on |
 | `PENGUDROID_TRACE_ROOTFS` | log every Android→host path rewrite (`/system/…` → `<sysroot>/system/…`) |
 | `PENGUDROID_DEBUG_WRAP='gdb -x script.gdb --args'` | prefix the ART helper with a wrapper (`art-test` only) |

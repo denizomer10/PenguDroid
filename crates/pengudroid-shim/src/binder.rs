@@ -123,6 +123,34 @@ static APP_THREAD_COOKIE: AtomicU64 = AtomicU64::new(0);
 /// Set when a probe transaction should be delivered to `APP_THREAD_NODE`.
 static APP_THREAD_PROBE: AtomicBool = AtomicBool::new(false);
 
+/// `IWindow.resized` (AIDL code 2): the callback the window manager sends after
+/// an asynchronous relayout.
+const IWINDOW_RESIZED: u32 = 2;
+
+/// AIDL descriptor of the app's `IWindow`, which `IWindow.Stub.onTransact`
+/// enforces as the parcel's interface token.
+const IWINDOW_DESCRIPTOR: &str = "android.view.IWindow";
+
+/// Body of `IWindow.resized` after the interface token, marshalled by the host
+/// with the framework's own `Parcel` writers (`ClientWindowFrames` is a
+/// framework detail and hand-rolling it shifts every following field).
+static RESIZED_PAYLOAD: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// A transaction waiting to be delivered to a binder node owned by this process.
+///
+/// The kernel binder driver queues these itself; the userspace broker has to
+/// keep them and hand them out on the next `BINDER_WRITE_READ` that has room.
+struct PendingAppTransaction {
+    weak: u64,
+    cookie: u64,
+    code: u32,
+    parcel: Vec<u8>,
+}
+
+static APP_TX_QUEUE: std::sync::LazyLock<std::sync::Mutex<std::collections::VecDeque<PendingAppTransaction>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+
 /// Transaction flag: no reply is expected.
 const TF_ONE_WAY: u32 = 0x1;
 
@@ -640,6 +668,10 @@ const IWM_OPEN_SESSION: u32 = 4;
 const IWS_ADD_TO_DISPLAY_AS_USER: u32 = 2;
 const IWS_REMOVE: u32 = 4;
 const IWS_RELAYOUT: u32 = 5;
+/// `relayoutAsync`: the one-way variant `ViewRootImpl` uses when only the
+/// layout params changed. It clears `mWinFrame` and waits for the window
+/// manager to call back `IWindow.resized` — the same call, without the reply.
+const IWS_RELAYOUT_ASYNC: u32 = 6;
 const IWS_PREPARE_TO_REPLACE_WINDOWS: u32 = 7;
 const IWS_SET_INSETS: u32 = 9;
 const IWS_FINISH_DRAWING: u32 = 10;
@@ -832,12 +864,28 @@ struct WriteRead {
     read_buffer: u64,
 }
 
-/// Write a diagnostic line straight to stderr.
+/// Write a diagnostic line straight to stderr, stamped with the monotonic clock.
 ///
 /// Logging must not re-enter the JVM (it would call back into binder), so this
 /// deliberately uses `write(2)` only.
+///
+/// The stamp matters because the interesting questions are *ordering*
+/// questions — "was the relayout reply written before or after the tap?", "did
+/// the window's frame collapse between two probes?" — and the apphost's probe
+/// output and this trace come from the same process, so one monotonic clock
+/// lines them up exactly.
+/// Milliseconds on `CLOCK_MONOTONIC`. The apphost stamps its probe lines with
+/// the same clock, so the two logs can be aligned exactly.
+pub(crate) fn monotonic_ms() -> u128 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `ts` is a valid `timespec`.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u128 * 1000 + ts.tv_nsec as u128 / 1_000_000
+}
+
 unsafe fn diag(line: &str) {
-    libc::write(2, line.as_ptr() as *const c_void, line.len());
+    let stamp = format!("[+{} ms] {line}", monotonic_ms());
+    libc::write(2, stamp.as_ptr() as *const c_void, stamp.len());
 }
 
 fn trace_enabled() -> bool {
@@ -1374,7 +1422,9 @@ fn send_vsync() {
             dropped += 1;
         }
     }
-    if trace_enabled() {
+    // One line per second: vsync fires 60 times a second, and every one of them
+    // in the trace buries the transactions that matter.
+    if trace_enabled() && frame % 60 == 0 {
         unsafe {
             diag(&format!(
                 "[binder]   -> vsync frame {frame} ts={vsync_time} dropped={dropped}\n"
@@ -2479,6 +2529,69 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                 parcel.len() - reply_start
             ));
         }
+        if tr.code == IWS_RELAYOUT_ASYNC {
+            // `relayoutAsync` has no reply: the client expects the window manager
+            // to call `IWindow.resized`, and it uses that call as the "layout is
+            // settled" signal.
+            //
+            // Measured: replaying `IWindow.resized` through the emulated binder
+            // does *not* work here — the app's `IWindow.Stub.onTransact` answers
+            // `UNKNOWN_TRANSACTION` for every code (even
+            // `INTERFACE_TRANSACTION`), so the replay reaches a binder node that
+            // does not run the stub. The host therefore plays the window manager
+            // directly (`PENGUDROID_PUMP_RESIZED` calls
+            // `ViewRootImpl.dispatchResized` through JNI); this path stays behind
+            // an opt-in flag for whoever wants to keep digging.
+            if std::env::var_os("PENGUDROID_BINDER_RESIZED").is_none() {
+                if trace_enabled() {
+                    diag("[binder]   relayoutAsync: host-side resized pump is authoritative\n");
+                }
+            } else if tr.data_size > 0 && tr.data_ptr != 0 {
+                let data =
+                    std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
+                match find_local_binder(data) {
+                    Some((weak, cookie, at)) => {
+                        let payload = RESIZED_PAYLOAD
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
+                        if payload.is_empty() {
+                            diag("[binder]   relayoutAsync: no IWindow.resized payload installed\n");
+                        } else {
+                            let mut body = string16(IWINDOW_DESCRIPTOR);
+                            body.extend_from_slice(&payload);
+                            // `PENGUDROID_RESIZED_CODE` exists to prove the
+                            // delivery path itself: `1598968902` is
+                            // `INTERFACE_TRANSACTION`, which every `IWindow.Stub`
+                            // answers without touching the payload.
+                            let code = std::env::var("PENGUDROID_RESIZED_CODE")
+                                .ok()
+                                .and_then(|v| v.trim().parse::<u32>().ok())
+                                .unwrap_or(IWINDOW_RESIZED);
+                            APP_TX_QUEUE
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push_back(PendingAppTransaction {
+                                    weak,
+                                    cookie,
+                                    code,
+                                    parcel: body,
+                                });
+                            if trace_enabled() {
+                                diag(&format!(
+                                    "[binder]   relayoutAsync win={cookie:#x} (object at {at}): queued IWindow.resized\n"
+                                ));
+                            }
+                        }
+                    }
+                    None => {
+                        if trace_enabled() {
+                            diag("[binder]   relayoutAsync: no IWindow object in the request\n");
+                        }
+                    }
+                }
+            }
+        }
     }
     if tr.target_handle == handle_for("locale")
         && (tr.code == ILM_GET_APPLICATION_LOCALES || tr.code == ILM_GET_SYSTEM_LOCALES)
@@ -2613,7 +2726,12 @@ unsafe fn incoming_transaction(target_weak: u64, cookie: u64, code: u32, parcel:
         _pad0: (target_weak >> 32) as u32,
         cookie,
         code,
-        flags: 0,
+        // `IWindow.resized` is `oneway`: the sender never waits for a reply, so
+        // the transaction must carry TF_ONE_WAY. Delivering it synchronously
+        // makes the client write a BC_REPLY from inside a call it is itself
+        // waiting on, which deadlocks the binder thread (measured: the main
+        // thread hung inside `relayoutAsync`).
+        flags: TF_ONE_WAY,
         sender_pid: libc::getpid(),
         sender_euid: 0,
         data_size: parcel.len() as u64,
@@ -2824,6 +2942,56 @@ unsafe fn handle_write_read(wr: *mut WriteRead) -> c_int {
             } else {
                 APP_THREAD_PROBE.store(false, Ordering::Relaxed);
             }
+        }
+    }
+
+    // Deliver queued callbacks to the app's own binder nodes (currently
+    // `IWindow.resized`, the window manager's answer to `relayoutAsync`). The
+    // kernel driver does this itself; the broker has to emulate it.
+    //
+    // Only on a *pure read* (`write_size == 0`), which is what a looper thread
+    // parked in the driver does. Attaching the callback to the same call that
+    // produced it deadlocks: the client is inside `waitForResponse` for its own
+    // oneway `relayoutAsync`, `resized` runs there, and the completion it is
+    // waiting for can never be parsed (measured: Java stack parked in
+    // `IWindowSession$Stub$Proxy.relayoutAsync`).
+    if wr.write_size == 0 && wr.read_size > 0 {
+        loop {
+            if out.len() as u64 >= wr.read_size {
+                break;
+            }
+            let Some(tx) = APP_TX_QUEUE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_front()
+            else {
+                break;
+            };
+            let Some(bytes) =
+                (unsafe { incoming_transaction(tx.weak, tx.cookie, tx.code, &tx.parcel) })
+            else {
+                if trace_enabled() {
+                    diag("[binder]   queued callback could not be placed\n");
+                }
+                break;
+            };
+            if out.len() as u64 + bytes.len() as u64 > wr.read_size {
+                // No room in this read buffer; keep it for the next call.
+                APP_TX_QUEUE
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_front(tx);
+                break;
+            }
+            if trace_enabled() {
+                diag(&format!(
+                    "[binder]   delivering code={} to app node cookie={:#x} ({} byte parcel)\n",
+                    tx.code,
+                    tx.cookie,
+                    tx.parcel.len()
+                ));
+            }
+            out.extend_from_slice(&bytes);
         }
     }
 
@@ -3360,6 +3528,23 @@ pub unsafe extern "C" fn __pengudroid_binder_set_relayout_frames(ptr: *const u8,
     }
     let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
     *RELAYOUT_FRAMES.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
+}
+
+/// `void __pengudroid_binder_set_resized_payload(const uint8_t *bytes, size_t len)`
+///
+/// Installs the body of `IWindow.resized` after the interface token. The host
+/// marshals it, because `ClientWindowFrames`/`InsetsState` are framework types
+/// whose field order is a framework detail.
+///
+/// # Safety
+/// `ptr` must point to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_resized_payload(ptr: *const u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
+    *RESIZED_PAYLOAD.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
 }
 
 /// `int __pengudroid_binder_mmap_prot(int fd, int prot)`
