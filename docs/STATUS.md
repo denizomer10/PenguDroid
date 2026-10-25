@@ -193,16 +193,22 @@ ve `[blast] created` + `Surface.copyFrom(queue)` çalışıyor.
 (kurucu çalışmamışsa) çağrıyı atlayıp log basıyor. Bu, `Surface`'ın serbest
 bırakılmış bellekte `lock_shared()` çağırmasını engelliyor.
 
-### Açık: probe gezintisi hâlâ bazen erken bitiyor
+### Düzeltildi: probe gezintisi artık ağacı tamamlıyor
 
-`describe_exception()` her düğümde çağrılmasına rağmen ağaç dökümü bazen
-`NavigationView` içindeki bir `ViewStub`'ta bitiyor ve `SurfaceView` hiç
-bulunamıyor (o koşuda `[blast] created` çıkmıyor). Aynı ikili bir sonraki
-koşuda `SurfaceView`'ı bulup `[blast] created` + `Surface.copyFrom(queue)`
-üretiyor, yani sorun gezintinin kendisinde. Sıradaki adım: gezintiyi
-tamamlamak (muhtemelen `getChildCount` başarısız olduğunda üst düğümün
-çocuklarını da durdurmamak) ve ardından decoder'ı `PlaceholderSurface` yerine
-bizim kuyruğa bağlamak.
+Gezinti, `getChildCount`'u nesnenin kendi sınıfında arıyordu; bu, `ViewStub`
+gibi bir `View`'da `NoSuchMethodError` bırakıp sonraki JNI çağrılarını sessizce
+null yapıyor ve dökümü orada kesiyordu. Artık `Class.isInstance` ile
+`ViewGroup` testi yapılıyor (istisna bırakmıyor) ve `SurfaceView` her koşuda
+bulunuyor (ölçüldü: iki geçişte de `requested 720x405`).
+
+### Açık: `layout()` çağrısı hâlâ yarışıyor
+
+`View.layout()`'u probe iş parçacığından çağırmak ana thread'in kendi
+traversal'ıyla yarışıyor ve `signal 11` üretiyor (gezinti erken durdurulsa
+bile). Bu yüzden zorunlu yüzey yolu şu an yalnızca alan yazıyor + traversal
+istiyor; `SurfaceView` 720 genişlikte ölçülmediği için `[blast] created`
+çıkmıyor. Sıradaki adım: layout'u ana thread'e taşımak (bir `Runnable`
+postalamak) ya da `mWidth`/`mWinFrame` yolunu düzeltmek.
 
 ### Yan bulgu: bayat `.so` protokolü bozuyor
 

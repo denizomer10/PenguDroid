@@ -1051,6 +1051,9 @@ fn report_surface_views(env: &JniEnv) {
     let Some(get_name) = env.method_id(class_class, "getName", "()Ljava/lang/String;") else {
         return;
     };
+    let Some(is_instance) = env.method_id(class_class, "isInstance", "(Ljava/lang/Object;)Z") else {
+        return;
+    };
     let Some(view_group) = env.find_class("android/view/ViewGroup") else {
         return;
     };
@@ -1070,8 +1073,11 @@ fn report_surface_views(env: &JniEnv) {
         get_name: JMethodId,
         child_count: JMethodId,
         get_child: JMethodId,
+        is_instance: JMethodId,
+        view_group: JObject,
+        done: &mut bool,
     ) {
-        if view.is_null() || depth > 24 {
+        if *done || view.is_null() || depth > 24 {
             return;
         }
         // A failed reflective lookup leaves an exception pending, and every JNI
@@ -1198,6 +1204,10 @@ fn report_surface_views(env: &JniEnv) {
                     println!(
                         "views:   requested {w}x{h} (traversal: {scheduled}, postInvalidate: {invalidated})"
                     );
+                    // Stop here: the main thread is about to traverse, and
+                    // walking the tree while it does was measured to SIGSEGV.
+                    *done = true;
+                    return;
                 } else {
                     eprintln!("views:   mRequestedWidth not found");
                 }
@@ -1254,22 +1264,22 @@ fn report_surface_views(env: &JniEnv) {
             println!("views:   size = {w}x{h}");
         }
         // `ViewGroup.getChildCount` must not be invoked on a plain `View`: JNI
-        // does not check the receiver's class, and ART faults on the mismatch.
-        let class = env.call_object(view, get_class, &[]).unwrap_or(std::ptr::null_mut());
-        // A null receiver must not reach JNI: ART faults on it. Whether this is
-        // a container is decided by looking the method up on the object's own
-        // class, which is cheaper and safer than an `isInstance` round trip.
-        if class.is_null() {
+        // does not check the receiver's class and ART faults on the mismatch.
+        // Looking the method up on the object's own class avoided the fault but
+        // left a pending `NoSuchMethodError` behind, which silently truncated
+        // the walk at the first `ViewStub` — the `SurfaceView` was never
+        // reached. `Class.isInstance` is the safe test and leaves no exception.
+        if env.call_boolean(view_group, is_instance, &[JValue { l: view }]) != Some(true) {
             return;
         }
-        let Some(own_count) = env.method_id(class, "getChildCount", "()I") else {
-            return;
-        };
-        let count = env.call_int(view, own_count, &[]).unwrap_or(0);
+        let count = env.call_int(view, child_count, &[]).unwrap_or(0);
         for i in 0..count {
+            if *done {
+                return;
+            }
             println!("views: {:width$}child {i}/{count}", "", width = depth * 2);
             if let Some(child) = env.call_object(view, get_child, &[JValue { i }]) {
-                walk(env, child, depth + 1, get_class, get_name, child_count, get_child);
+                walk(env, child, depth + 1, get_class, get_name, child_count, get_child, is_instance, view_group, done);
             }
         }
     }
@@ -1283,7 +1293,11 @@ fn report_surface_views(env: &JniEnv) {
         env.describe_exception();
         if let Some(root) = env.call_object(roots, get_m, &[JValue { i }]) {
             dump_root_state(env, root, i);
-            walk(env, root, 0, get_class, get_name, child_count, get_child);
+            let mut done = false;
+            walk(env, root, 0, get_class, get_name, child_count, get_child, is_instance, view_group, &mut done);
+            if done {
+                break;
+            }
         }
     }
 }
