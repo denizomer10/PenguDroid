@@ -58,21 +58,62 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.set_fps_meter_on(registry.setting("fps_meter", false));
 
     // ---------------------------------------------------------------- install
+    //
+    // The chooser runs on its own thread: `zenity`/`kdialog` block until the user
+    // answers, and blocking the Slint event loop would freeze the window (no
+    // repaint, no input) for as long as the dialog is open. The result comes back
+    // through `invoke_from_event_loop`, which is the only thread-safe way to touch
+    // the UI.
     {
         let ui_weak = ui.as_weak();
-        let mut registry = registry.clone();
+        let fallback = registry.clone();
         ui.on_install_requested(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
-            match registry.pick_apk() {
-                Some(path) => match registry.install(&path) {
-                    Ok(entry) => ui.set_status(format!("Installed {}", entry.label).into()),
-                    Err(e) => ui.set_status(format!("Install failed: {e}").into()),
-                },
-                None => ui.set_status(
-                    "No .apk found in ~/Downloads or the current directory".into(),
-                ),
-            }
-            refresh(&ui, &registry);
+            ui.set_status("Choosing a package…".into());
+            let ui_weak = ui.as_weak();
+            let fallback = fallback.clone();
+            std::thread::spawn(move || {
+                let picked = Registry::choose_apks().or_else(|| {
+                    // No native chooser installed: fall back to the directory
+                    // scan so `+` still does something useful.
+                    fallback.pick_apk().map(|p| vec![p])
+                });
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(ui) = ui_weak.upgrade() else { return };
+                    let mut registry = Registry::load();
+                    match picked {
+                        None => ui.set_status(
+                            "No file chooser found (install zenity, kdialog or yad)".into(),
+                        ),
+                        Some(paths) if paths.is_empty() => {
+                            ui.set_status("Install cancelled".into());
+                        }
+                        Some(paths) => {
+                            let mut installed = Vec::new();
+                            let mut errors = Vec::new();
+                            for path in paths {
+                                match registry.install(&path) {
+                                    Ok(entry) => installed.push(entry.label),
+                                    Err(e) => errors.push(format!("{}: {e}", path.display())),
+                                }
+                            }
+                            let mut status = if installed.is_empty() {
+                                String::new()
+                            } else {
+                                format!("Installed {}", installed.join(", "))
+                            };
+                            if !errors.is_empty() {
+                                if !status.is_empty() {
+                                    status.push_str(" — ");
+                                }
+                                status.push_str(&format!("failed: {}", errors.join("; ")));
+                            }
+                            ui.set_status(status.into());
+                        }
+                    }
+                    refresh(&ui, &registry);
+                });
+            });
         });
     }
 

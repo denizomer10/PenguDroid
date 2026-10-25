@@ -63,8 +63,10 @@ export component MainWindow inherits Window {
                         vertical-alignment: center;
                     }
                     Rectangle { horizontal-stretch: 1; }
-                    // "+" installs an APK; the same action is reachable by
-                    // dropping a file on the window.
+                    // "+" opens the desktop's own file chooser. A file-manager
+                    // drag cannot be received here: Slint's core has no
+                    // "external drop" event, so `pengudroid-gui file.apk` (the
+                    // file manager's "Open with") is the supported route.
                     Rectangle {
                         width: 32px;
                         height: 32px;
@@ -138,7 +140,7 @@ export component MainWindow inherits Window {
                 }
 
                 Text {
-                    text: "Drop an .apk here or press +";
+                    text: "Press + to choose a package";
                     color: #6b7280;
                     font-size: 11px;
                     wrap: word-wrap;

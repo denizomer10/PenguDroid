@@ -177,10 +177,56 @@ impl Registry {
         let _ = std::fs::write(&self.path, text);
     }
 
+    /// Ask the desktop to pick one or more packages.
+    ///
+    /// `zenity` (GTK/GNOME), `kdialog` (KDE) and `yad` all present the *desktop's*
+    /// own file chooser, so the user gets the same dialog as everywhere else and
+    /// we need no toolkit of our own. Returns an empty vector when the user
+    /// cancels, and `None` when no chooser is installed at all.
+    pub fn choose_apks() -> Option<Vec<PathBuf>> {
+        let filter = "*.apk *.apkm *.xapk *.apks *.zip";
+        let attempts: [(&str, &[&str]); 3] = [
+            (
+                "zenity",
+                &["--file-selection", "--multiple", "--separator=\n",
+                  "--title=Install an Android package", "--file-filter=Android packages | *.apk *.apkm *.xapk *.apks"],
+            ),
+            (
+                "kdialog",
+                &["--getopenfilename", ".", "*.apk *.apkm *.xapk *.apks", "--multiple", "--separate-output"],
+            ),
+            (
+                "yad",
+                &["--file-selection", "--multiple", "--separator=\n", "--file-filter=Android packages | *.apk *.apkm *.xapk *.apks"],
+            ),
+        ];
+        let _ = filter;
+        for (program, args) in attempts {
+            let output = match std::process::Command::new(program).args(args).output() {
+                Ok(out) => out,
+                // Not installed: try the next one.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => continue,
+            };
+            // A cancelled dialog exits 1 with no stdout.
+            if !output.status.success() {
+                return Some(Vec::new());
+            }
+            let paths: Vec<PathBuf> = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(PathBuf::from)
+                .collect();
+            return Some(paths);
+        }
+        None
+    }
+
     /// Find an APK to install without a file dialog.
     ///
-    /// Looks at `~/Downloads` and the working directory, newest first. The GUI is
-    /// also usable over a remote session, where a toolkit dialog may not exist.
+    /// Fallback for a session where no native chooser exists: looks at
+    /// `~/Downloads` and the working directory, newest first.
     pub fn pick_apk(&self) -> Option<PathBuf> {
         let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
         let mut dirs = vec![std::env::current_dir().unwrap_or_default()];
