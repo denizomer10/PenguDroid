@@ -113,13 +113,32 @@ gezintisinin içinde). Bu yüzden `PENGUDROID_FORCE_SURFACE` artık `layout()`
 `postInvalidate()` çağırıyor. **Bu haliyle çökme yok, ama traversal ölçümü de
 henüz yapmıyor** (`size = 0x405` kalıyor) — sıradaki iş bu.
 
-### Yan bulgu: pencere ağacı 0 genişlikte
+### Kök neden: ana pencerenin `ViewRootImpl.mWidth`'i 0
 
-`PENGUDROID_PROBE_VIEWS` artık her görünümün ölçüsünü basıyor. Ana pencerenin
-`DecorView`'ı **0x0**, dolayısıyla `SurfaceView` de 0 genişlikte ölçülüyor —
-"SurfaceView 0 genişlikte" sorununun kökü bu. `mRequestedWidth` yazmak
-`SurfaceView.onMeasure`'un `super.onMeasure` çağrısını 720 yapıyor, ama
-`ExpandableSurfaceView.onMeasure` parent'ın spec'ini (0) okuyup erken dönüyor.
+`PENGUDROID_PROBE_VIEWS` artık her kök için `ViewRootImpl` durumunu basıyor:
+
+```
+views: root 0 mWidth=720 mHeight=1280 mStopped=false mAppVisible=true mLayoutRequested=false mFirst=false mTraversalScheduled=false mIsInTraversal=false
+views: root 1 mWidth=0   mHeight=0    mStopped=false mAppVisible=true mLayoutRequested=false mFirst=false mTraversalScheduled=false mIsInTraversal=false
+```
+
+`SurfaceView`'ın bulunduğu pencere **root 1** ve `mWidth = 0`. Zinciri:
+
+1. `performTraversals` `desiredWindowWidth`'i `mWinFrame.width()`'tan alır,
+2. `mWinFrame` `relayoutWindow`'un `ClientWindowFrames` çıktısından gelir,
+3. bu pencere için o çerçeve 0 geliyor, dolayısıyla `measureHierarchy`
+   0 genişlikli bir spec kuruyor,
+4. `DecorView` 0×0 ölçülüyor, `SurfaceView` de 0 genişlikte kalıyor.
+
+`mWidth`/`mHeight` alanlarını doğrudan 720/1280 yazmak **işe yaramıyor**:
+`relayoutWindow` bir sonraki traversal'da onları yine 0'a çekiyor (ölçüldü:
+`mWidth 0 -> 720` yazıldıktan sonra ikinci geçişte tekrar 0). `mWinFrame`'i de
+zorlamak denendi ve süreci SIGSEGV'e soktu (ana thread'in kendi
+`relayoutWindow`'u ile yarışıyor).
+
+Sıradaki adım: bu pencerenin `relayout` yanıtının neden 0 çerçeve döndürdüğünü
+bulmak (`PENGUDROID_TRACE_BINDER=1` ile `IWS_RELAYOUT` işlemini izlemek);
+root 0 aynı yanıtla 720 alıyor, yani fark pencerenin kendisinde.
 
 ### Yan bulgu: bayat `.so` protokolü bozuyor
 

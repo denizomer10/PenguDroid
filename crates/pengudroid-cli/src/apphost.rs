@@ -1132,6 +1132,36 @@ fn report_surface_views(env: &JniEnv) {
                     .filter(|vri| !vri.is_null())
                     .and_then(|vri| {
                         let vri_class = env.find_class("android/view/ViewRootImpl")?;
+                        // The window this `SurfaceView` lives in reports
+                        // `mWidth = 0` (measured), so `performMeasure` would
+                        // build a 0-wide spec and every view would measure to
+                        // nothing. `mWidth`/`mHeight` are what
+                        // `getRootMeasureSpec` uses, so writing them is what
+                        // makes the whole tree lay out at the window size.
+                        let (ww, wh) = (
+                            env.field_id(vri_class, "mWidth", "I")
+                                .map(|f| env.int_field(vri, f))
+                                .unwrap_or(0),
+                            env.field_id(vri_class, "mHeight", "I")
+                                .map(|f| env.int_field(vri, f))
+                                .unwrap_or(0),
+                        );
+                        if ww <= 0 || wh <= 0 {
+                            if let Some(f) = env.field_id(vri_class, "mWidth", "I") {
+                                env.set_int_field(vri, f, 720);
+                            }
+                            if let Some(f) = env.field_id(vri_class, "mHeight", "I") {
+                                env.set_int_field(vri, f, 1280);
+                            }
+                            // NOTE: forcing `mWinFrame` here as well was tried
+                            // and made the process SIGSEGV (it races the main
+                            // thread's own `relayoutWindow`). `mWidth` alone is
+                            // not enough either: `performTraversals` derives
+                            // `desiredWindowWidth` from `mWinFrame`, which
+                            // `relayoutWindow` resets to 0 for this window. See
+                            // `docs/STATUS.md`.
+                            println!("views:   ViewRootImpl.mWidth {ww} -> 720");
+                        }
                         // `layoutRequested` is `mLayoutRequested && (!mStopped ||
                         // mReportNextDraw)`, so a stopped window silently drops
                         // the request.
@@ -1247,9 +1277,52 @@ fn report_surface_views(env: &JniEnv) {
         // "stops" halfway through a tree.
         env.describe_exception();
         if let Some(root) = env.call_object(roots, get_m, &[JValue { i }]) {
+            dump_root_state(env, root, i);
             walk(env, root, 0, get_class, get_name, child_count, get_child);
         }
     }
+}
+
+/// Print the `ViewRootImpl` fields that decide whether a layout pass happens.
+///
+/// A `DecorView` that measures 0×0 means `performLayout` never ran (or ran with
+/// `mWidth == 0`), and the reason is always one of these fields.
+fn dump_root_state(env: &JniEnv, root: JObject, index: i32) {
+    let Some(vri_class) = env.find_class("android/view/ViewRootImpl") else {
+        return;
+    };
+    let Some(view_class) = env.find_class("android/view/View") else {
+        return;
+    };
+    let Some(get_vri) = env.method_id(view_class, "getViewRootImpl", "()Landroid/view/ViewRootImpl;") else {
+        return;
+    };
+    let Some(vri) = env.call_object(root, get_vri, &[]).filter(|v| !v.is_null()) else {
+        println!("views: root {index} has no ViewRootImpl");
+        return;
+    };
+    let mut parts = Vec::new();
+    for (field, sig) in [
+        ("mWidth", "I"),
+        ("mHeight", "I"),
+        ("mStopped", "Z"),
+        ("mAppVisible", "Z"),
+        ("mLayoutRequested", "Z"),
+        ("mFirst", "Z"),
+        ("mTraversalScheduled", "Z"),
+        ("mIsInTraversal", "Z"),
+    ] {
+        let Some(id) = env.field_id(vri_class, field, sig) else {
+            continue;
+        };
+        let value = if sig == "Z" {
+            format!("{}", env.boolean_field(vri, id))
+        } else {
+            format!("{}", env.int_field(vri, id))
+        };
+        parts.push(format!("{field}={value}"));
+    }
+    println!("views: root {index} {}", parts.join(" "));
 }
 
 /// Turn on the app's "use `TextureView` for video" preference.
