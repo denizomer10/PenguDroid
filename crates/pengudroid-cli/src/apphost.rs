@@ -3490,12 +3490,15 @@ fn spawn_input_pump(env: &JniEnv) {
         type Poll = unsafe extern "C" fn(*mut u8) -> i32;
         let poll: Poll = unsafe { std::mem::transmute(sym) };
         let Some(env) = attach_current_thread(vm) else {
+            eprintln!("apphost: input pump: cannot attach the thread");
             return;
         };
         let Some(wmg_class) = env.find_class("android/view/WindowManagerGlobal") else {
+            eprintln!("apphost: input pump: WindowManagerGlobal not found");
             return;
         };
         let Some(root_class) = env.find_class("android/view/ViewRootImpl") else {
+            eprintln!("apphost: input pump: ViewRootImpl not found");
             return;
         };
         let Some(motion_class) = env.find_class("android/view/MotionEvent") else {
@@ -3656,6 +3659,7 @@ fn spawn_input_pump(env: &JniEnv) {
         // `@delayMs` is the wait *before* that tap (default 8000 ms), so
         // `"665,682;145,300@12000"` means "tap OK after 8 s, then open the first
         // feed item 12 s later".
+        eprintln!("apphost: input pump: reached the click/probe stage");
         let spec = std::env::var("PENGUDROID_SYNTH_CLICK").unwrap_or_default();
         if !spec.is_empty()
             || std::env::var_os("PENGUDROID_PROBE_VIEWS").is_some()

@@ -340,7 +340,7 @@ unsafe extern "C" fn native_create(
     // leave `Blast::item_consumer` dangling (measured: SIGSEGV inside
     // `BufferItemConsumer::acquireBuffer`, jumping into `main_arena`). Take a
     // reference of our own so the object outlives every consumer of it.
-    keep_alive(gui, "item_consumer", item_consumer);
+    keep_alive(gui, "item_consumer", item_consumer, None);
     if std::env::var_os("PENGUDROID_TRACE_VIDEO").is_some() {
         // The vtable pointer is the cheapest proof that the constructor really
         // ran: `BufferItemConsumer::acquireBuffer` calls through it, and a
@@ -365,7 +365,7 @@ unsafe extern "C" fn native_create(
     // Same reason as `item_consumer`: `Surface` is a `RefBase`, so the last
     // `decStrong` would `delete this` on a `calloc` block. The reference we take
     // here is the one `Blast::surface` relies on.
-    keep_alive(gui, "surface", surface);
+    keep_alive(gui, "surface", surface, Some(0));
     (gui.set_buffers_format)(surface, format);
     (gui.set_user_dimensions)(surface, width, height);
 
@@ -422,7 +422,7 @@ unsafe extern "C" fn native_get_surface(
     }
     // `Surface(long)` does not take a reference; the Java object owns one.
     if let Some(gui) = gui() {
-        keep_alive(gui, "surface(handout)", blast.surface);
+        keep_alive(gui, "surface(handout)", blast.surface, Some(0));
     }
     let args = [JValue {
         j: blast.surface as i64,
@@ -522,7 +522,7 @@ unsafe extern "C" fn surface_from_blast(
     // The Java `Surface` takes ownership of this reference and releases it in
     // `nativeRelease`, so hand out a new one.
     if let Some(gui) = gui() {
-        keep_alive(gui, "surface(copyFrom)", blast.surface);
+        keep_alive(gui, "surface(copyFrom)", blast.surface, Some(0));
     }
     eprintln!(
         "[blast] Surface.copyFrom(queue) -> {:#x}",
@@ -560,12 +560,34 @@ unsafe fn refbase_of(obj: *mut c_void) -> *mut c_void {
 /// measured as `Surface::hook_perform` aborting inside `lock_shared()` on freed
 /// memory. Returns false (and logs) when the object has no `mRefs`, which means
 /// the constructor did not run and calling `incStrong` would fault.
-unsafe fn keep_alive(gui: &Gui, what: &str, obj: *mut c_void) -> bool {
-    let rb = refbase_of(obj);
+unsafe fn keep_alive(gui: &Gui, what: &str, obj: *mut c_void, fixed_offset: Option<i32>) -> bool {
+    let vptr = *(obj as *const *const u8);
+    // `Surface` has `RefBase` as its (non-virtual) primary base, so it lives at
+    // offset 0; its vtable header does not carry a usable vbase entry (measured:
+    // `v[-3]` decodes to -1312590112). `BufferItemConsumer` inherits
+    // `virtual RefBase`, so there the offset really is in the vtable.
+    let off = match fixed_offset {
+        Some(off) => off,
+        None if vptr.is_null() => 0,
+        None => *(vptr.sub(24) as *const i32),
+    };
+    // A vbase offset outside the object we allocated is not a `RefBase` at all;
+    // calling `incStrong` there faults. Bail instead of guessing.
+    let trace = std::env::var_os("PENGUDROID_TRACE_VIDEO").is_some();
+    if off < 0 || off as usize >= OBJECT_SIZE - 16 {
+        if trace {
+            eprintln!("[blast] {what}: implausible RefBase offset {off}; skipping");
+        }
+        return false;
+    }
+    let rb = (obj as *mut u8).offset(off as isize) as *mut c_void;
     let refs = *(rb.add(8) as *const usize);
     if refs == 0 {
         eprintln!("[blast] {what}: no mRefs at {rb:p}; not taking a reference");
         return false;
+    }
+    if trace {
+        eprintln!("[blast] {what}: RefBase at +{off} ({rb:p}) mRefs={refs:#x}");
     }
     (gui.inc_strong)(rb, &OWNER_ID as *const u8 as *const c_void);
     true
