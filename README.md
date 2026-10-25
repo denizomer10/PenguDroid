@@ -441,11 +441,23 @@ opt-in and cost nothing when unset.
 | `PENGUDROID_FORCE_SURFACE=1` | give a zero-width `SurfaceView` a real frame (`PENGUDROID_VIDEO_W`/`_H`, default 720×405) and let the framework's own main-thread pre-draw listener create the surface. Never call `updateSurface()` yourself: it ends in `ExoPlayer.setVideoSurface`, which asserts the main thread |
 | `PENGUDROID_TRACE_VIDEO=1` | trace the `BLASTBufferQueue` consumer: created queue, geometry updates, the daemon subsurface, and every 30th presented frame |
 | `PENGUDROID_VIDEO_X` / `_Y` | where the video subsurface sits inside the app window (default `0,0`) |
+| `PENGUDROID_TRACE_OPEN=1` | log every failed `open`/`openat` once, with `errno` and the path after rootfs rewriting — the fastest way to see which resource a guest gave up on |
+| `PENGUDROID_TRACE_ROOTFS` | log every Android→host path rewrite (`/system/…` → `<sysroot>/system/…`) |
 | `PENGUDROID_DEBUG_WRAP='gdb -x script.gdb --args'` | prefix the ART helper with a wrapper (`art-test` only) |
 
 `tools/make_h264.py <path> [width_mb] [height_mb]` generates the test stream:
 every macroblock is `I_PCM`, so the samples are exactly what the script wrote and
 a decoded frame can be checked byte for byte against `ffmpeg`'s output.
+
+### Per-app settings overrides (`ClientAppSettings.json`)
+
+Roblox-style guests read a debug override file from `/data/local/tmp`. Because
+`/data` is rewritten to the sysroot, dropping the file at
+`<sysroot>/data/local/tmp/ClientAppSettings.json` makes the guest see it at the
+Android path — no root, no mount, no container. Verified with Roblox 2.743: the
+`FileNotFoundException` in `rbx.settings.local` disappears and the keys are
+queryable afterwards. This is how a fastflag can be tried without patching the
+APK.
 
 ## License
 

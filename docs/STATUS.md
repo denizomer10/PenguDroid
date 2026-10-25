@@ -874,6 +874,11 @@ Doğrulama: Roblox `ActivitySplash.onCreate` içinde
   bildirim yine `result: 1` geldi. Yani JSON'u üreten şey o switch değil;
   switch'ten *önce* çalışıyor. (Yama geri alındı; `libroblox.so` orijinal hâlinde.)
 * **`appData/ClientSettings/ClientAppSettings.json`** yazmak: Roblox okumadı.
+  (*Doğru* yol: `/data/local/tmp/ClientAppSettings.json` — aşağıda.)
+* **`FLog::<grup>` client-setting'leri native log gruplarını açmıyor.**
+  Aynı JSON'a `FLog::StartupController`, `FLog::ClientSettings`,
+  `DFLog::FlagCache`, `DFLog::AppBridge`, `FIntLogLevel=4` konuldu; native log
+  dosyası yine **3 satır** kaldı.
 * **Temiz durum** (data + `appData` silinip yeniden): `stage` hâlâ 4.
 
 ### `stage` senkron karar (önemli ipucu)
@@ -896,6 +901,73 @@ stderr'e yazar. Bu oturumda Roblox'un eksik dosya yüzünden düşmediğini
 gösterdi: sysroot lib aramaları, `primary.prof`, `tzdata` dışında kayda değer
 bir `ENOENT` yok.
 
+### Çalışan bir fastflag yolu var: `/data/local/tmp/ClientAppSettings.json`
+
+Roblox'un Java tarafı harici ayar dosyasını **`/data/local/tmp/ClientAppSettings.json`**
+dan okuyor (`rbx.settings.local`). Rootfs `/data` → `<sysroot>/data` eşlendiği
+ için dosyayı şuraya koymak yeterli:
+
+```
+.toolchain/sysroot/data/local/tmp/ClientAppSettings.json
+```
+
+Önce/sonra (aynı koşu):
+
+```
+önce : ERROR rbx.settings.local: readLocalSettings: ClientAppSettings.json:
+       java.io.FileNotFoundException: /data/local/tmp/ClientAppSettings.json
+sonra: WARN  rbx.settings.local: getFlagValueFromSettings: 'FStringAuthCookie'
+       key not found in settings
+```
+
+Yani dosya **gerçekten parse ediliyor** ve anahtarlar sorgulanıyor. Bu,
+Roblox'a client-setting/fastflag enjekte etmenin doğrulanmış yolu.
+
+### Kapı (`result != 0`) gerçekten bir kapı — arkasında ikinci bir duvar var
+
+`libroblox.so` içinde `result`'u üreten komut çiftini yamalayıp
+(`0x249175f`: `41 83 ff 02 40 0f 95 c6` → `31 f6` + 6×`nop`, yani `esi = 0`)
+JSON `{"result":0,…}` oldu ve **retry UI kayboldu**. Sonra:
+
+```
+doAfterFetchBrowserTrackerId:...
+→ k0.i(this) → k0.p() → gk.c.e(ctx) → gk.c.f(ctx,null)
+   → gk.a (AsyncTask) THREAD_POOL_EXECUTOR'da başlıyor
+```
+
+Ama hâlâ çizim yok (20. swap'a kadar kare yok). Yani kapıyı aşmak yetmiyor;
+app-shell bootstrap'ından sonra **ikinci bir durak** var. Yama geri alındı
+(`/tmp` temizliğiyle gitti); shippable değil, yalnızca ölçüm içindi.
+
+Ama zincirin devamı ölçüldü ve aslında bir yan yol: `gk.a` **AdvertisingId**
+görevi (`q8.a` = Play Services `AdvertisingIdClient`; GMS yoksa
+`00000000-…` dönen catch dalı var), callback sadece `gk/c.b` statik alanına
+yazıyor. Yani `k0.i()/k0.p()` Lua app'i başlatmıyor. Kapıdan sonra uygulama
+hâlâ `btid = -1` ile bekliyor ve **hiçbir BTID/app-version isteği atmıyor** —
+yani gerçek eksik parça hâlâ **device init**.
+
+Uyarı: `k0$b.run` içindeki `if-nez v0, 00e7` **ters** okunmamalı — `u5()`
+*true* ise `0xe7`'ye atlanıp `return` ediliyor; `k0.i()` yalnızca `u5()`
+*false* iken çalışıyor. Bizde false, yani o adım çalıştı.
+
+### `th.i.u5()` → `FFlagShouldDisableAdIds`
+
+`uh.a.u5()` gövdesi `a0` alanını okuyup `flags/a$a.k()` çağırıyor; `a0`,
+`uh.a.<init>` içinde `new a$a("FFlagShouldDisableAdIds", false, …)` ile
+kuruluyor.
+
+### Ortam notu: `/tmp` temizliği
+
+Makine yeniden başlayınca `/tmp/pengudroid-libs` ve `/tmp/rbx*` kaybolur.
+Yeniden çıkarma (`.apkm` depoda):
+
+```
+mkdir -p /tmp/rbxbundle && (cd /tmp/rbxbundle && unzip -o -q <bundle>.apkm \
+  && unzip -o -q base.apk 'classes*.dex' -d /tmp/rbxdex)
+unzip -o -q -j /tmp/rbxbundle/split_config.x86_64.apk \
+  lib/x86_64/libroblox.so -d /tmp/rbxlib
+```
+
 ### Sıradaki adım (öncelik sırasıyla)
 
 1. **`stage = 4`'ü 2 yapan koşulu bulmak.** En kısa yol: `ptrace` tabanlı küçük
@@ -904,13 +976,16 @@ bir `ENOENT` yok.
    (`rbx`) yakalamak, sonra `*(int*)(rbx+0x30)` üzerine watchpoint kurup
    değeri **4 yazan** yeri bulmak. ASLR yüzünden `libroblox.so` tabanını
    `/proc/<pid>/maps`'ten okumak gerekir.
-2. **Native log gruplarını açmak** (dolaylı ama çok işe yarar). `DFLog`
-   grupları client-settings flag'leriyle açılıyor; flag cache dosyasının yolunu
-   bulmak `[DFLog::FlagCache]` kodundan çıkarılabilir.
-3. **`Settings` sağlayıcısına gerçek değerler** (`android_id`, `device_name`,
-   `device_provisioned`, `user_setup_complete`). Şu an her anahtara boş
-   `Bundle` dönüyor; device-init bir kimlik okuyorsa bu yüzden düşüyor olabilir.
-   Kalıp: `PROVIDER_ENTRIES` + `__pengudroid_binder_set_*`.
+2. **Native log gruplarını açmak** (dolaylı ama çok işe yarar). `ClientAppSettings.json`
+   üzerinden `FLog::<grup>` denendi ve **işe yaramadı** (ölçüldü, yukarı bkz.).
+   Geriye `DFLog`'un grup maskesini okuyan kodun kendisini bulmak kalıyor
+   (`[DFLog::FlagCache]`/`[FLog::…]` yazımından sorumlu fonksiyon).
+3. **Kapının arkasındaki ikinci duvar.** `result:0` yamasıyla app-shell
+   bootstrap'ı (`gk.a` AsyncTask) başlıyor ama çizim yok. O `doInBackground`
+   gövdesini (dexdump) okuyup nerede durduğunu bulmak, `stage`'i çözmekten daha
+   kısa yoldan oynanabilir bir ekrana götürebilir.
+4. **`Settings` sağlayıcısı** — *tamamlandı* (yukarı bkz. §"Settings sağlayıcısı
+   artık gerçek değer dönüyor"), `stage`'i değiştirmedi ama `android_id` artık gerçek.
 
 ### Beach Buggy Racing 2
 
