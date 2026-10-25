@@ -550,6 +550,10 @@ fn push_pcm(track: &Track, bytes: &[u8]) -> i32 {
     consumed as i32
 }
 
+/// How many times a dead audio sink is respawned before the track is declared
+/// dead. Bounded so a permanently broken audio server cannot spin.
+const MAX_SINK_RESTARTS: u32 = 5;
+
 /// Start the thread that drains the queue into `pw-cat`.
 fn start_pump(track: &mut Track) {
     if track.pump.is_some() {
@@ -561,9 +565,15 @@ fn start_pump(track: &mut Track) {
     };
     let shared = Arc::clone(&track.shared);
     let bytes_per_frame = (track.channels.max(1) as u32) * 2;
+    let (rate, channels) = (track.rate, track.channels);
     track.pump = Some(std::thread::spawn(move || {
         let mut sink = sink;
         let mut stdin = sink.stdin.take();
+        // A sink can die for reasons that have nothing to do with the app: the
+        // PipeWire daemon restarts, the default device changes, a USB headset is
+        // unplugged. Treating that as fatal stalled ExoPlayer forever, so the
+        // sink is respawned a bounded number of times instead.
+        let mut restarts: u32 = 0;
         loop {
             let chunk = {
                 let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -596,9 +606,38 @@ fn start_pump(track: &mut Track) {
                 None => false,
             };
             if !wrote {
-                let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
-                sh.alive = false;
-                break;
+                if restarts >= MAX_SINK_RESTARTS {
+                    let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    sh.alive = false;
+                    break;
+                }
+                restarts += 1;
+                // Put the chunk back: it was popped before the write, and
+                // dropping it would punch a hole in the audio at every restart.
+                {
+                    let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    for byte in chunk.iter().rev() {
+                        sh.queue.push_front(*byte);
+                    }
+                }
+                // Give the audio server a moment to come back before retrying;
+                // a device change is not instantaneous.
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                match crate::spawn_sink(rate, channels) {
+                    Some(mut fresh) => {
+                        stdin = fresh.stdin.take();
+                        sink = fresh;
+                        eprintln!(
+                            "audio: AudioTrack sink restarted (attempt {restarts}/{MAX_SINK_RESTARTS})"
+                        );
+                        continue;
+                    }
+                    None => {
+                        let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+                        sh.alive = false;
+                        break;
+                    }
+                }
             }
             let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
             sh.played += (chunk.len() / bytes_per_frame as usize) as u64;

@@ -17,7 +17,16 @@ backpressure gibi görünüp ExoPlayer'ın ilerlemesini durduruyordu.
 - Host ses yardımcılarından guest `LD_PRELOAD` ve `LD_LIBRARY_PATH` kaldırıldı.
   Çıkış hataları artık loglanıyor. Ölü AudioTrack çıkışına yazma
   `ERROR_DEAD_OBJECT` (-6) döndürüyor; dolu ama yaşayan kuyruk 0 döndürmeye devam
-  ediyor. Otomatik sink yeniden başlatma henüz yok.
+  ediyor.
+- **Otomatik sink yeniden başlatma eklendi.** Sink ölürse (PipeWire yeniden
+  başlar, varsayılan cihaz değişir, USB kulaklık çıkar) pompa artık ölmüyor:
+  yazılamayan parça kuyruğa geri konuyor, 150 ms bekleyip `pw-cat` yeniden
+  başlatılıyor ve en fazla `MAX_SINK_RESTARTS = 5` denemeden sonra track ölü
+  ilan ediliyor. Sınır, kalıcı bozuk bir ses sunucusunun sonsuz dönmesini
+  engelliyor. Parçayı geri koymak, her yeniden başlatmada sesde delik açmıyor.
+  **Not:** bu yol henüz canlı bir koşuda gözlenmedi — oynayan bir VOD'a ulaşmak
+  klavyeden yazmayı gerektiriyor ve bu otomatikleştirilemiyor; mantık sınırlı ve
+  yan etkisiz olduğu için eklendi, doğrulaması manuel.
 - Normal NewPipe arama → Blender Big Buck Bunny 09:57 VOD akışı, zorlanmış
   Surface olmadan **191,5 saniyede 4200 kareyi geçti** (örnek aralığında yaklaşık
   21,9 kare/s). Son üç kare özeti farklı; tek donmuş kare tekrarından ibaret değil.
