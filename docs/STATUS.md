@@ -3,6 +3,55 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
+## Bu oturum (12): **video gerçekten oynuyor** — kare çözülüp subsurface'e gidiyor
+
+Hedef tamamlandı: NewPipe bir video açtı, `c2.android.avc.decoder` kareleri
+çözdü, bizim `BLASTBufferQueue` tüketicimiz onları daemon'a `PresentDmabuf`
+olarak verdi ve daemon `wl_subsurface` üzerinde kompozit etti. Kanıt, doğrudan
+tüketicinin okuduğu tampondan alınan kare:
+
+```
+[blast] video: first frame presented (1280x720 fourcc=0x36314752)
+[blast] video: 360 frames            (55 sn'lik koşu, çökme yok)
+[pengudroid-daemon I] created subsurface 3 of 2 at 0,0
+442 × presented dmabuf
+```
+
+`PENGUDROID_DUMP_VIDEO=/tmp/vid` ile alınan `vid-180.ppm` → PNG: 1280x720,
+gerçek bir sahne (sahnedeki şarkıcı ve yakılmış "YOU'RE A MAN OF YOUR WORD"
+altyazısı). Yani çözülen kareler gerçek video, düz arka plan değil.
+
+### Kilidi açan iki düzeltme
+
+1. **`keep_alive` yanlış `RefBase` alt nesnesini kullanıyordu.** İki sınıf farklı
+   davranıyor:
+
+   | Sınıf | `RefBase` yeri | Ölçüm |
+   |---|---|---|
+   | `Surface` | offset **0** (sanal olmayan birincil taban) | vtable başlığında kullanılabilir vbase girdisi yok (`v[-3]` = -1312590112) |
+   | `BufferItemConsumer` | offset **0x698** (`virtual RefBase`) | `v[-3]` = 1688 |
+
+   `keep_alive` artık offseti açıkça alıyor ve makul olmayanı reddediyor.
+
+2. **`releaseBuffer`'a boş `sp<Fence>` geçmek çöküyordu.** libgui'nin
+   `addReleaseFenceLocked`'ı fence'i dereference ediyor. `libui.so`
+   `android::Fence::NO_FENCE`'ı ihraç ediyor; artık o statik geçiliyor. Öncesi:
+   ilk kareden hemen sonra SIGSEGV. Sonrası: 360+ kare, çökme yok.
+
+### Doğrulama aracı
+
+`PENGUDROID_DUMP_VIDEO=<önek>` (+ `PENGUDROID_DUMP_VIDEO_EVERY=<n>`, varsayılan
+30) tüketici iş parçacığının aldığı tamponu `pread` ile okuyup P6 PPM yazıyor.
+`ffmpeg -i vid-180.ppm vid-180.png` ile bakılabilir. RGB_565 ve RGBA_8888
+destekleniyor.
+
+### Notlar
+
+- Hâlâ `PENGUDROID_FORCE_SURFACE=1` gerekiyor: activity penceresinin
+  `mWinFrame`'i tıklama sonrası 0 kalıyor (oturum 10/11'in ölçümü), yani
+  `SurfaceView` kendiliğinden 720 genişlikte ölçülmüyor.
+- Canlı yayın 403'ü aralıklı: bu koşuda akış açıldı.
+
 ## Bu oturum (11): `relayoutAsync` — pencere 0×0'ya kilitlenmesinin gerçek nedeni
 
 REA (MCP) + JADX ile **bu sysroot'un kendi `framework.jar`'ı** decompile edildi;

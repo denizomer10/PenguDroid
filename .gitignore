@@ -31,3 +31,7 @@ fixtures/*.h264
 
 # ExoPlayer cache dumps written by the guest at runtime.
 exoplayer/
+
+# Video frames dumped by PENGUDROID_DUMP_VIDEO.
+/tmp/vid-*.ppm
+vid-*.png

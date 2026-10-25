@@ -751,6 +751,23 @@ fn consumer_loop(addr: usize) {
                         match conn.send_message(&msg, &[fd]).and_then(|_| conn.recv_message()) {
                             Ok((Message::Ack, _)) => {
                                 presented += 1;
+                                if let Ok(prefix) = std::env::var("PENGUDROID_DUMP_VIDEO") {
+                                    let every: u64 = std::env::var("PENGUDROID_DUMP_VIDEO_EVERY")
+                                        .ok()
+                                        .and_then(|v| v.trim().parse().ok())
+                                        .unwrap_or(30);
+                                    if presented % every == 0 || presented == 1 {
+                                        unsafe { dump_rgb565(
+                                            &prefix,
+                                            fd,
+                                            width,
+                                            height,
+                                            stride,
+                                            format,
+                                            presented,
+                                        ) };
+                                    }
+                                }
                                 if !announced {
                                     announced = true;
                                     eprintln!(
@@ -791,6 +808,70 @@ fn consumer_loop(addr: usize) {
             }
         }
         unsafe { (gui.release)(blast.item_consumer, item_ptr, no_fence) };
+    }
+}
+
+/// Write one queued video buffer as a binary PPM (P6).
+///
+/// This is the honest check that the frames are real: the daemon composites the
+/// subsurface, but a screenshot needs a compositor-specific tool, while the
+/// buffer itself is a plain memfd we can read.
+unsafe fn dump_rgb565(
+    prefix: &str,
+    fd: i32,
+    width: u32,
+    height: u32,
+    stride: u32,
+    format: i32,
+    index: u64,
+) {
+    let bpp: usize = if format == 4 { 2 } else { 4 };
+    let size = stride as usize * height as usize * bpp;
+    let mut raw = vec![0u8; size];
+    let dup = libc::dup(fd);
+    if dup < 0 {
+        return;
+    }
+    let mut got = 0usize;
+    while got < size {
+        let n = libc::pread(
+            dup,
+            raw[got..].as_mut_ptr() as *mut c_void,
+            size - got,
+            got as libc::off_t,
+        );
+        if n <= 0 {
+            break;
+        }
+        got += n as usize;
+    }
+    libc::close(dup);
+    if got < size {
+        return;
+    }
+    let mut out = Vec::with_capacity(size / bpp * 3 + 32);
+    out.extend_from_slice(format!("P6\n{width} {height}\n255\n").as_bytes());
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let o = y * stride as usize * bpp + x * bpp;
+            if format == 4 {
+                let v = u16::from_le_bytes([raw[o], raw[o + 1]]);
+                let r = ((v >> 11) & 0x1f) as u8;
+                let g = ((v >> 5) & 0x3f) as u8;
+                let b = (v & 0x1f) as u8;
+                out.push((r << 3) | (r >> 2));
+                out.push((g << 2) | (g >> 4));
+                out.push((b << 3) | (b >> 2));
+            } else {
+                out.push(raw[o]);
+                out.push(raw[o + 1]);
+                out.push(raw[o + 2]);
+            }
+        }
+    }
+    let path = format!("{prefix}-{index}.ppm");
+    if std::fs::write(&path, out).is_ok() {
+        eprintln!("[blast] video: wrote {path}");
     }
 }
 
