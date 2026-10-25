@@ -44,6 +44,32 @@ ikincisi 0×0 kalıyor** — yani sorun pencere başına tutulan bir durumda
 (relayout yanıtının o pencereye bağlanması ya da `addToDisplayAsUser` sonrası
 kurulan oturum/kanal durumu).
 
+### `PENGUDROID_FORCE_SURFACE=1` ile decoder artık yüzeye **bağlanıyor**
+
+Bu, oturumun en somut ilerlemesi. İki tıklı akış + `FORCE_SURFACE=1`:
+
+```
+views:  ExpandableSurfaceView
+views:    ViewRootImpl.mWidth 0 -> 720
+views:    requested 720x405 (traversal: true, postInvalidate: true)
+…
+SurfaceUtils: connecting to surface 0x7fa0fc1e4580, reason connectToSurface
+SurfaceUtils: disconnecting … reason connectToSurface(reconnect)
+MediaCodec: [c2.android.avc.decoder] setting surface generation to 47214593
+Codec2-InputBufferManager: frameIndex = 625 … 1294      ← ~1300 kare çözüldü
+```
+
+Önceki oturumun duvarı `BufferQueue has been abandoned` / `Failed to connect,
+err -19` idi; o **artık yok**. Yani codec2 decoder'ı gerçek bir yüzeye bağlanıp
+kare üretiyor.
+
+Kalan halka: **`mBlastBufferQueue` hâlâ null**, yani bizim tüketici
+(`[blast] created` / `[video]` izleri hiç çıkmıyor) başlamıyor ve çözülen
+kareleri hiçbir şey kompozit etmiyor. Sıradaki iş tam olarak bu: forced-surface
+yolunda da `BLASTBufferQueue`'yu kurmak (şu an kod yolu `mHaveFrame`'in kendi
+kendine true olmasını bekliyor) veya decoder'ın bağlandığı `Surface`'ın
+gralloc bloklarını doğrudan sunmak.
+
 ### `PENGUDROID_TEXTURE_VIEW` bu sürümde çıkmaz sokak
 
 NewPipe 0.29.1'de `TextureView` sınıfı **yok** (`classes*.dex` içinde
@@ -63,7 +89,7 @@ yolu zorunlu, BLAST'ı atlamanın kısa yolu yok.
     pengudroid launch NewPipe_v0.29.1.apk --sysroot .toolchain/sysroot
   ```
   0. tık diyaloğu kapatır, 1. tık ilk canlı yayını açar; probe 12 s sonra
-oğacı basar.
+  ağacı basar.
 * **`views: root N …` satırı artık `mWinFrame` de yazıyor** — `mWidth=0`
   gördüğünde “yanıt gelmedi mi, sonra mı sıfırlandı” sorusunu ayırıyor.
 * **Shim, her `relayout`'ta `IWindow` cookie'sini basıyor**
@@ -71,17 +97,22 @@ oğacı basar.
 
 ### Sıradaki adım
 
-İkinci pencerenin `relayout` yanıtı neden uygulanmıyor? İki yol:
-
-1. **Ana thread'i host'un pompalaması.** `apphost` şu an `Looper.loop()` çağırıp
+1. **Tüketiciyi forced-surface yolunda da başlatmak.** Decoder bağlanıyor ve
+   ~1300 kare çözüyor, ama `mBlastBufferQueue == null` olduğu için `blast.rs`
+   tüketicisi hiç başlamıyor. `FORCE_SURFACE` yolunda `SurfaceView`'ın kendi
+   pre-draw listener'ı `updateSurface()`'ı çağırmıyor (mHaveFrame false kaldığı
+   için); ya o listener'ı tetiklemenin temiz bir yolu bulunmalı ya da
+   `mHaveFrame`/`mSurfaceControl` alanları ana thread'de yazılmalı.
+2. **Ana thread'i host'un pompalaması.** `apphost` şu an `Looper.loop()` çağırıp
    bloklanıyor, bu yüzden UI alanlarına dokunmak zorunda kalan her kod başka bir
    thread'de koşuyor (ve `mWinFrame` yazmak bu yüzden SIGSEGV veriyordu).
    `Looper.loopOnce()` döngüsü host'a geçerse `mWinFrame`/`mWidth` **ana thread'de**
-   yazılabilir ve yarış kalmaz.
-2. **Pencere başına durumu bulmak.** `addToDisplayAsUser` iki kez çağrılıyor;
-   ikinci çağrıda dönen oturum/surface handle'ı birincisiyle çakışıyor olabilir
-   (shim her `add_to_display` çağrısında yeni fd çifti üretiyor mu, aynı handle'ı mı
-   tekrar veriyor — ölçülmedi).
+   yazılabilir ve yarış kalmaz. Bu aynı zamanda 1. maddenin de temiz çözümü.
+3. **İkinci pencerenin `mWinFrame`'i neden boş?** Ölçülen: üç relayout'un da
+   yanıtı birebir aynı, üçü de farklı `IWindow` cookie'si taşıyor, istek
+   argümanları farklı (`data=528/508/132`, `requestedWidth=-2/-1/…`).
+   `addToDisplayAsUser`'ın ikinci çağrıda ne döndürdüğü (yeni fd çifti mi, aynı
+   handle mi) henüz ölçülmedi.
 
 ## Bu oturum (9): BLASTBufferQueue gerçekten çalışıyor, kalan duvar `PlaceholderSurface`
 

@@ -2391,7 +2391,30 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             let data =
                 std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
             let win = find_local_binder(data).map(|(_, cookie, _)| cookie).unwrap_or(0);
-            diag(&format!("[binder]   relayout win={win:#x}\n"));
+            // Everything after the `IWindow` object is the rest of the call:
+            // `seq, requestedWidth, requestedHeight, viewVisibility, flags, …`.
+            // The object is 24 bytes (type/flags/binder/cookie) plus a stability
+            // word on Android 12+, so dump both candidate alignments rather than
+            // guess which one this framework writes.
+            let at = find_local_binder(data).map(|(_, _, at)| at).unwrap_or(0);
+            let mut ints = Vec::new();
+            for off in [at + 24, at + 28] {
+                if off + 20 <= data.len() {
+                    let v: Vec<i32> = (0..5)
+                        .map(|i| {
+                            i32::from_ne_bytes(
+                                data[off + 4 * i..off + 4 * i + 4].try_into().unwrap(),
+                            )
+                        })
+                        .collect();
+                    ints.push(format!("@{off}:{v:?}"));
+                }
+            }
+            diag(&format!(
+                "[binder]   relayout win={win:#x} data={} {}\n",
+                data.len(),
+                ints.join(" ")
+            ));
         }
         window_session_reply(tr.code, &mut parcel, &mut objects);
     }
