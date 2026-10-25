@@ -999,6 +999,24 @@ pub fn art_main(args: &[String]) -> i32 {
                 }
                 return run_main(&env, &class, &app_args);
             }
+            if std::env::var_os("PENGUDROID_PROBE_AUDIO_FOCUS").is_some() {
+                if !crate::apphost::probe_audio_focus(&env) {
+                    eprintln!("audio: AIDL focus probe failed");
+                    return 1;
+                }
+            }
+            if std::env::var_os("PENGUDROID_PROBE_WINDOW_CONFIG").is_some() {
+                if !crate::apphost::probe_window_configuration(&env) {
+                    eprintln!("window: local layout probe failed");
+                    return 1;
+                }
+            }
+            if std::env::var_os("PENGUDROID_PROBE_KEYBOARD").is_some() {
+                if !crate::apphost::probe_keyboard(&env) {
+                    eprintln!("keyboard: native InputManager/KeyCharacterMap probe failed");
+                    return 1;
+                }
+            }
             if let Some(class) = probe_class {
                 let descriptor = format!("L{};", class.replace('.', "/"));
                 return match env.load_class(&descriptor) {

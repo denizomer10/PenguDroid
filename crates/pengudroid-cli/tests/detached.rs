@@ -57,7 +57,7 @@ fn start_daemon(tag: &str) -> (Daemon, PathBuf) {
         .arg("--socket")
         .arg(&socket)
         .arg("--no-wayland")
-        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_RUNTIME_DIR", &runtime).env_remove("PENGUDROID_SOCKET")
         .env("PENGUDROID_CLI", binary("pengudroid"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -97,7 +97,7 @@ fn read_log() -> String {
 fn cli(runtime: &Path, args: &[&str]) -> Output {
     Command::new(binary("pengudroid"))
         .args(args)
-        .env("XDG_RUNTIME_DIR", runtime)
+        .env("XDG_RUNTIME_DIR", runtime).env_remove("PENGUDROID_SOCKET")
         .env("PENGUDROID_DAEMON", binary("pengudroid-daemon"))
         .output()
         .expect("run cli")

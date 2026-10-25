@@ -26,11 +26,12 @@
 //!
 //! # Where the frames go
 //!
-//! A consumer thread acquires each queued buffer and presents it to the daemon
-//! as a dma-buf on a **`wl_subsurface` of the app's window**. That is the
+//! A consumer thread acquires each queued CPU buffer and sends its memfd to the
+//! daemon for a `wl_shm` snapshot on a **`wl_subsurface` of the app's window**. That is the
 //! Wayland equivalent of the extra layer SurfaceFlinger would composite: the
 //! video is a child surface positioned inside the parent, so the compositor
-//! blends it without any copy and without a GPU context in the daemon.
+//! composites it without a GPU context in the daemon. CPU buffers are copied
+//! before acknowledgement because the decoder may immediately reuse them.
 //!
 //! `android.view.Surface.nativeGetFromBlastBufferQueue` is hosted too: the
 //! framework implementation casts the queue pointer back to a real
@@ -277,6 +278,8 @@ struct Blast {
     /// The daemon surface the consumer thread presents frames on (0 until the
     /// first frame).
     video_surface: std::sync::atomic::AtomicU32,
+    /// SurfaceView layout size, independent of the decoder's buffer dimensions.
+    display_size: std::sync::atomic::AtomicU64,
 }
 
 // SAFETY: the pointers are only ever used from the thread that owns the object,
@@ -384,6 +387,7 @@ unsafe extern "C" fn native_create(
         height,
         format,
         video_surface: std::sync::atomic::AtomicU32::new(0),
+        display_size: std::sync::atomic::AtomicU64::new(((width as u64) << 32) | height as u64),
     });
     let ptr = Box::into_raw(blast);
     BLASTS
@@ -475,6 +479,7 @@ unsafe extern "C" fn native_update(
         blast.width = w;
         blast.height = h;
     }
+    blast.display_size.store(((w as u64) << 32) | h as u64, std::sync::atomic::Ordering::Release);
     eprintln!("[blast] update {w}x{h} fmt={format:#x}");
 }
 
@@ -648,7 +653,7 @@ fn consumer_loop(addr: usize) {
     // for a while rather than giving up on the first refusal.
     let mut conn = None;
     for _ in 0..50 {
-        if let Ok(c) = Connection::connect(&default_socket_path()) {
+        if let Ok(c) = Connection::connect_endpoint(&default_socket_path()) {
             let hello = Message::Hello {
                 version: PROTO_VERSION,
                 role: Role::Guest,
@@ -707,15 +712,15 @@ fn consumer_loop(addr: usize) {
                     let format = h.data[2];
                     let width = h.data[3].max(1) as u32;
                     let height = h.data[4].max(1) as u32;
-                    let (fourcc, bpp) = fourcc_for(format);
+                    let (_fourcc, bpp) = fourcc_for(format);
 
                     if surface_id == 0 {
+                        let display = blast.display_size.load(std::sync::atomic::Ordering::Acquire);
+                        let (display_w, display_h) = ((display >> 32) as u32, display as u32);
                         let msg = Message::CreateSubsurface {
                             parent_pid: std::process::id() as i32,
-                            x,
-                            y,
-                            width,
-                            height,
+                            x, y,
+                            width: display_w.max(1), height: display_h.max(1),
                         };
                         match conn.send_message(&msg, &[]).and_then(|_| conn.recv_message()) {
                             Ok((Message::SubsurfaceCreated { surface_id: id }, _)) => {
@@ -724,7 +729,7 @@ fn consumer_loop(addr: usize) {
                                     .video_surface
                                     .store(id, std::sync::atomic::Ordering::Relaxed);
                                 eprintln!(
-                                    "[blast] video surface {id} at {x},{y} ({width}x{height} fmt={format})"
+                                    "[blast] video surface {id} at {x},{y} source={width}x{height} layout={display_w}x{display_h} fmt={format}"
                                 );
                             }
                             Ok((other, _)) => {
@@ -739,14 +744,12 @@ fn consumer_loop(addr: usize) {
                     }
 
                     if surface_id != 0 {
-                        let msg = Message::PresentDmabuf {
-                            surface_id,
-                            width,
-                            height,
-                            stride: stride * bpp,
-                            fourcc,
-                            modifier: 0,
-                            offset: 0,
+                        // Our GraphicBuffer allocator returns a CPU memfd, not
+                        // a DMA_BUF fd. Importing it through linux-dmabuf kills
+                        // the compositor connection. Snapshot via wl_shm instead.
+                        let msg = Message::PresentShm {
+                            surface_id, width, height, stride: stride * bpp,
+                            format: format as u32,
                         };
                         match conn.send_message(&msg, &[fd]).and_then(|_| conn.recv_message()) {
                             Ok((Message::Ack, _)) => {
@@ -771,7 +774,7 @@ fn consumer_loop(addr: usize) {
                                 if !announced {
                                     announced = true;
                                     eprintln!(
-                                        "[blast] video: first frame presented ({width}x{height} fourcc={fourcc:#x})"
+                                        "[blast] video: first software frame submitted ({width}x{height} format={format})"
                                     );
                                 } else if trace && presented % 30 == 0 {
                                     eprintln!("[blast] video: {presented} frames");

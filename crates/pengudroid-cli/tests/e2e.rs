@@ -71,7 +71,7 @@ fn start_daemon(tag: &str) -> (Daemon, PathBuf, PathBuf) {
         .arg("--socket")
         .arg(&socket)
         .arg("--no-wayland")
-        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_RUNTIME_DIR", &runtime).env_remove("PENGUDROID_SOCKET")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -98,7 +98,7 @@ fn start_daemon(tag: &str) -> (Daemon, PathBuf, PathBuf) {
 fn cli(runtime: &Path, args: &[&str]) -> Output {
     Command::new(binary("pengudroid"))
         .args(args)
-        .env("XDG_RUNTIME_DIR", runtime)
+        .env("XDG_RUNTIME_DIR", runtime).env_remove("PENGUDROID_SOCKET")
         .env("PENGUDROID_DAEMON", binary("pengudroid-daemon"))
         .output()
         .expect("run cli")
@@ -187,4 +187,45 @@ fn stop_then_start_is_race_free() {
     assert!(stdout(&status).contains("daemon: running"));
 
     assert!(cli(&runtime, &["stop"]).status.success());
+}
+
+#[test]
+fn idle_input_subscriber_receives_every_key_in_order() {
+    use pengudroid_proto::InputKind;
+
+    let (_daemon, runtime, socket) = start_daemon("keys");
+    let subscriber = Connection::connect_endpoint(&socket).expect("connect subscriber");
+    subscriber.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    subscriber.send_message(&Message::Hello {
+        version: PROTO_VERSION, role: Role::Guest, pid: 424242,
+    }, &[]).unwrap();
+    assert!(matches!(subscriber.recv_message().unwrap().0, Message::Welcome { .. }));
+    subscriber.send_message(&Message::SubscribeInput { surface_id: 71 }, &[]).unwrap();
+    assert_eq!(subscriber.recv_message().unwrap().0, Message::Ack);
+
+    // Each CLI is a different socket. The subscription's serving thread is
+    // waiting on recv when a key arrives in its inbox. A discarded try_recv
+    // in the timeout path used to eat the first event in almost every burst.
+    for code in 16..32 {
+        std::thread::sleep(Duration::from_millis(12));
+        let sent = cli(&runtime, &["key", &code.to_string()]);
+        assert!(sent.status.success(), "{}", stderr(&sent));
+        for pressed in [true, false] {
+            let received = subscriber.recv_message().expect("input event was lost").0;
+            assert_eq!(received, Message::InputEvent {
+                surface_id: 71, event: InputKind::Key { keycode: code, pressed },
+            });
+        }
+    }
+    for (state, pressed) in [("down", true), ("up", false)] {
+        assert!(cli(&runtime, &["key", "42", state]).status.success());
+        assert_eq!(subscriber.recv_message().unwrap().0, Message::InputEvent {
+            surface_id: 71, event: InputKind::Key { keycode: 42, pressed },
+        });
+    }
+    for invalid in [&[][..], &["-1"][..], &["768"][..], &["30", "invalid"][..], &["30", "up", "extra"][..]] {
+        let mut args = vec!["key"];
+        args.extend_from_slice(invalid);
+        assert_eq!(cli(&runtime, &args).status.code(), Some(2));
+    }
 }

@@ -54,6 +54,8 @@ mod ahardwarebuffer;
 mod android_native;
 mod audiotrack;
 mod binder;
+mod audiofocus;
+mod virtual_input;
 mod blast;
 mod codec2;
 mod netdb;
@@ -4722,24 +4724,32 @@ thread_local! {
     static IN_BQ_CALLBACK: std::cell::Cell<bool> = std::cell::Cell::new(false);
 }
 
+/// Host helpers must use host libraries: inheriting the guest's LD_PRELOAD
+/// would inject Bionic interpositions into pw-cat/aplay and its plugins.
+fn host_sink_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.env_remove("LD_PRELOAD").env_remove("LD_LIBRARY_PATH");
+    command
+}
+
 /// Spawn `pw-cat` (preferred) or `aplay` reading S16 PCM from stdin.
 fn spawn_sink(rate: u32, channels: u32) -> Option<Sink> {
     let rate = rate.to_string();
     let channels = channels.to_string();
 
-    let pw_cat = Command::new("pw-cat")
+    let pw_cat = host_sink_command("pw-cat")
         .args(["-p", "-a", "--rate", &rate, "--channels", &channels, "--format", "s16", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn();
     let child = match pw_cat {
         Ok(child) => Some(child),
-        Err(_) => Command::new("aplay")
+        Err(_) => host_sink_command("aplay")
             .args(["-q", "-t", "raw", "-f", "S16_LE", "-r", &rate, "-c", &channels, "-"])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .ok(),
     }?;
@@ -4967,6 +4977,16 @@ pub static __pengudroid_ver_ld: u8 = 0;
 mod tests {
     use super::*;
     use std::os::unix::io::FromRawFd;
+
+    #[test]
+    fn host_audio_helpers_do_not_inherit_the_guest_loader() {
+        let command = host_sink_command("pw-cat");
+        for name in ["LD_PRELOAD", "LD_LIBRARY_PATH"] {
+            let entry = command.get_envs().find(|(key, _)| *key == std::ffi::OsStr::new(name));
+            assert_eq!(entry.map(|(_, value)| value), Some(None));
+        }
+        assert!(!command.get_envs().any(|(key, _)| key == std::ffi::OsStr::new("XDG_RUNTIME_DIR")));
+    }
 
     #[test]
     fn log_line_format() {

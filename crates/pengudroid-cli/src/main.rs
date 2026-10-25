@@ -23,6 +23,7 @@ mod guest;
 mod isolate;
 mod jni;
 mod launcher;
+mod keyboard;
 mod nativelib;
 mod native;
 mod runner;
@@ -60,6 +61,7 @@ fn real_main() -> i32 {
         "start" => cmd_start(&args[2..]),
         "ps" => cmd_ps(),
         "tap" => cmd_tap(&args[2..]),
+        "key" => cmd_key(&args[2..]),
         "input" => cmd_tap(&args[2..]),
         "info" | "inspect" => cmd_info(&args[2..]),
         "deps" => deps::run(&args[2..]),
@@ -283,6 +285,41 @@ fn cmd_tap(args: &[String]) -> i32 {
         }
     }
     println!("tapped {x},{y}");
+    0
+}
+
+/// Inject a physical Linux key through the same daemon queue as Wayland.
+/// A down/up pair is the default; explicit states allow modifier chords.
+fn cmd_key(args: &[String]) -> i32 {
+    let Some(code) = args.first().and_then(|v| v.parse::<u32>().ok()).filter(|v| *v <= 0x2ff) else {
+        eprintln!("usage: pengudroid key <linux-keycode> [down|up]");
+        return 2;
+    };
+    let states: &[bool] = match (args.get(1).map(String::as_str), args.len()) {
+        (None, 1) => &[true, false],
+        (Some("down"), 2) => &[true],
+        (Some("up"), 2) => &[false],
+        _ => {
+            eprintln!("usage: pengudroid key <linux-keycode> [down|up]");
+            return 2;
+        }
+    };
+    let client = match connect() {
+        Ok(c) => c,
+        Err(e) => return fail(&e),
+    };
+    for &pressed in states {
+        let message = Message::InputEvent {
+            surface_id: 0,
+            event: InputKind::Key { keycode: code, pressed },
+        };
+        match client.request(&message) {
+            Ok((Message::Ack, _)) => {}
+            Ok((other, _)) => return fail(&format!("unexpected reply: {other:?}")),
+            Err(e) => return fail(&e),
+        }
+    }
+    println!("injected key {code}");
     0
 }
 
@@ -641,6 +678,8 @@ fn print_help() {
          \x20   demo                                        launch the built-in demo window\n\
          \x20   start <app.apk> [--wait]                   let the daemon fork the guest\n\
          \x20   start --demo [--wait]                       same, for the built-in demo\n\
+         \x20   key <linux-keycode> [down|up]              inject a physical key (default: press + release)\n\
+         \x20   tap <x> <y>                                inject a pointer click\n\
          \x20   ps                                          list running guests\n\
          \x20   info <app.apk>                              show manifest details\n\
          \x20   deps <lib.so>                               bionic import coverage\n\

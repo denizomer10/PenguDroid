@@ -352,9 +352,9 @@ fn serve(daemon: Arc<Daemon>, conn: Connection) -> io::Result<()> {
             Err(pengudroid_socket::SocketError::Io(e))
                 if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
             {
-                if peer.inbox.try_recv().is_ok() {
-                    // Something arrived while we slept: loop to drain it.
-                }
+                // Do not peek with try_recv: it consumes (and used to drop)
+                // the first queued key, pointer event or forwarded guest call.
+                // The top of the loop drains every message to the socket.
                 continue;
             }
             Err(pengudroid_socket::SocketError::Io(e))
@@ -367,6 +367,20 @@ fn serve(daemon: Arc<Daemon>, conn: Connection) -> io::Result<()> {
         };
         let (msg, raw_fds) = received;
         let (reply, out_fds, close) = match msg {
+            Message::PresentShm { surface_id, width, height, stride, format } => {
+                let owned: Vec<OwnedFd> = raw_fds.into_iter().map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }).collect();
+                let mut fds = owned.into_iter();
+                let result = match (fds.next(), daemon.graphics.lock().unwrap().as_mut()) {
+                    (Some(fd), Some(gfx)) => gfx.present_shm(surface_id, fd, width, height, stride, format),
+                    (None, _) => Err("PresentShm: no fd attached".into()),
+                    (_, None) => Err("graphics unavailable".into()),
+                };
+                let reply = match result {
+                    Ok(()) => Message::Ack,
+                    Err(message) => Message::Error { code: -22, message },
+                };
+                (Some(reply), vec![], false)
+            }
             Message::PresentDmabuf { surface_id, width, height, stride, fourcc, modifier, offset } => {
                 // SAFETY: these fds arrived via SCM_RIGHTS and are now ours.
                 let in_fds: Vec<OwnedFd> = raw_fds
@@ -799,10 +813,10 @@ fn handle(
             SHUTDOWN.store(true, Ordering::Relaxed);
             (Some(Message::Goodbye), vec![], true)
         }
-        Message::PresentDmabuf { .. } => (
+        Message::PresentDmabuf { .. } | Message::PresentShm { .. } => (
             Some(Message::Error {
                 code: -22,
-                message: "PresentDmabuf must carry a dma-buf fd".into(),
+                message: "buffer presentation must carry an fd".into(),
             }),
             vec![],
             false,

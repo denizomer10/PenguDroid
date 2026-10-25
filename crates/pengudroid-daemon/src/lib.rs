@@ -26,5 +26,6 @@ pub mod props;
 pub mod server;
 pub mod services;
 pub mod stubs;
+mod software;
 
 pub use server::Daemon;

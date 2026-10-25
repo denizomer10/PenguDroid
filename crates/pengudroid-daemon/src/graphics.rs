@@ -47,7 +47,7 @@ mod imp {
     use pengudroid_proto::abi;
     use wayland_client::globals::{registry_queue_init, GlobalListContents};
     use wayland_client::protocol::{
-        wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_registry,
+        wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_registry, wl_region,
         wl_seat, wl_shm, wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface,
     };
     use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
@@ -504,6 +504,12 @@ mod imp {
             let id = self.state.alloc_id();
             let wl_surface = compositor.create_surface(&qh, ());
             let subsurface = subcompositor.get_subsurface(&wl_surface, &parent_surface, &qh, ());
+            // Android dispatches SurfaceView touch events through the parent
+            // ViewRootImpl. This video-only child has no input subscription;
+            // without an empty input region it swallows clicks over the video.
+            let input_region = compositor.create_region(&qh, ());
+            wl_surface.set_input_region(Some(&input_region));
+            input_region.destroy();
             subsurface.set_position(x, y);
             subsurface.set_desync();
 
@@ -551,7 +557,7 @@ mod imp {
                 },
             );
             let _ = self.conn.flush();
-            crate::info!("created subsurface {id} of {parent} at {x},{y}");
+            crate::info!("created subsurface {id} of {parent} at {x},{y} size={width}x{height} (input transparent)");
             Some(id)
         }
 
@@ -703,6 +709,40 @@ mod imp {
                 return Err("compositor rejected the dmabuf".to_string());
             }
             Ok(())
+        }
+
+        /// Snapshot decoder-owned CPU memory and submit it through wl_shm.
+        /// Every frame has separate storage until the compositor releases it.
+        pub fn present_shm(&mut self, id: u32, fd: std::os::fd::OwnedFd,
+            width: u32, height: u32, stride: u32, format: u32) -> Result<(), String> {
+            if !self.state.surfaces.contains_key(&id) {
+                return Err(format!("unknown surface {id}"));
+            }
+            let pixels = crate::software::snapshot(fd, width, height, stride, format)?;
+            let source_size = (width, height);
+            let surface = self.state.surfaces.get(&id).unwrap();
+            let (width, height) = if surface.subsurface.is_some() {
+                (surface.width, surface.height)
+            } else { (width, height) };
+            let pixels = crate::software::resize(pixels, source_size.0, source_size.1, width, height)?;
+            let region = AshmemRegion::create("pengudroid-video-snapshot", pixels.len() as u64)
+                .map_err(|e| e.to_string())?;
+            region.map_mut().map_err(|e| e.to_string())?.as_mut_slice().copy_from_slice(&pixels);
+            let shm = self.state.shm.as_ref().ok_or("no wl_shm")?;
+            let qh = self.queue.handle();
+            let duplicate = region.try_clone_fd().map_err(|e| e.to_string())?;
+            let pool = shm.create_pool(duplicate.as_fd(), pixels.len() as i32, &qh, ());
+            let buffer = pool.create_buffer(0, width as i32, height as i32,
+                (width * 4) as i32, wl_shm::Format::Xrgb8888, &qh, SoftwareFrame);
+            pool.destroy();
+            let s = self.state.surfaces.get_mut(&id).unwrap();
+            s.wl_surface.set_buffer_transform(wl_output::Transform::Normal);
+            s.wl_surface.attach(Some(&buffer), 0, 0);
+            s.wl_surface.damage(0, 0, width as i32, height as i32);
+            s.wl_surface.commit();
+            // The pool request sends its own fd. Wayland retains the snapshot
+            // independently of the Android buffer, which may now be recycled.
+            self.conn.flush().map_err(|e| e.to_string())
         }
 
         /// Present a GPU-rendered dma-buf on an existing surface (zero-copy).
@@ -873,11 +913,23 @@ mod imp {
         };
     }
 
+    /// Snapshot buffers are immutable and retired only after wl_buffer.release.
+    struct SoftwareFrame;
+    impl Dispatch<wl_buffer::WlBuffer, SoftwareFrame> for State {
+        fn event(_: &mut Self, buffer: &wl_buffer::WlBuffer, event: wl_buffer::Event,
+            _: &SoftwareFrame, _: &Connection, _: &QueueHandle<Self>) {
+            if let wl_buffer::Event::Release = event {
+                buffer.destroy();
+            }
+        }
+    }
+
     ignore_events!(wl_compositor::WlCompositor, ());
     ignore_events!(wl_shm::WlShm, ());
     ignore_events!(wl_shm_pool::WlShmPool, ());
     ignore_events!(wl_buffer::WlBuffer, ());
     ignore_events!(wl_surface::WlSurface, ());
+    ignore_events!(wl_region::WlRegion, ());
     ignore_events!(wl_callback::WlCallback, ());
     ignore_events!(wl_subcompositor::WlSubcompositor, ());
     ignore_events!(wl_subsurface::WlSubsurface, ());
@@ -1102,6 +1154,12 @@ mod imp {
         pub fn set_subsurface_position(&mut self, _id: u32, _x: i32, _y: i32) -> bool {
             false
         }
+        pub fn focused_surface(&self) -> Option<u32> {
+            None
+        }
+        pub fn destroy_surface(&mut self, _id: u32) -> bool {
+            false
+        }
         pub fn present(&mut self, _id: u32) -> bool {
             false
         }
@@ -1139,6 +1197,11 @@ mod imp {
             _modifier: u64,
             _offset: u32,
         ) -> Result<(), String> {
+            Err("graphics built without the `wayland` feature".into())
+        }
+        #[allow(clippy::too_many_arguments)]
+        pub fn present_shm(&mut self, _id: u32, _fd: std::os::fd::OwnedFd,
+            _width: u32, _height: u32, _stride: u32, _format: u32) -> Result<(), String> {
             Err("graphics built without the `wayland` feature".into())
         }
         #[allow(clippy::too_many_arguments)]

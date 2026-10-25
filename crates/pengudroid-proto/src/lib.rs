@@ -74,6 +74,7 @@ pub enum MsgKind {
     /// Move a subsurface inside its parent (parent-local pixels).
     SetSubsurfacePosition = 66,
     DestroySurface = 67,
+    PresentShm = 68,
 
     GetProp = 70,
     PropValue = 71,
@@ -132,6 +133,7 @@ impl MsgKind {
             65 => SubsurfaceCreated,
             66 => SetSubsurfacePosition,
             67 => DestroySurface,
+            68 => PresentShm,
             70 => GetProp,
             71 => PropValue,
             72 => SetProp,
@@ -267,6 +269,9 @@ pub enum Message {
     SubsurfaceCreated { surface_id: u32 },
     SetSubsurfacePosition { surface_id: u32, x: i32, y: i32 },
     DestroySurface { surface_id: u32 },
+    /// Snapshot a CPU buffer (memfd passed out-of-band), never a GPU dma-buf.
+    /// `format` is an Android HAL pixel format; `stride` is bytes per row.
+    PresentShm { surface_id: u32, width: u32, height: u32, stride: u32, format: u32 },
     /// Present a dma-buf (fd passed out-of-band) on an existing surface.
     PresentDmabuf {
         surface_id: u32,
@@ -354,6 +359,7 @@ impl Message {
             SetSubsurfacePosition { .. } => MsgKind::SetSubsurfacePosition,
             DestroySurface { .. } => MsgKind::DestroySurface,
             PresentDmabuf { .. } => MsgKind::PresentDmabuf,
+            PresentShm { .. } => MsgKind::PresentShm,
             GetProp { .. } => MsgKind::GetProp,
             PropValue { .. } => MsgKind::PropValue,
             SetProp { .. } => MsgKind::SetProp,
@@ -482,6 +488,13 @@ impl Message {
                 e.i32(*y);
             }
             DestroySurface { surface_id } => e.u32(*surface_id),
+            PresentShm { surface_id, width, height, stride, format } => {
+                e.u32(*surface_id);
+                e.u32(*width);
+                e.u32(*height);
+                e.u32(*stride);
+                e.u32(*format);
+            }
             PresentDmabuf { surface_id, width, height, stride, fourcc, modifier, offset } => {
                 e.u32(*surface_id);
                 e.u32(*width);
@@ -661,6 +674,10 @@ impl Message {
                 y: d.i32()?,
             },
             K::DestroySurface => DestroySurface { surface_id: d.u32()? },
+            K::PresentShm => PresentShm {
+                surface_id: d.u32()?, width: d.u32()?, height: d.u32()?,
+                stride: d.u32()?, format: d.u32()?,
+            },
             K::PresentDmabuf => PresentDmabuf {
                 surface_id: d.u32()?,
                 width: d.u32()?,
@@ -907,16 +924,23 @@ impl fmt::Display for ProtoError {
 
 impl std::error::Error for ProtoError {}
 
-/// Where the daemon's control socket lives. Prefers the per-user runtime dir,
-/// falling back to a per-uid directory under `/tmp` when `XDG_RUNTIME_DIR` is
-/// unset (e.g. under `su`, cron, or a bare TTY).
+/// Where the daemon's control socket lives. An explicit PENGUDROID_SOCKET
+/// isolates a broker without replacing XDG_RUNTIME_DIR: PipeWire and Wayland
+/// must still see the real desktop session. Without it retain the runtime-dir
+/// and per-uid /tmp fallback used by existing installations.
 pub fn default_socket_path() -> std::path::PathBuf {
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        if !dir.is_empty() {
-            return std::path::PathBuf::from(dir).join("pengudroid").join("daemon.sock");
-        }
+    socket_path(std::env::var_os("PENGUDROID_SOCKET").as_deref(),
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(), uid())
+}
+
+fn socket_path(explicit: Option<&std::ffi::OsStr>, runtime: Option<&std::ffi::OsStr>, uid: u32) -> std::path::PathBuf {
+    if let Some(path) = explicit.filter(|s| !s.is_empty()) {
+        return std::path::PathBuf::from(path);
     }
-    std::path::PathBuf::from(format!("/tmp/pengudroid-{}", uid())).join("daemon.sock")
+    if let Some(dir) = runtime.filter(|s| !s.is_empty()) {
+        return std::path::PathBuf::from(dir).join("pengudroid/daemon.sock");
+    }
+    std::path::PathBuf::from(format!("/tmp/pengudroid-{uid}/daemon.sock"))
 }
 
 /// Current effective uid, read via `std` metadata (no `unsafe`, no `libc`
@@ -941,6 +965,16 @@ mod tests {
     }
 
     #[test]
+    fn explicit_control_socket_preserves_the_host_runtime_contract() {
+        use std::ffi::OsStr;
+        assert_eq!(socket_path(Some(OsStr::new("/tmp/private/daemon.sock")), Some(OsStr::new("/run/user/1000")), 1000),
+            std::path::PathBuf::from("/tmp/private/daemon.sock"));
+        assert_eq!(socket_path(Some(OsStr::new("")), Some(OsStr::new("/run/user/1000")), 1000),
+            std::path::PathBuf::from("/run/user/1000/pengudroid/daemon.sock"));
+        assert_eq!(socket_path(None, None, 1000), std::path::PathBuf::from("/tmp/pengudroid-1000/daemon.sock"));
+    }
+
+    #[test]
     fn roundtrip_simple() {
         roundtrip(Message::Ping);
         roundtrip(Message::Shutdown);
@@ -949,6 +983,7 @@ mod tests {
 
     #[test]
     fn roundtrip_complex() {
+        roundtrip(Message::PresentShm { surface_id: 4, width: 426, height: 240, stride: 852, format: 4 });
         roundtrip(Message::RunApk {
             path: "/tmp/app.apk".into(),
             component: Some("com.x/.Main".into()),

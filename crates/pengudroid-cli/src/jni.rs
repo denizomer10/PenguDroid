@@ -97,6 +97,18 @@ mod slot {
 #[derive(Clone, Copy)]
 pub struct JniEnv(pub *mut c_void);
 
+/// JNI references created on an attached native thread otherwise remain live
+/// until the thread detaches. Bound each input event's temporary references.
+pub struct LocalFrame(JniEnv);
+
+impl Drop for LocalFrame {
+    fn drop(&mut self) {
+        let pop: unsafe extern "C" fn(*mut c_void, JObject) -> JObject =
+            unsafe { self.0.func(slot::POP_LOCAL_FRAME) };
+        unsafe { pop(self.0.0, std::ptr::null_mut()) };
+    }
+}
+
 impl JniEnv {
     /// The function table. Slot 0 of the table is `GetVersion`'s predecessor
     /// only in the sense that the table itself starts at `reserved0`, so the
@@ -111,6 +123,17 @@ impl JniEnv {
         let p = *self.table().add(index);
         debug_assert_eq!(std::mem::size_of::<F>(), std::mem::size_of::<*const c_void>());
         std::mem::transmute_copy(&p)
+    }
+
+    pub fn local_frame(&self, capacity: i32) -> Option<LocalFrame> {
+        let push: unsafe extern "C" fn(*mut c_void, i32) -> i32 =
+            unsafe { self.func(slot::PUSH_LOCAL_FRAME) };
+        if unsafe { push(self.0, capacity) } == JNI_OK {
+            Some(LocalFrame(*self))
+        } else {
+            self.describe_exception();
+            None
+        }
     }
 
     /// `GetVersion()` — used to validate the table layout.

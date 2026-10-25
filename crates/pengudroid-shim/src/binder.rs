@@ -784,6 +784,16 @@ const ITHERMAL_GET_THERMAL_HEADROOM: u32 = 11;
 /// `IDisplayManager` transaction code for `getDisplayInfo(int)`.
 const IDM_GET_DISPLAY_INFO: u32 = 1;
 
+/// Framework-marshalled virtual keyboard InputDevice, including its native map.
+static VIRTUAL_INPUT_DEVICE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+/// IAudioService codes verified with this framework's IAudioService$Stub.
+const IAS_REQUEST_AUDIO_FOCUS: u32 = 66;
+const IAS_ABANDON_AUDIO_FOCUS: u32 = 67;
+const IAS_UNREGISTER_AUDIO_FOCUS_CLIENT: u32 = 68;
+const IAS_GET_CURRENT_AUDIO_FOCUS: u32 = 69;
+static AUDIO_FOCUS: crate::audiofocus::AudioFocus = crate::audiofocus::AudioFocus::new();
+
 /// A serialized `DisplayInfo` for the default display.
 static DISPLAY_INFO: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
@@ -1975,7 +1985,17 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                 if trace_enabled() {
                     diag(&format!("[binder]   -> {name} (handle {})\n", handle_for(&name)));
                 }
-                push_flat_handle(&mut parcel, &mut objects, handle_for(&name));
+                if name == "autofill" {
+                    // No autofill engine is hosted. Advertising a dummy binder
+                    // makes AutofillManager.addClient wait five seconds for a
+                    // callback on every focus/layout change. Service absence is
+                    // Android's supported "autofill unavailable" path.
+                    parcel.extend_from_slice(&BINDER_TYPE_BINDER.to_ne_bytes());
+                    parcel.extend_from_slice(&0x7fu32.to_ne_bytes());
+                    parcel.extend_from_slice(&[0u8; 16]); // null binder + cookie
+                } else {
+                    push_flat_handle(&mut parcel, &mut objects, handle_for(&name));
+                }
             }
         }
     }
@@ -2343,6 +2363,42 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         // settings (user not unlocked)" and refuses the provider lookup, and
         // `getSharedPreferences` throws for credential-encrypted storage.
         parcel.extend_from_slice(&1u32.to_ne_bytes());
+    }
+    if tr.target_handle == handle_for("audio") {
+        match tr.code {
+            IAS_REQUEST_AUDIO_FOCUS => {
+                let data = if tr.data_size > 0 && tr.data_ptr != 0 {
+                    std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize)
+                } else { &[] };
+                // AIDL order: AudioAttributes, durationHint, IBinder client.
+                // Locate the real client object instead of guessing the
+                // variable-length AudioAttributes parcel's size.
+                let gain = find_local_binder(data).and_then(|(_, _, at)| {
+                    let from = at.checked_sub(4)?;
+                    Some(i32::from_ne_bytes(data.get(from..at)?.try_into().ok()?))
+                }).unwrap_or(0);
+                let result = AUDIO_FOCUS.request(gain);
+                parcel.extend_from_slice(&result.to_ne_bytes());
+                if trace_enabled() {
+                    diag(&format!("[binder]   -> audio focus gain={gain} result={result}\n"));
+                }
+            }
+            IAS_ABANDON_AUDIO_FOCUS => parcel.extend_from_slice(&AUDIO_FOCUS.abandon().to_ne_bytes()),
+            IAS_UNREGISTER_AUDIO_FOCUS_CLIENT => { AUDIO_FOCUS.abandon(); }
+            IAS_GET_CURRENT_AUDIO_FOCUS => parcel.extend_from_slice(&AUDIO_FOCUS.current().to_ne_bytes()),
+            _ => {}
+        }
+    }
+    if tr.target_handle == handle_for("input") && matches!(tr.code, 1..=7 | 22) {
+        let data = if tr.data_size > 0 && tr.data_ptr != 0 {
+            std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize)
+        } else { &[] };
+        if let Some(args) = crate::virtual_input::arguments(data) {
+            let device = VIRTUAL_INPUT_DEVICE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(body) = crate::virtual_input::reply(tr.code, args, &device) {
+                parcel.extend_from_slice(&body);
+            }
+        }
     }
     if tr.target_handle == handle_for("display") && tr.code == IDM_GET_DISPLAY_INFO {
         let info = DISPLAY_INFO.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -3562,6 +3618,16 @@ pub unsafe extern "C" fn __pengudroid_binder_set_setting(
     }
 }
 
+/// Install the virtual keyboard's framework-written InputDevice parcel.
+/// # Safety
+/// `ptr` must reference `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_input_device(ptr: *const u8, len: usize) {
+    if ptr.is_null() || len == 0 { return; }
+    *VIRTUAL_INPUT_DEVICE.lock().unwrap_or_else(|e| e.into_inner()) =
+        std::slice::from_raw_parts(ptr, len).to_vec();
+}
+
 /// `void __pengudroid_binder_set_display_info(const uint8_t *bytes, size_t len)`
 ///
 /// # Safety
@@ -3701,6 +3767,20 @@ mod tests {
         assert_eq!(last_string16(&parcel).as_deref(), Some("activity"));
         let parcel = service_request("android.os.IServiceManager", "package");
         assert_eq!(last_string16(&parcel).as_deref(), Some("package"));
+    }
+
+    #[test]
+    fn absent_autofill_does_not_advertise_a_binder_that_never_calls_back() {
+        let data = service_request("android.os.IServiceManager", "autofill");
+        let tr = TransactionData {
+            target_handle: 0, _pad0: 0, cookie: 0, code: ISM_GET_SERVICE, flags: 0,
+            sender_pid: 0, sender_euid: 0, data_size: data.len() as u64,
+            offsets_size: 0, data_ptr: data.as_ptr() as u64, offsets_ptr: 0,
+        };
+        let reply = unsafe { make_reply(&tr, 1) };
+        assert!(reply.objects.is_empty());
+        assert_eq!(&reply.parcel[4..8], &BINDER_TYPE_BINDER.to_ne_bytes());
+        assert_eq!(&reply.parcel[12..28], &[0u8; 16]);
     }
 
     #[test]

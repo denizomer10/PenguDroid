@@ -414,6 +414,8 @@ struct SurfaceRec {
     /// into one Wayland surface, so they overwrote each other and only whichever
     /// drew last was visible.
     surface_id: u32,
+    /// Only surfaces created here may be destroyed here; injected ids are borrowed.
+    owns_surface: bool,
 }
 
 /// Substitute the cached host display for `EGL_NO_DISPLAY`.
@@ -766,7 +768,7 @@ fn ensure_surface_id(st: &mut State, rec: &mut SurfaceRec) -> Result<u32, String
         }
         st.connect_attempted = true;
 
-        let conn = Connection::connect(&default_socket_path())
+        let conn = Connection::connect_endpoint(&default_socket_path())
             .map_err(|e| format!("cannot connect to the daemon: {e}"))?;
         // Never block a guest indefinitely behind a wedged daemon.
         let _ = conn.set_read_timeout(Some(Duration::from_millis(500)));
@@ -826,6 +828,7 @@ fn ensure_surface_id(st: &mut State, rec: &mut SurfaceRec) -> Result<u32, String
     match reply {
         Message::SurfaceCreated { surface_id, .. } => {
             rec.surface_id = surface_id;
+            rec.owns_surface = true;
             subscribe_input(surface_id);
             Ok(surface_id)
         }
@@ -846,7 +849,7 @@ static INPUT_QUEUE: Mutex<Vec<(u32, pengudroid_proto::InputKind)>> = Mutex::new(
 /// reader thread only ever appends to [`INPUT_QUEUE`].
 fn subscribe_input(surface_id: u32) {
     std::thread::spawn(move || {
-        let conn = match Connection::connect(&default_socket_path()) {
+        let conn = match Connection::connect_endpoint(&default_socket_path()) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("[pengudroid-gleshim] input: cannot connect: {e}");
@@ -877,16 +880,22 @@ fn subscribe_input(surface_id: u32) {
             match conn.recv_message() {
                 Ok((Message::InputEvent { surface_id, event }, fds)) => {
                     close_fds(&fds);
-                    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
-                        eprintln!("[gleshim] queued {event:?} for surface {surface_id}");
+                    if std::env::var_os("PENGUDROID_TRACE_INPUT").is_some() {
+                        eprintln!("[gleshim:input] received {event:?} for surface {surface_id}");
                     }
                     let mut q = INPUT_QUEUE.lock().unwrap();
                     if q.len() < 256 {
                         q.push((surface_id, event));
                     }
                 }
-                Ok((_, fds)) => close_fds(&fds),
-                Err(_) => return,
+                Ok((other, fds)) => {
+                    close_fds(&fds);
+                    eprintln!("[gleshim:input] unexpected {:?} on surface {surface_id}", other.kind());
+                }
+                Err(e) => {
+                    eprintln!("[gleshim:input] surface {surface_id} disconnected: {e}");
+                    return;
+                }
             }
         }
     });
@@ -912,6 +921,9 @@ pub unsafe extern "C" fn pengudroid_input_poll(out: *mut u8) -> i32 {
         q.remove(0)
     };
     let (surface_id, kind) = event;
+    if std::env::var_os("PENGUDROID_TRACE_INPUT").is_some() {
+        eprintln!("[gleshim:input] polled {kind:?} for surface {surface_id}");
+    }
     let (tag, a, b) = match kind {
         pengudroid_proto::InputKind::PointerEnter { x, y } => (1u32, x, y),
         pengudroid_proto::InputKind::PointerLeave => (2, 0.0, 0.0),
@@ -1473,10 +1485,39 @@ pub unsafe extern "C" fn eglCreateWindowSurface(
         tex: 0,
         fbo: 0,
         surface_id: 0,
+        owns_surface: false,
     });
     let surface = Box::into_raw(rec) as EGLSurface;
     lock_state().current_surface = surface as usize;
     surface
+}
+
+/// Complete the request/reply exchange before another swap uses this socket.
+/// On transport failure discard it: a late Ack must never answer a later present.
+fn destroy_daemon_surface(st: &mut State, rec: &mut SurfaceRec) -> Result<(), String> {
+    if !rec.owns_surface || rec.surface_id == 0 {
+        return Ok(());
+    }
+    let id = std::mem::replace(&mut rec.surface_id, 0);
+    rec.owns_surface = false;
+    let Some(conn) = st.conn.take() else { return Ok(()) };
+    if let Err(e) = conn.send_message(&Message::DestroySurface { surface_id: id }, &[]) {
+        st.connect_attempted = false;
+        return Err(format!("DestroySurface send failed: {e}"));
+    }
+    let (reply, fds) = match conn.recv_message() {
+        Ok(reply) => reply,
+        Err(e) => {
+            st.connect_attempted = false;
+            return Err(format!("DestroySurface reply failed: {e}"));
+        }
+    };
+    close_fds(&fds);
+    st.conn = Some(conn);
+    match reply {
+        Message::Ack => Ok(()),
+        other => Err(format!("unexpected DestroySurface reply: {other:?}")),
+    }
 }
 
 #[no_mangle]
@@ -1488,6 +1529,10 @@ pub unsafe extern "C" fn eglDestroySurface(_dpy: EGLDisplay, surface: EGLSurface
         let mut st = lock_state();
         if st.current_surface == surface as usize {
             st.current_surface = 0;
+        }
+        let rec = &mut *(surface as *mut SurfaceRec);
+        if let Err(e) = destroy_daemon_surface(&mut st, rec) {
+            eprintln!("[pengudroid-gleshim] {e}");
         }
     }
     // SAFETY: `surface` was produced by `Box::into_raw` in
@@ -1524,7 +1569,7 @@ pub unsafe extern "C" fn eglCreatePbufferSurface(
             i += 2;
         }
     }
-    let rec = Box::new(SurfaceRec { w, h, tex: 0, fbo: 0, surface_id: 0 });
+    let rec = Box::new(SurfaceRec { w, h, tex: 0, fbo: 0, surface_id: 0, owns_surface: false });
     let surface = Box::into_raw(rec) as EGLSurface;
     lock_state().current_surface = surface as usize;
     surface

@@ -21,6 +21,7 @@ açısından tek yerde toplar. Uygulamanın neyi çalıştırdığı/neyi çalı
 | `pengudroid run app.apk` | guest'i CLI altında başlatır, Ctrl-C ile birlikte durur; olmayan APK hata olur | çalışır (Wayland oturumu gerekir) |
 | `pengudroid start app.apk [--wait]` | guest'i *daemon* altında başlatır; `--wait` çıkış kodunu bekler | çalışır |
 | `pengudroid start --demo [--wait]` | aynısı, dahili demo ile | çalışır |
+| `pengudroid key <linux-keycode> [down|up]` | fiziksel tuşu daemon üzerinden iletir; durum verilmezse basma+bırakma, ayrı durumlarla Shift/Ctrl akorları | çalışır; sanal aygıt/karakter haritası ve NewPipe UI metin girişi doğrulandı |
 | `pengudroid ps` | çalışan guest'leri daemon'ın tablosundan listeler | çalışır |
 | `pengudroid services` | broker'ın servis tablosunu (handle/isim/arayüz) yazar | çalışır |
 | `pengudroid getprop [NAME]` | bir özelliği okur; NAME yoksa hepsini listeler | çalışır |
@@ -34,7 +35,11 @@ açısından tek yerde toplar. Uygulamanın neyi çalıştırdığı/neyi çalı
 
 ## Protokol (v2)
 
-Taşıma: `$XDG_RUNTIME_DIR/pengudroid/daemon.sock` (mode `0600`), uzunluk önekli
+Taşıma: varsa boş olmayan `PENGUDROID_SOCKET`, aksi halde
+`$XDG_RUNTIME_DIR/pengudroid/daemon.sock` (mode `0600`). Özel daemon için
+`PENGUDROID_SOCKET` kullanın; XDG_RUNTIME_DIR gerçek Wayland/PipeWire oturumunu
+göstermeye devam etsin. CLI, daemon ve guest aynı soket değerini kullanmalı.
+Uzunluk önekli
 çerçeve `[u32 body_len][body]`, `body = [kind u8][alanlar…]`. Dosya tanıtıcıları
 `SCM_RIGHTS` ile çerçeve dışında geçer. Her bağlantı `Hello`/`Welcome` ile
 başlar; `Hello.role` = `Cli`, `Shim` veya `Guest`.
@@ -52,6 +57,7 @@ başlar; `Hello.role` = `Cli`, `Shim` veya `Guest`.
 | `GuestCall { code, data, token }` / `GuestCallReply { status, data }` | daemon ↔ guest | guest servisine iletim ve cevap |
 | `CreateSurface { width, height, title }` → `SurfaceCreated { … }` + fd | guest → daemon | Wayland toplevel + paylaşılan buffer |
 | `PresentFrame { surface_id }` → `Ack` | guest → daemon | buffer'ı commit et |
+| `PresentShm { surface_id, width, height, stride, format }` + fd → `Ack` | guest → daemon | CPU memfd tamponunu kopyalayıp `wl_shm` ile sunar; Android formatları 1/2/4/5, stride bayt; Ack kaynak tamponun yeniden kullanılabileceğini belirtir, ekranda göründüğünü kanıtlamaz |
 | `GetProp` / `SetProp` / `ListProps` | CLI/guest | özellik deposu |
 | `Shutdown` → `Goodbye` | CLI → daemon | temiz kapanış |
 

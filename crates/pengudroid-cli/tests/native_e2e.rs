@@ -76,9 +76,9 @@ fn native_activity_game_renders_on_the_host_gpu() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("pengudroid")).expect("runtime dir");
 
-    // The daemon and the EGL shim both derive the socket from XDG_RUNTIME_DIR.
+    // Isolate the control socket while retaining the real Wayland/PipeWire runtime.
     let child = Command::new(binary("pengudroid-daemon"))
-        .env("XDG_RUNTIME_DIR", &dir)
+        .env("PENGUDROID_SOCKET", dir.join("pengudroid/daemon.sock"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -96,7 +96,7 @@ fn native_activity_game_renders_on_the_host_gpu() {
         .args(["native", "--lib"])
         .arg(&fixture)
         .args(["--width", "640", "--height", "360", "--seconds", "3"])
-        .env("XDG_RUNTIME_DIR", &dir)
+        .env("PENGUDROID_SOCKET", dir.join("pengudroid/daemon.sock"))
         .env("PENGUDROID_DAEMON", binary("pengudroid-daemon"))
         .output()
         .expect("run native");
@@ -124,4 +124,64 @@ fn native_activity_game_renders_on_the_host_gpu() {
     conn.send_message(&Message::Shutdown, &[]).expect("shutdown");
     let _ = conn.recv_message();
     drop(daemon);
+}
+
+#[test]
+fn software_video_frames_keep_wayland_connection_alive() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        eprintln!("skipping: no WAYLAND_DISPLAY");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("pd-shm-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("pengudroid")).unwrap();
+    // Resolve the compositor explicitly; the host runtime remains unchanged.
+    let display = PathBuf::from(std::env::var_os("WAYLAND_DISPLAY").unwrap());
+    let display = if display.is_absolute() { display } else {
+        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join(display)
+    };
+    let child = Command::new(binary("pengudroid-daemon"))
+        .env("PENGUDROID_SOCKET", dir.join("pengudroid/daemon.sock")).env("WAYLAND_DISPLAY", display)
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+        .spawn().unwrap();
+    let _daemon = Daemon { child, dir: dir.clone() };
+    let socket = dir.join("pengudroid/daemon.sock");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !handshake(&socket) {
+        assert!(Instant::now() < deadline, "daemon never came up");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let conn = Connection::connect_endpoint(&socket).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    conn.send_message(&Message::Hello {
+        version: PROTO_VERSION, role: Role::Guest, pid: std::process::id() as i32,
+    }, &[]).unwrap();
+    conn.recv_message().unwrap();
+    let request = |msg: Message, fds: &[i32]| {
+        conn.send_message(&msg, fds).unwrap();
+        let (reply, received_fds) = conn.recv_message().unwrap();
+        for fd in received_fds { drop(unsafe { OwnedFd::from_raw_fd(fd) }); }
+        reply
+    };
+    let parent = request(Message::CreateSurface { width: 64, height: 64, title: "Software video test".into() }, &[]);
+    assert!(matches!(parent, Message::SurfaceCreated { .. }), "{parent:?}");
+    let child = request(Message::CreateSubsurface {
+        parent_pid: std::process::id() as i32, x: 0, y: 0, width: 16, height: 16,
+    }, &[]);
+    let Message::SubsurfaceCreated { surface_id } = child else { panic!("{child:?}") };
+    // RGB565 red. This is ordinary memfd storage, deliberately not DMA_BUF.
+    let raw = unsafe { libc::memfd_create(c"software-video-test".as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(raw >= 0);
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let pixels = [0, 0xf8].repeat(32 * 32);
+    assert_eq!(unsafe { libc::write(fd.as_raw_fd(), pixels.as_ptr().cast(), pixels.len()) }, pixels.len() as isize);
+    for _ in 0..8 {
+        assert_eq!(request(Message::PresentShm { surface_id, width: 32, height: 32, stride: 64, format: 4 }, &[fd.as_raw_fd()]), Message::Ack);
+    }
+    // Creating another toplevel forces a compositor roundtrip. A bogus
+    // linux-dmabuf import can appear Acked before its fatal protocol error is
+    // dispatched; this must still succeed after all software frames.
+    let after = request(Message::CreateSurface { width: 64, height: 64, title: "After software frames".into() }, &[]);
+    assert!(matches!(after, Message::SurfaceCreated { .. }), "compositor connection was lost: {after:?}");
+    assert_eq!(request(Message::Shutdown, &[]), Message::Goodbye);
 }

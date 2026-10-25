@@ -233,6 +233,27 @@ fn new_configuration(env: &JniEnv) -> Option<JObject> {
     set_int("screenWidthDp", SURFACE_W_DP);
     set_int("screenHeightDp", SURFACE_H_DP);
     set_int("smallestScreenWidthDp", SURFACE_W_DP.min(SURFACE_H_DP));
+    // WindowLayout.computeFrames uses Configuration.windowConfiguration bounds
+    // for local relayout, not DisplayInfo or screenWidthDp. Empty bounds made a
+    // later relayoutAsync collapse a previously valid activity window to 0x0.
+    // Build the real window-manager configuration before Resources copies it.
+    let window_class = env.find_class("android/app/WindowConfiguration")?;
+    let field = env.field_id(class, "windowConfiguration", "Landroid/app/WindowConfiguration;")?;
+    let window = env.object_field(config, field);
+    if window.is_null() { return None; }
+    let rect_class = env.find_class("android/graphics/Rect")?;
+    let ctor = env.method_id(rect_class, "<init>", "(IIII)V")?;
+    let coords = [JValue { i: 0 }, JValue { i: 0 }, JValue { i: SURFACE_W }, JValue { i: SURFACE_H }];
+    let bounds = env.new_object(rect_class, ctor, &coords)?;
+    if bounds.is_null() { return None; }
+    let set_bounds = env.method_id(window_class, "setBounds", "(Landroid/graphics/Rect;)V")?;
+    if !env.call_void(window, set_bounds, &[JValue { l: bounds }]) { return None; }
+    for name in ["setAppBounds", "setMaxBounds"] {
+        let set = env.method_id(window_class, name, "(IIII)V")?;
+        if !env.call_void(window, set, &coords) { return None; }
+    }
+    let mode = env.method_id(window_class, "setWindowingMode", "(I)V")?;
+    if !env.call_void(window, mode, &[JValue { i: 1 }]) { return None; } // FULLSCREEN
     Some(config)
 }
 
@@ -703,6 +724,10 @@ pub fn font_debug(env: &JniEnv) {
 /// Bind the app into `thread`, the object returned by
 /// `ActivityThread.currentActivityThread()`.
 pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bool {
+    if install_virtual_keyboard(env).is_none() {
+        eprintln!("apphost: cannot install the Android virtual keyboard");
+        return false;
+    }
     let Some((bind_class, data)) = new_instance(env, "android/app/ActivityThread$AppBindData") else {
         eprintln!("apphost: cannot allocate AppBindData");
         return false;
@@ -3561,9 +3586,9 @@ fn spawn_input_pump(env: &JniEnv) {
         let Some(key_class) = env.find_class("android/view/KeyEvent") else {
             return;
         };
-        // `KeyEvent(int action, int code)` is the simplest public constructor and
-        // is enough for a text field: repeat/meta/scanCode only matter to games.
-        let Some(key_ctor) = env.method_id(key_class, "<init>", "(II)V") else {
+        // Include physical-keyboard source, scan code and meta state so EditText
+        // and shortcut handlers receive Shift/Ctrl chords correctly.
+        let Some(key_ctor) = env.method_id(key_class, "<init>", "(JJIIIIIIII)V") else {
             return;
         };
 
@@ -3573,6 +3598,7 @@ fn spawn_input_pump(env: &JniEnv) {
         const ACTION_HOVER_MOVE: i32 = 7;
         const ACTION_SCROLL: i32 = 8;
 
+        let mut keyboard = crate::keyboard::Keyboard::default();
         let mut down_time = 0i64;
         let mut pressed = false;
         let mut last = (0.0f32, 0.0f32);
@@ -3767,7 +3793,13 @@ fn spawn_input_pump(env: &JniEnv) {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|v| *v > 0);
         let mut last_roots = std::time::Instant::now();
+        let trace_input = std::env::var_os("PENGUDROID_TRACE_INPUT").is_some();
+        let mut input_heartbeat = std::time::Instant::now();
         loop {
+            if trace_input && input_heartbeat.elapsed() >= std::time::Duration::from_secs(2) {
+                input_heartbeat = std::time::Instant::now();
+                println!("input: pump alive");
+            }
             if let Some(ms) = root_trace_ms {
                 if last_roots.elapsed().as_millis() >= ms as u128 {
                     last_roots = std::time::Instant::now();
@@ -3784,9 +3816,17 @@ fn spawn_input_pump(env: &JniEnv) {
                 std::thread::sleep(std::time::Duration::from_millis(8));
                 continue;
             }
+            let Some(_local_frame) = env.local_frame(64) else {
+                eprintln!("apphost: input pump: cannot allocate JNI local frame");
+                return;
+            };
             let tag = u32::from_le_bytes(buf[4..8].try_into().unwrap());
             let a = f32::from_le_bytes(buf[8..12].try_into().unwrap());
             let b = f32::from_le_bytes(buf[12..16].try_into().unwrap());
+            if trace_input {
+                let surface = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+                println!("input: received surface={surface} tag={tag} a={a} b={b}");
+            }
             // Mouse wheel: Wayland's axis value is positive when scrolling down,
             // while `MotionEvent.AXIS_VSCROLL` is positive when scrolling up, so
             // sign flips. This is what lets the user scroll a feed at all.
@@ -3796,21 +3836,10 @@ fn spawn_input_pump(env: &JniEnv) {
             }
             // Keyboard: `a` is the Linux keycode, `b` is 1 for press.
             if tag == 6 {
-                println!("input: key tag=6 code={} pressed={} (mapped={:?})", a, b != 0.0, android_keycode(a as u32));
-                let Some(code) = android_keycode(a as u32) else {
+                let now = env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
+                let Some(key) = keyboard.event(a as u32, b != 0.0, now) else {
                     continue;
                 };
-                let action = if b != 0.0 { 0 } else { 1 }; // ACTION_DOWN / ACTION_UP
-                let Some(event) = env.new_object(
-                    key_class,
-                    key_ctor,
-                    &[JValue { i: action }, JValue { i: code }],
-                ) else {
-                    continue;
-                };
-                if event.is_null() {
-                    continue;
-                }
                 let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else {
                     continue;
                 };
@@ -3818,15 +3847,25 @@ fn spawn_input_pump(env: &JniEnv) {
                 if roots.is_null() {
                     continue;
                 }
-                let count = env.call_int(roots, size_m, &[]).unwrap_or(0);
-                for i in 0..count {
-                    let Some(root) = env.call_object(roots, get_m, &[JValue { i }]) else {
-                        continue;
-                    };
-                    if root.is_null() {
-                        continue;
+                println!("input: key code={} pressed={} android={} meta={:#x}",
+                    a, b != 0.0, key.code, key.meta);
+                let Some(root) = keyboard_root(&env, roots, root_class, size_m, get_m) else {
+                    continue;
+                };
+                // Each window manager focus notification is queued on this
+                // root's main Handler before its input event. Without it VRI
+                // drops every physical key with "no window focus".
+                if let Some(event) = env.new_object(key_class, key_ctor, &[
+                    JValue { j: key.down_time }, JValue { j: now },
+                    JValue { i: key.action }, JValue { i: key.code },
+                    JValue { i: key.repeat }, JValue { i: key.meta },
+                    JValue { i: -1 }, // KeyCharacterMap.VIRTUAL_KEYBOARD
+                    JValue { i: a as i32 }, JValue { i: 0 },
+                    JValue { i: 0x101 }, // InputDevice.SOURCE_KEYBOARD
+                ]) {
+                    if !event.is_null() {
+                        env.call_void(root, dispatch, &[JValue { l: event }]);
                     }
-                    env.call_void(root, dispatch, &[JValue { l: event }]);
                 }
                 continue;
             }
@@ -3858,6 +3897,48 @@ fn spawn_input_pump(env: &JniEnv) {
             inject(action, x, y, down_time);
         }
     });
+}
+
+/// Select the top focusable app window and deliver the window-manager focus
+/// callback. LayoutParams types preserve app/dialog ordering even when a dialog
+/// was added during onCreate, before its activity's base window was attached.
+fn keyboard_root(env: &JniEnv, roots: JObject, root_class: JClass,
+    size: JMethodId, get: JMethodId) -> Option<JObject> {
+    let view_class = env.find_class("android/view/View")?;
+    let params_class = env.find_class("android/view/WindowManager$LayoutParams")?;
+    let params_field = env.field_id(root_class, "mWindowAttributes", "Landroid/view/WindowManager$LayoutParams;")?;
+    let view_field = env.field_id(root_class, "mView", "Landroid/view/View;")?;
+    let flags_field = env.field_id(params_class, "flags", "I")?;
+    let type_field = env.field_id(params_class, "type", "I")?;
+    let visibility = env.method_id(view_class, "getVisibility", "()I")?;
+    let has_focus = env.method_id(view_class, "hasWindowFocus", "()Z")?;
+    let change_focus = env.method_id(root_class, "windowFocusChanged", "(Z)V")?;
+    let count = env.call_int(roots, size, &[])?;
+    let mut windows = Vec::new();
+    let mut target = None;
+    for i in 0..count {
+        let Some(root) = env.call_object(roots, get, &[JValue { i }]) else { continue };
+        if root.is_null() { continue; }
+        let view = env.object_field(root, view_field);
+        let params = env.object_field(root, params_field);
+        if view.is_null() || params.is_null() { continue; }
+        windows.push((root, view));
+        let flags = env.int_field(params, flags_field);
+        // FLAG_NOT_FOCUSABLE, and hidden roots, cannot take physical keys.
+        if flags & 8 != 0 || env.call_int(view, visibility, &[]) != Some(0) { continue; }
+        let rank = (env.int_field(params, type_field), i);
+        if target.as_ref().map_or(true, |(best, _)| rank > *best) {
+            target = Some((rank, root));
+        }
+    }
+    let (_, target) = target?;
+    for (root, view) in windows {
+        let focused = root == target;
+        if env.call_boolean(view, has_focus, &[]) != Some(focused) {
+            env.call_void(root, change_focus, &[JValue { z: focused as u8 }]);
+        }
+    }
+    Some(target)
 }
 
 /// Poll the first `ViewRootImpl` from a host thread and print what the draw
@@ -5002,6 +5083,179 @@ fn probe_app_class(env: &JniEnv, data: JObject, name: &str) {
     }
 }
 
+/// Drive the real AIDL proxy so focus tests cover request argument parsing,
+/// rather than only the hosted policy's Rust state machine.
+pub fn probe_audio_focus(env: &JniEnv) -> bool {
+    let run = || -> Option<()> {
+        let _frame = env.local_frame(32)?;
+        let sm = env.find_class("android/os/ServiceManager")?;
+        let get = env.static_method_id(sm, "getService", "(Ljava/lang/String;)Landroid/os/IBinder;")?;
+        let name = env.new_string("audio");
+        let binder = env.call_static_object(sm, get, &[JValue { l: name }])?;
+        if binder.is_null() { return None; }
+        let stub = env.find_class("android/media/IAudioService$Stub")?;
+        let as_interface = env.static_method_id(stub, "asInterface", "(Landroid/os/IBinder;)Landroid/media/IAudioService;")?;
+        let service = env.call_static_object(stub, as_interface, &[JValue { l: binder }])?;
+        if service.is_null() { return None; }
+        let (builder_class, builder) = new_instance(env, "android/media/AudioAttributes$Builder")?;
+        let build = env.method_id(builder_class, "build", "()Landroid/media/AudioAttributes;")?;
+        let attrs = env.call_object(builder, build, &[])?;
+        let (_, client) = new_instance(env, "android/os/Binder")?;
+        let client_id = env.new_string("pengudroid-focus-probe");
+        let package = env.new_string("org.pengudroid.probe");
+        let class = env.find_class("android/media/IAudioService")?;
+        let request = env.method_id(class, "requestAudioFocus",
+            "(Landroid/media/AudioAttributes;ILandroid/os/IBinder;Landroid/media/IAudioFocusDispatcher;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ILandroid/media/audiopolicy/IAudioPolicyCallback;I)I")?;
+        let null = std::ptr::null_mut();
+        let result = env.call_int(service, request, &[
+            JValue { l: attrs }, JValue { i: 1 }, JValue { l: client }, JValue { l: null },
+            JValue { l: client_id }, JValue { l: package }, JValue { l: null },
+            JValue { i: 0 }, JValue { l: null }, JValue { i: 33 },
+        ])?;
+        let current = env.method_id(class, "getCurrentAudioFocus", "()I")?;
+        if result != 1 || env.call_int(service, current, &[])? != 1 { return None; }
+        let abandon = env.method_id(class, "abandonAudioFocus",
+            "(Landroid/media/IAudioFocusDispatcher;Ljava/lang/String;Landroid/media/AudioAttributes;Ljava/lang/String;)I")?;
+        let result = env.call_int(service, abandon, &[
+            JValue { l: null }, JValue { l: client_id }, JValue { l: attrs }, JValue { l: package },
+        ])?;
+        if result != 1 || env.call_int(service, current, &[])? != 0 { return None; }
+        println!("audio: AIDL focus granted, current gain verified, abandon cleared");
+        Some(())
+    };
+    run().is_some()
+}
+
+/// Exercise Android's local layout, the path that used to turn a good frame
+/// into 0x0 after a subsequent relayout. This checks computed output, not just
+/// the configuration fields written by the host.
+pub fn probe_window_configuration(env: &JniEnv) -> bool {
+    let run = || -> Option<()> {
+        let _frame = env.local_frame(48)?;
+        let config = new_configuration(env)?;
+        let config_class = env.find_class("android/content/res/Configuration")?;
+        let window_field = env.field_id(config_class, "windowConfiguration", "Landroid/app/WindowConfiguration;")?;
+        let window = env.object_field(config, window_field);
+        if window.is_null() { return None; }
+        let window_class = env.find_class("android/app/WindowConfiguration")?;
+        let get_bounds = env.method_id(window_class, "getBounds", "()Landroid/graphics/Rect;")?;
+        let bounds = env.call_object(window, get_bounds, &[])?;
+        let (params_class, params) = new_instance(env, "android/view/WindowManager$LayoutParams")?;
+        for (name, value) in [("width", -1), ("height", -1), ("type", 1)] {
+            env.set_int_field(params, env.field_id(params_class, name, "I")?, value);
+        }
+        let (insets_class, insets) = new_instance(env, "android/view/InsetsState")?;
+        let set_display = env.method_id(insets_class, "setDisplayFrame", "(Landroid/graphics/Rect;)V")?;
+        env.call_void(insets, set_display, &[JValue { l: bounds }]);
+        let (_, safe) = new_instance(env, "android/graphics/Rect")?;
+        let safe_method = env.method_id(insets_class, "getDisplayCutoutSafe", "(Landroid/graphics/Rect;)V")?;
+        env.call_void(insets, safe_method, &[JValue { l: safe }]);
+        let (_, visible) = new_instance(env, "android/view/InsetsVisibilities")?;
+        let (frames_class, frames) = new_instance(env, "android/window/ClientWindowFrames")?;
+        let (layout_class, layout) = new_instance(env, "android/view/WindowLayout")?;
+        let compute = env.method_id(layout_class, "computeFrames",
+            "(Landroid/view/WindowManager$LayoutParams;Landroid/view/InsetsState;Landroid/graphics/Rect;Landroid/graphics/Rect;IIILandroid/view/InsetsVisibilities;FLandroid/window/ClientWindowFrames;)V")?;
+        if !env.call_void(layout, compute, &[
+            JValue { l: params }, JValue { l: insets }, JValue { l: safe }, JValue { l: bounds },
+            JValue { i: 1 }, JValue { i: SURFACE_W }, JValue { i: SURFACE_H },
+            JValue { l: visible }, JValue { f: 1.0 }, JValue { l: frames },
+        ]) { return None; }
+        let frame = env.object_field(frames, env.field_id(frames_class, "frame", "Landroid/graphics/Rect;")?);
+        if frame.is_null() { return None; }
+        let rect_class = env.find_class("android/graphics/Rect")?;
+        let width = env.method_id(rect_class, "width", "()I")?;
+        let height = env.method_id(rect_class, "height", "()I")?;
+        let (w, h) = (env.call_int(frame, width, &[])?, env.call_int(frame, height, &[])?);
+        println!("window: local WindowLayout.computeFrames = {w}x{h}");
+        (w == SURFACE_W && h == SURFACE_H).then_some(())
+    };
+    run().is_some()
+}
+
+/// Headless end-to-end check of service lookup, native parcel decoding and
+/// Android's own Unicode conversion. Called by the ART diagnostic entry point.
+pub fn probe_keyboard(env: &JniEnv) -> bool {
+    let run = || -> Option<()> {
+        install_virtual_keyboard(env)?;
+        let _frame = env.local_frame(16)?;
+        let class = env.find_class("android/view/KeyCharacterMap")?;
+        let load = env.static_method_id(class, "load", "(I)Landroid/view/KeyCharacterMap;")?;
+        let map = env.call_static_object(class, load, &[JValue { i: -1 }])?;
+        if map.is_null() { return None; }
+        let get = env.method_id(class, "get", "(II)I")?;
+        for (code, meta, expected) in [(29, 0, 97), (29, 1, 65), (29, 0x100000, 65),
+            (29, 0x100001, 97), (8, 1, 33), (29, 0x3000, 0)] {
+            if env.call_int(map, get, &[JValue { i: code }, JValue { i: meta }])? != expected {
+                return None;
+            }
+        }
+        let device_class = env.find_class("android/view/InputDevice")?;
+        let get_device = env.static_method_id(device_class, "getDevice", "(I)Landroid/view/InputDevice;")?;
+        let device = env.call_static_object(device_class, get_device, &[JValue { i: -1 }])?;
+        if device.is_null() { return None; }
+        let virtual_method = env.method_id(device_class, "isVirtual", "()Z")?;
+        if env.call_boolean(device, virtual_method, &[]) != Some(true) { return None; }
+        // A genuinely absent device stays absent; only KeyCharacterMap.load
+        // (not InputDevice lookup) is allowed to use the virtual fallback.
+        let missing = env.call_static_object(device_class, get_device, &[JValue { i: 123456 }])?;
+        if !missing.is_null() { return None; }
+        println!("keyboard: InputManager -> InputDevice(-1) -> native KeyCharacterMap: 6 Unicode cases passed");
+        Some(())
+    };
+    run().is_some()
+}
+
+/// Publish a real InputDevice and native KeyCharacterMap through IInputManager.
+/// The framework reads the map itself; key events still travel through VRI.
+fn install_virtual_keyboard(env: &JniEnv) -> Option<()> {
+    let _frame = env.local_frame(32)?;
+    let parcel_class = env.find_class("android/os/Parcel")?;
+    let obtain = env.static_method_id(parcel_class, "obtain", "()Landroid/os/Parcel;")?;
+    let parcel = env.call_static_object(parcel_class, obtain, &[])?;
+    let raw = crate::keyboard::virtual_character_map_parcel();
+    let bytes = env.new_byte_array(raw.len() as i32)?;
+    env.set_byte_array_region(bytes, 0, &raw);
+    let unmarshall = env.method_id(parcel_class, "unmarshall", "([BII)V")?;
+    if !env.call_void(parcel, unmarshall, &[JValue { l: bytes }, JValue { i: 0 }, JValue { i: raw.len() as i32 }]) {
+        return None;
+    }
+    let reset = env.method_id(parcel_class, "setDataPosition", "(I)V")?;
+    env.call_void(parcel, reset, &[JValue { i: 0 }]);
+    let map_class = env.find_class("android/view/KeyCharacterMap")?;
+    let ctor = env.method_id(map_class, "<init>", "(Landroid/os/Parcel;)V")?;
+    let map = env.new_object(map_class, ctor, &[JValue { l: parcel }])?;
+    let recycle = env.method_id(parcel_class, "recycle", "()V")?;
+    env.call_void(parcel, recycle, &[]);
+    if map.is_null() { return None; }
+    // Exercise the actual libinput map, not a Rust model of its result. A
+    // sysroot with a different native parcel format fails here before launch.
+    let get = env.method_id(map_class, "get", "(II)I")?;
+    for (code, meta, expected) in [(29, 0, 97), (29, 1, 65), (29, 0x100000, 65),
+        (29, 0x100001, 97), (8, 1, 33), (29, 0x3000, 0)] {
+        let actual = env.call_int(map, get, &[JValue { i: code }, JValue { i: meta }])?;
+        if actual != expected {
+            eprintln!("apphost: keyboard map mismatch: code={code} meta={meta:#x} expected={expected} actual={actual}");
+            return None;
+        }
+    }
+    let device_class = env.find_class("android/view/InputDevice")?;
+    let ctor = env.method_id(device_class, "<init>",
+        "(IIILjava/lang/String;IILjava/lang/String;ZIILandroid/view/KeyCharacterMap;ZZZZZ)V")?;
+    let name = env.new_string("PenguDroid Virtual Keyboard");
+    let descriptor = env.new_string("pengudroid:virtual-keyboard");
+    let device = env.new_object(device_class, ctor, &[
+        JValue { i: -1 }, JValue { i: 1 }, JValue { i: 0 }, JValue { l: name },
+        JValue { i: 0 }, JValue { i: 0 }, JValue { l: descriptor }, JValue { z: 0 },
+        JValue { i: 0x101 }, JValue { i: 2 }, JValue { l: map },
+        JValue { z: 0 }, JValue { z: 0 }, JValue { z: 0 }, JValue { z: 0 }, JValue { z: 0 },
+    ])?;
+    if device.is_null() { return None; }
+    let data = marshal_object(env, device, "android/view/InputDevice")?;
+    install_reply(&data, "__pengudroid_binder_set_input_device");
+    println!("apphost: virtual keyboard installed; native character map validated");
+    Some(())
+}
+
 /// Serialize `obj` with the framework's own `writeToParcel`.
 ///
 /// Hand-rolling a parcel for a framework class is version-specific and fails
@@ -6096,76 +6350,6 @@ pub fn attach_current_thread(vm: *mut c_void) -> Option<JniEnv> {
     } else {
         Some(JniEnv(env))
     }
-}
-
-/// Map a Linux input keycode (`KEY_*`) to an Android `KeyEvent` key code.
-///
-/// Only the keys a text field needs: letters, digits, space, enter, backspace,
-/// tab, escape and the arrows. Anything else returns `None` and is dropped, which
-/// is better than dispatching the wrong character.
-fn android_keycode(linux: u32) -> Option<i32> {
-    Some(match linux {
-        1 => 111, // KEY_ESC
-        2 => 8,   // KEY_1
-        3 => 9,
-        4 => 10,
-        5 => 11,
-        6 => 12,
-        7 => 13,
-        8 => 14,
-        9 => 15,
-        10 => 16,
-        11 => 7,  // KEY_0
-        12 => 69, // KEY_MINUS
-        13 => 70, // KEY_EQUAL
-        14 => 67, // KEY_BACKSPACE
-        15 => 61, // KEY_TAB
-        // q w e r t y u i o p
-        16 => 45,
-        17 => 51,
-        18 => 33,
-        19 => 46,
-        20 => 48,
-        21 => 53,
-        22 => 49,
-        23 => 37,
-        24 => 43,
-        25 => 44,
-        26 => 71, // KEY_LEFTBRACE
-        27 => 72, // KEY_RIGHTBRACE
-        28 => 66, // KEY_ENTER
-        // a s d f g h j k l
-        30 => 29,
-        31 => 47,
-        32 => 32,
-        33 => 34,
-        34 => 35,
-        35 => 36,
-        36 => 38,
-        37 => 39,
-        38 => 40,
-        39 => 74, // KEY_SEMICOLON
-        40 => 75, // KEY_APOSTROPHE
-        41 => 68, // KEY_GRAVE
-        43 => 73, // KEY_BACKSLASH
-        // z x c v b n m
-        44 => 54,
-        45 => 52,
-        46 => 31,
-        47 => 50,
-        48 => 30,
-        49 => 42,
-        50 => 41,
-        51 => 55,  // KEY_COMMA
-        52 => 56,  // KEY_DOT
-        53 => 76,  // KEY_SLASH
-        57 => 62,  // KEY_SPACE
-        103 => 19, // KEY_UP
-        105 => 21, // KEY_LEFT
-        106 => 22, // KEY_RIGHT
-        108 => 20, // KEY_DOWN
-        _ => return None,
-    })
 }
 
 #[cfg(test)]

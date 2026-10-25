@@ -532,29 +532,22 @@ fn to_s16(encoding: i32, bytes: &[u8]) -> Vec<u8> {
 }
 
 /// Append PCM to the track's queue and return how many **source** bytes fit.
-fn push_pcm(track: &Track, bytes: &[u8]) -> usize {
+fn push_pcm(track: &Track, bytes: &[u8]) -> i32 {
     let src_frame = track.bytes_per_frame() as usize;
-    if src_frame == 0 || bytes.is_empty() {
-        return 0;
-    }
-    let converted = to_s16(if track.bytes_per_sample == 4 { ENCODING_PCM_FLOAT } else { ENCODING_PCM_16BIT }, bytes);
-    let dst_frame = (track.channels.max(1) as usize) * 2;
+    if src_frame == 0 || bytes.is_empty() { return 0; }
+    let dst_frame = track.channels.max(1) as usize * 2;
     let capacity = track.queue_capacity();
     let mut sh = track.shared.lock().unwrap_or_else(|e| e.into_inner());
-    let free = capacity.saturating_sub(sh.queue.len());
-    // One source frame becomes one sink frame, so the limit is the same in both.
-    let mut fit_frames = free / dst_frame;
-    if fit_frames == 0 {
-        return 0;
-    }
-    let want_frames = converted.len() / dst_frame;
-    fit_frames = fit_frames.min(want_frames);
-    if fit_frames == 0 {
-        return 0;
-    }
-    let take = fit_frames * dst_frame;
-    sh.queue.extend(converted[..take].iter().copied());
-    fit_frames * src_frame
+    // A zero short-write means "retry later". Once the sink has died that
+    // would leave ExoPlayer retrying a permanently full queue forever.
+    if !sh.alive { return -6; } // AudioTrack.ERROR_DEAD_OBJECT
+    let fit_frames = (capacity.saturating_sub(sh.queue.len()) / dst_frame)
+        .min(bytes.len() / src_frame);
+    if fit_frames == 0 { return 0; }
+    let consumed = fit_frames * src_frame;
+    let converted = to_s16(if track.bytes_per_sample == 4 { ENCODING_PCM_FLOAT } else { ENCODING_PCM_16BIT }, &bytes[..consumed]);
+    sh.queue.extend(converted);
+    consumed as i32
 }
 
 /// Start the thread that drains the queue into `pw-cat`.
@@ -592,7 +585,13 @@ fn start_pump(track: &mut Track) {
             let wrote = match stdin.as_mut() {
                 Some(pipe) => {
                     use std::io::Write as _;
-                    pipe.write_all(&chunk).is_ok()
+                    match pipe.write_all(&chunk) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            eprintln!("audio: AudioTrack output failed: {e}");
+                            false
+                        }
+                    }
                 }
                 None => false,
             };
@@ -774,7 +773,7 @@ unsafe fn write_bytes(
     let Some(track) = all.get(&handle) else {
         return -1;
     };
-    push_pcm(track, data) as i32
+    push_pcm(track, data)
 }
 
 unsafe extern "C" fn native_write_byte(
@@ -1049,6 +1048,16 @@ mod tests {
         assert_eq!(push_pcm(&t, &first), 0, "a full buffer accepts nothing");
         t.shared.lock().unwrap().queue.clear();
         assert_eq!(push_pcm(&t, &first), 8 * 4);
+    }
+
+    #[test]
+    fn dead_sink_reports_an_error_even_when_the_buffer_is_full() {
+        let t = track(2, 2, 32);
+        assert_eq!(push_pcm(&t, &[0; 32]), 32);
+        t.shared.lock().unwrap().alive = false;
+        assert_eq!(push_pcm(&t, &[0; 4]), -6);
+        t.shared.lock().unwrap().queue.clear();
+        assert_eq!(push_pcm(&t, &[0; 4]), -6);
     }
 
     #[test]

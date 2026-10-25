@@ -3,6 +3,297 @@
 Bu dosya, kaldığımız yerin dürüst özeti. Başka bir makinede devam edecek kişi
 için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2.4.
 
+## Son doğrulama: NewPipe VOD artık ilerliyor (2026-10-26)
+
+Önceki iki karede kalma kaydının nedeni GDB ile ölçüldü: AAC ve AudioTrack
+çalışıyordu; kapanan `pw-cat` sonrasında ses kuyruğu 44100 baytta doluyor,
+`alive=false` olmasına rağmen yazılar sürekli 0 dönüyordu. Bu, geçici
+backpressure gibi görünüp ExoPlayer'ın ilerlemesini durduruyordu.
+
+- Özel test XDG_RUNTIME_DIR'i, gerçek PipeWire soketini gizliyordu.
+  Aynı pw-cat denemesi özel runtime'da `Host is down`, gerçek oturumda başarı
+  verdi. Kontrol soketi artık `PENGUDROID_SOCKET` ile ayrı seçilebiliyor;
+  Wayland/PipeWire için gerçek XDG_RUNTIME_DIR korunuyor.
+- Host ses yardımcılarından guest `LD_PRELOAD` ve `LD_LIBRARY_PATH` kaldırıldı.
+  Çıkış hataları artık loglanıyor. Ölü AudioTrack çıkışına yazma
+  `ERROR_DEAD_OBJECT` (-6) döndürüyor; dolu ama yaşayan kuyruk 0 döndürmeye devam
+  ediyor. Otomatik sink yeniden başlatma henüz yok.
+- Normal NewPipe arama → Blender Big Buck Bunny 09:57 VOD akışı, zorlanmış
+  Surface olmadan **191,5 saniyede 4200 kareyi geçti** (örnek aralığında yaklaşık
+  21,9 kare/s). Son üç kare özeti farklı; tek donmuş kare tekrarından ibaret değil.
+  PipeWire düğümü `running`, `Stream/Output/Audio`; pw-cat süreç ortamında guest
+  loader değişkenleri yok, XDG_RUNTIME_DIR `/run/user/1000`.
+- Bu, bu VOD için sürdürülen video ve ses çıkış zinciri doğrulamasıdır.
+  Duyulan ses kalitesi, tam A/V senkronu, tüm videolar veya tüm Android
+  uygulamaları için garanti değildir. CPU video kopyalama/ölçekleme sürüyor.
+- `cargo test --workspace --offline`: **219 geçti, 0 başarısız**.
+  Yeni regresyonlar: soket seçimi, host yardımcı ortamı ve ölü ses kuyruğu.
+
+Yerel kanıtlar: `/tmp/pd-playback-gdb/debugger.log` ve
+`/tmp/pd-playback-host/{app.log,daemon.log,tests.log,video-*.ppm}`.
+Bu kayıt önceki “oynatma hâlâ tamamlanmadı” bölümünün devamıdır; aşağıdaki
+iki kare gözlemi düzeltme öncesine aittir. Genel uçtan uca uyumluluk hedefi açık.
+
+Özel kontrol soketiyle çalıştırma (iki komutta da aynı değer):
+
+```sh
+PENGUDROID_SOCKET=/tmp/pengudroid-test.sock target/debug/pengudroid-daemon
+PENGUDROID_SOCKET=/tmp/pengudroid-test.sock target/debug/pengudroid launch NewPipe_v0.29.1.apk --sysroot .toolchain/sysroot
+```
+
+## Son doğrulama: pencere sınırları, video boyutu ve tıklama engeli (2026-10-26)
+
+### Donma kaydından ölçülerek ilerlenen düzeltmeler
+
+- Sonradan VOD açılınca root `mRelayoutSeq=3`, `mWinFrame=(0,0)-(0,0)` ve
+  `SurfaceView 0x405 haveFrame=false queue=0` oluyordu. Input pompası hayattaydı.
+- `new_configuration` yalnızca dp/density ayarlıyor, **WindowConfiguration
+  bounds/appBounds/maxBounds alanlarını boş bırakıyordu**. Android'in yerel
+  WindowLayout hesabı sonraki relayout'ta bu boş sınırları kullanıyordu.
+- Şimdi gerçek `WindowConfiguration` API'leriyle 720x1280 sınırlar ve fullscreen
+  modu kuruluyor. Aynı normal tıklama/VOD akışında root 720x1280 kaldı;
+  `SurfaceView 720x405 haveFrame=true`, gerçek Surface ve BLAST kuyruğu oluştu.
+  **SYNTH_CLICK/PROBE_VIEWS/FORCE_SURFACE kullanılmadı**; eski forced-view
+  gezintisi çalıştırılmadan yüzey kendiliğinden oluştu.
+- Android'in gerçek `WindowLayout.computeFrames` yolunu çalıştıran başsız probe
+  720x1280 frame hesapladı. `tests/art_framework.rs`, kurulu sysroot varsa bunu
+  ve gerçek binder/native klavye haritasını otomatik test ediyor; sysroot yoksa
+  açıkça atlıyor.
+
+### Klavyeden arama artık uygulama içinde doğrulandı
+
+Shift+A, b, Backspace, c → NewPipe aramasında **Ac** ve öneriler görüldü.
+Kanıt: `docs/screenshots/newpipe-keyboard.png`. Ardından Ctrl+A ile değiştirilip
+`big buck bunny` yazıldı; Enter ile gerçek VOD sonuçları geldi ve Blender'ın
+09:57 uzunluğundaki videosu normal tıklamayla açıldı.
+
+### Beş saniyelik focus/layout beklemesi giderildi
+
+Sahte autofill binder'ı `AutofillManager.addClient`'ın callback'ini hiç
+çağırmıyor, her denemede `SyncResultReceiver TimeoutException: 5000ms` üretiyordu.
+Autofill motoru barındırılmadığı için artık servis yöneticisi bunun için gerçek
+null binder döndürüyor. Yeni süreçte arama/yazı/VOD akışında bu timeout'lar
+**0** oldu. Bu, autofill uygulaması değil; desteklenmeyen servisin doğru
+şekilde mevcut değil olarak bildirilmesi.
+
+### Kullanıcının taşan video ve donma ekran görüntüsü
+
+- Dekoder tampon boyutu (1280x720), SurfaceView yerleşim boyutu (720x405) olarak
+  kullanılıyordu. BLAST artık yerleşim boyutunu atomik yayımlıyor; daemon CPU
+  snapshot'ını bu alana ölçekliyor. Gerçek Wayland testinde 32x32 kaynak,
+  16x16 video alanında sunulup sonrasında compositor roundtrip'i geçiyor.
+- Video subsurface'inin input alıcısı yoktu ama fare olaylarını üzerine
+  alıyordu. Artık input region boş: tıklama ana pencerenin ViewRootImpl'ine
+  geçiyor. Görüntü katmanı etkileşim katmanı gibi davranmıyor.
+- Yeni trace `PENGUDROID_TRACE_INPUT=1`, gleshim'de alınan ve poll edilen olayı
+  ayrı ayrı, host'ta da decoded event ve pompa heartbeat'ini gösteriyor.
+  Bağlantı hataları artık sessizce yutulmuyor.
+
+### Oynatma hâlâ tamamlanmadı: ses odağı ayrı bir eksikti
+
+- Canlı izde IAudioService requestAudioFocus kod 66 çağrılıyordu; boş stub
+  sonucu 0 (başarısız) yapıyordu. Per-process temel focus durumu eklendi:
+  request gain 1..4 → granted (1), current focus ve abandon uygulanıyor.
+- Gerçek Java IAudioService AIDL proxy'siyle request/getCurrent/abandon probe'u
+  geçti. Canlı NewPipe izinde `audio focus gain=1 result=1` görüldü.
+- **Bu tek başına kesintisiz oynatmayı düzeltmedi.** Son koşuda yine yalnız ilk
+  iki software video karesi alındı. AAC decoder kurulup output formatını
+  bildiriyor; `AudioTrack`/pw-cat akışı henüz görünmüyor. Bir sonraki iş
+  AAC output → Java ByteBuffer → ExoPlayer AudioSink/AudioTrack zincirini
+  ölçmek; buna bakmadan “ses yüzünden durdu” kesinliği yok.
+- Ortak audio focus arbitration, focus-change callback'leri ve ducking henüz
+  yok. Layer-parent seçimi hâlâ pid'nin en yeni yüzeyine göre; EGL surface
+  ömrü ve orientation sırasında yeniden boyutlandırma ayrıca açık.
+
+### Son doğrulama
+
+Workspace build ve **216 test** başarılı. Gerçek ART framework testi klavye,
+yerel pencere hesabı ve ses odağı AIDL çağrılarını kapsıyor. Genel uyumluluk ve
+kesintisiz video hedefleri açık; bu kayıt bunların tamamlandığını iddia etmez.
+
+Canlı kanıtlar: `/tmp/pd-freeze-trace/before-config.log` (0x0),
+`/tmp/pd-config-bounds/verified-bounds.log` (doğal SurfaceView/BLAST),
+`/tmp/pd-geometry-final/app.log` (autofill timeout yok),
+`/tmp/pd-audio-focus/app.log` (ses odağı granted, ilk iki kare),
+`/tmp/pd-audio-focus/final-tests.log` (216 test).
+
+## Yeni devam: sanal klavye servisi ve kullanıcının donma kaydı
+
+### Sanal klavye artık framework'ten yükleniyor
+
+- Host, Android 13 native `KeyCharacterMap` parcel'inden gerçek harita oluşturup
+  framework'ün `InputDevice` kurucusuna veriyor. C++ nesne offseti veya sahte JNI
+  karakter callback'i yok. `InputDevice.writeToParcel` çıktısı broker'a kuruluyor.
+- `IInputManager` getInputDevice/getInputDeviceIds/isInputDeviceEnabled/hasKeys/
+  getKeyCodeForKeyLocation alt kümesi eklendi. Sanal aygıt id=-1; bilinmeyen
+  aygıtlar null dönüyor. Kodlar bu framework'ün `IInputManager$Stub` dökümünden:
+  1/2/3/6/7, listener kaydı 22. Sabit aygıt için hotplug üretilmiyor.
+- Harita US fiziksel düzenidir: harf, sayı, noktalama, Shift ve Caps Lock.
+  Türkçe/XKB ve IME composition bu değişiklikte uygulanmadı.
+- Gerçek ART + binder + libinput üzerinden bağımsız probe başarılı:
+  ```sh
+  PENGUDROID_PROBE_KEYBOARD=1 target/debug/pengudroid art-test \
+    --sysroot .toolchain/sysroot \
+    --register-natives libandroid_runtime.so,libhwui.so --vm-option -Xint
+  ```
+  Çıktı: `InputManager -> InputDevice(-1) -> native KeyCharacterMap: 6 Unicode
+  cases passed`. a/A, Caps, Shift+Caps, Shift+1 ve Ctrl durumları gerçek native
+  haritayla ölçüldü. Sanal aygıt varlığı ve bilinmeyen id'nin null olması da
+  framework yolu üzerinden kontrol edildi.
+- **NewPipe aramasında metin girişi henüz görsel olarak doğrulanmadı.** Canlı UI
+  denemesi kullanıcının bildirdiği donma sırasında kesildi; probe başarısı UI
+  başarısı olarak yorumlanmamalı.
+
+### Kullanıcı video açtıktan sonra uygulama dondu: yeniden başlatmadan log alındı
+
+- Etkilenen debug ART süreci PID 68068, özel daemon PID 68063.
+- `/tmp/pd-freeze-68068/` altında uygulama/daemon logları, SIGQUIT Java thread
+  dökümü, thread durumları ve Unix soketleri kaydedildi.
+- Paylaşılabilir arşiv: `/tmp/pengu-freeze-68068.zip`.
+- Ana thread ölçümde `MessageQueue.nativePollOnce -> Looper.loop` bekliyor;
+  RenderThread epoll'de. Bu örnek bir Java monitor deadlock'unu kanıtlamıyor.
+- `ExoPlayer:PlaceholderSurface` var, fakat bu koşuda BLAST consumer kurulmamış.
+  Ayrıca daemon'ın aldığı son sentetik girişlerin bazıları uygulamanın input
+  loguna ulaşmamış. Audio port cache hataları (-61) tekrarlanıyor.
+- Native GDB attach sistemin ptrace kısıtıyla reddedildi; Java/native durum
+  farkı henüz kapanmadı. Native kilitlenme veya kesin kök neden iddiası yok.
+- Daha eski release PID 35402'nin stderr'i `/dev/null`; geçmiş logu kurtarılamadı.
+  Eski sürece yeniden başlatma/öldürme yapılmadı.
+- **Donma düzeltilmiş değil.** Sonraki iş: input kuyruğu/poller ile normal
+  (debug synth-click olmadan) SurfaceView yaşam döngüsünü izlemek. Özellikle
+  `spawn_input_pump`'ın yüzey düzeltmesini yalnız başlangıçtaki probe koşulunda
+  yapması incelenmeli; gerçek tıklamayla sonradan açılan oynatıcı bu yola
+  girmeyebiliyor.
+
+Doğrulama: workspace build başarılı, 210 test başarılı; üç yeni sanal input
+servisi testi dahil. Bağımsız gerçek ART karakter haritası probe'u ayrıca geçti.
+Genel uyumluluk hedefi açık; UI metin girişi, video devamlılığı ve ARM64 hâlâ açık.
+
+## Son canlı doğrulama: olay kaybı ve geçersiz video importu düzeltildi
+
+Bu kayıt, aşağıdaki fiziksel klavye bölümünden daha yenidir. Kullanıcının
+paylaştığı ekran görüntüsünde video yer tutucu kalıyordu; bu oturumda aynı
+belirti yeniden üretildi. Eski “ilk kare sunuldu” logu tek başına ekranda video
+olduğuna kanıt değildir.
+
+### Ölçülen iki gerçek hata ve düzeltme
+
+1. Daemon `serve()` soket zaman aşımında `peer.inbox.try_recv().is_ok()` ile bir
+   olayı kuyruktan çıkarıp atıyordu. Bu, tekil tıklama/tuşları ve guest çağrılarını
+   kaybettiriyordu. Kaldırıldı; döngünün başındaki `drain_inbox` teslim ediyor.
+   Yeni entegrasyon testi **önce başarısız** oldu: basma beklerken bırakma geldi.
+   Düzeltmeden sonra 16 ayrı tuşun tüm çiftleri ve Shift down/up sırasıyla geldi.
+2. `ahardwarebuffer::allocate_buffer` gerçek `DMA_BUF` değil **memfd** üretiyor.
+   BLAST bu fd'yi `PresentDmabuf` ile gönderince compositor bağlantısı şu hatayla
+   kopuyordu (yeniden üretildi):
+   `failed to import supplied dmabufs: EGL failed to allocate resources`.
+   `PresentShm` (mesaj kodu 68) eklendi. Daemon RGB565/RGBA/RGBX/BGRA tamponunu
+   boyut/stride/fd uzunluğu kontrollerinden geçirip XRGB8888 snapshot'a çeviriyor,
+   `wl_shm` ile sunuyor. Snapshot, kaynak tampon Ack sonrası yeniden kullanılsa
+   da değişmez; `wl_buffer.release` geldiğinde Wayland buffer'ı yok ediliyor.
+   GPU'dan gelen gerçek `PresentDmabuf` yolu ayrı kaldı.
+
+### Canlı kanıt ve sınırları
+
+- NewPipe `426x240`, format 4 (RGB565) kare verdi. Tüketiciden alınan
+  `/tmp/pd-key-live/fixed-video-1.ppm` görüntüsü futbol yayını/stüdyo/scoreboard
+  içeriyor; düz renk değil. Yeni log “software frame **submitted**” diyor.
+- Bu koşuda önceki dma-buf protokol hatası oluşmadı. Ancak yalnızca ilk birkaç
+  kare görüldü; **sürekli ve doğru pencere üzerinde oynatma henüz doğrulanmadı**.
+  Parent seçimi hâlâ pid'nin en yeni yüzeyine göre; EGL yüzeyi yenilenince eski
+  katmanda kalma, geometri ve ölçekleme ayrıca çözülmeli.
+- Gerçek Wayland testinde 8 memfd/RGB565 karesinden sonra yeni toplevel yaratıp
+  compositor roundtrip'i başarılı oldu. Bu, yalnızca erken Ack'a güvenmez;
+  bağlantının asenkron import hatasıyla kopmadığını da kontrol eder.
+
+### Klavye: odak eşiği aşıldı, sonraki eksik sanal aygıt
+
+- `pengudroid key <linux-keycode> [down|up]` eklendi. Durum yoksa basma+bırakma;
+  ayrı down/up ile modifier akorları daemon ve gleshim kuyruğundan test edilir.
+- Önce Android açıkça `Dropping event (no window focus)` diyordu. Host artık
+  görünür/focusable kökleri LayoutParams türü ve eklenme sırasına göre seçip
+  `ViewRootImpl.windowFocusChanged` bildirimi kuyruğa koyuyor; yalnız seçili
+  köke klavye olayı gönderiyor. Bu, tam WMS/Wayland odak köprüsü değildir.
+- Canlı koşuda Escape ve arama tıklaması işlendi; Search YouTube alanı açıldı.
+  Shift+A / b / Backspace / c olayları doğru meta ile geldi, “no window focus”
+  kesildi. **Yazı yine girilemedi**; bu kez gerçek engel:
+  `KeyCharacterMap$UnavailableException: Could not load key character map for device -1`.
+  Android `KeyEvent.getUnicodeChar()` → `KeyCharacterMap.load(-1)` aşamasında
+  sanal `InputDevice`/karakter haritası istiyor. Sysroot'ta
+  `system/usr/keychars` dizini de yok. Sonraki somut iş bu aygıtı/haritayı sağlamak.
+- Girdi olaylarının geçici JNI referansları artık yerel frame içinde tutulup
+  olay bitince serbest bırakılıyor; uzun yaşayan input thread'inde birikmiyor.
+- Türkçe XKB, IME composition, compositor focus leave ve key repeat hâlâ açık.
+
+### Doğrulama ve tekrar çalıştırma
+
+- `cargo build --workspace --offline` başarılı. Protokol değişiminden sonra
+  **tüm `.so` dosyalarını da birlikte derlemek gerekir**; yalnız CLI/daemon
+  derleyip eski gleshim'i yüklemek canlı testte input subscription'ını bozdu.
+  Tam workspace derlemesi sonrası subscription ve tuş akışı geri geldi.
+- `cargo test --workspace --offline`: 207 test başarılı (22 suite/doc-test
+  çalıştırması). Yeni testler: idle input subscriber, üç pixel/layout kontrolü,
+  gerçek compositor üzerinde yazılım video kareleri. Mevcut uyarılar sürüyor.
+- `cargo check -p pengudroid-daemon --no-default-features --offline` başarılı;
+  grafik kapalı dalındaki eksik `focused_surface`/`destroy_surface` karşılıkları
+  da tamamlandı.
+- Bu oturumun deneyleri özel `/tmp/pd-key-live/runtime` daemon'u ile yapıldı;
+  daha önce açık olan release ART süreçlerine dokunulmadı.
+
+Genel hedef açık: her Android oyun/uygulamasını çalıştırma tamamlanmadı.
+Öncelikler: sanal klavye aygıtı ve karakter haritası; doğru video parent/geometri
+ve deterministik kesintisiz oynatma; ardından ARM64 yürütme.
+
+## Güncel devam noktası (2026-10-25): fiziksel klavye olayları
+
+**Okuma sırası:** bu bölüm ve hemen altındaki video/GUI kaydı güncel başlangıç
+noktasıdır. Dosyanın sonundaki “12. NewPipe penceresi açılıyor, video katmanı
+boş” bölümü geçmiş bir denemeyi anlatır; üstteki başarılı video ölçümlerini
+geçersiz kılmaz. Video başarısı önceki oturumun kanıtıdır; bu oturumda NewPipe
+videosu yeniden oynatılmadı.
+
+Hedef aynı: VM/container başlatmadan Android uygulamalarını Linux süreçleri
+olarak çalıştıran uçtan uca uyumluluk katmanı. Her oyun ve uygulama için genel
+uyumluluk henüz sağlanmadı; özellikle ARM64 yürütme ve platform servisleri
+büyük açıklar.
+
+### Bu devamda yapılan düzeltme
+
+- Fiziksel klavye için `keyboard.rs` durum takibi eklendi. Shift/Ctrl/Alt/Meta
+  tuşlarının sağ/sol ve toplu Android meta bitleri, Caps Lock, basış zamanı ve
+  tekrar sayısı korunuyor. Home/End/PageUp/PageDown/Insert/Delete eşlendi.
+- ART input pompası artık `KeyEvent(JJIIIIIIII)` kullanıyor: olay zamanı,
+  meta durumu, fiziksel scan code, sanal klavye aygıtı ve `SOURCE_KEYBOARD`
+  bilgisi Android'e gidiyor. Önceki iki argümanlı kurucu modifier bilgisini
+  kaybediyordu.
+- `dispatchInputEvent` aynı nesneyi birden fazla köke vermiyor; her kök kendi
+  olayını alıyor. Köklerin olayı geri dönüştürmesi nedeniyle nesneyi paylaşmak
+  güvenli değildi.
+- Dört regresyon testi: çift Shift bırakma sırası, tekrar/basış zamanı,
+  Caps Lock tekrarında yanlışlıkla kapanmama, Ctrl+A ve düzenleme tuşları.
+
+### Doğrulama
+
+- `cargo build --workspace --offline`: başarılı.
+- `cargo test --workspace --offline`: 202 test başarılı, hata yok (22 test/doc-test
+  çalıştırması). Dört yeni klavye regresyon testi dahil.
+- Sandbox Unix soketini engellediği için entegrasyon testleri normal yerel
+  süreç izinleriyle yeniden çalıştırıldı. Mevcut derleyici uyarıları sürüyor.
+- `git diff --check`: temiz.
+
+### Sınırlar ve sıradaki doğrulama
+
+Bu değişiklik IME veya Türkçe metin bileşimi uygulamaz; compositor XKB keymap'i
+henüz çevrilmiyor. Pencere odak yönlendirmesi de eksik: fiziksel olaylar mevcut
+host davranışıyla tüm köklere, ayrı nesnelerle gönderiliyor. Compositor odak
+kaybında basılı tuşları sıfırlama ve otomatik Wayland tuş tekrarı ayrıca gerekli.
+NewPipe aramasına gerçek yazı girişi bu oturumda doğrulanmadı.
+
+Sıradaki somut iş: NewPipe arama alanında harf/Shift/Backspace/Enter akışını
+canlı doğrulamak; gerekirse `InputConnection`/pencere odak köprüsünü tamamlamak.
+Ardından ARM64 yürütme engeline dönmek. Video doğrulamasında değişken canlı
+yayınlar yerine deterministik içerik kullanmak gerekiyor.
+
 ## Bu oturum (12): **video gerçekten oynuyor** — kare çözülüp subsurface'e gidiyor
 
 > **Hedef tamamlandı.** Aşağıdaki sonuçlar artık **normal kullanıcı yolu** ile de
