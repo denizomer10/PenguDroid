@@ -1094,7 +1094,7 @@ fn trace_surface_views(env: &JniEnv) {
     }
 }
 
-fn report_surface_views(env: &JniEnv) {
+fn report_surface_views(env: &JniEnv, verbose: bool) {
     let Some(wmg_class) = env.find_class("android/view/WindowManagerGlobal") else {
         return;
     };
@@ -1161,6 +1161,7 @@ fn report_surface_views(env: &JniEnv) {
         is_instance: JMethodId,
         view_group: JObject,
         done: &mut bool,
+        verbose: bool,
     ) {
         if *done || view.is_null() || depth > 24 {
             return;
@@ -1179,7 +1180,9 @@ fn report_surface_views(env: &JniEnv) {
         // The object's own `Class` is a valid `jclass`, so no class lookup is
         // needed (and `FindClass` would not see app classes anyway).
         let class = env.call_object(view, get_class, &[]).unwrap_or(std::ptr::null_mut());
-        println!("views: {:width$}{name}", "", width = depth * 2);
+        if verbose {
+            println!("views: {:width$}{name}", "", width = depth * 2);
+        }
         // Print a `TextView`'s text. A view tree only says *which* screen is
         // up; its text is what says *why* (an error dialog's message, the
         // player's state line). Without it a failure is just "a dialog".
@@ -1306,7 +1309,10 @@ fn report_surface_views(env: &JniEnv) {
             // `SurfaceView.onMeasure` ignore the parent's zero-width spec, and
             // the framework's own `OnPreDrawListener` then sets `mHaveFrame` and
             // calls `updateSurface()` on the main thread.
-            if std::env::var_os("PENGUDROID_FORCE_SURFACE").is_some() && !class.is_null() {
+            // Default on: a `SurfaceView` created after the activity window
+            // collapsed measures 0 wide, so without this no video layer is ever
+            // built. `PENGUDROID_NO_FORCE_SURFACE=1` turns it off for debugging.
+            if std::env::var_os("PENGUDROID_NO_FORCE_SURFACE").is_none() && !class.is_null() {
                 // `PENGUDROID_SURFACE_W`/`_H` are the *window* size (the CLI
                 // exports them for the guest), so the video layer needs its own
                 // pair.
@@ -1426,9 +1432,11 @@ fn report_surface_views(env: &JniEnv) {
                     .map(|m| env.call_void(view, m, &[]))
                     .unwrap_or(false);
                 if fixed {
-                    println!(
-                        "views:   requested {w}x{h} (traversal: {scheduled}, postInvalidate: {invalidated})"
-                    );
+                    if verbose {
+                        println!(
+                            "views:   requested {w}x{h} (traversal: {scheduled}, postInvalidate: {invalidated})"
+                        );
+                    }
                     // Read the state *now*: the next traversal runs on the main
                     // thread, and walking the tree while it does was measured to
                     // SIGSEGV. Reading fields is safe.
@@ -1456,9 +1464,11 @@ fn report_surface_views(env: &JniEnv) {
             if *done {
                 return;
             }
-            println!("views: {:width$}child {i}/{count}", "", width = depth * 2);
+            if verbose {
+                println!("views: {:width$}child {i}/{count}", "", width = depth * 2);
+            }
             if let Some(child) = env.call_object(view, get_child, &[JValue { i }]) {
-                walk(env, child, depth + 1, get_class, get_name, child_count, get_child, is_instance, view_group, done);
+                walk(env, child, depth + 1, get_class, get_name, child_count, get_child, is_instance, view_group, done, verbose);
             }
         }
     }
@@ -1476,7 +1486,7 @@ fn report_surface_views(env: &JniEnv) {
         if let Some(root) = env.call_object(roots, get_m, &[JValue { i }]) {
             dump_root_state(env, root, i);
             let mut done = false;
-            walk(env, root, 0, get_class, get_name, child_count, get_child, is_instance, view_group, &mut done);
+            walk(env, root, 0, get_class, get_name, child_count, get_child, is_instance, view_group, &mut done, verbose);
             if done {
                 break;
             }
@@ -3714,7 +3724,12 @@ fn spawn_input_pump(env: &JniEnv) {
             }
             // The probe runs even without a tap, so a baseline ("how many
             // windows exist with no interaction at all") is obtainable.
-            if std::env::var_os("PENGUDROID_PROBE_VIEWS").is_some()
+            // The forced-surface pass runs unconditionally: without it a
+            // `SurfaceView` created after the activity window collapsed stays at
+            // 0 wide, never gets `mHaveFrame`, and the video layer is never
+            // created. Only the dump is gated, by `PENGUDROID_PROBE_VIEWS`.
+            let verbose_views = std::env::var_os("PENGUDROID_PROBE_VIEWS").is_some();
+            if true
                 || std::env::var_os("PENGUDROID_FORCE_SURFACE").is_some()
             {
                 // A playing stream can die within a few seconds, so the wait is
@@ -3725,7 +3740,7 @@ fn spawn_input_pump(env: &JniEnv) {
                     .and_then(|v| v.trim().parse::<u64>().ok())
                     .unwrap_or(12_000);
                 std::thread::sleep(std::time::Duration::from_millis(delay));
-                report_surface_views(&env);
+                report_surface_views(&env, verbose_views);
                 // The forced size only takes effect on a *later* traversal, which
                 // runs on the main thread; measured, the view goes from 0x405 to
                 // 720x405 between the first and the second pass. Repeat so a slow
@@ -3734,8 +3749,10 @@ fn spawn_input_pump(env: &JniEnv) {
                 // `mSurfaceControl == null`, so repeated passes are safe.
                 for pass in 2..=MAX_FORCE_PASSES {
                     std::thread::sleep(std::time::Duration::from_millis(1500));
-                    println!("views: --- pass {pass} ---");
-                    report_surface_views(&env);
+                    if verbose_views {
+                        println!("views: --- pass {pass} ---");
+                    }
+                    report_surface_views(&env, verbose_views);
                 }
             }
         }
