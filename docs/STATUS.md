@@ -34,6 +34,17 @@ için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2
 > gezildi, `SurfaceView` ağaçta vardı, ama `BLASTBufferQueue` yoktu). Artık
 > varsayılan; yalnızca ayrıntılı döküm `PENGUDROID_PROBE_VIEWS`'e bağlı,
 > `PENGUDROID_NO_FORCE_SURFACE=1` ile kapatılabiliyor.
+>
+> **GUI de artık gerçek uygulamayı çalıştırıyor.** Daemon'ın `RunApk`'ı
+> `pengudroid __guest --apk <yol>` başlatıyordu; `__guest` yalnızca bir pencere
+> açıp gradyan boyuyor, Android uygulamasını hiç çalıştırmıyor. Yani GUI'den
+> başlatılan hiçbir şey uygulamayı koşmuyordu ve ART/video işinin hiçbiri
+> arayüzden erişilebilir değildi. Gerçek APK artık `pengudroid launch` (ART
+> yolu) üzerinden gidiyor; `--component`, `-- args` ve
+> `PENGUDROID_ART_SYSROOT` iletiliyor. Yerleşik demo `__guest`'te kalıyor.
+>
+> Daemon yolu üzerinden ölçüm (`pengudroid start NewPipe_v0.29.1.apk`):
+> `RunApk: started guest` 1, `[blast] created` 1, 16 kare raporu, 470 dmabuf.
 
 Hedef tamamlandı: NewPipe bir video açtı, `c2.android.avc.decoder` kareleri
 çözdü, bizim `BLASTBufferQueue` tüketicimiz onları daemon'a `PresentDmabuf`
