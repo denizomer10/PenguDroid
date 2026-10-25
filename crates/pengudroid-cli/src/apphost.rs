@@ -1074,6 +1074,12 @@ fn report_surface_views(env: &JniEnv) {
         if view.is_null() || depth > 24 {
             return;
         }
+        // A failed reflective lookup leaves an exception pending, and every JNI
+        // call after that silently returns null — which is exactly how the walk
+        // "stopped" at the first `ViewStub` (measured: the tree dump ended there
+        // and the `SurfaceView` was never reached, so the forced layout never
+        // ran).
+        env.describe_exception();
         let name = env
             .call_object(view, get_class, &[])
             .and_then(|c| env.call_object(c, get_name, &[]))

@@ -28,3 +28,6 @@ fixtures/*.h264
 /*.apkx
 /*.xapk
 /*.apks
+
+# ExoPlayer cache dumps written by the guest at runtime.
+exoplayer/

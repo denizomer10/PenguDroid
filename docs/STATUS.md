@@ -151,11 +151,47 @@ Yani `ClientWindowFrames` **var** ve 720×1280 taşıyor. Buna rağmen o pencere
 `relayoutWindow`'u ya hiç çağırmıyor ya da sonucu `mWidth`'e taşımıyor
 (`mFirst=false`, `mLayoutRequested=false`).
 
-Sıradaki adım: bu pencerenin `performTraversals`'ında `relayoutWindow`'un
-çağrılıp çağrılmadığını izlemek (`mFirst`, `windowShouldResize`,
-`mForceNextWindowRelayout` alanları) ve `mWinFrame`'i `mWidth`'e taşıyan yolu
-(sysroot'taki LineageOS 20 `ViewRootImpl`'i AOSP 13.0.0_r1'den farklı olabilir)
-okumak.
+### Ölçülen: `RefBase` alt nesnesi offset 0'da değil
+
+`ConsumerBase` **`virtual RefBase`**'ten türüyor, yani `RefBase` alt nesnesi
+offset 0'da değil. Ölçüm: `BufferItemConsumer`'ın vtable'ında `v[-3] = 1688 =
+0x698`, ve kurucusu tam olarak `this + 0x698` ile `RefBase::RefBase()`
+çağırıyor. `RefBase::incStrong`'u dış işaretçiyle çağırmak çöp bir `mRefs`
+okuyor (`incStrong+4`, `lock addl 0x4(%rax)`). Itanium ABI'de sanal taban
+offseti `vptr - 24`'te duruyor; `Surface` gibi sanal olmayan birincil tabanı
+olan sınıflarda bu değer 0.
+
+### Ölçülen: `Surface` serbest bırakılınca `hook_perform` abort ediyor
+
+`incStrong` çağrıları kaldırılıp Java'nın `Surface`'ı serbest bırakmasına izin
+verilince:
+
+```
+#9  std::__1::__throw_system_error(int, char const*)      libc++.so
+#10 std::__1::mutex::lock()                               libc++.so
+#11 std::__1::__shared_mutex_base::lock_shared()          libc++.so
+#12 android::Surface::hook_perform(ANativeWindow*, int, ...)  libgui.so
+```
+
+Yani `Surface`'ın `shared_mutex`'i artık serbest bırakılmış bellekte ve
+`lock_shared()` `EINVAL` alıp `std::terminate` ediyor. `Surface`'a bizim
+tuttuğumuz bir referans şart; doğru `RefBase` alt nesnesiyle `incStrong`
+yapılması gerekiyor.
+
+### Yan bulgu: probe gezintisi `ViewStub`'ta duruyordu
+
+Başarısız bir yansıma çağrısı bekleyen bir istisna bırakıyor ve sonraki her JNI
+çağrısı sessizce null dönüyor. Ağaç dökümü ilk `ViewStub`'ta bitiyordu, yani
+`SurfaceView` hiç bulunamıyor ve zorunlu layout hiç çalışmıyordu. Gezinti artık
+her düğümde `describe_exception()` çağırıyor; ölçüldü: `SurfaceView` bulunuyor
+ve `[blast] created` + `Surface.copyFrom(queue)` çalışıyor.
+
+### Sıradaki adım
+
+`Surface` ve `BufferItemConsumer` için `incStrong`'u **doğru `RefBase` alt
+nesnesiyle** yapmak (`refbase_of`: `vptr - 24`'teki sanal taban offseti), böylece
+nesneler Java onları bıraktıktan sonra da yaşasın. Ondan sonra kalan tek şey
+decoder'ın `PlaceholderSurface` yerine bizim kuyruğa bağlanması.
 
 ### Yan bulgu: bayat `.so` protokolü bozuyor
 
