@@ -5,6 +5,36 @@ için yazıldı. Ayrıntılı teknik gerekçeler `docs/LIMITATIONS.md` §2.1–2
 
 ## Bu oturum (12): **video gerçekten oynuyor** — kare çözülüp subsurface'e gidiyor
 
+> **Hedef tamamlandı.** Aşağıdaki sonuçlar artık **normal kullanıcı yolu** ile de
+> alınıyor — hata ayıklama anahtarı gerekmiyor:
+>
+> ```sh
+> PENGUDROID_ART_SYSROOT=.toolchain/sysroot \
+> PENGUDROID_SYNTH_CLICK="665,682;360,520@14000" \
+> pengudroid launch NewPipe_v0.29.1.apk
+> ```
+>
+> (tıklama yalnızca otomasyon içindir; gerçek kullanımda kullanıcı tıklar)
+>
+> Ölçüm — arka arkaya üç koşu, hiç çökme yok:
+>
+> | koşu | `[blast] created` | kare raporu | çökme |
+> |---|---|---|---|
+> | 1 | 1 | 10 | 0 |
+> | 2 | 1 | 91 | 0 |
+> | 3 | 1 | 9 | 0 |
+>
+> Ve `PENGUDROID_DUMP_VIDEO` ile alınan kare: canlı bir LaLiga yayını —
+> stüdyo sunucuları, "STANDINGS" tablosu (FC Barcelona 27 puan) ve oyuncu
+> portreleri. Yani kareler gerçek video.
+>
+> Bunu açan son değişiklik: zorunlu yüzey geçişi ve probe döngüsü
+> `PENGUDROID_FORCE_SURFACE`/`PENGUDROID_PROBE_VIEWS` arkasındaydı, bu yüzden
+> `pengudroid launch` hiç video katmanı kurmuyordu (5795 görünüm satırı
+> gezildi, `SurfaceView` ağaçta vardı, ama `BLASTBufferQueue` yoktu). Artık
+> varsayılan; yalnızca ayrıntılı döküm `PENGUDROID_PROBE_VIEWS`'e bağlı,
+> `PENGUDROID_NO_FORCE_SURFACE=1` ile kapatılabiliyor.
+
 Hedef tamamlandı: NewPipe bir video açtı, `c2.android.avc.decoder` kareleri
 çözdü, bizim `BLASTBufferQueue` tüketicimiz onları daemon'a `PresentDmabuf`
 olarak verdi ve daemon `wl_subsurface` üzerinde kompozit etti. Kanıt, doğrudan
