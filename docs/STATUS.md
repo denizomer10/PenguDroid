@@ -113,16 +113,37 @@ yani çökme tam olarak Rect'e dokunmakta. `Rect.set(IIII)` denemesi de çöktü
 sonra ART'nin GC çıktısıyla (MemMap dökümü) yeniden çöktü — yani bu, ART
 nesnelerini host'tan kurcalamaktan kaynaklanan bir bozulma.
 
-**Ölçülen sürpriz:** ikinci pencerenin `mWinFrame` alanı **null** okunuyor
-(root 0'da dolu, root 1'de null). `ViewRootImpl`'de bu alan `final Rect` olarak
-başlatılır, yani null olmaması gerekir — iki anlamı olabilir: (a) ikinci
-pencerenin `ViewRootImpl`'i tam kurulmamış, (b) probe yanlış nesneyi okuyor.
-Hangisi olduğu ölçülmedi; **sıradaki adım tam olarak bu ayrımı yapmak**, çünkü
-(a) doğruysa kök neden `setView`/`addToDisplayAsUser` sırasında yutulan bir
-hatadır.
+**Düzeltme:** aşağıdaki tur 2'de ölçüldüğü gibi `mWinFrame` ikinci pencerede
+**null değil**, `(0,0)-(0,0)`. “null” gözlemi bekleyen bir JNI istisnasının
+artefaktıydı (JNI, exception pending iken null döner).
 
 Deney geri alındı (`git checkout -- crates/pengudroid-cli/src/apphost.rs`);
 ağaç temiz ve derleniyor.
+
+### Ölçüm turu 2: `relayout` çağrılıyor, yanıt tam, çerçeve yine de 0
+
+Yeni ölçümler (hepsi `PENGUDROID_PROBE_VIEWS` / `PENGUDROID_TRACE_BINDER`):
+
+* `ViewRootImpl` alanı **`mSeq` değil `mRelayoutSeq`** (bu build'de). Probe artık
+  `mRelayoutSeq`, `mRelayoutRequested`, `mForceNextWindowRelayout`, `mAdded` de
+  basıyor.
+* İki pencere `addToDisplayAsUser` çağırıyor; **üç** `relayout` oluyor.
+* Üç relayout yanıtının **hepsinde** `ClientWindowFrames` var:
+  `-> relayout reply: frames prefix 84 byte(s)` — yani “çerçeve yok” teorisi
+  **eleniyor**.
+* Buna rağmen root 1: `mWidth=0 mWinFrame=(0,0)-(0,0)`, ve **`mLayoutRequested=true`,
+  `mTraversalScheduled=true`** — yani pencere hâlâ yeniden traversal istiyor.
+* Önceki notta “root 1'in `mWinFrame`'i null” demiştim: bu **yanlıştı**. Probe onu
+  `(0,0)-(0,0)` okuyor. Boş görmemin sebebi, o kodda bekleyen bir JNI istisnası
+  olmasıydı (JNI, exception pending iken null döner).
+
+Yani şu üçü aynı anda doğru: relayout çağrılıyor, yanıt doğru, sonuç 0x0.
+Geriye kalan tek makul açıklama istemcinin bu yanıtı **uygulamaması**; bu noktadan
+sonrası ART'nin içinde ve elimizde debugger yok.
+
+**Sorulmamış ama önemli soru:** neden *ilk* pencere doğru? Diyalog penceresi
+`onCreate`'te ekleniyor, activity sonra. `mAdded` ikisinde de true. Pencere
+başına fark yaratan alan bulunursa çözüm de oradadır.
 
 ### Sıradaki adım
 

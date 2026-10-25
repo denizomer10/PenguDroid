@@ -1324,6 +1324,14 @@ fn dump_root_state(env: &JniEnv, root: JObject, index: i32) {
     for (field, sig) in [
         ("mWidth", "I"),
         ("mHeight", "I"),
+        // `mRelayoutSeq` is bumped every time `relayoutWindow` is about to run,
+        // so a window whose frame stayed empty is either a window whose relayout
+        // reply was not applied (`mRelayoutSeq > 0`) or one that never asked at
+        // all (`== 0`). The other two decide whether a relayout is still due.
+        ("mRelayoutSeq", "I"),
+        ("mRelayoutRequested", "Z"),
+        ("mForceNextWindowRelayout", "Z"),
+        ("mAdded", "Z"),
         ("mStopped", "Z"),
         ("mAppVisible", "Z"),
         ("mLayoutRequested", "Z"),

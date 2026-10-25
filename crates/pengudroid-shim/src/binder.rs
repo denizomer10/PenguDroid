@@ -1128,6 +1128,16 @@ fn window_session_reply(code: u32, parcel: &mut Vec<u8>, objects: &mut Vec<u64>)
                 } else {
                     parcel.extend_from_slice(&prefix);
                 }
+                if trace_enabled() {
+                    // SAFETY: `diag` only writes to stderr.
+                    unsafe {
+                        diag(&format!(
+                            "[binder]   -> relayout reply: frames prefix {} byte(s){}\n",
+                            prefix.len(),
+                            if prefix.is_empty() { " (ABSENT!)" } else { "" }
+                        ));
+                    }
+                }
             }
             // `outSurfaceControl`: present, so `ViewRootImpl` has something to
             // draw into. `SurfaceControl.readFromParcel` reads the Java-side
@@ -2387,6 +2397,19 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         // local binder, so its cookie identifies the window. Two windows exist
         // in a typical app (an activity and a dialog), and a reply that lands
         // for one but not the other is invisible without this.
+        if trace_enabled()
+            && tr.code == IWS_ADD_TO_DISPLAY_AS_USER
+            && tr.data_size > 0
+            && tr.data_ptr != 0
+        {
+            let data =
+                std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
+            let win = find_local_binder(data).map(|(_, cookie, _)| cookie).unwrap_or(0);
+            diag(&format!(
+                "[binder]   addToDisplay win={win:#x} data={}\n",
+                data.len()
+            ));
+        }
         if trace_enabled() && tr.code == IWS_RELAYOUT && tr.data_size > 0 && tr.data_ptr != 0 {
             let data =
                 std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
