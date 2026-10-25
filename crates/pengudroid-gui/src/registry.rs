@@ -126,12 +126,16 @@ impl Registry {
         if !apk.exists() {
             return Err(format!("{} does not exist", apk.display()));
         }
-        let (package, activity) = describe(apk)?;
-        let label = package
-            .rsplit('.')
-            .next()
-            .unwrap_or(&package)
-            .to_string();
+        let (package, activity, label) = describe(apk)?;
+        // The manifest's own label is what the user recognises ("NewPipe", not
+        // "newpipe"); fall back to the last package segment when it is absent.
+        let label = label.unwrap_or_else(|| {
+            package
+                .rsplit('.')
+                .next()
+                .unwrap_or(&package)
+                .to_string()
+        });
         let entry = Entry {
             package: package.clone(),
             label,
@@ -267,26 +271,47 @@ pub fn data_dir() -> PathBuf {
 }
 
 /// Ask the CLI for an APK's package and launcher activity.
-fn describe(apk: &Path) -> Result<(String, String), String> {
+/// `package`, `main activity` and `label` for an APK, read through
+/// `pengudroid info --plain`.
+///
+/// The `--plain` form is `key<TAB>value` lines. This used to parse the `Debug`
+/// dump and look for a line starting with `activity`, which the dump never
+/// contains (`main_activity: Some(...)`), so installation failed for every APK
+/// with "cannot read the package name from the APK".
+fn describe(apk: &Path) -> Result<(String, String, Option<String>), String> {
     let output = std::process::Command::new(pengudroid_binary())
         .arg("info")
+        .arg("--plain")
         .arg(apk)
         .output()
         .map_err(|e| format!("cannot run pengudroid info: {e}"))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        let err = err.trim();
+        return Err(if err.is_empty() {
+            "pengudroid info failed".to_string()
+        } else {
+            err.to_string()
+        });
+    }
     let text = String::from_utf8_lossy(&output.stdout);
-    let mut package = None;
-    let mut activity = None;
+    let (mut package, mut activity, mut label) = (None, None, None);
     for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("package") {
-            package = rest.trim_start_matches([':', ' ']).split_whitespace().next().map(str::to_string);
+        let Some((key, value)) = line.split_once('\t') else { continue };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
         }
-        if let Some(rest) = line.strip_prefix("activity") {
-            activity = rest.trim_start_matches([':', ' ']).split_whitespace().next().map(str::to_string);
+        match key.trim() {
+            "package" => package = Some(value.to_string()),
+            "activity" => activity = Some(value.to_string()),
+            "label" => label = Some(value.to_string()),
+            _ => {}
         }
     }
     match (package, activity) {
-        (Some(p), Some(a)) if !p.is_empty() && !a.is_empty() => Ok((p, a)),
+        (Some(p), Some(a)) => Ok((p, a, label)),
+        (Some(_), None) => Err("this APK declares no activity to launch".into()),
         _ => Err("cannot read the package name from the APK".into()),
     }
 }

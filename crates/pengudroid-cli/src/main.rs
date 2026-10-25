@@ -287,20 +287,80 @@ fn cmd_tap(args: &[String]) -> i32 {
 }
 
 fn cmd_info(args: &[String]) -> i32 {
-    let Some(path) = args.first() else {
-        eprintln!("usage: pengudroid info <app.apk|.apkm|.xapk|.apks>");
+    // `--plain` prints `key<TAB>value` lines instead of the `Debug` dump. The
+    // GUI parses this: the `Debug` form is for humans, and reading it back is
+    // how `registry::describe` ended up never matching (`main_activity` is not
+    // spelled `activity`).
+    let mut plain = false;
+    let mut path_arg = None;
+    for arg in args {
+        match arg.as_str() {
+            "--plain" | "--machine" => plain = true,
+            other => path_arg = Some(other),
+        }
+    }
+    let Some(path) = path_arg else {
+        eprintln!("usage: pengudroid info [--plain] <app.apk|.apkm|.xapk|.apks>");
         return 2;
     };
     let p = std::path::Path::new(path);
     if bundle::is_bundle(p) {
+        if plain {
+            return info_bundle_plain(p);
+        }
         return info_bundle(p);
     }
     match apk::read_apk(path) {
         Ok(info) => {
+            if plain {
+                print_apk_plain(&info);
+                return 0;
+            }
             println!("{info:#?}");
             if let Ok(entries) = apk::apk_entries(path) {
                 println!("archive entries: {}", entries.len());
             }
+            0
+        }
+        Err(e) => fail(&e),
+    }
+}
+
+/// The `--plain` form of [`ApkInfo`]: one `key<TAB>value` line per field.
+///
+/// Only fields a caller can act on are printed, and the activity falls back to
+/// the first declared one when the manifest has no MAIN/LAUNCHER pair, which is
+/// what a bundle's base APK often looks like.
+fn print_apk_plain(info: &apk::ApkInfo) {
+    println!("package\t{}", info.package);
+    if let Some(v) = &info.version_name {
+        println!("version\t{v}");
+    }
+    if let Some(v) = info.version_code {
+        println!("version-code\t{v}");
+    }
+    if let Some(v) = &info.label {
+        println!("label\t{v}");
+    }
+    if let Some(a) = info.main_activity_name() {
+        println!("activity\t{a}");
+    } else if let Some(first) = info.activities.first() {
+        println!("activity\t{}", first.name);
+    }
+    if let Some(c) = &info.application_class {
+        println!("application\t{c}");
+    }
+}
+
+fn info_bundle_plain(path: &std::path::Path) -> i32 {
+    let b = match bundle::Bundle::open(path) {
+        Ok(b) => b,
+        Err(e) => return fail(&e),
+    };
+    match b.info() {
+        Ok(info) => {
+            print_apk_plain(&info);
+            println!("bundle\t{}", path.display());
             0
         }
         Err(e) => fail(&e),
