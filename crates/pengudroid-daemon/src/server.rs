@@ -848,19 +848,38 @@ fn run_apk(daemon: &Arc<Daemon>, path: &str, component: Option<String>, args: &[
         return Message::Error { code: -2, message: format!("no such file: {path}") };
     }
     let mut cmd = std::process::Command::new(&cli);
-    cmd.arg("__guest").arg("--socket").arg(&daemon.socket_path);
     if demo {
+        // The built-in demo is the EGL/Wayland exercise, not an Android app.
+        cmd.arg("__guest").arg("--socket").arg(&daemon.socket_path);
         cmd.arg("--package")
             .arg("com.pengudroid.demo")
             .arg("--title")
             .arg("PenguDroid demo");
     } else {
-        cmd.arg("--apk").arg(path);
+        // A real APK has to go through `launch`, which is the path that runs it
+        // under ART: `__guest` only opens a window and paints a gradient, so
+        // nothing the GUI started ever executed the app.
+        cmd.arg("launch").arg(path);
+        if let Some(c) = &component {
+            cmd.arg("--component").arg(c);
+        }
+        if !args.is_empty() {
+            cmd.arg("--").args(args);
+        }
+        // `launch` needs a sysroot for the ART backend; inherit whatever the
+        // daemon was started with.
+        for var in ["PENGUDROID_ART_SYSROOT", "PENGUDROID_APK_SYSROOT"] {
+            if let Some(v) = std::env::var_os(var) {
+                cmd.env(var, v);
+            }
+        }
     }
-    if let Some(c) = &component {
-        cmd.arg("--component").arg(c);
+    if demo {
+        if let Some(c) = &component {
+            cmd.arg("--component").arg(c);
+        }
+        cmd.args(args);
     }
-    cmd.args(args);
     // A daemon started before the session existed (or from a cron job) still
     // hands the guest the session when the caller knows it.
     for var in ["WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DISPLAY", "PULSE_SERVER"] {
