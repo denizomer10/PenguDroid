@@ -340,7 +340,7 @@ unsafe extern "C" fn native_create(
     // leave `Blast::item_consumer` dangling (measured: SIGSEGV inside
     // `BufferItemConsumer::acquireBuffer`, jumping into `main_arena`). Take a
     // reference of our own so the object outlives every consumer of it.
-    (gui.inc_strong)(item_consumer, &OWNER_ID as *const u8 as *const c_void);
+    keep_alive(gui, "item_consumer", item_consumer);
     if std::env::var_os("PENGUDROID_TRACE_VIDEO").is_some() {
         // The vtable pointer is the cheapest proof that the constructor really
         // ran: `BufferItemConsumer::acquireBuffer` calls through it, and a
@@ -365,7 +365,7 @@ unsafe extern "C" fn native_create(
     // Same reason as `item_consumer`: `Surface` is a `RefBase`, so the last
     // `decStrong` would `delete this` on a `calloc` block. The reference we take
     // here is the one `Blast::surface` relies on.
-    (gui.inc_strong)(surface, &OWNER_ID as *const u8 as *const c_void);
+    keep_alive(gui, "surface", surface);
     (gui.set_buffers_format)(surface, format);
     (gui.set_user_dimensions)(surface, width, height);
 
@@ -422,7 +422,7 @@ unsafe extern "C" fn native_get_surface(
     }
     // `Surface(long)` does not take a reference; the Java object owns one.
     if let Some(gui) = gui() {
-        (gui.inc_strong)(blast.surface, &OWNER_ID as *const u8 as *const c_void);
+        keep_alive(gui, "surface(handout)", blast.surface);
     }
     let args = [JValue {
         j: blast.surface as i64,
@@ -522,7 +522,7 @@ unsafe extern "C" fn surface_from_blast(
     // The Java `Surface` takes ownership of this reference and releases it in
     // `nativeRelease`, so hand out a new one.
     if let Some(gui) = gui() {
-        (gui.inc_strong)(blast.surface, &OWNER_ID as *const u8 as *const c_void);
+        keep_alive(gui, "surface(copyFrom)", blast.surface);
     }
     eprintln!(
         "[blast] Surface.copyFrom(queue) -> {:#x}",
@@ -533,6 +533,43 @@ unsafe extern "C" fn surface_from_blast(
 
 /// Identity used for every `incStrong`/`decStrong` pair we make.
 static OWNER_ID: u8 = 0;
+
+/// The `RefBase` subobject of a `libgui` object.
+///
+/// `ConsumerBase` inherits `virtual RefBase`, so its `RefBase` lives at the
+/// offset the vtable's virtual-base entry names — **not** at offset 0. Measured
+/// for `BufferItemConsumer`: `v[-3] = 1688 = 0x698`, which is exactly the
+/// `this + 0x698` its constructor passes to `RefBase::RefBase`. For a class
+/// whose `RefBase` is a non-virtual primary base (`Surface`) the entry is 0.
+unsafe fn refbase_of(obj: *mut c_void) -> *mut c_void {
+    if obj.is_null() {
+        return obj;
+    }
+    let vptr = *(obj as *const *const u8);
+    if vptr.is_null() {
+        return obj;
+    }
+    let off = *(vptr.sub(24) as *const i32);
+    (obj as *mut u8).offset(off as isize) as *mut c_void
+}
+
+/// Take a strong reference on a `libgui` object we constructed ourselves.
+///
+/// Without it the last `decStrong` (Java's `nativeRelease`) runs `delete this`
+/// on a block that came from `calloc` and leaves our raw pointer dangling —
+/// measured as `Surface::hook_perform` aborting inside `lock_shared()` on freed
+/// memory. Returns false (and logs) when the object has no `mRefs`, which means
+/// the constructor did not run and calling `incStrong` would fault.
+unsafe fn keep_alive(gui: &Gui, what: &str, obj: *mut c_void) -> bool {
+    let rb = refbase_of(obj);
+    let refs = *(rb.add(8) as *const usize);
+    if refs == 0 {
+        eprintln!("[blast] {what}: no mRefs at {rb:p}; not taking a reference");
+        return false;
+    }
+    (gui.inc_strong)(rb, &OWNER_ID as *const u8 as *const c_void);
+    true
+}
 
 
 

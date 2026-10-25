@@ -186,12 +186,23 @@ Başarısız bir yansıma çağrısı bekleyen bir istisna bırakıyor ve sonrak
 her düğümde `describe_exception()` çağırıyor; ölçüldü: `SurfaceView` bulunuyor
 ve `[blast] created` + `Surface.copyFrom(queue)` çalışıyor.
 
-### Sıradaki adım
+### Yapılan: `keep_alive`
 
-`Surface` ve `BufferItemConsumer` için `incStrong`'u **doğru `RefBase` alt
-nesnesiyle** yapmak (`refbase_of`: `vptr - 24`'teki sanal taban offseti), böylece
-nesneler Java onları bıraktıktan sonra da yaşasın. Ondan sonra kalan tek şey
-decoder'ın `PlaceholderSurface` yerine bizim kuyruğa bağlanması.
+`blast.rs` artık `refbase_of` (sanal taban offseti `vptr - 24`) ile doğru
+`RefBase` alt nesnesini bulup `incStrong` yapıyor, ve `mRefs` sıfırsa
+(kurucu çalışmamışsa) çağrıyı atlayıp log basıyor. Bu, `Surface`'ın serbest
+bırakılmış bellekte `lock_shared()` çağırmasını engelliyor.
+
+### Açık: probe gezintisi hâlâ bazen erken bitiyor
+
+`describe_exception()` her düğümde çağrılmasına rağmen ağaç dökümü bazen
+`NavigationView` içindeki bir `ViewStub`'ta bitiyor ve `SurfaceView` hiç
+bulunamıyor (o koşuda `[blast] created` çıkmıyor). Aynı ikili bir sonraki
+koşuda `SurfaceView`'ı bulup `[blast] created` + `Surface.copyFrom(queue)`
+üretiyor, yani sorun gezintinin kendisinde. Sıradaki adım: gezintiyi
+tamamlamak (muhtemelen `getChildCount` başarısız olduğunda üst düğümün
+çocuklarını da durdurmamak) ve ardından decoder'ı `PlaceholderSurface` yerine
+bizim kuyruğa bağlamak.
 
 ### Yan bulgu: bayat `.so` protokolü bozuyor
 
