@@ -51,8 +51,12 @@ impl Keyboard {
 /// Unknown keys return `None` rather than dispatching a wrong character.
 pub fn android_keycode(linux: u32) -> Option<i32> {
     Some(match linux {
-        1 => 111, // KEY_ESC
-        2 => 8,   // KEY_1
+        // Desktop keyboards have no dedicated Back key. Escape is the
+        // conventional stand-in (the Android emulator maps it the same way);
+        // `KEYCODE_ESCAPE` is not handled by most apps, so offering it would
+        // leave the user unable to leave a screen without the mouse.
+        1 => 4, // KEY_ESC -> KEYCODE_BACK
+        2 => 8, // KEY_1
         3 => 9,
         4 => 10,
         5 => 11,
@@ -120,6 +124,7 @@ pub fn android_keycode(linux: u32) -> Option<i32> {
         111 => 112, // KEY_DELETE
         125 => 117, // KEY_LEFTMETA
         126 => 118, // KEY_RIGHTMETA
+        158 => 4, // KEY_BACK -> KEYCODE_BACK (laptop/media keyboards)
         57 => 62,  // KEY_SPACE
         103 => 19, // KEY_UP
         105 => 21, // KEY_LEFT
@@ -133,6 +138,17 @@ pub fn android_keycode(linux: u32) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_and_back_keys_reach_android_back() {
+        // Without this a desktop user cannot leave an Android screen from the
+        // keyboard: `KEYCODE_ESCAPE` is not a substitute for `KEYCODE_BACK`.
+        assert_eq!(android_keycode(1), Some(4));
+        assert_eq!(android_keycode(158), Some(4));
+        // The rest of the table stays untouched.
+        assert_eq!(android_keycode(2), Some(8));
+        assert_eq!(android_keycode(28), Some(66));
+    }
 
     #[test]
     fn shift_chord_retains_other_side_until_released() {

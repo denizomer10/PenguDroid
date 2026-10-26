@@ -6,6 +6,15 @@ This is the current handoff note. It records verified behavior, known limits, an
 
 The requested product target is end-to-end stable NewPipe playback and interaction, a responsive launcher with real app icons/names and per-app controls, desktop-compatible movable/resizable/closable windows, forced termination of hung guests, and a PenguDroid-owned transparent keymapper control outside the Android renderer. A real game, ultimately Genshin Impact, follows this foundation. This goal remains active.
 
+### Desktop Back key
+
+A desktop keyboard has no Android Back key, and `KEYCODE_ESCAPE` is not a substitute:
+most apps never handle it, so leaving an Android screen required the mouse.
+`KEY_ESC` and `KEY_BACK` now translate to Android `KEYCODE_BACK` (4). Verified
+live in NewPipe: opening search and pressing either key dispatched `android=4`
+and returned to the feed (`/tmp/np7.log`); the unit test is in
+`crates/pengudroid-cli/src/keyboard.rs`.
+
 ### Input subscription lifetime fix
 
 One process can open multiple daemon connections for rendering, Binder traffic and framework service calls. Input subscriptions now carry a unique connection id as well as the process id. Closing one connection removes only the subscriptions it owns; process exit still removes all subscriptions for that process. Previously, a retiring connection from the same process could silently remove a still-live input subscription and make keyboard/pointer input stop arriving.
