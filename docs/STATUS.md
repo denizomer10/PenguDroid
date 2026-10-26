@@ -6,6 +6,29 @@ This is the current handoff note. It records verified behavior, known limits, an
 
 The requested product target is end-to-end stable NewPipe playback and interaction, a responsive launcher with real app icons/names and per-app controls, desktop-compatible movable/resizable/closable windows, forced termination of hung guests, and a PenguDroid-owned transparent keymapper control outside the Android renderer. A real game, ultimately Genshin Impact, follows this foundation. This goal remains active.
 
+### Runtime per-app keymapper
+
+Keymap profiles are applied at runtime for ART apps. The input pump loads
+`$XDG_CONFIG_HOME/pengudroid/keymaps/<package>.keymap` (or `~/.config/…`), the
+same path the GUI editor writes, and turns each bound key into an Android touch:
+`tap` presses and releases at a point, `hold` presses until the key is released,
+and `swipe` interpolates a drag. A bound key is consumed, so it never also
+reaches the app as a key press, and auto-repeat does not repeat a gesture. The
+GUI's controls editor and the runtime therefore agree on the file format and the
+location.
+
+The profile path is resolved by `pengudroid launch` *before* the per-app prefix
+overrides the guest's `HOME`, and passed as `PENGUDROID_KEYMAP_PATH`; without
+that step the pump looked inside the prefix and found nothing. Profiles are read
+once per launch, so an edit applies on the next launch.
+
+Verified live in NewPipe with a three-binding profile: `F2 = tap 668 64` opened
+search, `F3 = hold 360 500` opened the first feed item (short press; a one-second
+press is a long-press), and `F4 = swipe 400 1000 400 300 10` scrolled the detail
+page to the comments. Gesture conversion is unit-tested in
+`crates/pengudroid-cli/src/keymap_gesture.rs` without ART. The transparent
+guest-attached keymapper button is still not implemented.
+
 ### Desktop Back key
 
 A desktop keyboard has no Android Back key, and `KEYCODE_ESCAPE` is not a substitute:

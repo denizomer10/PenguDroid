@@ -27,7 +27,7 @@ The daemon also handles guest window close independently of Android responsivene
 
 ## Controls editor and remaining work
 
-Configure controls opens a separate PenguDroid window. It parses and saves the selected app's keymap under `$XDG_CONFIG_HOME/pengudroid/keymaps/<package>.keymap` (or `~/.config/pengudroid/keymaps/`). Keymapper preference persistence and profile editing work; runtime mapping and the requested transparent control attached to the guest window are still pending. The GUI does not inject its editor into the Android renderer.
+Configure controls opens a separate PenguDroid window. It parses and saves the selected app's keymap under `$XDG_CONFIG_HOME/pengudroid/keymaps/<package>.keymap` (or `~/.config/pengudroid/keymaps/`). Keymapper preference persistence and profile editing work, and the saved profile is applied at runtime by the guest's input pump: a bound key becomes a tap, hold or swipe instead of a key press, so touch-only games are playable from the keyboard. The requested transparent control attached to the guest window is still pending. The GUI does not inject its editor into the Android renderer.
 
 The old automatic evdev/uinput mapper startup is intentionally no longer invoked by the launcher. A profile checkbox does not claim that runtime touch routing is connected. Kernel uinput devices are virtual devices; direct physical touch forwarding and complete multitouch support remain open.
 

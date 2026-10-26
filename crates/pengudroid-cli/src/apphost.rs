@@ -721,9 +721,17 @@ pub fn font_debug(env: &JniEnv) {
     }
 }
 
+/// The package being hosted, for per-app host configuration.
+///
+/// [`bind_application`] is the only path that reaches [`loop_forever`], so the
+/// input pump can read the keymap for this package without threading a
+/// parameter through the JNI setup.
+static APP_PACKAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// Bind the app into `thread`, the object returned by
 /// `ActivityThread.currentActivityThread()`.
 pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bool {
+    let _ = APP_PACKAGE.set(spec.package.to_string());
     if install_virtual_keyboard(env).is_none() {
         eprintln!("apphost: cannot install the Android virtual keyboard");
         return false;
@@ -3847,6 +3855,38 @@ fn spawn_input_pump(env: &JniEnv) {
             }
         }
 
+        // Per-app keymap: a bound key becomes a gesture instead of a key press.
+        // The GUI writes this file, and a missing file simply means no mapping.
+        let keymap = APP_PACKAGE.get().and_then(|package| {
+            // The launcher resolves the host path before the prefix overrides
+            // the guest's HOME; fall back to the documented location otherwise.
+            let path = std::env::var_os("PENGUDROID_KEYMAP_PATH")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| pengudroid_input::keymap::keymap_path(package));
+            let text = std::fs::read_to_string(&path).ok()?;
+            match pengudroid_input::keymap::Keymap::parse(&text) {
+                Ok(map) if !map.bindings.is_empty() => {
+                    println!(
+                        "input: keymap {} ({} binding(s))",
+                        path.display(),
+                        map.bindings.len()
+                    );
+                    Some(map)
+                }
+                Ok(_) => None,
+                Err(e) => {
+                    // A typo must be visible, not silently ignored: the user
+                    // would otherwise think the mapping is broken.
+                    eprintln!("input: keymap {} ignored: {e}", path.display());
+                    None
+                }
+            }
+        });
+        let mut mapped_held = crate::keymap_gesture::HeldPoints::default();
+        // Mapped gestures share one pointer, so the press time of the most
+        // recent `Down` is enough to keep `MotionEvent`'s downTime consistent.
+        let mut mapped_down = 0i64;
+
         let mut last_trace = std::time::Instant::now();
         // `PENGUDROID_TRACE_ROOTS=<ms>`: a timeline of the window roots. The
         // single probe pass only says where the state ended up; this says *when*
@@ -3908,6 +3948,46 @@ fn spawn_input_pump(env: &JniEnv) {
             }
             // Keyboard: `a` is the Linux keycode, `b` is 1 for press.
             if tag == 6 {
+                // A bound key drives a touch gesture instead of the Android
+                // key. Consuming it here is what makes a touch-only game
+                // playable without also typing into the app.
+                if let Some(map) = &keymap {
+                    if let Some(action) = map.action_for(a as u16) {
+                        let gesture_steps = crate::keymap_gesture::steps(
+                            action,
+                            a as u16,
+                            b != 0.0,
+                            &mut mapped_held,
+                        );
+                        if !gesture_steps.is_empty() {
+                            println!(
+                                "input: keymap code={a} -> {} touch step(s)",
+                                gesture_steps.len()
+                            );
+                        }
+                        for step in gesture_steps {
+                            if step.delay_ms > 0 {
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    step.delay_ms,
+                                ));
+                            }
+                            match step.event {
+                                crate::keymap_gesture::Event::Down { x, y } => {
+                                    mapped_down =
+                                        env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
+                                    inject(ACTION_DOWN, x, y, mapped_down);
+                                }
+                                crate::keymap_gesture::Event::Move { x, y } => {
+                                    inject(ACTION_MOVE, x, y, mapped_down);
+                                }
+                                crate::keymap_gesture::Event::Up { x, y } => {
+                                    inject(ACTION_UP, x, y, mapped_down);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
                 let now = env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
                 let Some(key) = keyboard.event(a as u32, b != 0.0, now) else {
                     continue;

@@ -400,6 +400,13 @@ pub fn launch(args: &[String]) -> i32 {
                      ActivityThread.main"
                 );
             }
+            // The prefix overrides the guest's `HOME`, so the keymap for this
+            // package has to be resolved against the host's configuration now
+            // and passed through (the GUI writes the same path).
+            cmd.env(
+                "PENGUDROID_KEYMAP_PATH",
+                pengudroid_input::keymap::keymap_path(&info.package),
+            );
             cmd.arg("--main").arg(main);
             // The JIT crashes in `nterp_op_invoke_virtual` on this framework
             // build, so the interpreter is the only working execution mode.

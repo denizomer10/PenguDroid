@@ -24,6 +24,7 @@ mod isolate;
 mod jni;
 mod launcher;
 mod keyboard;
+mod keymap_gesture;
 mod nativelib;
 mod native;
 mod runner;
