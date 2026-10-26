@@ -42,6 +42,29 @@ windows receive a `SurfaceControl`, the frame is 720×1280, the app reaches
   pointer the Java side passed down (`sp<T>` construction on an object whose
   vptr is 0; `si_addr = -0x18`, i.e. `vptr[-3]`). That is the current blocker.
 
+The faulting function was identified from the library itself (scanning the
+`JNINativeMethod` table for the function address):
+
+```
+libhwui.so+0x3275b0  nSetBLASTBufferQueue  (JJ)V
+```
+
+So Java hands `RootRenderNode::setBLASTBufferQueue(sp<BLASTBufferQueue>)` the
+value that `BLASTBufferQueue.nativeCreate` returned. `blast.rs` returns a
+`Box<Blast>` — a Rust struct whose first word is not a C++ vptr — while the
+framework expects a real `android::BLASTBufferQueue`. That is the whole crash.
+
+`libgui.so` does export the matching constructor
+`_ZN7android16BLASTBufferQueueC1ERKNSt3__112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEEb`,
+whose signature is exactly `nativeCreate(String name, boolean
+updateDestinationFrame)`. The next step is therefore to host a **real**
+`BLASTBufferQueue` instead of the hand-rolled `Blast` object. That in turn means
+the producer's buffers have to be released the way SurfaceFlinger releases them
+(`setTransactionState` + the consumer side of the queue), otherwise hwui stalls
+once the maximum acquired-buffer count is reached. That is the BLAST lifecycle
+work already listed in [ANDROID17.md](ANDROID17.md), now with a concrete entry
+point.
+
 Three more real contracts were needed to get this far:
 
 3. **`AndroidRuntime::mJavaVM` must be published.** Android's build uses LTO, so
