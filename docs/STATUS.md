@@ -28,19 +28,48 @@ shipped libraries rather than guessed:
    fail with `SurfaceComposerClient::createSurface error Operation not permitted`
    / `PERMISSION_DENIED`.
 
-Verified in `/tmp/a17-run7.log`: NewPipe creates **two** real input channels
-(`Input channel constructed: name='pengudroid', fd=107` / `fd=109`), both windows
-receive a `SurfaceControl`, `mSurface.isValid()` is true, the frame is 720×1280,
-and the app reaches `Looper.loop()`. The next failure is a SIGSEGV immediately
-after the loop starts (`art: helper killed by signal Some(11)`); that is the
-current blocker.
+Verified in `/tmp/a17-run8.log` / `/tmp/a17-rc6.log`: NewPipe creates **two** real input
+channels (`Input channel constructed: name='pengudroid', fd=107` / `fd=109`), both
+windows receive a `SurfaceControl`, the frame is 720×1280, the app reaches
+`Looper.loop()`, and then:
+
+- vsync is delivered and `NativeDisplayEventReceiver::dispatchVsync` runs,
+- `Choreographer` dispatches the first frame callback,
+- `ViewRootImpl.performTraversals` → `relayoutWindow` → `updateBlastSurfaceIfNeeded`
+  creates the BLAST buffer queue (`[blast] update 848x1408`) and hands out a
+  `Surface`,
+- and the process then faults in `libhwui.so+0x3275d6` while wrapping the surface
+  pointer the Java side passed down (`sp<T>` construction on an object whose
+  vptr is 0; `si_addr = -0x18`, i.e. `vptr[-3]`). That is the current blocker.
+
+Three more real contracts were needed to get this far:
+
+3. **`AndroidRuntime::mJavaVM` must be published.** Android's build uses LTO, so
+   framework translation units inline `AndroidRuntime::getJNIEnv()` and read the
+   static member directly through the GOT. `dispatchVsync` is one of them and
+   faulted on a null `mJavaVM` at the first vsync. The shim now writes the VM
+   into the exported `_ZN7android14AndroidRuntime7mJavaVME` slot
+   (`__pengudroid_publish_java_vm`).
+4. **BLAST `acquireBuffer`/`releaseBuffer` gained a trailing
+   `std::optional<std::function<void(const sp<GraphicBuffer>&)>>`.** The old
+   three-argument symbols no longer exist in `libgui.so`, which made the whole
+   BLAST bridge bail out with "libgui/libutils is missing a required entry
+   point". The shim now looks up the new symbols and passes a zeroed 32-byte
+   disengaged `libc++ optional` by invisible reference (the Itanium ABI for a
+   non-trivially-copyable by-value parameter).
+
+A diagnostic fault handler was also added: `PENGUDROID_CRASH_BT=1` makes the
+host install a `SA_SIGINFO` handler after `JNI_CreateJavaVM` and again right
+before `Looper.loop()`, printing `rip`, `rsp`, `si_addr` and a `lib+offset`
+backtrace. It goes through `dlsym(RTLD_NEXT)` because the shim itself interposes
+`sigaction`/`sigaltstack` for Bionic compatibility.
 
 Removed with the hard lock: `ViewRootImpl.mForceDisableBLAST` (the field does not
 exist in Android 17; BLAST is the only render path), `InsetsState.SIZE`, the
 `RELAYOUT_FRAMES`/`ClientWindowFrames` reply prefix, and the
 `surface_composer_client` "status last" special case.
 
-## Android 17 actual runtime checkpoint (2026-10-26)
+## Earlier Android 17 runtime checkpoint (2026-10-26)
 
 A real, checksum-verified API-37 x86_64 GSI is now extracted separately at
 `.toolchain/sysroot-android17`. Its ART boots (JNI_OK, imageless fallback), and

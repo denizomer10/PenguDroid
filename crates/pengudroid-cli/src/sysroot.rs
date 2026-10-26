@@ -970,6 +970,36 @@ pub fn art_main(args: &[String]) -> i32 {
                     }
                 }
             }
+            // Android's LTO inlines `AndroidRuntime::getJNIEnv()` in framework
+            // translation units, which then read the static `mJavaVM` member
+            // directly. Publish our VM there so those paths do not fault.
+            if let Ok(name) = CString::new("__pengudroid_publish_java_vm") {
+                let f = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+                if f.is_null() {
+                    diag("art: the shim does not export the JavaVM publisher");
+                } else {
+                    let publish: unsafe extern "C" fn() -> bool = unsafe { std::mem::transmute(f) };
+                    if unsafe { publish() } {
+                        diag("art: published JavaVM into AndroidRuntime::mJavaVM");
+                    } else {
+                        diag("art: could not publish JavaVM into AndroidRuntime::mJavaVM");
+                    }
+                }
+            }
+            if std::env::var_os("PENGUDROID_CRASH_BT").is_some() {
+                // Take the fault handler slot away from ART, which otherwise
+                // reports `HandleUnexpectedSignal reenter` and nothing else.
+                if let Ok(name) = CString::new("__pengudroid_install_crash_handler") {
+                    let f = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+                    if f.is_null() {
+                        diag("art: the shim does not export the crash handler");
+                    } else {
+                        let install: unsafe extern "C" fn() = unsafe { std::mem::transmute(f) };
+                        unsafe { install() };
+                        diag("art: installed the pengudroid fault handler");
+                    }
+                }
+            }
             if let Some(name) = dump_class.as_deref() {
                 crate::apphost::dump_class(&env, name);
                 return 0;

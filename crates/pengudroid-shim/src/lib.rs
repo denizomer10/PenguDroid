@@ -195,6 +195,134 @@ extern "C" {
     fn backtrace(buffer: *mut *mut c_void, size: c_int) -> c_int;
 }
 
+/// Install a last-resort fault handler that prints a native backtrace.
+///
+/// ART installs its own handler during `Runtime::Init`, so the host calls this
+/// *after* `JNI_CreateJavaVM` and thereby takes the slot over. ART's handler is
+/// what turns a guest fault into `HandleUnexpectedSignal reenter` without a
+/// usable dump; replacing it shows the faulting chain instead.
+#[no_mangle]
+pub extern "C" fn __pengudroid_install_crash_handler() {
+    // `sigaction`/`sigaltstack` are *interposed* by this shim (Bionic layout in,
+    // glibc layout out), so naming them directly binds to our own translation
+    // and a glibc `struct sigaction` would be reinterpreted as Bionic — the
+    // handler then silently never installs. Go through `RTLD_NEXT`.
+    unsafe {
+        let Some(real_sigaction) = dlsym_next::<RealSigaction>(b"sigaction\0") else {
+            return;
+        };
+        type RealSigaltstack = unsafe extern "C" fn(*const libc::stack_t, *mut libc::stack_t) -> c_int;
+        let Some(real_sigaltstack) = dlsym_next::<RealSigaltstack>(b"sigaltstack\0") else {
+            return;
+        };
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = pengudroid_fault_handler as usize;
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+        libc::sigemptyset(&mut sa.sa_mask);
+        // An altstack is per-thread; install it here (the main thread) and once
+        // per spawned thread by the host if needed.
+        let mut stack = vec![0u8; 256 * 1024];
+        let ss = libc::stack_t {
+            ss_sp: stack.as_mut_ptr() as *mut c_void,
+            ss_flags: 0,
+            ss_size: stack.len(),
+        };
+        real_sigaltstack(&ss, std::ptr::null_mut());
+        std::mem::forget(stack);
+        for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE, libc::SIGABRT] {
+            real_sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
+extern "C" fn pengudroid_fault_handler(sig: c_int, _info: *mut c_void, ctx: *mut c_void) {
+    // Write first, allocate later: if the fault happened inside the allocator or
+    // on an exhausted stack, anything fancier may never run.
+    const ENTER: &[u8] = b"\n[pengudroid] fault handler entered\n";
+    unsafe { libc::write(2, ENTER.as_ptr() as *const c_void, ENTER.len()) };
+    let rip = unsafe { fault_rip(ctx) };
+    let rsp = unsafe { fault_rsp(ctx) };
+    let addr = if _info.is_null() {
+        0
+    } else {
+        unsafe { (*(_info as *const libc::siginfo_t)).si_addr() as usize }
+    };
+    let mut out = [0u8; 8192];
+    let mut n = 0usize;
+    append(
+        &mut out,
+        &mut n,
+        &format!("[pengudroid] fatal signal {sig} rip={rip:#x} rsp={rsp:#x} addr={addr:#x}\n"),
+    );
+    unsafe {
+        let mut frames = [std::ptr::null_mut::<c_void>(); 48];
+        let count = backtrace(frames.as_mut_ptr(), frames.len() as c_int).max(0) as usize;
+        for (i, &frame) in frames[..count].iter().enumerate() {
+            if frame.is_null() {
+                continue;
+            }
+            let mut info: libc::Dl_info = std::mem::zeroed();
+            let mut line = format!("[pengudroid]   #{i} {frame:p}");
+            if libc::dladdr(frame, &mut info) != 0 {
+                if !info.dli_fbase.is_null() {
+                    line.push_str(&format!(
+                        " +{:#x}",
+                        frame as usize - info.dli_fbase as usize
+                    ));
+                }
+                if !info.dli_sname.is_null() {
+                    line.push(' ');
+                    line.push_str(&std::ffi::CStr::from_ptr(info.dli_sname).to_string_lossy());
+                }
+                if !info.dli_fname.is_null() {
+                    line.push_str(" (");
+                    line.push_str(&std::ffi::CStr::from_ptr(info.dli_fname).to_string_lossy());
+                    line.push(')');
+                }
+            }
+            line.push('\n');
+            append(&mut out, &mut n, &line);
+            if n >= out.len() {
+                break;
+            }
+        }
+        append(&mut out, &mut n, "[pengudroid] end of backtrace\n");
+        libc::write(2, out.as_ptr() as *const c_void, n);
+        libc::_exit(128 + sig);
+    }
+}
+
+fn append(out: &mut [u8], n: &mut usize, text: &str) {
+    let bytes = text.as_bytes();
+    let take = bytes.len().min(out.len() - *n);
+    out[*n..*n + take].copy_from_slice(&bytes[..take]);
+    *n += take;
+}
+
+/// Read `REG_RIP` out of the `ucontext_t` a `SA_SIGINFO` handler receives.
+///
+/// # Safety
+/// `ctx` must be the `ucontext_t*` from the signal frame.
+unsafe fn fault_rip(ctx: *mut c_void) -> u64 {
+    if ctx.is_null() {
+        return 0;
+    }
+    let uc = ctx as *const libc::ucontext_t;
+    (*uc).uc_mcontext.gregs[libc::REG_RIP as usize] as u64
+}
+
+/// Read `REG_RSP` out of the signal frame.
+///
+/// # Safety
+/// `ctx` must be the `ucontext_t*` from the signal frame.
+unsafe fn fault_rsp(ctx: *mut c_void) -> u64 {
+    if ctx.is_null() {
+        return 0;
+    }
+    let uc = ctx as *const libc::ucontext_t;
+    (*uc).uc_mcontext.gregs[libc::REG_RSP as usize] as u64
+}
+
 /// Print a symbolized backtrace for log lines containing `PENGUDROID_TRACE_BT`.
 ///
 /// gdb cannot follow the libraries this process `dlopen`s (the shim loads them
@@ -3050,6 +3178,34 @@ pub unsafe extern "C" fn _ZN7android14AndroidRuntime9getJNIEnvEv() -> *mut c_voi
         return std::ptr::null_mut();
     }
     env
+}
+
+/// Publish this process's `JavaVM` into `android::AndroidRuntime::mJavaVM`.
+///
+/// `AndroidRuntime::getJavaVM()`/`getJNIEnv()` are exported and this shim
+/// interposes them, but Android's build uses LTO, so several framework
+/// translation units inline the accessor and read the *static member* directly
+/// through the GOT. `NativeDisplayEventReceiver::dispatchVsync` is one of them:
+/// it faults on a null `mJavaVM` on the very first vsync, which is exactly when
+/// the first frame is produced.
+///
+/// On a device `app_process` sets this member. PenguDroid creates the VM itself,
+/// so it has to fill the slot in.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_publish_java_vm() -> bool {
+    let vm = created_java_vm();
+    if vm.is_null() {
+        return false;
+    }
+    let p = libc::dlsym(
+        libc::RTLD_DEFAULT,
+        b"_ZN7android14AndroidRuntime7mJavaVME\0".as_ptr() as *const c_char,
+    );
+    if p.is_null() {
+        return false;
+    }
+    *(p as *mut *mut c_void) = vm;
+    true
 }
 
 /// The process's `JavaVM`, via the JNI invocation API.

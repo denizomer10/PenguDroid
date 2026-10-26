@@ -2947,8 +2947,30 @@ pub fn loop_forever(env: &JniEnv) {
         return;
     };
     println!("apphost: entering Looper.loop()");
+    install_crash_handler();
     let _ = env.call_static_void(looper_class, loop_fn, &[]);
     eprintln!("apphost: Looper.loop() returned");
+}
+
+/// Take the fault-handler slot right before the first frame is produced.
+///
+/// ART installs its own handler lazily; installing here, immediately before the
+/// loop starts, is the last chance to own the slot before the crash site.
+fn install_crash_handler() {
+    if std::env::var_os("PENGUDROID_CRASH_BT").is_none() {
+        return;
+    }
+    let Some(f) = shim_symbol("__pengudroid_install_crash_handler") else {
+        return;
+    };
+    let install: unsafe extern "C" fn() = unsafe { std::mem::transmute(f) };
+    unsafe { install() };
+    println!("apphost: installed the fault handler before Looper.loop()");
+    if std::env::var_os("PENGUDROID_CRASH_SELFTEST").is_some() {
+        println!("apphost: crash self-test: dereferencing null");
+        unsafe { std::ptr::write_volatile(std::ptr::null_mut::<u8>(), 1) };
+        println!("apphost: crash self-test did NOT fault");
+    }
 }
 
 /// How long the service thread sleeps between queue polls.

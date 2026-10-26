@@ -109,10 +109,35 @@ type CreateBufferQueue = unsafe extern "C" fn(*mut [u64; 2], *mut [u64; 2], bool
 type ItemConsumerCtor = unsafe extern "C" fn(*mut c_void, *const [u64; 2], u64, i32, bool);
 type BufferItemCtor = unsafe extern "C" fn(*mut c_void);
 type BufferItemDtor = unsafe extern "C" fn(*mut c_void);
-/// `BufferItemConsumer::acquireBuffer(BufferItem*, nsecs_t, bool)`.
-type AcquireBuffer = unsafe extern "C" fn(*mut c_void, *mut c_void, i64, bool) -> i32;
-/// `BufferItemConsumer::releaseBuffer(const BufferItem&, const sp<Fence>&)`.
-type ReleaseBuffer = unsafe extern "C" fn(*mut c_void, *const c_void, *const [u64; 2]) -> i32;
+/// `BufferItemConsumer::acquireBuffer(BufferItem*, nsecs_t, bool,
+/// std::optional<std::function<void(const sp<GraphicBuffer>&)>>)`.
+///
+/// Android 17 added the trailing libc++ `optional<function<...>>`. A class with
+/// a non-trivial copy constructor/destructor is passed by *invisible reference*
+/// (the Itanium ABI), so the last argument is a pointer to the caller's
+/// temporary. A zeroed 32-byte block is a valid disengaged libc++
+/// `optional<function>`: `__engaged_` lives at byte 24 and stays 0, and the
+/// destructor then does nothing.
+type AcquireBuffer =
+    unsafe extern "C" fn(*mut c_void, *mut c_void, i64, bool, *mut UnusedOptional) -> i32;
+/// `BufferItemConsumer::releaseBuffer(const BufferItem&, const sp<Fence>&,
+/// std::optional<std::function<void(const sp<GraphicBuffer>&)>>)`.
+type ReleaseBuffer =
+    unsafe extern "C" fn(*mut c_void, *const c_void, *const [u64; 2], *mut UnusedOptional) -> i32;
+
+/// One disengaged libc++ `optional<std::function<void(const sp<GraphicBuffer>&)>>`.
+///
+/// `std::function` is three pointers (24 bytes); libc++ stores the engaged flag
+/// at the next byte, so the whole `optional` is 32 bytes with 8-byte alignment.
+/// All-zero therefore means "not engaged".
+#[repr(C, align(8))]
+pub struct UnusedOptional(pub [u64; 4]);
+
+impl UnusedOptional {
+    fn empty() -> Self {
+        UnusedOptional([0; 4])
+    }
+}
 type SetDefaultSize = unsafe extern "C" fn(*mut c_void, u32, u32) -> i32;
 type SetDefaultFormat = unsafe extern "C" fn(*mut c_void, i32) -> i32;
 type SetConsumerUsage = unsafe extern "C" fn(*mut c_void, u64) -> i32;
@@ -174,11 +199,11 @@ fn gui() -> Option<&'static Gui> {
         let item_dtor = guest_sym(b"libgui.so\0", b"_ZN7android10BufferItemD1Ev\0");
         let acquire = guest_sym(
             b"libgui.so\0",
-            b"_ZN7android18BufferItemConsumer13acquireBufferEPNS_10BufferItemElb\0",
+            b"_ZN7android18BufferItemConsumer13acquireBufferEPNS_10BufferItemElbNSt3__18optionalINS3_8functionIFvRKNS_2spINS_13GraphicBufferEEEEEEEE\0",
         );
         let release = guest_sym(
             b"libgui.so\0",
-            b"_ZN7android18BufferItemConsumer13releaseBufferERKNS_10BufferItemERKNS_2spINS_5FenceEEE\0",
+            b"_ZN7android18BufferItemConsumer13releaseBufferERKNS_10BufferItemERKNS_2spINS_5FenceEEENSt3__18optionalINS9_8functionIFvRKNS4_INS_13GraphicBufferEEEEEEEE\0",
         );
         let set_default_size = guest_sym(
             b"libgui.so\0",
@@ -752,7 +777,10 @@ fn consumer_loop(addr: usize) {
     let mut presented = 0u64;
 
     while !blast.stopped.load(std::sync::atomic::Ordering::Acquire) {
-        let rc = unsafe { (gui.acquire)(blast.item_consumer, item_ptr, 0, true) };
+        let rc = unsafe {
+            let mut unused = UnusedOptional::empty();
+            (gui.acquire)(blast.item_consumer, item_ptr, 0, true, &mut unused)
+        };
         if rc != 0 {
             // `NO_BUFFER_AVAILABLE`/`TIMED_OUT` — nothing queued yet.
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -854,7 +882,10 @@ fn consumer_loop(addr: usize) {
                 eprintln!("[blast] video: releasing slot {slot}");
             }
         }
-        unsafe { (gui.release)(blast.item_consumer, item_ptr, no_fence) };
+        unsafe {
+            let mut unused = UnusedOptional::empty();
+            (gui.release)(blast.item_consumer, item_ptr, no_fence, &mut unused)
+        };
     }
     if let Err(e) = layer.retire(&conn) {
         eprintln!("[blast] video: layer cleanup failed: {e}");
