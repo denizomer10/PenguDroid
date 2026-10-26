@@ -534,34 +534,32 @@ const IPM_GET_PROVIDER_INFO: u32 = 15;
 /// server the reply is empty, the singleton caches null and the next call NPEs
 /// inside `createBaseContextForActivity`.
 const ATM_GET_ACTIVITY_CLIENT_CONTROLLER: u32 = 18;
-static APPLICATION_TRANSACTION_CODES: Mutex<[u32; 2]> = Mutex::new([18, 23]);
+/// ActivityTaskManager controller, then IActivityManager provider/start/bind/
+/// bind-isolated. The defaults cover the API-33 regression fixture; ART replaces
+/// all five from the loaded framework before an application can issue them.
+static APPLICATION_TRANSACTION_CODES: Mutex<[u32; 5]> = Mutex::new([18, 23, 27, 30, 30]);
 
 #[no_mangle]
-pub extern "C" fn __pengudroid_binder_set_application_transactions(controller: u32, provider: u32) -> bool {
-    if [controller, provider].iter().any(|&code| code == 0 || code >= 0x00ff_fffe) { return false; }
-    *APPLICATION_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner()) = [controller, provider];
+pub extern "C" fn __pengudroid_binder_set_application_transactions(
+    controller: u32,
+    provider: u32,
+    start_service: u32,
+    bind_service: u32,
+    bind_isolated_service: u32,
+) -> bool {
+    let codes = [controller, provider, start_service, bind_service, bind_isolated_service];
+    if codes.iter().any(|&code| code == 0 || code >= 0x00ff_fffe) { return false; }
+    *APPLICATION_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner()) = codes;
     true
 }
 
 
-/// `IActivityManager` transaction code for `getContentProvider`.
+/// `IActivityManager` transaction code for `getContentProvider` in API 33.
 ///
 /// Arguments are `(IApplicationThread, String opPackageName, String auth,
 /// int userId, boolean stable)`; `Activity.attach` needs the `settings`
 /// provider and NPEs on a null `IContentProvider` without it.
 const IAM_GET_CONTENT_PROVIDER: u32 = 23;
-
-/// `IActivityManager` transaction code for `startService` / `startForegroundService`.
-///
-/// Measured from a live transaction: the parcel carries the app package and
-/// `org.schabi.newpipe.player.PlayerService` (plus the
-/// `should_start_foreground_extra` key for the foreground variant).
-const IAM_START_SERVICE: u32 = 27;
-
-/// `IActivityManager` transaction code for `bindService`/`bindIsolatedService`.
-///
-/// Same component as [`IAM_START_SERVICE`] but without the intent extras.
-const IAM_BIND_SERVICE: u32 = 30;
 
 /// `ISessionManager` transaction code for `createSession`.
 ///
@@ -1913,16 +1911,20 @@ fn string8_start_ending_at(data: &[u8], end: usize) -> Option<usize> {
 /// Offset of the `Intent` that contains the component package at
 /// `package_offset`.
 ///
-/// `Intent.writeToParcel` (Android 13) writes, in order:
-/// `action` (string8), `data` (`Uri`, either a string8 or an int `0`), `type`
-/// (string8), `identifier` (string8), `flags` (int), `package` (string8), then
-/// the `ComponentName` as two `string16`s. The package this function is given is
-/// the second of those (the component's), so walking back over the six fields
-/// before it lands on `action` — the first byte of the `Intent`, and therefore
-/// the offset `Parcel.unmarshall` wants.
+/// `Intent.writeToParcel` writes, in order: `action` (string8), `data` (`Uri`,
+/// either a string8 or an int `0`), `type` (string8), `identifier` (string8),
+/// `flags` (int), `extendedFlags` (int, added after Android 13), `package`
+/// (string8), then the `ComponentName` as two `string16`s. The package this
+/// function is given is the second of those (the component's), so walking back
+/// over the seven fields before it lands on `action` — the first byte of the
+/// `Intent`, and therefore the offset `Parcel.unmarshall` wants.
+///
+/// The service host also tries four bytes later for the legacy layout without
+/// `extendedFlags`, retaining the API-33 regression fixture.
 fn intent_start(data: &[u8], package_offset: usize) -> Option<usize> {
     let package = string8_start_ending_at(data, package_offset)?;
-    let flags = package.checked_sub(4)?;
+    let extended_flags = package.checked_sub(4)?;
+    let flags = extended_flags.checked_sub(4)?;
     if flags == 0 {
         return None;
     }
@@ -2077,6 +2079,57 @@ fn reply_has_status(handle: u32, code: u32) -> bool {
     true
 }
 
+/// Generated AIDL parcelables include a presence word and a self-size prefix.
+fn push_sized_parcelable(parcel: &mut Vec<u8>, fields: impl FnOnce(&mut Vec<u8>)) {
+    parcel.extend_from_slice(&1i32.to_ne_bytes());
+    let start = parcel.len();
+    parcel.extend_from_slice(&0i32.to_ne_bytes());
+    fields(parcel);
+    let size = (parcel.len() - start) as i32;
+    parcel[start..start + 4].copy_from_slice(&size.to_ne_bytes());
+}
+
+fn push_static_display_info(parcel: &mut Vec<u8>) {
+    // API-37 gui::StaticDisplayInfo::readFromParcel (libgui +0xe56f0).
+    push_sized_parcelable(parcel, |parcel| {
+        for word in [0u32, 0, 2.0f32.to_bits(), 0, 0, 0, 0] {
+            parcel.extend_from_slice(&word.to_ne_bytes());
+        }
+    });
+}
+
+fn push_dynamic_display_info(parcel: &mut Vec<u8>) {
+    // API-37 gui::DynamicDisplayInfo and DisplayMode readers (+0xe6330,
+    // +0x1908b0). This is a synthetic SDR display, not host HDR discovery.
+    push_sized_parcelable(parcel, |parcel| {
+        parcel.extend_from_slice(&1i32.to_ne_bytes()); // one supported mode
+        push_sized_parcelable(parcel, |parcel| {
+            parcel.extend_from_slice(&1i32.to_ne_bytes()); // mode ID
+            push_sized_parcelable(parcel, |parcel| {
+                parcel.extend_from_slice(&720i32.to_ne_bytes());
+                parcel.extend_from_slice(&1280i32.to_ne_bytes());
+            });
+            for word in [320.0f32.to_bits(), 320.0f32.to_bits(), 0,
+                60.0f32.to_bits(), 60.0f32.to_bits()] {
+                parcel.extend_from_slice(&word.to_ne_bytes());
+            }
+            for value in [0i64, 16_666_667, 16_666_667] {
+                parcel.extend_from_slice(&value.to_ne_bytes());
+            }
+            parcel.extend_from_slice(&0i32.to_ne_bytes()); // mode group
+            parcel.extend_from_slice(&0i32.to_ne_bytes()); // trailing mode field
+        });
+        parcel.extend_from_slice(&1i32.to_ne_bytes()); // active mode ID
+        parcel.extend_from_slice(&60.0f32.to_ne_bytes()); // render frame rate
+        for value in [1i32, 0, 0] { // one native color mode, active native mode
+            parcel.extend_from_slice(&value.to_ne_bytes());
+        }
+        // The generated reader accepts a body ending at activeColorMode.
+        // Later capabilities retain their constructed defaults; do not invent
+        // null encodings for its non-null HDR/refresh-rate parcelables.
+    });
+}
+
 /// Build the reply parcel for a transaction.
 ///
 /// Every reply starts with the AIDL status word (`0` = no exception); a
@@ -2092,7 +2145,9 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
     if is_surface_flinger(tr.target_handle) && crate::get_prop("ro.build.version.sdk").as_deref() == Some("37")
         && tr.data_size > 0 && tr.data_ptr != 0 {
         let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
-        if parcel_contains_string16(data, "android.gui.ISurfaceComposer") && matches!(tr.code, 2 | 3 | 6 | 7 | 34) {
+        if parcel_contains_string16(data, "android.gui.ISurfaceComposer")
+            && matches!(tr.code, 2 | 3 | 6 | 7 | 12 | 13 | 34 | 69)
+        {
             parcel.extend_from_slice(&0u32.to_ne_bytes()); // AIDL Status
             match tr.code {
                 2 => push_flat_handle(&mut parcel, &mut objects, handle_for("display_event_connection")),
@@ -2102,7 +2157,19 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                     parcel.extend_from_slice(&0i64.to_ne_bytes());
                 }
                 7 => push_flat_handle(&mut parcel, &mut objects, handle_for("display_token")),
-                34 => for value in [0i32, 1, 0, 1] { parcel.extend_from_slice(&value.to_ne_bytes()); },
+                12 => push_static_display_info(&mut parcel),
+                13 => push_dynamic_display_info(&mut parcel),
+                34 => push_sized_parcelable(&mut parcel, |parcel| {
+                    for value in [0i32, 1, 0, 1] {
+                        parcel.extend_from_slice(&value.to_ne_bytes());
+                    }
+                }),
+                // `int getMaxAcquiredBufferCount()` — transaction 0x45, measured from
+                // `BpSurfaceComposer::getMaxAcquiredBufferCount` in libgui.so.
+                // `BLASTBufferQueue::initialize()` uses it to size its consumer; a
+                // missing reply leaves the count at 0 and the queue logs
+                // "setMaxAcquiredBufferCount: invalid count 0".
+                69 => parcel.extend_from_slice(&2i32.to_ne_bytes()),
                 _ => unreachable!(),
             }
             return Reply { parcel, objects };
@@ -2432,8 +2499,16 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             tr.code, tr.data_size, text
         ));
     }
+    let application_codes = *APPLICATION_TRANSACTION_CODES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let start_service = application_codes[2];
+    let bind_service = application_codes[3];
+    let bind_isolated_service = application_codes[4];
     if tr.target_handle == handle_for("activity")
-        && (tr.code == IAM_START_SERVICE || tr.code == IAM_BIND_SERVICE)
+        && (tr.code == start_service
+            || tr.code == bind_service
+            || tr.code == bind_isolated_service)
     {
         // The player lives in the app's own process (`PlayerService`), and with
         // no system_server nothing schedules its creation, so these two calls
@@ -2450,10 +2525,10 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         if trace_enabled() {
             diag(&format!(
                 "[binder]   -> {} component={component:?}\n",
-                if tr.code == IAM_START_SERVICE { "startService" } else { "bindService" }
+                if tr.code == start_service { "startService" } else { "bindService" }
             ));
         }
-        if tr.code == IAM_START_SERVICE {
+        if tr.code == start_service {
             match &component {
                 Some((pkg, cls, _)) => {
                     parcel.extend_from_slice(&1u32.to_ne_bytes()); // present
@@ -2484,7 +2559,13 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                 diag(&format!("[binder]   request hex={hex}\n"));
             }
             let intent_offset = maybe_offset.unwrap_or(0);
-            note_service_request(&pkg, &cls, tr.code, data, intent_offset);
+            note_service_request(
+                &pkg,
+                &cls,
+                tr.code == bind_service || tr.code == bind_isolated_service,
+                data,
+                intent_offset,
+            );
         }
     }
     if tr.target_handle == handle_for("activity") && tr.code == APPLICATION_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner())[1] {
@@ -3747,8 +3828,7 @@ pub const SERVICE_REQUEST_CAP: usize = 8192;
 
 static SERVICE_REQUESTS: Mutex<Vec<ServiceRequest>> = Mutex::new(Vec::new());
 
-fn note_service_request(package: &str, class: &str, code: u32, data: &[u8], intent_offset: usize) {
-    let bind = code == IAM_BIND_SERVICE;
+fn note_service_request(package: &str, class: &str, bind: bool, data: &[u8], intent_offset: usize) {
     let mut queue = SERVICE_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
     // Log each distinct request once, but *queue every occurrence*: a rebind
     // after `unbindService` is a real new bind the host has to answer, and the
@@ -4083,6 +4163,26 @@ mod tests {
         std::fs::remove_dir_all(temp).unwrap();
     }
 
+    #[test]
+    fn android17_display_info_has_sized_nested_parcelables() {
+        let word = |bytes: &[u8], at: usize| {
+            u32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap())
+        };
+        let mut parcel = Vec::new();
+        push_static_display_info(&mut parcel);
+        assert_eq!(parcel.len(), 36);
+        assert_eq!((word(&parcel, 0), word(&parcel, 4)), (1, 32));
+        assert_eq!(word(&parcel, 16), 2.0f32.to_bits());
+        parcel.clear();
+        push_dynamic_display_info(&mut parcel);
+        assert_eq!(parcel.len(), 112);
+        for (offset, expected) in [(0, 1), (4, 108), (8, 1), (12, 1),
+            (16, 76), (20, 1), (24, 1), (28, 12), (32, 720), (36, 1280),
+            (92, 1), (96, 60.0f32.to_bits()), (100, 1), (104, 0), (108, 0)] {
+            assert_eq!(word(&parcel, offset), expected, "field at {offset}");
+        }
+    }
+
     /// Build the parcel shape `writeInterfaceToken` + `writeString(name)`
     /// produces: three header words, the descriptor, then the name.
     fn service_request(descriptor: &str, name: &str) -> Vec<u8> {
@@ -4111,6 +4211,19 @@ mod tests {
         assert_eq!(last_string16(&parcel).as_deref(), Some("activity"));
         let parcel = service_request("android.os.IServiceManager", "package");
         assert_eq!(last_string16(&parcel).as_deref(), Some("package"));
+    }
+
+    #[test]
+    fn android17_intent_location_includes_extended_flags() {
+        let mut data = Vec::new();
+        // action, null Uri, type, identifier, flags, extendedFlags, package.
+        for word in [u32::MAX, 0, u32::MAX, u32::MAX, 4, 0, u32::MAX] {
+            data.extend_from_slice(&word.to_ne_bytes());
+        }
+        let component_package = data.len();
+        data.extend_from_slice(&18u32.to_ne_bytes());
+        data.resize(data.len() + 38, 0);
+        assert_eq!(intent_start(&data, component_package), Some(0));
     }
 
     #[test]

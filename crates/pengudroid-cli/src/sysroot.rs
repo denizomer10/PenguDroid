@@ -938,9 +938,16 @@ pub fn art_main(args: &[String]) -> i32 {
             }
             if let Some(setup) = &bridge_setup {
                 if let Some(spec) = bridge_selftest.as_deref() {
-                    // Direct Itf use: no libnativebridge state machine, so no
-                    // guest app_process is started.
-                    run_bridge_selftest(setup, &env, spec);
+                    // Direct Itf driving. Note this translator's initializer
+                    // itself starts a guest app_process on a thread (measured:
+                    // `GuestLoader::StartAppProcessInNewThread` inside the
+                    // initializer), so "direct" here does not mean "no guest
+                    // bootstrap" — it means we drive the Itf table instead of
+                    // libnativebridge's state machine.
+                    if !run_bridge_selftest(setup, &env, spec) {
+                        eprintln!("art: bridge selftest failed");
+                        return 1;
+                    }
                 } else {
                     finish_native_bridge(setup, &env);
                 }
@@ -1036,6 +1043,9 @@ pub fn art_main(args: &[String]) -> i32 {
                 }
                 return run_main(&env, &class, &app_args);
             }
+            if std::env::var_os("PENGUDROID_PROBE_NATIVE_DISPLAY").is_some() {
+                if !crate::apphost::probe_native_display(&env) { return 1; }
+            }
             if std::env::var_os("PENGUDROID_PROBE_BLAST_LIFECYCLE").is_some() {
                 if !crate::apphost::probe_blast_lifecycle(&env) { return 1; }
             }
@@ -1119,6 +1129,17 @@ struct BridgeCallbacks {
         unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u32) -> u32,
 }
 
+/// `LoadNativeBridge` does **not** copy the table; it stores the pointer and
+/// hands it back to the translator on every later JNI call. A stack-local table
+/// would leave the translator dereferencing overwritten stack bytes (measured:
+/// `GetJMethodShorty` retains and jumps through it). It therefore has to outlive
+/// the whole process, so it is a `static`.
+static BRIDGE_CALLBACKS: BridgeCallbacks = BridgeCallbacks {
+    get_method_shorty: bridge_get_method_shorty,
+    get_native_method_count: bridge_get_native_method_count,
+    get_native_methods: bridge_get_native_methods,
+};
+
 unsafe extern "C" fn bridge_get_method_shorty(_env: *mut c_void, _method: *mut c_void) -> *const c_char {
     c"".as_ptr()
 }
@@ -1175,14 +1196,9 @@ fn setup_native_bridge(libs: Option<&Path>, data_dir: &Path, isa: &str) -> Optio
     let name = std::env::var("PENGUDROID_PROP_ro.dalvik.vm.native.bridge")
         .unwrap_or_else(|_| "libndk_translation.so".to_string());
     let cname = CString::new(name.as_str()).ok()?;
-    let callbacks = BridgeCallbacks {
-        get_method_shorty: bridge_get_method_shorty,
-        get_native_method_count: bridge_get_native_method_count,
-        get_native_methods: bridge_get_native_methods,
-    };
     type Load = unsafe extern "C" fn(*const c_char, *const BridgeCallbacks) -> bool;
     let f: Load = unsafe { std::mem::transmute(load) };
-    let loaded = unsafe { f(cname.as_ptr(), &callbacks) };
+    let loaded = unsafe { f(cname.as_ptr(), &BRIDGE_CALLBACKS) };
     diag(&format!("art: LoadNativeBridge({name}) = {loaded}"));
     if !loaded {
         return None;
@@ -1272,18 +1288,22 @@ fn bridge_init_mode() -> String {
 /// `spec` is `<lib path>#<symbol>`; the symbol is called with a JNI-static
 /// shape `(JNIEnv*, jclass) -> jint` and its return value printed, so a guest
 /// function that returns a known constant proves translation end to end.
-fn run_bridge_selftest(setup: &BridgeSetup, env: &crate::jni::JniEnv, spec: &str) {
+///
+/// Returns false on any step that did not produce a callable entry point and a
+/// completed call: a self-test that logs a failure and returns success is worse
+/// than no test at all.
+fn run_bridge_selftest(setup: &BridgeSetup, env: &crate::jni::JniEnv, spec: &str) -> bool {
     let (lib, symbol) = match spec.split_once('#') {
         Some(v) => v,
         None => {
             eprintln!("art: --bridge-selftest expects <lib>#<symbol>");
-            return;
+            return false;
         }
     };
     let itf = unsafe { libc::dlsym(setup.translator, c"NativeBridgeItf".as_ptr()) };
     if itf.is_null() {
         eprintln!("art: the translator does not export NativeBridgeItf");
-        return;
+        return false;
     }
     // struct NativeBridgeCallbacks { uint32_t version; <function pointers...> }
     let version = unsafe { *(itf as *const u32) };
@@ -1293,19 +1313,17 @@ fn run_bridge_selftest(setup: &BridgeSetup, env: &crate::jni::JniEnv, spec: &str
     };
     diag(&format!("art: NativeBridgeItf.version = {version}"));
 
-    let callbacks = BridgeCallbacks {
-        get_method_shorty: bridge_get_method_shorty,
-        get_native_method_count: bridge_get_native_method_count,
-        get_native_methods: bridge_get_native_methods,
-    };
-
     let init_ptr = {
         // Offset 8 = slot 1. This ndk_translation build takes three arguments:
         // (callbacks, app_data_dir, instruction_set) — passing only the
         // callbacks leaves the other two as garbage, and it strcmp()s them.
         unsafe { *(itf as *const u8).add(8).cast::<*const c_void>() }
     };
-    if !init_ptr.is_null() {
+    if init_ptr.is_null() {
+        eprintln!("art: Itf.initialize is null");
+        return false;
+    }
+    {
         type Init = unsafe extern "C" fn(*const BridgeCallbacks, *const c_char, *const c_char) -> bool;
         let f: Init = unsafe { std::mem::transmute(init_ptr) };
         let data_dir = std::env::var_os("PENGUDROID_BRIDGE_DATA")
@@ -1316,7 +1334,7 @@ fn run_bridge_selftest(setup: &BridgeSetup, env: &crate::jni::JniEnv, spec: &str
             CString::new(data_dir.display().to_string()),
             CString::new("arm64"),
         ) else {
-            return;
+            return false;
         };
         let mode = bridge_init_mode();
         let (p2, p3) = match mode.as_str() {
@@ -1325,38 +1343,51 @@ fn run_bridge_selftest(setup: &BridgeSetup, env: &crate::jni::JniEnv, spec: &str
             "isa+dir" => (cisa.as_ptr(), cdata.as_ptr()),
             _ => (cdata.as_ptr(), cisa.as_ptr()),
         };
-        let ok = unsafe { f(&callbacks, p2, p3) };
+        // The translator retains this table pointer for the process lifetime,
+        // so the static must be passed here too — never a stack-local copy.
+        let ok = unsafe { f(&BRIDGE_CALLBACKS, p2, p3) };
         diag(&format!("art: Itf.initialize(mode={mode}) = {ok}"));
+        if !ok {
+            return false;
+        }
     }
 
     let load = slot(2);
     if load.is_null() {
         eprintln!("art: Itf.loadLibrary is null");
-        return;
+        return false;
     }
     type LoadLib = unsafe extern "C" fn(*const c_char, c_int) -> *mut c_void;
     let f: LoadLib = unsafe { std::mem::transmute(load) };
-    let Ok(clib) = CString::new(lib) else { return };
+    let Ok(clib) = CString::new(lib) else { return false };
     let handle = unsafe { f(clib.as_ptr(), 2) }; // RTLD_NOW
     diag(&format!("art: Itf.loadLibrary({lib}) = {handle:p}"));
     if handle.is_null() {
-        return;
+        return false;
     }
 
     let tramp = slot(3);
     if tramp.is_null() {
         eprintln!("art: Itf.getTrampoline is null");
-        return;
+        return false;
     }
-    type GetTramp = unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> *mut c_void;
+    // `getTrampoline(handle, name, shorty, shorty_len)`: the shorty is the JNI
+    // shorty ("I" for a static ()I), not the method descriptor "()I". Passing
+    // a descriptor or the wrong length makes the translator build a trampoline
+    // with the wrong marshalling.
+    type GetTramp = unsafe extern "C" fn(
+        *mut c_void,
+        *const c_char,
+        *const c_char,
+        u32,
+    ) -> *mut c_void;
     let f: GetTramp = unsafe { std::mem::transmute(tramp) };
-    let (Ok(csym), Ok(cshorty)) = (CString::new(symbol), CString::new("()I")) else {
-        return;
-    };
-    let entry = unsafe { f(handle, csym.as_ptr(), cshorty.as_ptr()) };
-    diag(&format!("art: Itf.getTrampoline({symbol}) = {entry:p}"));
+    let shorty = b"I";
+    let Ok(csym) = CString::new(symbol) else { return false };
+    let entry = unsafe { f(handle, csym.as_ptr(), shorty.as_ptr() as *const c_char, shorty.len() as u32) };
+    diag(&format!("art: Itf.getTrampoline({symbol}, shorty=I) = {entry:p}"));
     if entry.is_null() {
-        return;
+        return false;
     }
 
     type StaticIntFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
@@ -1364,6 +1395,7 @@ fn run_bridge_selftest(setup: &BridgeSetup, env: &crate::jni::JniEnv, spec: &str
     diag("art: calling the translated guest function");
     let value = unsafe { call(env.0, std::ptr::null_mut()) };
     diag(&format!("art: guest {symbol}() returned {value}"));
+    true
 }
 
 /// Re-install the translator's signal handlers over ART's.

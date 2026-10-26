@@ -125,9 +125,11 @@ fn bytes_for(desc: &HardwareBufferDesc) -> usize {
 /// The real constructor looks up a gralloc mapper (HIDL, via
 /// `hwservicemanager`) and calls `LOG_ALWAYS_FATAL("gralloc-mapper is
 /// missing")` when none is found, which is what kills the render thread inside
-/// `BufferQueueProducer::allocateBuffers`. The singleton's storage is zeroed
-/// `.bss`, so leaving it untouched gives a mapper with a null backend; the next
-/// call tells us which method has to be implemented.
+/// `BufferQueueProducer::allocateBuffers`. This only covers constructor calls
+/// through the PLT, not API-37 LTO-inlined constructors/backend operations.
+/// Only the singleton pointer slot is zeroed `.bss`; the heap object is not.
+/// This hook is not a fully initialized mapper and must not be used to seed
+/// the singleton for code that accesses its backend directly.
 #[no_mangle]
 pub unsafe extern "C" fn _ZN7android19GraphicBufferMapperC1Ev(_this: *mut c_void) {
     if std::env::var_os("PENGUDROID_TRACE_AHB").is_some() {

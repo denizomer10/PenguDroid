@@ -14,7 +14,7 @@ impl Drop for Run {
     }
 }
 
-fn run_framework_probe(sysroot: &Path, label: &str, blast: bool) -> String {
+fn run_framework_probe(sysroot: &Path, label: &str, blast: bool, native_display: bool) -> String {
     let binary = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("pengudroid");
     let dir = std::env::temp_dir().join(format!("pd-framework-{}-{label}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -29,8 +29,12 @@ fn run_framework_probe(sysroot: &Path, label: &str, blast: bool) -> String {
         .env("PENGUDROID_PROBE_AUDIO_FOCUS", "1")
         .env("PENGUDROID_PROBE_SETTINGS", "1")
         .env("PENGUDROID_TRACE_VIDEO", "1")
-        .env("XDG_RUNTIME_DIR", &dir).env_remove("PENGUDROID_SOCKET")
+        .env("XDG_RUNTIME_DIR", &dir)
+        .env("XDG_CACHE_HOME", dir.join("cache"))
+        .env_remove("PENGUDROID_SOCKET")
         .stdin(Stdio::null()).stdout(output.try_clone().unwrap()).stderr(output);
+    if native_display { command.env("PENGUDROID_PROBE_NATIVE_DISPLAY", "1"); }
+    else { command.env_remove("PENGUDROID_PROBE_NATIVE_DISPLAY"); }
     if blast { command.env("PENGUDROID_PROBE_BLAST_LIFECYCLE", "1"); }
     else {
         command.env_remove("PENGUDROID_PROBE_BLAST_LIFECYCLE")
@@ -58,7 +62,7 @@ fn real_art_keyboard_and_local_window_layout() {
         eprintln!("skipping: no Android sysroot (set PENGUDROID_TEST_SYSROOT)");
         return;
     }
-    let text = run_framework_probe(&sysroot, "full", true);
+    let text = run_framework_probe(&sysroot, "full", true, false);
     assert!(text.contains("settings: Binder/Parcel scalar value, missing key and unsupported list passed"), "{text}");
     assert!(text.contains("blast: real framework create/destroy/recreate passed"), "{text}");
     assert_eq!(text.matches("[blast] video: consumer stopped").count(), 2, "{text}");
@@ -68,8 +72,24 @@ fn real_art_keyboard_and_local_window_layout() {
     assert!(text.contains("audio: AIDL focus granted, current gain verified, abandon cleared"), "{text}");
 }
 
-/// Core API-37 migration gate. BLAST/media lifecycle remains a separate full
-/// gate above; this test must not be presented as Android-17 app compatibility.
+#[test]
+fn android17_blast_lifecycle_under_checkjni() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+    let sysroot = std::env::var_os("PENGUDROID_TEST_ANDROID17_SYSROOT").map(PathBuf::from)
+        .unwrap_or_else(|| workspace.join(".toolchain/sysroot-android17"));
+    if !sysroot.join("system/framework/framework.jar").exists() {
+        eprintln!("skipping: no API-37 runtime (set PENGUDROID_TEST_ANDROID17_SYSROOT)");
+        return;
+    }
+    let text = run_framework_probe(&sysroot, "api37-blast", true, true);
+    assert!(text.contains("display: native internal 720x1280 @ 60 Hz, SDR RGBA_8888 passed"), "{text}");
+    assert!(text.contains("binder: framework ServiceManager codes = [1, 3, 2, 4]"), "{text}");
+    assert!(text.contains("blast: real framework create/destroy/recreate passed"), "{text}");
+    assert_eq!(text.matches("[blast] video: consumer stopped").count(), 2, "{text}");
+}
+
+/// Core API-37 migration gate. BLAST lifecycle has its own gate; neither test
+/// establishes Android-17 app rendering or media compatibility.
 #[test]
 fn android17_core_services_under_checkjni() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
@@ -79,8 +99,9 @@ fn android17_core_services_under_checkjni() {
         eprintln!("skipping: no API-37 runtime (set PENGUDROID_TEST_ANDROID17_SYSROOT)");
         return;
     }
-    let text = run_framework_probe(&sysroot, "api37-core", false);
+    let text = run_framework_probe(&sysroot, "api37-core", false, true);
     for expected in [
+        "display: native internal 720x1280 @ 60 Hz, SDR RGBA_8888 passed",
         "platform: feature cache native shared-memory roundtrip passed",
         "audio: probe framework SDK_INT=37, focusEnvironmentToken=true",
         "binder: framework ServiceManager codes = [1, 3, 2, 4]",

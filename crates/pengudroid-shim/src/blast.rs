@@ -147,6 +147,16 @@ type SurfaceCtor =
     unsafe extern "C" fn(*mut c_void, *const [u64; 2], bool, *const [u64; 2]);
 type SurfaceIntSetter = unsafe extern "C" fn(*mut c_void, i32) -> i32;
 type SurfaceDimsSetter = unsafe extern "C" fn(*mut c_void, u32, u32) -> i32;
+/// `BLASTBufferQueue::update(const sp<SurfaceControl>&, uint32_t width,
+/// uint32_t height, int32_t format)`.
+type BbqUpdate = unsafe extern "C" fn(*mut c_void, *const *mut c_void, u32, u32, i32);
+/// `BLASTBufferQueue::BLASTBufferQueue(const std::string& name,
+/// bool updateDestinationFrame)`.
+///
+/// A libc++ `std::string` is 24 bytes in both the old and the new ABI layouts,
+/// and an all-zero short-string is a valid empty string, so the name is passed
+/// as 24 zeroed bytes.
+type BbqCtor = unsafe extern "C" fn(*mut c_void, *const [u8; 24], bool);
 /// `RefBase::incStrong(const void*) const`.
 type IncStrong = unsafe extern "C" fn(*mut c_void, *const c_void);
 
@@ -177,6 +187,8 @@ struct Gui {
     set_buffers_format: SurfaceIntSetter,
     set_user_dimensions: SurfaceDimsSetter,
     inc_strong: IncStrong,
+    bbq_ctor: BbqCtor,
+    bbq_update: BbqUpdate,
     /// `android::Fence::NO_FENCE` — the `sp<Fence>` `releaseBuffer` expects.
     /// Held as an address: raw pointers would make `Gui` neither `Send` nor
     /// `Sync`, and the value never changes after load.
@@ -234,6 +246,14 @@ fn gui() -> Option<&'static Gui> {
             b"_ZN7android7Surface24setBuffersUserDimensionsEjj\0",
         );
         let inc_strong = guest_sym(b"libutils.so\0", b"_ZNK7android7RefBase9incStrongEPKv\0");
+        let bbq_ctor = guest_sym(
+            b"libgui.so\0",
+            b"_ZN7android16BLASTBufferQueueC1ERKNSt3__112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEEb\0",
+        );
+        let bbq_update = guest_sym(
+            b"libgui.so\0",
+            b"_ZN7android16BLASTBufferQueue6updateERKNS_2spINS_14SurfaceControlEEEjji\0",
+        );
         if create_buffer_queue.is_null()
             || item_consumer_ctor.is_null()
             || item_ctor.is_null()
@@ -248,6 +268,8 @@ fn gui() -> Option<&'static Gui> {
             || set_buffers_format.is_null()
             || set_user_dimensions.is_null()
             || inc_strong.is_null()
+            || bbq_ctor.is_null()
+            || bbq_update.is_null()
         {
             eprintln!("[blast] libgui/libutils is missing a required entry point");
             return None;
@@ -267,6 +289,8 @@ fn gui() -> Option<&'static Gui> {
             set_buffers_format: std::mem::transmute(set_buffers_format),
             set_user_dimensions: std::mem::transmute(set_user_dimensions),
             inc_strong: std::mem::transmute(inc_strong),
+            bbq_ctor: std::mem::transmute(bbq_ctor),
+            bbq_update: std::mem::transmute(bbq_update),
             no_fence: guest_sym(b"libui.so\0", b"_ZN7android5Fence8NO_FENCEE\0") as usize,
         })
     })
@@ -295,6 +319,16 @@ struct Blast {
     item_consumer: *mut c_void,
     /// `android::Surface*` — the native half of the Java `Surface` we hand out.
     surface: *mut c_void,
+    /// A **real** `android::BLASTBufferQueue*`.
+    ///
+    /// Android 17's hwui calls `syncNextTransaction`, `applyPendingTransactions`,
+    /// `mergeWithNextTransaction`, `gatherPendingTransactions` and the two
+    /// callback setters on whatever `BLASTBufferQueue.nativeCreate` returned, so
+    /// that value has to be a genuine object with those methods' state. Its own
+    /// buffer queue stays idle: the frames are still produced and consumed
+    /// through `surface`/`item_consumer` above, because there is no
+    /// SurfaceFlinger to release them.
+    bbq: *mut c_void,
     /// Global reference to that Java `Surface`, created on first request.
     java_state: Mutex<JavaState>,
     stopped: std::sync::atomic::AtomicBool,
@@ -316,19 +350,20 @@ struct JavaState {
 
 /// Hosted objects, kept alive for the life of the process.
 ///
-/// The address of the `Box` is the `long mNativeObject` the Java side holds, so
-/// it must not move; `Box` gives us that.
-static BLASTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// Java and hwui hold the real `BLASTBufferQueue*`; this table maps that native
+/// handle to the separately allocated Rust state used by the consumer thread.
+static BLASTS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
 unsafe fn blast_at(ptr: i64) -> Option<&'static Blast> {
     if ptr == 0 {
         return None;
     }
-    let boxes = BLASTS.lock().unwrap_or_else(|e| e.into_inner());
-    if boxes.iter().any(|&b| b == ptr as usize) {
-        return Some(&*(ptr as *const Blast));
-    }
-    None
+    let state = BLASTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find_map(|&(native, state)| (native == ptr as usize).then_some(state))?;
+    Some(&*(state as *const Blast))
 }
 
 /// `BLASTBufferQueue.nativeCreate(String name, boolean updateDestinationFrame)`
@@ -405,27 +440,49 @@ unsafe extern "C" fn native_create(
     (gui.set_buffers_format)(surface, format);
     (gui.set_user_dimensions)(surface, width, height);
 
+    // A real `BLASTBufferQueue`. The constructor only records its name; the
+    // queue is created from `onFirstRef()` → `initialize()`, which `incStrong`
+    // triggers. `initialize()` asks SurfaceFlinger for the maximum acquired
+    // buffer count over binder, so the broker answers that call.
+    let bbq = libc::calloc(1, OBJECT_SIZE);
+    if bbq.is_null() {
+        return 0;
+    }
+    let empty_name = [0u8; 24];
+    (gui.bbq_ctor)(bbq, &empty_name, false);
+    // `BLASTBufferQueue : public ConsumerBase::FrameAvailableListener`, and that
+    // listener derives from `virtual RefBase`, so `RefBase` is *not* at offset 0.
+    // `keep_alive` reads the vtable's vbase entry, and its `incStrong` is also
+    // what triggers `onFirstRef()` → `initialize()` (which creates the queue and
+    // asks the broker for the max acquired buffer count).
+    if !keep_alive(gui, "bbq", bbq, None) {
+        eprintln!("[blast] BLASTBufferQueue is not refcounted as expected");
+        return 0;
+    }
+
     let blast = Box::new(Blast {
         producer,
         consumer,
         item_consumer,
         surface,
+        bbq,
         java_state: Mutex::new(JavaState { java_surface: 0, width, height, format }),
         stopped: std::sync::atomic::AtomicBool::new(false),
         video_surface: std::sync::atomic::AtomicU32::new(0),
         display_size: std::sync::atomic::AtomicU64::new(((width as u64) << 32) | height as u64),
     });
     let ptr = Box::into_raw(blast);
+    // Keyed by the value Java (and therefore hwui) holds: the real queue.
     BLASTS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push(ptr as usize);
+        .push((bbq as usize, ptr as usize));
     eprintln!(
-        "[blast] created {width}x{height} fmt={format:#x} producer={:#x} surface={:#x}",
-        producer[0] as usize, surface as usize
+        "[blast] created {width}x{height} fmt={format:#x} producer={:#x} surface={:#x} bbq={:#x}",
+        producer[0] as usize, surface as usize, bbq as usize
     );
     start_consumer(ptr);
-    ptr as i64
+    bbq as i64
 }
 
 /// `BLASTBufferQueue.nativeGetSurface(long ptr, boolean includeHandle)` →
@@ -486,7 +543,7 @@ unsafe extern "C" fn native_update(
     _env: *mut c_void,
     _class: *mut c_void,
     ptr: i64,
-    _surface_control: i64,
+    surface_control: i64,
     width: i64,
     height: i64,
     format: i32,
@@ -495,11 +552,25 @@ unsafe extern "C" fn native_update(
         return;
     };
     let Some(blast) = blast_at(ptr) else {
+        eprintln!("[blast] update: unknown queue {ptr:#x}");
         return;
     };
+    eprintln!("[blast] update: enter ptr={ptr:#x} sc={surface_control:#x} {width}x{height} fmt={format:#x}");
     let mut state = blast.java_state.lock().unwrap_or_else(|e| e.into_inner());
     if blast.stopped.load(std::sync::atomic::Ordering::Acquire) { return; }
     let (w, h) = (width.max(1) as u32, height.max(1) as u32);
+
+    // Drive the real queue too: hwui reads its geometry back and uses it for the
+    // sync-transaction path. `update` takes `const sp<SurfaceControl>&`, so the
+    // argument is a pointer to one pointer (an `sp` is a single word here) and
+    // the assignment inside the callee takes the reference.
+    if !blast.bbq.is_null() && surface_control != 0 {
+        let sc = surface_control as *mut c_void;
+        eprintln!("[blast] update: calling real BLASTBufferQueue::update");
+        (gui.bbq_update)(blast.bbq, &sc, w, h, format);
+        eprintln!("[blast] update: real update returned");
+    }
+
     if format != state.format {
         (gui.set_buffers_format)(blast.surface, format);
         (gui.set_default_format)(blast.item_consumer, format);
@@ -1269,21 +1340,23 @@ mod tests {
         let blast = Box::leak(Box::new(Blast {
             producer: [0; 2], consumer: [0; 2],
             item_consumer: std::ptr::null_mut(), surface: std::ptr::null_mut(),
+            bbq: 0x1234usize as *mut c_void,
             java_state: Mutex::new(JavaState { java_surface: 0, width: 1, height: 1, format: 0 }),
             stopped: std::sync::atomic::AtomicBool::new(false),
             video_surface: std::sync::atomic::AtomicU32::new(0),
             display_size: std::sync::atomic::AtomicU64::new(0),
         }));
-        let ptr = blast as *const Blast as i64;
-        BLASTS.lock().unwrap().push(ptr as usize);
+        let ptr = blast.bbq as i64;
+        BLASTS.lock().unwrap().push((ptr as usize, blast as *const Blast as usize));
         unsafe {
+            assert!(std::ptr::eq(blast_at(ptr).unwrap(), blast));
             native_destroy(std::ptr::null_mut(), std::ptr::null_mut(), ptr);
             native_destroy(std::ptr::null_mut(), std::ptr::null_mut(), ptr);
             assert!(native_get_surface(std::ptr::null_mut(), std::ptr::null_mut(), ptr, 0).is_null());
             assert_eq!(surface_from_blast(std::ptr::null_mut(), std::ptr::null_mut(), 0, ptr), 0);
         }
         assert!(blast.stopped.load(std::sync::atomic::Ordering::Acquire));
-        BLASTS.lock().unwrap().retain(|p| *p != ptr as usize);
+        BLASTS.lock().unwrap().retain(|(native, _)| *native != ptr as usize);
         // Match production storage lifetime: readers may still hold a reference.
     }
 }

@@ -3197,8 +3197,16 @@ impl ServiceHost {
             && request.intent_offset > 0
             && request.intent_offset < request.parcel.len()
         {
-            if let Some(intent) = self.unmarshall_intent(request) {
-                return Some(intent);
+            // Android 17 added `mExtendedFlags` before `mPackage`. The broker
+            // locates that layout first; four bytes later is the API-33 layout.
+            // Trying both keeps the older framework regression fixture honest
+            // without selecting parcel semantics from the APK's targetSdk.
+            for offset in [request.intent_offset, request.intent_offset + 4] {
+                if offset < request.parcel.len() {
+                    if let Some(intent) = self.unmarshall_intent(request, offset) {
+                        return Some(intent);
+                    }
+                }
             }
             eprintln!(
                 "service: cannot unmarshall the Intent of {}; using a bare one",
@@ -3208,7 +3216,7 @@ impl ServiceHost {
         self.component_intent(request)
     }
 
-    fn unmarshall_intent(&self, request: &ServiceRequest) -> Option<JObject> {
+    fn unmarshall_intent(&self, request: &ServiceRequest, intent_offset: usize) -> Option<JObject> {
         let parcel_class = self.env.find_class("android/os/Parcel")?;
         // `unmarshall` is an *instance* method in this framework (`obtain()`
         // first, then `unmarshall(bytes, offset, length)`); there is no static
@@ -3225,8 +3233,8 @@ impl ServiceHost {
             .method_id(parcel_class, "unmarshall", "([BII)V")?;
         let bytes = self.env.new_byte_array(request.parcel.len() as i32)?;
         self.env.set_byte_array_region(bytes, 0, &request.parcel);
-        let offset = request.intent_offset as i32;
-        let length = (request.parcel.len() - request.intent_offset) as i32;
+        let offset = intent_offset as i32;
+        let length = (request.parcel.len() - intent_offset) as i32;
         if !self.env.call_void(
             parcel,
             unmarshall,
@@ -5398,18 +5406,21 @@ pub fn probe_settings(env: &JniEnv) -> bool {
 
 fn install_application_transactions(env: &JniEnv) -> Option<()> {
     let _frame = env.local_frame(16)?;
-    let mut codes = [0u32; 2];
+    let mut codes = [0u32; 5];
     for (index, (class, field)) in [
         ("android/app/IActivityTaskManager$Stub", "TRANSACTION_getActivityClientController"),
         ("android/app/IActivityManager$Stub", "TRANSACTION_getContentProvider"),
+        ("android/app/IActivityManager$Stub", "TRANSACTION_startService"),
+        ("android/app/IActivityManager$Stub", "TRANSACTION_bindService"),
+        ("android/app/IActivityManager$Stub", "TRANSACTION_bindIsolatedService"),
     ].into_iter().enumerate() {
         let class = env.find_class(class)?;
         let field = env.static_field_id(class, field, "I")?;
         codes[index] = u32::try_from(env.static_int_field(class, field)).ok()?;
     }
     let setter = shim_symbol("__pengudroid_binder_set_application_transactions")?;
-    let setter: unsafe extern "C" fn(u32, u32) -> bool = unsafe { std::mem::transmute(setter) };
-    if !unsafe { setter(codes[0], codes[1]) } { return None; }
+    let setter: unsafe extern "C" fn(u32, u32, u32, u32, u32) -> bool = unsafe { std::mem::transmute(setter) };
+    if !unsafe { setter(codes[0], codes[1], codes[2], codes[3], codes[4]) } { return None; }
     println!("binder: framework application transaction codes = {codes:?}");
     Some(())
 }
@@ -5524,13 +5535,72 @@ pub fn probe_audio_focus(env: &JniEnv) -> bool {
     run().is_some()
 }
 
-/// Exercise Android's local layout, the path that used to turn a good frame
-/// into 0x0 after a subsequent relayout. This checks computed output, not just
-/// the configuration fields written by the host.
-/// Exercise the real framework constructor and destroy path twice, as a
-/// SurfaceView recreation would. Consumer exit is checked by the ART test log.
+/// Exercise the native display API used by hwui's wide-color initialization.
+pub fn probe_native_display(env: &JniEnv) -> bool {
+    let run = || -> Option<()> {
+        install_service_manager_abi(env)?;
+        unsafe {
+            let handle = libc::dlopen(c"libnativedisplay.so".as_ptr(), libc::RTLD_NOW);
+            if handle.is_null() { return None; }
+            let result = (|| -> Option<()> {
+                let symbol = |name: &std::ffi::CStr| {
+                    let ptr = libc::dlsym(handle, name.as_ptr());
+                    (!ptr.is_null()).then_some(ptr)
+                };
+                let acquire: unsafe extern "C" fn(*mut *mut *mut c_void) -> i32 = std::mem::transmute(
+                    symbol(c"_ZN7android32ADisplay_acquirePhysicalDisplaysEPPPNS_8ADisplayE")?);
+                let release: unsafe extern "C" fn(*mut *mut c_void) = std::mem::transmute(
+                    symbol(c"_ZN7android16ADisplay_releaseEPPNS_8ADisplayE")?);
+                let display_type: unsafe extern "C" fn(*mut c_void) -> i32 = std::mem::transmute(
+                    symbol(c"_ZN7android23ADisplay_getDisplayTypeEPNS_8ADisplayE")?);
+                let config: unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> i32 = std::mem::transmute(
+                    symbol(c"_ZN7android25ADisplay_getCurrentConfigEPNS_8ADisplayEPPNS_14ADisplayConfigE")?);
+                let width: unsafe extern "C" fn(*mut c_void) -> i32 = std::mem::transmute(
+                    symbol(c"_ZN7android23ADisplayConfig_getWidthEPNS_14ADisplayConfigE")?);
+                let height: unsafe extern "C" fn(*mut c_void) -> i32 = std::mem::transmute(
+                    symbol(c"_ZN7android24ADisplayConfig_getHeightEPNS_14ADisplayConfigE")?);
+                let fps: unsafe extern "C" fn(*mut c_void) -> f32 = std::mem::transmute(
+                    symbol(c"_ZN7android21ADisplayConfig_getFpsEPNS_14ADisplayConfigE")?);
+                let color: unsafe extern "C" fn(*mut c_void, *mut i32, *mut i32) = std::mem::transmute(
+                    symbol(c"_ZN7android36ADisplay_getPreferredWideColorFormatEPNS_8ADisplayEP10ADataSpaceP22AHardwareBuffer_Format")?);
+                let mut displays = std::ptr::null_mut();
+                let count = acquire(&mut displays);
+                if count <= 0 || displays.is_null() {
+                    eprintln!("display: native physical-display acquisition failed ({count})");
+                    return None;
+                }
+                let valid = (|| -> Option<()> {
+                    if count != 1 || (*displays).is_null() { return None; }
+                    let display = *displays;
+                    let mut current = std::ptr::null_mut();
+                    if config(display, &mut current) != 0 || current.is_null() { return None; }
+                    let (w, h, rate) = (width(current), height(current), fps(current));
+                    let (mut dataspace, mut format) = (-1, -1);
+                    color(display, &mut dataspace, &mut format);
+                    if display_type(display) != 0 || (w, h) != (720, 1280)
+                        || !rate.is_finite() || (rate - 60.0).abs() > 0.01
+                        || (dataspace, format) != (0, 1) { return None; }
+                    println!("display: native internal 720x1280 @ 60 Hz, SDR RGBA_8888 passed");
+                    Some(())
+                })();
+                // Config/display pointers are borrowed from this single allocation.
+                release(displays);
+                valid
+            })();
+            libc::dlclose(handle);
+            result
+        }
+    };
+    run().is_some()
+}
+
+/// Exercise framework queue construction, update, destruction and recreation.
+/// Consumer exit is checked by the ART test log.
 pub fn probe_blast_lifecycle(env: &JniEnv) -> bool {
     let run = || -> Option<()> {
+        // The real native queue queries SurfaceFlinger from onFirstRef().
+        // Install the loaded framework's reply shapes before its constructor runs.
+        install_service_manager_abi(env)?;
         let _frame = env.local_frame(32)?;
         let class = env.find_class("android/graphics/BLASTBufferQueue")?;
         let ctor = env.method_id(class, "<init>", "(Ljava/lang/String;Z)V")?;

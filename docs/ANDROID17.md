@@ -1,10 +1,11 @@
 # Android 17 migration target
 
-The forward compatibility target is **Android 17 / API 37**. Existing APKs keep
-their declared minSdk/targetSdk; the desired platform level is not substituted
-for either. A separate Android 17 runtime now boots and passes core framework
-probes. The default working app tree is still API 33 while API-37 window/media
-integration is incomplete. Older runtime adapters remain regression fixtures.
+The runtime target is **Android 17 / API 37 only**. Existing APKs keep their
+declared minSdk/targetSdk; the platform level is not substituted for either.
+The Android 17 runtime boots and passes core framework and BLAST lifecycle
+probes. Window/media integration remains incomplete. API-33 artifacts are
+historical regression fixtures, not a window/input fallback. See STATUS.md
+for the latest handoff; earlier checkpoints below record migration history.
 
 ## Actual API-37 runtime bringup
 
@@ -61,12 +62,23 @@ this renderer does not collect Android GPU stats. Other context attributes
 continue to receive host validation. The real GPU regression accepts this
 HWUI hint and still rejects an unknown attribute.
 
-**API-37 NewPipe is not yet usable.** The latest run passes context creation
-but fails in the window/input-channel path (`socket -1`, Bad file descriptor).
-The complete BLAST lifecycle gate also fails: API-37 acquireBuffer/releaseBuffer
-have new libc++ optional/function parameters. A matching native C++ ABI bridge
-is needed; do not cast the new functions to the old Rust signatures. InputChannel,
-IWindowSession/InsetsState and display-mode contracts remain to be ported.
+**API-37 NewPipe UI now renders; playback remains unverified.** Input-channel and SurfaceControl
+reply contracts were subsequently corrected (see STATUS.md). The real native
+BLAST create/update/destroy/recreate gate now passes with CheckJNI, after mapping
+the C++ queue handle to separate Rust state and installing the framework's
+ServiceManager ABI before construction. This headless probe does not exercise
+frame presentation or transaction/release callbacks. A subsequent bounded
+Wayland run passed native BLAST update and hwui's physical-display discovery
+after correcting API-37 static/dynamic display and composition-preference
+parcelables. The native `ADisplay` API now has a CheckJNI regression verifying
+the synthetic internal 720x1280/60 Hz SDR display. The subsequent gralloc abort
+came from the optional `ANativeWindow_tryAllocateBuffers` preallocation hint.
+The shim now declines that hint, as allowed by the NDK contract; host EGL renders
+into its own FBOs. A real 20-second Wayland run remained alive and reached UI
+frame counter 550, with 52 distinct hashes among 55 sampled images. See
+`screenshots/newpipe-android17.png` and STATUS.md. This does not implement
+mandatory API-37 GraphicBuffer allocation: LTO-inlined mapper/backend accesses
+still require an ABI-matched backend. No video decode/playback success is claimed.
 
 Other observed limits: boot images have a read-barrier mismatch; ART successfully
 falls back to imageless execution. Aconfig metadata under /metadata/aconfig is
@@ -79,15 +91,16 @@ Reproduction (build runtime shared libraries before tests):
 ```sh
 cargo build --workspace --offline
 cargo test -p pengudroid-cli --test art_framework --offline
-# Runs the legacy full gate and the separate API-37 core-services gate.
-# Explicit full API-37 gate (currently fails at the BLAST boundary):
+# Includes dedicated API-37 core-services and BLAST lifecycle gates.
+# Explicit full API-37 gate:
 PENGUDROID_TEST_SYSROOT="$PWD/.toolchain/sysroot-android17" cargo test -p pengudroid-cli --test art_framework real_art_keyboard_and_local_window_layout --offline
 pengudroid launch NewPipe_v0.29.1.apk --sysroot .toolchain/sysroot-android17
 ```
 
-The latest workspace checkpoint has **251 passing tests**, with both installed
-runtime fixtures exercised. The separate full API-37 lifecycle test still fails;
-a green workspace run is not a claim that API-37 window/media integration works.
+The earlier workspace checkpoint had **251 passing tests**, with both installed
+runtime fixtures exercised. The API-37 lifecycle probe now passes separately;
+this is not a claim that API-37 window/media integration works. See STATUS.md
+for the current validation scope.
 
 Logs are under `/tmp/pd-android17/`: `shared-framework-tests.log`,
 `full-framework17-test.log`, `guard-abi.log`, `properties-abi.log`,

@@ -2,6 +2,113 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
+## Android 17 NewPipe UI renders and continues drawing (2026-10-27)
+
+The immediate mapper abort was triggered by `ANativeWindow_tryAllocateBuffers`,
+not by an obligatory dequeue. This NDK API is a best-effort preallocation hint:
+implementations are explicitly allowed to allocate nothing. The shim now ignores
+that hint, consistent with the host EGL FBO rendering path, rather than eagerly
+entering Android's unavailable gralloc HAL. Actual allocation/dequeue operations
+are unchanged. Reference: [NDK native-window contract](https://developer.android.com/ndk/reference/group/a-native-window#anativewindow_tryallocatebuffers).
+
+Two bounded real Wayland runs verified progress:
+
+- `target/newpipe-api37-preallocate/`: the first 720x1280 UI frame contains the
+  NewPipe header/tabs. Pointer interaction reached a video-detail view. A
+  compositor close retired the guest's desktop windows; no gralloc abort occurred.
+- `target/newpipe-api37-frame-progress/`: the guest was still running after
+  20.01 seconds, before test cleanup. The EGL dump counter reached 550 across
+  UI surfaces. 55 sampled images had 52 distinct SHA-256 hashes. This is UI
+  frame progress, **not decoded video frames or a stable frame-rate claim**.
+  The final sample is retained as `docs/screenshots/newpipe-android17.png`.
+
+The test broker/guest process groups were stopped afterward. Logs, sampled
+frames and `result.json` are in those target directories. The shim build,
+5 native-window unit tests and 2 API-37 ART/CheckJNI tests passed;
+`git diff --check` was clean.
+
+**Mandatory API-37 GraphicBuffer allocation is still incomplete.** Binary
+inspection shows libui LTO inlines mapper construction and backend calls inside
+GraphicBuffer constructors. The existing no-op constructor hooks cannot catch
+those operations. Only the singleton pointer slot is zeroed `.bss`; its heap
+object is not guaranteed zero-initialized. Bootstrapping that singleton alone
+would merely replace the HAL abort with an invalid backend access. A matching
+C++ backend or source-built explicit shim boundary is required for that path;
+no fabricated mapper vtable or singleton pointer was introduced here.
+
+Next: verify PlayerService creation/binding and the API-37 MediaCodec path with
+retained logs, then implement required allocator/mapper contracts for real video
+buffers. Playback, pause/seek, hardware decode and broad app stability remain
+unverified. Existing service/resource warnings and multiple app windows remain.
+
+## Android 17 native display discovery passes; gralloc is next (2026-10-27)
+
+A bounded NewPipe run reached the real native BLAST `update()` and then exposed
+hwui's `Failed to acquire physical displays for WCG support!` abort. The API-37
+SurfaceComposer replies were missing static/dynamic display information and the
+composition-preference reply lacked its parcelable framing.
+
+Measured from the shipped x86_64 `libgui.so`:
+
+- `getStaticDisplayInfo` is transaction 12; `getDynamicDisplayInfoFromId` is 13.
+- Both return AIDL Status, presence=1, and a self-sized structured parcelable.
+- Supported display modes require per-element presence/size and a nested sized
+  `gui::Size`. The hosted display is fixed at 720x1280, 320 dpi, 60 Hz, mode ID 1.
+- Transaction 34's composition preference is also present/self-sized, not four
+  raw words. It reports UNKNOWN dataspace and RGBA_8888, not wide-gamut support.
+- Dynamic info intentionally ends at activeColorMode, which the generated reader
+  accepts; later capabilities retain defaults. This is a supported prefix, not
+  a complete implementation of HDR/refresh-rate capability metadata.
+
+A new native-display probe uses the real `libnativedisplay.so` API to acquire the
+single internal display, query its current config/size/FPS and SDR preferred
+format, then release the returned allocation. Both API-37 CheckJNI framework
+regressions pass with this probe enabled. A standalone unit regression checks
+nested parcelable sizes. Final focused verification passed 15 Binder tests,
+3 BLAST tests and 2 API-37 ART/CheckJNI tests; `git diff --check` was clean.
+CLI/shim/daemon/gleshim builds succeeded.
+
+A separate real Wayland broker run then passed display discovery and native
+BLAST update, but aborted in `GraphicBuffer::GraphicBuffer()` at
+`libui.so+0x2fd0f`: `GraphicBufferMapper: gralloc-mapper is missing`. The stack
+runs through BufferQueueProducer::allocateBuffers and ANativeWindow_tryAllocateBuffers.
+No frame dump was produced; there is no NewPipe rendering/playback claim yet.
+The next concrete task is the API-37 GraphicBuffer/mapper constructor and allocator
+boundary, followed by continued hwui frame progress and transaction/release work.
+The private broker and guest process groups were stopped after the bounded run.
+
+Evidence: `target/newpipe-api37-check/{app,daemon}.log` (sandbox diagnostic),
+`target/newpipe-api37-render/{app,daemon}.log` (real Wayland),
+`target/art37-display-{build,tests,unit}.log`, `target/art37-render-build.log`.
+
+## Android 17 real BLAST lifecycle checkpoint (2026-10-27)
+
+The in-progress native bridge now returns a real `BLASTBufferQueue*` to Java
+and hwui, while retaining the separate hosted producer/consumer for presentation.
+The native queue handle must be mapped to the Rust `Blast` state: casting the
+C++ address directly to `Blast*` is invalid. The registry and teardown regression
+now exercise these distinct addresses. The native queue/storage and Java global
+reference still have process-lifetime retention; ownership cleanup is not solved.
+
+The standalone ART lifecycle probe also needs the loaded framework's
+ServiceManager transaction table **before** constructing the native queue.
+Without it, `onFirstRef()` → `initialize()` fails to look up SurfaceFlingerAIDL
+and faults at `libgui.so+0xec5c2`. The application binding path already installed
+this table; the lifecycle probe now does so independently of other probes.
+
+Validation: CLI/shim offline build succeeded; all three BLAST unit tests passed;
+the full lifecycle/framework probe passed on the real API-37 tree with CheckJNI.
+A dedicated `android17_blast_lifecycle_under_checkjni` regression now covers this
+runtime explicitly. Both API-37 regressions passed together (2 tests, no failures).
+Each framework probe now uses a private temporary XDG cache, avoiding concurrent
+compat-symlink replacement and writes to the user's existing cache.
+Logs: `target/art37-blast-{build,probe}.log`, `target/art37-regressions.log`.
+No live NewPipe render/playback result is claimed. The next gate is hwui's real
+`nSetBLASTBufferQueue` path and continued frame progress, followed by transaction
+callbacks/release semantics and the existing playback/interaction checklist.
+The broader shim run previously failed in the unrelated DNS negative-name test;
+`rustfmt` is not installed in the selected stable toolchain.
+
 ## Android 17 hard lock: window, input and surface gates pass (2026-10-26)
 
 The runtime is now **Android 17 only**. The API-33 reply shapes and the legacy

@@ -341,6 +341,17 @@ pub unsafe extern "C" fn ANativeWindow_getFormat(_w: *mut c_void) -> i32 {
     1
 }
 
+/// This NDK API is only a preallocation hint: implementations may allocate no
+/// buffers. Host EGL owns its FBOs, so eagerly allocating an Android BufferQueue
+/// here is unnecessary and would enter the unavailable gralloc HAL. Actual
+/// dequeue/allocation calls are deliberately not replaced by this hint handler.
+#[no_mangle]
+pub unsafe extern "C" fn ANativeWindow_tryAllocateBuffers(_w: *mut c_void) {
+    if std::env::var_os("PENGUDROID_TRACE_AHB").is_some() {
+        eprintln!("[ahb] native window preallocation hint ignored (host rendering)");
+    }
+}
+
 /// `ANativeWindow_setBuffersGeometry(w, width, height, format)`.
 #[no_mangle]
 pub unsafe extern "C" fn ANativeWindow_setBuffersGeometry(
@@ -691,6 +702,13 @@ mod tests {
         assert!(!dir.is_null());
         assert!(unsafe { AAssetDir_getNextFileName(dir) }.is_null());
         unsafe { AAssetDir_close(dir) };
+    }
+
+    #[test]
+    fn preallocation_hint_does_not_touch_the_opaque_window() {
+        let mut opaque = [0xa5u8; 64];
+        unsafe { ANativeWindow_tryAllocateBuffers(opaque.as_mut_ptr().cast()); }
+        assert_eq!(opaque, [0xa5; 64]);
     }
 
     #[test]

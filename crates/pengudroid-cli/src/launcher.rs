@@ -408,6 +408,20 @@ pub fn launch(args: &[String]) -> i32 {
                 pengudroid_input::keymap::keymap_path(&info.package),
             );
             cmd.arg("--main").arg(main);
+            // ARM-only apps need the native bridge. This stays opt-in so the
+            // existing x86_64 app path (NewPipe and friends) is unchanged; the
+            // translator is not yet able to finish guest execution for every
+            // app, so enabling it by default would regress working launches.
+            // The 128 MiB heap is required once the bridge has reserved the
+            // guest address layout (see LIMITATIONS.md §2.1).
+            if let Ok(bridge_lib) = std::env::var("PENGUDROID_NATIVE_BRIDGE_LIB") {
+                cmd.arg("--bridge-lib").arg(bridge_lib);
+                let name = std::env::var("PENGUDROID_NATIVE_BRIDGE_NAME")
+                    .unwrap_or_else(|_| "libndk_translation.so".to_string());
+                cmd.arg("--native-bridge").arg(name);
+                cmd.arg("--init-bridge").arg("arm64");
+                cmd.arg("--xmx").arg("128m");
+            }
             // The JIT crashes in `nterp_op_invoke_virtual` on this framework
             // build, so the interpreter is the only working execution mode.
             cmd.arg("--vm-option").arg("-Xint");
@@ -440,15 +454,18 @@ fn bundle_abi(b: &crate::bundle::Bundle, backend: Backend) -> Option<String> {
             }
         }
         Backend::Art => {
-            // Prefer the host ABI. Picking `arm64-v8a` here (as this used to) is
-            // exactly backwards on an x86_64 host: without a working ARM
-            // translator the arm64 split's native libraries cannot be loaded, and
-            // the x86_64 split — the one that actually contains `libroblox.so` —
-            // is never even extracted, so every `native*` method becomes an
-            // `UnsatisfiedLinkError`.
+            // Prefer the host ABI when the bundle has it. An ARM-only bundle has
+            // no x86_64 split, so pick the architecture the native bridge can
+            // translate: arm64-v8a before armeabi-v7a. Falling back to
+            // `abis.first()` made the choice depend on split order, which for a
+            // Play bundle is not a contract.
             let host = crate::nativelib::host_abi();
             if b.abis.iter().any(|a| a == host) {
                 Some(host.to_string())
+            } else if b.abis.iter().any(|a| a == "arm64-v8a") {
+                Some("arm64-v8a".to_string())
+            } else if b.abis.iter().any(|a| a == "armeabi-v7a") {
+                Some("armeabi-v7a".to_string())
             } else {
                 b.abis.first().cloned()
             }
