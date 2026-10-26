@@ -199,7 +199,7 @@ mod tests {
 /// device id and presence flag. Native read/writeToParcel validate this layout
 /// again at runtime. See frameworks/native/libs/input/KeyCharacterMap.cpp.
 /// This is a US physical layout; compositor XKB layouts are a separate layer.
-pub fn virtual_character_map_parcel() -> Vec<u8> {
+pub fn virtual_character_map_parcel(modern: bool) -> Vec<u8> {
     let mut keys: Vec<(i32, char, char)> = (0..26)
         .map(|i| (29 + i, (b'a' + i as u8) as char, (b'A' + i as u8) as char))
         .collect();
@@ -213,8 +213,10 @@ pub fn virtual_character_map_parcel() -> Vec<u8> {
         (75, '\'', '"'), (76, '/', '?'),
     ]);
     keys.sort_by_key(|k| k.0);
-    let mut words = vec![-1i32, 1, 0, 4, 0, keys.len() as i32];
-    // [device=-1][present][empty C string padded to 4][FULL][overlay=false][keys]
+    let mut words = vec![-1i32, 1, 0];
+    // API 33 uses a C string; API 37 uses length-prefixed String8.
+    if modern { words.push(0); }
+    words.extend([4, 0, keys.len() as i32]);
     for (code, plain, shifted) in keys {
         let number = if plain.is_ascii_digit() { plain as i32 } else { 0 };
         words.extend([code, shifted as i32, number]);
@@ -230,6 +232,7 @@ pub fn virtual_character_map_parcel() -> Vec<u8> {
         }
         words.push(0); // end of behavior list
     }
+    if modern { words.push(0); } // no key-code remapping
     words.extend([0, 0]); // no scan-code or HID usage overlays
     words.into_iter().flat_map(i32::to_le_bytes).collect()
 }

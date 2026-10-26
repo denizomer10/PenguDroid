@@ -10,6 +10,7 @@
 //! pengudroid daemon           start the daemon if it is not running
 //! ```
 
+mod compat;
 mod apk;
 mod apphost;
 mod audio;

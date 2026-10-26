@@ -2994,6 +2994,7 @@ dependencies = [
  "pengudroid-input",
  "pengudroid-proto",
  "pengudroid-socket",
+ "roxmltree",
 ]
 
 [[package]]

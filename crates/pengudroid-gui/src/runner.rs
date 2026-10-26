@@ -18,7 +18,7 @@ pub struct RunningApp {
 impl RunningApp {
     pub fn id(&self) -> u32 { self.child.id() }
 
-    pub fn launch(entry: &Entry, fps: bool) -> Result<Self, String> {
+    pub fn launch(entry: &Entry, fps: bool, keymapper: bool) -> Result<Self, String> {
         use std::os::unix::process::CommandExt;
         let log_dir = crate::registry::data_dir().join("logs");
         std::fs::create_dir_all(&log_dir).map_err(|e| e.to_string())?;
@@ -27,8 +27,8 @@ impl RunningApp {
         let mut cmd = Command::new(pengudroid_binary());
         cmd.arg("launch").arg(&entry.apk);
         if let Some(sysroot) = sysroot() { cmd.arg("--sysroot").arg(sysroot); }
+        launch_preferences(&mut cmd, fps, keymapper);
         cmd.env("PENGUDROID_APP_LABEL", &entry.label)
-            .env("PENGUDROID_FPS_METER", if fps { "1" } else { "0" })
             .stdin(Stdio::null()).stdout(log.try_clone().map_err(|e| e.to_string())?)
             .stderr(log).process_group(0);
         let child = cmd.spawn().map_err(|e| format!("cannot launch app: {e}"))?;
@@ -72,6 +72,12 @@ impl Drop for RunningApp {
     }
 }
 
+/// Always send both states so inherited settings cannot override an app's UI.
+fn launch_preferences(cmd: &mut Command, fps: bool, keymapper: bool) {
+    cmd.env("PENGUDROID_FPS_METER", if fps { "1" } else { "0" })
+        .env("PENGUDROID_KEYMAPPER", if keymapper { "1" } else { "0" });
+}
+
 /// The Android tree to run against.
 ///
 /// `PENGUDROID_SYSROOT` wins, then the in-repo tree, then the per-user install
@@ -103,6 +109,21 @@ mod tests {
     use std::os::unix::process::CommandExt;
 
     #[test]
+    fn launcher_passes_each_apps_controls_preference_to_the_child() {
+        for enabled in [false, true] {
+            let mut child = Command::new("/bin/sh");
+            child.args(["-c", "printf '%s:%s' \"$PENGUDROID_KEYMAPPER\" \"$PENGUDROID_FPS_METER\""]);
+            child.env("PENGUDROID_KEYMAPPER", "inherited")
+                .env("PENGUDROID_FPS_METER", "inherited");
+            launch_preferences(&mut child, !enabled, enabled);
+            let output = child.output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8(output.stdout).unwrap(),
+                if enabled { "1:0" } else { "0:1" });
+        }
+    }
+
+    #[test]
     fn stopping_launcher_also_kills_a_hung_android_child() {
         let mut child = Command::new("/bin/sh")
             .args(["-c", "trap '' TERM; sleep 30 & echo $!; wait"])
@@ -117,8 +138,15 @@ mod tests {
         assert!(began.elapsed() < std::time::Duration::from_secs(3));
         // A dead descendant can briefly be a zombie awaiting its host reaper;
         // it must never remain an executing/sleeping Android helper.
-        let state = std::fs::read_to_string(format!("/proc/{descendant}/stat")).ok()
-            .and_then(|text| text.rsplit_once(") ").map(|(_, fields)| fields.chars().next().unwrap()));
-        assert!(state.is_none() || state == Some('Z'), "descendant is still alive: {state:?}");
+        // SIGKILL is asynchronous: reaping the launcher does not imply the
+        // scheduler has already delivered the signal to every descendant.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let state = std::fs::read_to_string(format!("/proc/{descendant}/stat")).ok()
+                .and_then(|text| text.rsplit_once(") ").map(|(_, fields)| fields.chars().next().unwrap()));
+            if state.is_none() || state == Some('Z') { break; }
+            assert!(std::time::Instant::now() < deadline, "descendant is still alive: {state:?}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }

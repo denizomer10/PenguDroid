@@ -14,31 +14,29 @@ impl Drop for Run {
     }
 }
 
-#[test]
-fn real_art_keyboard_and_local_window_layout() {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
-    let sysroot = std::env::var_os("PENGUDROID_TEST_SYSROOT").map(PathBuf::from)
-        .unwrap_or_else(|| workspace.join(".toolchain/sysroot"));
-    if !sysroot.join("system/framework/framework.jar").exists() {
-        eprintln!("skipping: no Android sysroot (set PENGUDROID_TEST_SYSROOT)");
-        return;
-    }
+fn run_framework_probe(sysroot: &Path, label: &str, blast: bool) -> String {
     let binary = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("pengudroid");
-    let dir = std::env::temp_dir().join(format!("pd-framework-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("pd-framework-{}-{label}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let log = dir.join("probe.log");
     let output = std::fs::File::create(&log).unwrap();
-    let child = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .args(["art-test", "--sysroot"]).arg(&sysroot)
-        .args(["--register-natives", "libandroid_runtime.so,libhwui.so", "--vm-option", "-Xint"])
+        .args(["--register-natives", "libandroid_runtime.so,libhwui.so", "--vm-option", "-Xint", "--vm-option", "-Xcheck:jni"])
         .env("PENGUDROID_PROBE_KEYBOARD", "1")
         .env("PENGUDROID_PROBE_WINDOW_CONFIG", "1")
         .env("PENGUDROID_PROBE_AUDIO_FOCUS", "1")
-        .env("PENGUDROID_PROBE_BLAST_LIFECYCLE", "1")
+        .env("PENGUDROID_PROBE_SETTINGS", "1")
         .env("PENGUDROID_TRACE_VIDEO", "1")
         .env("XDG_RUNTIME_DIR", &dir).env_remove("PENGUDROID_SOCKET")
-        .stdin(Stdio::null()).stdout(output.try_clone().unwrap()).stderr(output)
-        .spawn().unwrap();
+        .stdin(Stdio::null()).stdout(output.try_clone().unwrap()).stderr(output);
+    if blast { command.env("PENGUDROID_PROBE_BLAST_LIFECYCLE", "1"); }
+    else {
+        command.env_remove("PENGUDROID_PROBE_BLAST_LIFECYCLE")
+            .env("PENGUDROID_PROBE_PLATFORM_STATE", "1");
+    }
+    let child = command.spawn().unwrap();
     let mut run = Run { child, dir };
     let deadline = Instant::now() + Duration::from_secs(20);
     let status = loop {
@@ -48,9 +46,47 @@ fn real_art_keyboard_and_local_window_layout() {
     };
     let text = std::fs::read_to_string(log).unwrap();
     assert!(status.success(), "ART probe failed ({status}):\n{text}");
+    text
+}
+
+#[test]
+fn real_art_keyboard_and_local_window_layout() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+    let sysroot = std::env::var_os("PENGUDROID_TEST_SYSROOT").map(PathBuf::from)
+        .unwrap_or_else(|| workspace.join(".toolchain/sysroot"));
+    if !sysroot.join("system/framework/framework.jar").exists() {
+        eprintln!("skipping: no Android sysroot (set PENGUDROID_TEST_SYSROOT)");
+        return;
+    }
+    let text = run_framework_probe(&sysroot, "full", true);
+    assert!(text.contains("settings: Binder/Parcel scalar value, missing key and unsupported list passed"), "{text}");
     assert!(text.contains("blast: real framework create/destroy/recreate passed"), "{text}");
     assert_eq!(text.matches("[blast] video: consumer stopped").count(), 2, "{text}");
     assert!(text.contains("window: local WindowLayout.computeFrames = 720x1280"), "{text}");
     assert!(text.contains("native KeyCharacterMap: 6 Unicode cases passed"), "{text}");
+    assert!(text.contains("audio: framework focus transaction codes ="), "{text}");
     assert!(text.contains("audio: AIDL focus granted, current gain verified, abandon cleared"), "{text}");
+}
+
+/// Core API-37 migration gate. BLAST/media lifecycle remains a separate full
+/// gate above; this test must not be presented as Android-17 app compatibility.
+#[test]
+fn android17_core_services_under_checkjni() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+    let sysroot = std::env::var_os("PENGUDROID_TEST_ANDROID17_SYSROOT").map(PathBuf::from)
+        .unwrap_or_else(|| workspace.join(".toolchain/sysroot-android17"));
+    if !sysroot.join("system/framework/framework.jar").exists() {
+        eprintln!("skipping: no API-37 runtime (set PENGUDROID_TEST_ANDROID17_SYSROOT)");
+        return;
+    }
+    let text = run_framework_probe(&sysroot, "api37-core", false);
+    for expected in [
+        "platform: feature cache native shared-memory roundtrip passed",
+        "audio: probe framework SDK_INT=37, focusEnvironmentToken=true",
+        "binder: framework ServiceManager codes = [1, 3, 2, 4]",
+        "settings: Binder/Parcel scalar value, missing key and unsupported list passed",
+        "audio: AIDL focus granted, current gain verified, abandon cleared",
+        "window: local WindowLayout.computeFrames = 720x1280",
+        "native KeyCharacterMap: 6 Unicode cases passed",
+    ] { assert!(text.contains(expected), "missing {expected}:\n{text}"); }
 }

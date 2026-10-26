@@ -58,7 +58,8 @@ fn main() -> Result<(), slint::PlatformError> {
             let Some(entry) = state.registry.get(index as usize).cloned() else { return };
             if state.running.contains_key(&entry.package) || state.stopping.contains(&entry.package) { return; }
             let fps = state.registry.app_setting(&entry.package, "fps_meter", false);
-            match runner::RunningApp::launch(&entry, fps) {
+            let keymapper = state.registry.app_setting(&entry.package, "keymapper", false);
+            match runner::RunningApp::launch(&entry, fps, keymapper) {
                 Ok(child) => {
                     state.registry.set_running(&entry.package, Some(child.id()));
                     state.running.insert(entry.package.clone(), child);
@@ -94,7 +95,7 @@ fn main() -> Result<(), slint::PlatformError> {
             if let Some(entry) = entry {
                 let result = state.registry.set_app_setting(&entry.package, "keymapper", on);
                 ui.set_status(match result {
-                    Ok(()) => format!("{}: controls profile {}. Runtime mapping is not connected yet.", entry.label, if on { "enabled" } else { "disabled" }).into(),
+                    Ok(()) => format!("{}: controls profile {}. Applies on next launch.", entry.label, if on { "enabled" } else { "disabled" }).into(),
                     Err(e) => format!("Cannot save preference: {e}").into(),
                 });
                 select(&ui, &state, ui.get_selected());

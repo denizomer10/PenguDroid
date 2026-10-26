@@ -238,18 +238,25 @@ impl Layout {
             boot_jars.push(icu);
             boot_locations.push("/apex/com.android.i18n/javalib/core-icu4j.jar".into());
         }
-        for name in [
-            "framework.jar",
-            "framework-graphics.jar",
-            "ext.jar",
-            "telephony-common.jar",
-            "voip-common.jar",
-            "ims-common.jar",
-        ] {
-            let p = framework.join(name);
-            if p.exists() {
-                boot_jars.push(p);
-                boot_locations.push(format!("/system/framework/{name}"));
+        // Android 17 split additional framework classes into jars such as
+        // framework-location and framework-ondeviceintelligence-platform.
+        // The image's classpath fragment, not a release-specific list, is the
+        // source of truth. Retain the old list for images without a fragment.
+        let configured = std::fs::read(system.join("etc/classpaths/bootclasspath.pb"))
+            .map(|bytes| jar_paths_in_bootclasspath_pb(&bytes)).unwrap_or_default();
+        let mut framework_locations: Vec<String> = configured.into_iter()
+            .filter(|p| p.starts_with("/system/framework/")).collect();
+        if framework_locations.is_empty() {
+            framework_locations = ["framework.jar", "framework-graphics.jar", "ext.jar",
+                "telephony-common.jar", "voip-common.jar", "ims-common.jar"]
+                .into_iter().map(|name| format!("/system/framework/{name}")).collect();
+        }
+        for location in framework_locations {
+            if boot_locations.contains(&location) { continue; }
+            let file = root.join(location.trim_start_matches('/'));
+            if file.is_file() {
+                boot_jars.push(file);
+                boot_locations.push(location);
             }
         }
 
@@ -1002,6 +1009,15 @@ pub fn art_main(args: &[String]) -> i32 {
             if std::env::var_os("PENGUDROID_PROBE_BLAST_LIFECYCLE").is_some() {
                 if !crate::apphost::probe_blast_lifecycle(&env) { return 1; }
             }
+            if std::env::var_os("PENGUDROID_PROBE_PLATFORM_STATE").is_some() {
+                if !crate::apphost::probe_platform_state(&env) { return 1; }
+            }
+            if std::env::var_os("PENGUDROID_PROBE_SETTINGS").is_some() {
+                if !crate::apphost::probe_settings(&env) {
+                    eprintln!("settings: Binder/Parcel probe failed");
+                    return 1;
+                }
+            }
             if std::env::var_os("PENGUDROID_PROBE_AUDIO_FOCUS").is_some() {
                 if !crate::apphost::probe_audio_focus(&env) {
                     eprintln!("audio: AIDL focus probe failed");
@@ -1447,7 +1463,13 @@ fn register_framework_natives(env: &crate::jni::JniEnv, path: &str, libs: Option
     // `register_android_os_Binder` last (it triggers `StrictMode.<clinit>`, whose
     // natives must already exist). Symbol-table order is arbitrary, so impose
     // the same shape here: a small head, then everything else, then Binder.
-    let head = ["register_android_util_Log", "register_android_util_EventLog"];
+    let head = [
+        "register_android_util_Log", "register_android_util_EventLog",
+        // API 37 DisplayManagerGlobal initializes a sysprop-backed static
+        // field while its native group is registered. Properties must precede
+        // every group that can initialize a framework class.
+        "register_android_os_SystemProperties",
+    ];
     let mut ordered: Vec<String> = Vec::with_capacity(names.len());
     for h in head {
         if let Some(i) = names.iter().position(|n| n.contains(h)) {

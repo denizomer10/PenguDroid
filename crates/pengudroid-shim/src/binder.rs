@@ -52,15 +52,16 @@ static MAP_LEN: AtomicUsize = AtomicUsize::new(0);
 /// payload size wrong desynchronises the whole command stream.
 const BC_TRANSACTION: u32 = 0x4040_6300;
 const BC_REPLY: u32 = 0x4040_6301;
-const BC_ACQUIRE: u32 = 0x4004_6302;
-const BC_RELEASE: u32 = 0x4004_6303;
-const BC_DECREFS: u32 = 0x4004_6304;
-const BC_INCREFS: u32 = 0x4004_6305;
-const BC_ACQUIRE_DONE: u32 = 0x4008_6306;
-const BC_RELEASE_DONE: u32 = 0x4008_6307;
-const BC_INCREFS_DONE: u32 = 0x4008_6308;
-const BC_FREE_BUFFER: u32 = 0x4008_6309;
-const BC_ATTEMPT_ACQUIRE: u32 = 0x4004_630b;
+const BC_ACQUIRE_RESULT: u32 = 0x4004_6302;
+const BC_FREE_BUFFER: u32 = 0x4008_6303;
+const BC_INCREFS: u32 = 0x4004_6304;
+const BC_ACQUIRE: u32 = 0x4004_6305;
+const BC_RELEASE: u32 = 0x4004_6306;
+const BC_DECREFS: u32 = 0x4004_6307;
+const BC_INCREFS_DONE: u32 = 0x4010_6308;
+const BC_ACQUIRE_DONE: u32 = 0x4010_6309;
+const BC_ATTEMPT_ACQUIRE: u32 = 0x4008_630a;
+const BC_REGISTER_LOOPER: u32 = 0x0000_630b;
 const BC_ENTER_LOOPER: u32 = 0x0000_630c;
 const BC_EXIT_LOOPER: u32 = 0x0000_630d;
 const BC_REQUEST_DEATH_NOTIFICATION: u32 = 0x4010_630e;
@@ -477,6 +478,29 @@ unsafe fn hidl_service_manager_reply(
 /// `android.os.IServiceManager` transaction codes.
 const ISM_GET_SERVICE: u32 = 1;
 const ISM_CHECK_SERVICE: u32 = 2;
+// get/check legacy binder replies, followed by get/check Service-union replies.
+static SERVICE_MANAGER_CODES: Mutex<[u32; 4]> = Mutex::new([1, 2, 0, 0]);
+
+fn service_manager_shape(codes: [u32; 4], code: u32) -> Option<bool> {
+    if codes[..2].contains(&code) { Some(false) }
+    else if code != 0 && codes[2..].contains(&code) { Some(true) }
+    else { None }
+}
+
+#[no_mangle]
+pub extern "C" fn __pengudroid_binder_set_service_manager_codes(
+    get: u32, check: u32, get2: u32, check2: u32,
+) -> bool {
+    let codes = [get, check, get2, check2];
+    if get == 0 || check == 0 || (get2 == 0) != (check2 == 0)
+        || codes.iter().any(|&c| c >= 0x00ff_fffe)
+        || codes.iter().enumerate().any(|(i, &c)| c != 0 && codes[..i].contains(&c)) {
+        return false;
+    }
+    *SERVICE_MANAGER_CODES.lock().unwrap_or_else(|e| e.into_inner()) = codes;
+    true
+}
+
 
 /// `android.content.pm.IPackageManager` transaction code for `getPackageInfo`.
 ///
@@ -510,6 +534,15 @@ const IPM_GET_PROVIDER_INFO: u32 = 15;
 /// server the reply is empty, the singleton caches null and the next call NPEs
 /// inside `createBaseContextForActivity`.
 const ATM_GET_ACTIVITY_CLIENT_CONTROLLER: u32 = 18;
+static APPLICATION_TRANSACTION_CODES: Mutex<[u32; 2]> = Mutex::new([18, 23]);
+
+#[no_mangle]
+pub extern "C" fn __pengudroid_binder_set_application_transactions(controller: u32, provider: u32) -> bool {
+    if [controller, provider].iter().any(|&code| code == 0 || code >= 0x00ff_fffe) { return false; }
+    *APPLICATION_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner()) = [controller, provider];
+    true
+}
+
 
 /// `IActivityManager` transaction code for `getContentProvider`.
 ///
@@ -668,41 +701,102 @@ static VSYNC_SEND_FDS: std::sync::LazyLock<std::sync::Mutex<Vec<RawFd>>> =
 /// `IWindowManager` transaction code for `openSession`.
 const IWM_OPEN_SESSION: u32 = 4;
 
-/// `IWindowSession` transaction codes, read out of this framework.jar with
-/// `--dump-class android.view.IWindowSession$Stub`.
-const IWS_ADD_TO_DISPLAY_AS_USER: u32 = 2;
-const IWS_REMOVE: u32 = 4;
-const IWS_RELAYOUT: u32 = 5;
+/// Semantic identifiers for the `IWindowSession` methods this broker answers.
+///
+/// The numeric transaction codes are *not* stable across releases: Android 17
+/// inserted `relayout2`/`relayoutAsync2` after `relayout`, moved `remove` from
+/// 4 to 3 and dropped `prepareToReplaceWindows`/`setInTouchMode` entirely. The
+/// shim therefore asks the loaded framework for its generated
+/// `IWindowSession$Stub.TRANSACTION_*` constants and dispatches on these ids,
+/// keeping the API-33 table only as a fallback.
+const WS_ADD_TO_DISPLAY: u8 = 1;
+const WS_ADD_TO_DISPLAY_AS_USER: u8 = 2;
+const WS_REMOVE: u8 = 3;
+const WS_RELAYOUT: u8 = 4;
+const WS_RELAYOUT2: u8 = 5;
 /// `relayoutAsync`: the one-way variant `ViewRootImpl` uses when only the
 /// layout params changed. It clears `mWinFrame` and waits for the window
 /// manager to call back `IWindow.resized` — the same call, without the reply.
-const IWS_RELAYOUT_ASYNC: u32 = 6;
-const IWS_PREPARE_TO_REPLACE_WINDOWS: u32 = 7;
-const IWS_SET_INSETS: u32 = 9;
-const IWS_FINISH_DRAWING: u32 = 10;
-const IWS_SET_IN_TOUCH_MODE: u32 = 11;
-const IWS_GET_IN_TOUCH_MODE: u32 = 12;
-const IWS_PERFORM_HAPTIC_FEEDBACK: u32 = 13;
-const IWS_ON_RECTANGLE_ON_SCREEN_REQUESTED: u32 = 27;
-const IWS_GET_WINDOW_ID: u32 = 28;
-const IWS_POKE_DRAW_LOCK: u32 = 29;
-const IWS_UPDATE_POINTER_ICON: u32 = 32;
-const IWS_UPDATE_TAP_EXCLUDE_REGION: u32 = 33;
-const IWS_UPDATE_INPUT_CHANNEL: u32 = 38;
-const IWS_CLEAR_TOUCHABLE_REGION: u32 = 42;
+const WS_RELAYOUT_ASYNC: u8 = 6;
+const WS_RELAYOUT_ASYNC2: u8 = 7;
+const WS_OUT_OF_MEMORY: u8 = 8;
+const WS_SET_INSETS: u8 = 9;
+const WS_FINISH_DRAWING: u8 = 10;
+const WS_GET_IN_TOUCH_MODE: u8 = 11;
+const WS_PERFORM_HAPTIC_FEEDBACK: u8 = 12;
+const WS_ON_RECTANGLE_ON_SCREEN_REQUESTED: u8 = 13;
+const WS_GET_WINDOW_ID: u8 = 14;
+const WS_POKE_DRAW_LOCK: u8 = 15;
+const WS_UPDATE_POINTER_ICON: u8 = 16;
+const WS_UPDATE_TAP_EXCLUDE_REGION: u8 = 17;
+const WS_UPDATE_INPUT_CHANNEL: u8 = 18;
+const WS_CLEAR_TOUCHABLE_REGION: u8 = 19;
+const WS_CANCEL_DRAW: u8 = 20;
+const WS_MOVE_FOCUS_TO_ADJACENT_WINDOW: u8 = 21;
+const WS_GRANT_INPUT_CHANNEL: u8 = 22;
 
-/// The reply to `IWindowSession.addToDisplayAsUser`, built by the host with the
-/// framework's own `Parcel` writer.
-static WINDOW_REPLY: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
-
-/// `InsetsState.SIZE`, the number of inset types this framework knows about.
+/// The API-37 `code -> semantic id` table, installed by the host from the
+/// loaded framework's own `IWindowSession$Stub`.
 ///
-/// `ViewRootImpl` passes `mTempControls`, an `InsetsSourceControl[SIZE]`, as the
-/// `out InsetsSourceControl[]` argument, and the AIDL proxy reads it with
-/// `readTypedArray(T[], Creator)`, which throws "bad array lengths" unless the
-/// count matches exactly.
-static INSETS_SIZE: AtomicU32 = AtomicU32::new(0);
+/// Android 13 support was removed on purpose: there is no legacy default, so a
+/// window session transaction is only answered once the host has published the
+/// real Android 17 constants. An empty table means "framework not initialised",
+/// not "fall back to older numbers".
+static WINDOW_SESSION_CODES: std::sync::LazyLock<Mutex<Vec<(u32, u8)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Map a transaction code to the method this broker answers, if any.
+fn window_session_method(code: u32) -> Option<u8> {
+    WINDOW_SESSION_CODES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, m)| *m)
+}
+
+/// `bool __pengudroid_binder_set_window_session_codes(const u32 *pairs, size_t len)`
+///
+/// `pairs` is `[code, semantic_id, code, semantic_id, ...]`.
+///
+/// # Safety
+/// `pairs` must point to `len` readable `u32`s.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_window_session_codes(
+    pairs: *const u32,
+    len: usize,
+) -> bool {
+    if pairs.is_null() || len == 0 || len % 2 != 0 {
+        return false;
+    }
+    let values = std::slice::from_raw_parts(pairs, len);
+    let mut table: Vec<(u32, u8)> = Vec::with_capacity(len / 2);
+    for pair in values.chunks_exact(2) {
+        let (code, method) = (pair[0], pair[1] as u8);
+        if code == 0 || code >= 0x00ff_fffe || method == 0 {
+            continue;
+        }
+        if table.iter().any(|&(c, m)| c == code || m == method) {
+            continue;
+        }
+        table.push((code, method));
+    }
+    if table.is_empty() {
+        return false;
+    }
+    *WINDOW_SESSION_CODES.lock().unwrap_or_else(|e| e.into_inner()) = table;
+    true
+}
+
+/// A marshalled `android.view.WindowRelayoutResult` from the loaded Android 17
+/// framework.
+///
+/// Android 17 replaced the four separate `relayout` out-parameters
+/// (`ClientWindowFrames`, `MergedConfiguration`, `InsetsState`,
+/// `InsetsSourceControl[]`) with this single parcelable, so the old reply body
+/// no longer lines up with what the client reads.
+static WINDOW_RELAYOUT_RESULT: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
 /// The server ends of the input channels handed to the client.
 static INPUT_SERVER_FDS: std::sync::LazyLock<std::sync::Mutex<Vec<RawFd>>> =
@@ -752,7 +846,7 @@ static EMPTY_BUNDLE: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
 ///
 /// The framework asks the `settings` provider with
 /// `IContentProvider.call("GET_secure", <key>, …)` and reads
-/// `reply.getString(<key>)`. There is no provider here, so the host installs a
+/// `reply.getString("value")`. There is no provider here, so the host installs a
 /// marshalled `Bundle` per key with [`__pengudroid_binder_set_setting`].
 ///
 /// A few keys are load-bearing rather than cosmetic: Roblox reads
@@ -786,25 +880,40 @@ const IDM_GET_DISPLAY_INFO: u32 = 1;
 
 /// Framework-marshalled virtual keyboard InputDevice, including its native map.
 static VIRTUAL_INPUT_DEVICE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+const INPUT_OPERATIONS: [u32; 8] = [1, 2, 3, 4, 5, 6, 7, 22];
+static INPUT_TRANSACTION_CODES: Mutex<[u32; 8]> = Mutex::new(INPUT_OPERATIONS);
 
-/// IAudioService codes verified with this framework's IAudioService$Stub.
-const IAS_REQUEST_AUDIO_FOCUS: u32 = 66;
-const IAS_ABANDON_AUDIO_FOCUS: u32 = 67;
-const IAS_UNREGISTER_AUDIO_FOCUS_CLIENT: u32 = 68;
-const IAS_GET_CURRENT_AUDIO_FOCUS: u32 = 69;
+/// `codes` points to the eight generated IInputManager constants in semantic order.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_input_transactions(codes: *const u32, len: usize) -> bool {
+    if codes.is_null() || len != 8 { return false; }
+    let codes: [u32; 8] = std::slice::from_raw_parts(codes, len).try_into().unwrap();
+    if codes.iter().enumerate().any(|(i, &c)| (c == 0 && i != 2) || c >= 0x00ff_fffe)
+        || codes.iter().enumerate().any(|(i, c)| *c != 0 && codes[..i].contains(c)) { return false; }
+    *INPUT_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner()) = codes;
+    true
+}
+
+
 static AUDIO_FOCUS: crate::audiofocus::AudioFocus = crate::audiofocus::AudioFocus::new();
+static AUDIO_FOCUS_TRANSACTIONS: Mutex<crate::audiofocus::Transactions> =
+    Mutex::new(crate::audiofocus::Transactions::LEGACY);
+
+/// Install the loaded framework's generated Stub codes as one validated unit.
+#[no_mangle]
+pub extern "C" fn __pengudroid_binder_set_audio_focus_transactions(
+    request: u32, abandon: u32, unregister: u32, current: u32,
+) -> bool {
+    let Some(table) = crate::audiofocus::Transactions::new([request, abandon, unregister, current]) else {
+        return false;
+    };
+    *AUDIO_FOCUS_TRANSACTIONS.lock().unwrap_or_else(|e| e.into_inner()) = table;
+    true
+}
+
 
 /// A serialized `DisplayInfo` for the default display.
 static DISPLAY_INFO: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
-
-/// The marshalled `ClientWindowFrames` + `MergedConfiguration` prefix of an
-/// `IWindowSession.relayout` reply.
-///
-/// Built by the host with the framework's own `Parcel.writeTypedObject`, because
-/// the field order inside `ClientWindowFrames` is a framework detail and getting
-/// it wrong shifts every following out-parameter.
-static RELAYOUT_FRAMES: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
 /// A `PackageInfo` reply serialized by the host with the framework's own
@@ -987,13 +1096,16 @@ pub unsafe fn ioctl(fd: RawFd, request: c_ulong, arg: *mut c_void) -> Option<c_i
 /// moment a command carries a different argument type than expected (which is
 /// exactly how `BC_TRANSACTION_SG` used to swallow the next transaction).
 fn command_payload(cmd: u32) -> Option<u64> {
-    if cmd & 0x4000_0000 == 0 {
-        // `_IO('c', nr)`: no payload (`BC_ENTER_LOOPER`, `BC_EXIT_LOOPER`).
-        return Some(0);
+    if (cmd >> 8) & 0xff != u32::from(b'c') {
+        return None;
     }
+    let direction = cmd >> 30;
     let size = ((cmd >> 16) & 0x3fff) as u64;
-    // A sane upper bound: `binder_transaction_data_sg` is the largest at 72.
-    (size <= 4096).then_some(size)
+    match direction {
+        0 if size == 0 => Some(0),
+        1 if size <= 4096 => Some(size),
+        _ => None,
+    }
 }
 
 fn push_u32(out: &mut Vec<u8>, value: u32) {
@@ -1079,6 +1191,30 @@ fn push_flat_handle(parcel: &mut Vec<u8>, objects: &mut Vec<u64>, handle: u32) {
     parcel.extend_from_slice(&BINDER_STABILITY_SYSTEM.to_ne_bytes());
 }
 
+/// Encode our own reply from the AIDL schema. New clients read a typed Service
+/// union (tag 0) containing a typed, size-delimited ServiceWithMetadata.
+fn push_service_reply(parcel: &mut Vec<u8>, objects: &mut Vec<u64>,
+    handle: Option<u32>, metadata: bool) {
+    let size_at = if metadata {
+        for value in [1u32, 0, 1] { parcel.extend_from_slice(&value.to_ne_bytes()); }
+        let at = parcel.len();
+        parcel.extend_from_slice(&0u32.to_ne_bytes());
+        Some(at)
+    } else { None };
+    if let Some(handle) = handle {
+        push_flat_handle(parcel, objects, handle);
+    } else {
+        parcel.extend_from_slice(&BINDER_TYPE_BINDER.to_ne_bytes());
+        parcel.extend_from_slice(&0x7fu32.to_ne_bytes());
+        parcel.extend_from_slice(&[0u8; 16]);
+    }
+    if let Some(at) = size_at {
+        parcel.extend_from_slice(&0u32.to_ne_bytes()); // isLazyService = false
+        let size = (parcel.len() - at) as u32;
+        parcel[at..at + 4].copy_from_slice(&size.to_ne_bytes());
+    }
+}
+
 /// Append a `flat_binder_object` of type `BINDER_TYPE_FD`.
 ///
 /// `Parcel::writeFileDescriptor` writes the descriptor number in the `handle`
@@ -1124,8 +1260,15 @@ fn provider_reply(code: u32, data: Option<&[u8]>, parcel: &mut Vec<u8>, objects:
             parcel.extend_from_slice(&0u32.to_ne_bytes()); // no window
         }
         ICP_CALL => {
+            // Android's getStringsForPrefix accepts null as an unsupported
+            // list request and returns an empty map. Never reuse a scalar
+            // Bundle here: getSerializable("value") expects a HashMap.
+            if data.is_some_and(|data| parcel_contains_string16(data, "LIST_config")) {
+                parcel.extend_from_slice(&(-1i32).to_ne_bytes());
+                return;
+            }
             // `Settings.NameValueCache` calls with the key as the `arg`
-            // argument and reads `bundle.getString(key)`; `getStringsForPrefix`
+            // argument and reads `bundle.getString("value")`; `getStringsForPrefix`
             // asks for a prefix instead and expects a `HashMap` under "value".
             // Match the parcel against the keys the host installed rather than
             // trying to parse the AIDL argument order.
@@ -1133,7 +1276,7 @@ fn provider_reply(code: u32, data: Option<&[u8]>, parcel: &mut Vec<u8>, objects:
                 let entries = SETTING_ENTRIES.lock().unwrap_or_else(|e| e.into_inner());
                 entries
                     .iter()
-                    .find(|(key, _)| parcel_contains_utf16(data, key))
+                    .find(|(key, _)| parcel_contains_string16(data, key))
                     .map(|(_, bytes)| bytes.clone())
             });
             match matched {
@@ -1180,154 +1323,236 @@ fn provider_reply(code: u32, data: Option<&[u8]>, parcel: &mut Vec<u8>, objects:
 /// surface it hands back is not a real one yet, so drawing stops at the
 /// `SurfaceControl` boundary.
 fn window_session_reply(code: u32, parcel: &mut Vec<u8>, objects: &mut Vec<u64>) {
-    match code {
-        IWS_ADD_TO_DISPLAY_AS_USER => {
+    match window_session_method(code) {
+        Some(WS_ADD_TO_DISPLAY_AS_USER) => {
             add_to_display_reply(parcel, objects);
         }
-        IWS_GET_IN_TOUCH_MODE | IWS_PERFORM_HAPTIC_FEEDBACK => {
-            parcel.extend_from_slice(&0u32.to_ne_bytes()); // status
+        Some(WS_GET_IN_TOUCH_MODE) | Some(WS_PERFORM_HAPTIC_FEEDBACK) => {
             parcel.extend_from_slice(&0u32.to_ne_bytes()); // false / no feedback
         }
-        IWS_RELAYOUT => {
-            // `[result][ClientWindowFrames][MergedConfiguration][SurfaceControl]
-            //  [InsetsState][InsetsSourceControl[]][Bundle]`, in the order
-            // `IWindowSession$Stub$Proxy.relayout` declares its `out` parameters
-            // (`--dump-class android.view.IWindowSession$Stub$Proxy`, now printing
-            // signatures).
-            //
-            // The first two out-parameters are marshalled by the host with the
-            // framework's own `Parcel.writeTypedObject`: the field order inside
-            // `ClientWindowFrames` is a framework detail, and shifting it by one
-            // word makes the client read `MergedConfiguration` out of the
-            // `SurfaceControl` bytes. An absent `ClientWindowFrames` used to leave
-            // `ViewRootImpl`'s frame at 0x0, so every view measured to nothing and
-            // `draw()` skipped hwui entirely.
+        Some(WS_RELAYOUT) => {
+            // Android 17 `IWindowSession.relayout`:
+            //   `int relayout(..., out @nullable WindowRelayoutResult outRelayoutResult,
+            //                  out SurfaceControl outSurface)`
+            // The reply is `[result][presence][WindowRelayoutResult][SurfaceControl]`.
             parcel.extend_from_slice(&0u32.to_ne_bytes()); // result
-            {
-                let prefix = RELAYOUT_FRAMES.lock().unwrap_or_else(|e| e.into_inner());
-                if prefix.is_empty() {
-                    // Both absent; `ViewRootImpl` keeps what it pre-allocated.
-                    parcel.extend_from_slice(&0u32.to_ne_bytes());
-                    parcel.extend_from_slice(&0u32.to_ne_bytes());
-                } else {
-                    parcel.extend_from_slice(&prefix);
-                }
-                if trace_enabled() {
-                    // SAFETY: `diag` only writes to stderr.
-                    unsafe {
-                        diag(&format!(
-                            "[binder]   -> relayout reply: frames prefix {} byte(s){}\n",
-                            prefix.len(),
-                            if prefix.is_empty() { " (ABSENT!)" } else { "" }
-                        ));
-                    }
-                }
-            }
-            // `outSurfaceControl`: present, so `ViewRootImpl` has something to
-            // draw into. `SurfaceControl.readFromParcel` reads the Java-side
-            // header (name + size + presence) and then
-            // `SurfaceControl::readFromParcel`'s
-            // `[client][handle][layerId][transformHint][w][h][format]`.
-            parcel.extend_from_slice(&1u32.to_ne_bytes()); // present
-            // `SurfaceControl.readFromParcel` starts with `readString8`.
-            push_string8(parcel, "pengudroid");
-            parcel.extend_from_slice(&1280i32.to_ne_bytes()); // width
-            parcel.extend_from_slice(&720i32.to_ne_bytes()); // height
-            parcel.extend_from_slice(&1i32.to_ne_bytes()); // hasNativeObject
-            push_flat_handle(parcel, objects, handle_for("surface_composer_client"));
-            push_flat_handle(parcel, objects, handle_for("surface_handle"));
-            parcel.extend_from_slice(&1i32.to_ne_bytes()); // layerId
-            parcel.extend_from_slice(&0u32.to_ne_bytes()); // transformHint
-            parcel.extend_from_slice(&1280u32.to_ne_bytes()); // width
-            parcel.extend_from_slice(&720u32.to_ne_bytes()); // height
-            parcel.extend_from_slice(&1u32.to_ne_bytes()); // format: RGBA_8888
-            parcel.extend_from_slice(&0u32.to_ne_bytes()); // insets state absent
-            let size = INSETS_SIZE.load(Ordering::Relaxed) as usize;
-            parcel.extend_from_slice(&(size as u32).to_ne_bytes());
-            for _ in 0..size {
-                parcel.extend_from_slice(&0u32.to_ne_bytes()); // null element
-            }
-            parcel.extend_from_slice(&(-1i32).to_ne_bytes()); // null Bundle
+            push_window_relayout_result(parcel);
+            push_surface_control_reply(parcel, objects);
         }
-        IWS_GET_WINDOW_ID => {
-            parcel.extend_from_slice(&0u32.to_ne_bytes()); // status
+        Some(WS_RELAYOUT2) => {
+            // `int relayout2(..., in SurfaceControl surface,
+            //                out @nullable WindowRelayoutResult)`
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // result
+            push_window_relayout_result(parcel);
+        }
+        Some(WS_OUT_OF_MEMORY) | Some(WS_CANCEL_DRAW) | Some(WS_MOVE_FOCUS_TO_ADJACENT_WINDOW) => {
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // false
+        }
+        Some(WS_GET_WINDOW_ID) => {
             push_flat_handle(parcel, objects, handle_for("window_token"));
         }
-        IWS_REMOVE
-        | IWS_PREPARE_TO_REPLACE_WINDOWS
-        | IWS_SET_INSETS
-        | IWS_FINISH_DRAWING
-        | IWS_SET_IN_TOUCH_MODE
-        | IWS_ON_RECTANGLE_ON_SCREEN_REQUESTED
-        | IWS_POKE_DRAW_LOCK
-        | IWS_UPDATE_POINTER_ICON
-        | IWS_UPDATE_TAP_EXCLUDE_REGION
-        | IWS_UPDATE_INPUT_CHANNEL
-        | IWS_CLEAR_TOUCHABLE_REGION => {
-            parcel.extend_from_slice(&0u32.to_ne_bytes()); // status only
+        Some(WS_GRANT_INPUT_CHANNEL) => {
+            // `@nullable InputChannel grantInputChannel(...)`
+            push_input_channel_present(parcel, objects);
+        }
+        Some(WS_REMOVE)
+        | Some(WS_SET_INSETS)
+        | Some(WS_FINISH_DRAWING)
+        | Some(WS_ON_RECTANGLE_ON_SCREEN_REQUESTED)
+        | Some(WS_POKE_DRAW_LOCK)
+        | Some(WS_UPDATE_POINTER_ICON)
+        | Some(WS_UPDATE_TAP_EXCLUDE_REGION)
+        | Some(WS_UPDATE_INPUT_CHANNEL)
+        | Some(WS_CLEAR_TOUCHABLE_REGION) => {
+            // Everything else is `oneway void` (or `void`): the status word that
+            // `make_reply` already wrote is the whole reply.
         }
         _ => {}
     }
     if trace_enabled() {
-        unsafe { diag(&format!("[binder]   -> window session code {code}\n")) };
+        unsafe {
+            diag(&format!(
+                "[binder]   -> window session code {code} ({:?}) reply={} object(s)\n",
+                window_session_method(code),
+                objects.len()
+            ))
+        };
     }
 }
 
-/// Build the reply to `IWindowSession.addToDisplayAsUser`.
+/// The marshalled `WindowRelayoutResult` the host installed from the loaded
+/// Android 17 framework. There is no hand-written fallback.
+fn window_relayout_result() -> Option<Vec<u8>> {
+    let bytes = WINDOW_RELAYOUT_RESULT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if bytes.is_empty() {
+        None
+    } else {
+        Some(bytes.clone())
+    }
+}
+
+/// Emit an AIDL `out @nullable WindowRelayoutResult`.
+fn push_window_relayout_result(parcel: &mut Vec<u8>) {
+    match window_relayout_result() {
+        Some(result) => {
+            parcel.extend_from_slice(&1u32.to_ne_bytes()); // present
+            parcel.extend_from_slice(&result);
+        }
+        None => {
+            if trace_enabled() {
+                unsafe { diag("[binder]   window reply: NO WindowRelayoutResult installed\n") };
+            }
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // absent
+        }
+    }
+}
+
+/// The `out SurfaceControl` half of `relayout`.
 ///
-/// The status word is already in `parcel`. Everything after it mirrors what
-/// `IWindowSession$Stub` writes:
+/// `SurfaceControl.readFromParcel` reads the Java-side header and then
+/// `SurfaceControl::readFromParcel`'s
+/// `[client][handle][layerId][transformHint][w][h][format]`.
+fn push_surface_control_reply(parcel: &mut Vec<u8>, objects: &mut Vec<u64>) {
+    parcel.extend_from_slice(&1u32.to_ne_bytes()); // present
+    // `SurfaceControl.readFromParcel` starts with `readString8`.
+    push_string8(parcel, "pengudroid");
+    parcel.extend_from_slice(&1280i32.to_ne_bytes()); // width
+    parcel.extend_from_slice(&720i32.to_ne_bytes()); // height
+    parcel.extend_from_slice(&1i32.to_ne_bytes()); // hasNativeObject
+    push_flat_handle(parcel, objects, handle_for("surface_composer_client"));
+    push_flat_handle(parcel, objects, handle_for("surface_handle"));
+    parcel.extend_from_slice(&1i32.to_ne_bytes()); // layerId
+    parcel.extend_from_slice(&0u32.to_ne_bytes()); // transformHint
+    parcel.extend_from_slice(&1280u32.to_ne_bytes()); // width
+    parcel.extend_from_slice(&720u32.to_ne_bytes()); // height
+    parcel.extend_from_slice(&1u32.to_ne_bytes()); // format: RGBA_8888
+}
+
+/// Write one `android.view.InputChannel` the way Android 17's native code does.
+///
+/// Source of truth, no guessing: `libinput.so`'s
+/// `android::os::InputChannelCore::writeToParcel` (disassembled) and
+/// `android_view_InputChannel_nativeWriteToParcel` in `libandroid_runtime.so`.
+///
+/// Android 17's AIDL C++ backend prefixes every parcelable with its own byte
+/// length, so that a reader can skip fields a newer writer added:
 ///
 /// ```text
-/// int result                       ADD_OKAY
-/// InputChannel outInputChannel     presence + [hasPtr][fd][String8 name]
-/// InsetsState insetsState          presence 0 (client keeps its own)
-/// InsetsSourceControl[] controls   count == InsetsState.SIZE, all null
-/// Rect attachedFrame               presence 0 (client keeps its own)
-/// float[] sizeCompatScale          one element, 1.0
+/// int32      isInitialized = 1     written by nativeWriteToParcel
+/// int32      coreSize              bytes from coreSize through the end
+/// String16   name                  writeUtf8AsUtf16
+/// int32      parcelablePresent=1   `Parcel::writeData(const Parcelable&)`
+///                                  (`kNonNullParcelableFlag`)
+/// int32      hasComm = 0           ParcelFileDescriptor (writeParcelable)
+/// flat fd                          BINDER_TYPE_FD, flags=0, cookie=1
+/// flat token                       writeStrongBinder(nullptr): binder == 0,
+///                                  so no offset-table entry is recorded
 /// ```
 ///
-/// The `InputChannel` has to be built here rather than in the host because it
-/// carries a file descriptor, and `Parcel.marshall()` cannot express one.
-fn add_to_display_reply(parcel: &mut Vec<u8>, objects: &mut Vec<u64>) {
-    parcel.extend_from_slice(&0u32.to_ne_bytes()); // result: ADD_OKAY
+/// Missing `coreSize` was the whole reason the client logged
+/// `channel '' ... socket (-1)`: the reader treats the next word as a size and
+/// bails out with `BAD_VALUE` when it is smaller than 4. The
+/// `kNonNullParcelableFlag` word is the second half of the same story: without
+/// it `readData(Parcelable*)` returns `UNEXPECTED_NULL` and the descriptor is
+/// never read.
+fn push_input_channel_core(
+    parcel: &mut Vec<u8>,
+    objects: &mut Vec<u64>,
+    name: &str,
+    fd: RawFd,
+) {
+    parcel.extend_from_slice(&1i32.to_ne_bytes()); // isInitialized
+    let size_at = parcel.len();
+    parcel.extend_from_slice(&0i32.to_ne_bytes()); // coreSize placeholder
+    parcel.extend_from_slice(&string16(name));
+    parcel.extend_from_slice(&1i32.to_ne_bytes()); // kNonNullParcelableFlag
+    parcel.extend_from_slice(&0i32.to_ne_bytes()); // ParcelFileDescriptor.hasComm
+    objects.push(parcel.len() as u64);
+    parcel.extend_from_slice(&BINDER_TYPE_FD.to_ne_bytes());
+    parcel.extend_from_slice(&0u32.to_ne_bytes()); // flags
+    parcel.extend_from_slice(&(fd as u32).to_ne_bytes()); // handle = fd
+    parcel.extend_from_slice(&0u32.to_ne_bytes()); // alignment
+    parcel.extend_from_slice(&1u64.to_ne_bytes()); // cookie: takeOwnership
+    // `IBinder token` is null: the client only hands it back to a window manager,
+    // which PenguDroid does not have. `writeStrongBinder` emits the object and
+    // then its stability word (`finishFlattenBinder`), so the null token is 28
+    // bytes, not 24.
+    parcel.extend_from_slice(&BINDER_TYPE_BINDER.to_ne_bytes());
+    parcel.extend_from_slice(&0u32.to_ne_bytes()); // flags
+    parcel.extend_from_slice(&0u32.to_ne_bytes()); // binder == 0
+    parcel.extend_from_slice(&0u32.to_ne_bytes()); // alignment
+    parcel.extend_from_slice(&0u64.to_ne_bytes()); // cookie
+    parcel.extend_from_slice(&0u32.to_ne_bytes()); // stability repr (null binder)
+    let size = (parcel.len() - size_at) as u32;
+    parcel[size_at..size_at + 4].copy_from_slice(&size.to_ne_bytes());
+}
 
+/// Emit `[presence][InputChannel]` for an AIDL parcelable out value.
+fn push_input_channel_present(parcel: &mut Vec<u8>, objects: &mut Vec<u64>) {
     match input_channel_pair() {
-        Some((client, server)) => {
+        Some((client, server)) if std::env::var_os("PENGUDROID_NO_INPUT_CHANNEL").is_none() => {
+            // `F_GETFD` proves the descriptor is open at reply-build time; if it
+            // were -1 here, the client would fail the same way for a different
+            // reason and we would be looking in the wrong place.
+            let open = unsafe { libc::fcntl(client, libc::F_GETFD) };
+            if trace_enabled() {
+                unsafe { diag(&format!("[binder]   input channel client={client} server={server} F_GETFD={open}\n")) };
+            }
             INPUT_SERVER_FDS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(server);
-            if std::env::var_os("PENGUDROID_NO_INPUT_CHANNEL").is_some() {
-                parcel.extend_from_slice(&0u32.to_ne_bytes()); // absent
-            } else {
-                parcel.extend_from_slice(&1u32.to_ne_bytes()); // present
-                parcel.extend_from_slice(&1u32.to_ne_bytes()); // InputChannel.mPtr != 0
-                // `InputChannel::writeToParcel` writes the connection token, then
-                // the name as UTF-16, then the descriptor — in that order.
-                parcel.extend_from_slice(&[0u8; 24]); // null token binder
-                parcel.extend_from_slice(&string16("pengudroid"));
-                push_flat_fd(parcel, objects, client);
-            }
+            parcel.extend_from_slice(&1u32.to_ne_bytes()); // present
+            push_input_channel_core(parcel, objects, "pengudroid", client);
+        }
+        Some((client, server)) => {
+            // Keep both ends alive so the socketpair does not become an EOF
+            // storm, but tell the client there is no channel.
+            let mut fds = INPUT_SERVER_FDS.lock().unwrap_or_else(|e| e.into_inner());
+            fds.push(server);
+            fds.push(client);
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // absent
         }
         None => {
             parcel.extend_from_slice(&0u32.to_ne_bytes()); // absent
         }
     }
+}
 
-    // The out-parameters are read in the order the AIDL declares them.
-    parcel.extend_from_slice(&0u32.to_ne_bytes()); // InsetsState absent
-
-    let size = INSETS_SIZE.load(Ordering::Relaxed) as usize;
-    parcel.extend_from_slice(&(size as u32).to_ne_bytes());
-    for _ in 0..size {
-        parcel.extend_from_slice(&0u32.to_ne_bytes()); // null element
+/// Build the reply to `IWindowSession.addToDisplayAsUser`.
+///
+/// The status word is already in `parcel`. Android 17 declares:
+///
+/// ```text
+/// int result                              ADD_OKAY
+/// out InputChannel outInputChannel        presence + InputChannel
+/// out WindowRelayoutResult result         presence + WindowRelayoutResult
+/// ```
+///
+/// The `InputChannel` has to be built here rather than in the host because it
+/// carries a file descriptor, and `Parcel.marshall()` cannot express one.
+fn add_to_display_reply(parcel: &mut Vec<u8>, objects: &mut Vec<u64>) {
+    let start = parcel.len();
+    parcel.extend_from_slice(&0u32.to_ne_bytes()); // result: ADD_OKAY
+    push_input_channel_present(parcel, objects);
+    push_window_relayout_result(parcel);
+    if trace_enabled() {
+        let words: Vec<String> = parcel[start..]
+            .chunks_exact(4)
+            .take(12)
+            .map(|w| format!("{}", u32::from_ne_bytes([w[0], w[1], w[2], w[3]])))
+            .collect();
+        unsafe {
+            diag(&format!(
+                "[binder]   addToDisplay reply {} byte(s) head=[{}] fds={:?}\n",
+                parcel.len() - start,
+                words.join(", "),
+                objects
+            ))
+        };
     }
-
-    parcel.extend_from_slice(&0u32.to_ne_bytes()); // attachedFrame absent
-
-    parcel.extend_from_slice(&1u32.to_ne_bytes()); // float[1]
-    parcel.extend_from_slice(&1.0f32.to_ne_bytes());
 }
 
 /// `Parcel::writeString8`: a byte count, the bytes, then padding to 4.
@@ -1355,7 +1580,8 @@ fn input_channel_pair() -> Option<(RawFd, RawFd)> {
 /// and divides the byte count by `sizeof(Event)`, so each `send` has to be
 /// exactly one whole event.
 fn send_vsync() {
-    let mut event = [0u8; DISPLAY_EVENT_SIZE];
+    let modern = crate::get_prop("ro.build.version.sdk").as_deref() == Some("37");
+    let mut event = vec![0u8; if modern { 224 } else { DISPLAY_EVENT_SIZE }];
     event[0..4].copy_from_slice(&DISPLAY_EVENT_VSYNC.to_ne_bytes());
     // `displayId` stays 0 (the default display).
 
@@ -1412,7 +1638,10 @@ fn send_vsync() {
     event[40..44].copy_from_slice(&0u32.to_ne_bytes()); // preferredFrameTimelineIndex
     let vsync_id = frame as i64;
     let expected = vsync_time + FRAME_INTERVAL;
-    let base = TIMELINES_OFFSET;
+    let base = if modern {
+        event[44..48].copy_from_slice(&1u32.to_ne_bytes()); // frameTimelinesLength
+        56 // numberQueuedBuffers and alignment precede the timeline array
+    } else { TIMELINES_OFFSET };
     event[base..base + 8].copy_from_slice(&vsync_id.to_ne_bytes());
     event[base + 8..base + 16].copy_from_slice(&expected.to_ne_bytes());
     event[base + 16..base + 24].copy_from_slice(&expected.to_ne_bytes());
@@ -1512,6 +1741,17 @@ fn vsync_channel() -> Option<(RawFd, RawFd)> {
 fn parcel_contains_utf16(data: &[u8], s: &str) -> bool {
     let needle: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
     !needle.is_empty() && data.windows(needle.len()).any(|w| w == needle.as_slice())
+}
+
+/// Match a whole, aligned Parcel String16 field, not a substring of a key.
+fn parcel_contains_string16(data: &[u8], value: &str) -> bool {
+    let units: Vec<u16> = value.encode_utf16().collect();
+    let mut needle = (units.len() as u32).to_le_bytes().to_vec();
+    needle.extend(units.iter().flat_map(|u| u.to_le_bytes()));
+    needle.extend_from_slice(&[0, 0]);
+    (0..data.len()).step_by(4).any(|offset| {
+        data.get(offset..offset + needle.len()) == Some(needle.as_slice())
+    })
 }
 
 /// Reverse lookup of a handle, for diagnostics.
@@ -1822,8 +2062,11 @@ fn reply_has_status(handle: u32, code: u32) -> bool {
         );
     }
     if handle == handle_for("surface_composer_client") {
-        // `callRemote` reads the out parameters first and the status last.
-        return false;
+        // Android 17's `android.gui.ISurfaceComposerClient` is generated AIDL, so
+        // its replies start with a `binder::Status`, exactly like every other
+        // AIDL interface. (The pre-17 hand-written interface read its outs first
+        // and its status last, which is where the old exception came from.)
+        return true;
     }
     if handle == handle_for("media.resource_manager") && code == INTERFACE_TRANSACTION {
         // `BpBinder::getInterfaceDescriptor` (`libbinder.so` `0x5ef60`) calls
@@ -1843,6 +2086,28 @@ fn reply_has_status(handle: u32, code: u32) -> bool {
 unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
     let mut parcel = Vec::new();
     let mut objects = Vec::new();
+    // API-37 android.gui.ISurfaceComposer is generated AIDL. Its method
+    // numbers and status prefix differ from the legacy android.ui interface,
+    // even when both are accessed through the same service alias.
+    if is_surface_flinger(tr.target_handle) && crate::get_prop("ro.build.version.sdk").as_deref() == Some("37")
+        && tr.data_size > 0 && tr.data_ptr != 0 {
+        let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
+        if parcel_contains_string16(data, "android.gui.ISurfaceComposer") && matches!(tr.code, 2 | 3 | 6 | 7 | 34) {
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // AIDL Status
+            match tr.code {
+                2 => push_flat_handle(&mut parcel, &mut objects, handle_for("display_event_connection")),
+                3 => push_flat_handle(&mut parcel, &mut objects, handle_for("surface_composer_client")),
+                6 => { // one hosted display
+                    parcel.extend_from_slice(&1i32.to_ne_bytes());
+                    parcel.extend_from_slice(&0i64.to_ne_bytes());
+                }
+                7 => push_flat_handle(&mut parcel, &mut objects, handle_for("display_token")),
+                34 => for value in [0i32, 1, 0, 1] { parcel.extend_from_slice(&value.to_ne_bytes()); },
+                _ => unreachable!(),
+            }
+            return Reply { parcel, objects };
+        }
+    }
     if trace_enabled() {
         let name = name_for_handle(tr.target_handle).unwrap_or_else(|| "?".to_string());
         diag(&format!(
@@ -1975,26 +2240,14 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             diag("[binder]   -> display_token handle\n");
         }
     }
-    if tr.target_handle == 0
-        && (tr.code == ISM_GET_SERVICE || tr.code == ISM_CHECK_SERVICE)
-        && !is_hidl_request(tr)
-    {
-        if tr.data_size > 0 && tr.data_ptr != 0 {
-            let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
-            if let Some(name) = last_string16(data) {
-                if trace_enabled() {
-                    diag(&format!("[binder]   -> {name} (handle {})\n", handle_for(&name)));
-                }
-                if name == "autofill" {
-                    // No autofill engine is hosted. Advertising a dummy binder
-                    // makes AutofillManager.addClient wait five seconds for a
-                    // callback on every focus/layout change. Service absence is
-                    // Android's supported "autofill unavailable" path.
-                    parcel.extend_from_slice(&BINDER_TYPE_BINDER.to_ne_bytes());
-                    parcel.extend_from_slice(&0x7fu32.to_ne_bytes());
-                    parcel.extend_from_slice(&[0u8; 16]); // null binder + cookie
-                } else {
-                    push_flat_handle(&mut parcel, &mut objects, handle_for(&name));
+    if tr.target_handle == 0 && !is_hidl_request(tr) {
+        let codes = *SERVICE_MANAGER_CODES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(metadata) = service_manager_shape(codes, tr.code) {
+            if tr.data_size > 0 && tr.data_ptr != 0 {
+                let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
+                if let Some(name) = last_string16(data) {
+                    let handle = (name != "autofill").then(|| handle_for(&name));
+                    push_service_reply(&mut parcel, &mut objects, handle, metadata);
                 }
             }
         }
@@ -2132,7 +2385,7 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
     if tr.target_handle == 0 && is_hidl_request(tr) {
         unsafe { hidl_service_manager_reply(tr.code, &mut parcel, &mut objects, tr) };
     }
-    if tr.target_handle == handle_for("activity_task") && tr.code == ATM_GET_ACTIVITY_CLIENT_CONTROLLER {
+    if tr.target_handle == handle_for("activity_task") && tr.code == APPLICATION_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner())[0] {
         push_flat_handle(
             &mut parcel,
             &mut objects,
@@ -2234,7 +2487,7 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             note_service_request(&pkg, &cls, tr.code, data, intent_offset);
         }
     }
-    if tr.target_handle == handle_for("activity") && tr.code == IAM_GET_CONTENT_PROVIDER {
+    if tr.target_handle == handle_for("activity") && tr.code == APPLICATION_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner())[1] {
         let info = PROVIDER_INFO.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if !info.is_empty() {
             // `ContentProviderHolder` layout, measured by marshalling one with
@@ -2365,8 +2618,10 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         parcel.extend_from_slice(&1u32.to_ne_bytes());
     }
     if tr.target_handle == handle_for("audio") {
-        match tr.code {
-            IAS_REQUEST_AUDIO_FOCUS => {
+        let operation = AUDIO_FOCUS_TRANSACTIONS.lock()
+            .unwrap_or_else(|e| e.into_inner()).operation(tr.code);
+        match operation {
+            Some(crate::audiofocus::Operation::Request) => {
                 let data = if tr.data_size > 0 && tr.data_ptr != 0 {
                     std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize)
                 } else { &[] };
@@ -2383,19 +2638,22 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                     diag(&format!("[binder]   -> audio focus gain={gain} result={result}\n"));
                 }
             }
-            IAS_ABANDON_AUDIO_FOCUS => parcel.extend_from_slice(&AUDIO_FOCUS.abandon().to_ne_bytes()),
-            IAS_UNREGISTER_AUDIO_FOCUS_CLIENT => { AUDIO_FOCUS.abandon(); }
-            IAS_GET_CURRENT_AUDIO_FOCUS => parcel.extend_from_slice(&AUDIO_FOCUS.current().to_ne_bytes()),
+            Some(crate::audiofocus::Operation::Abandon) => parcel.extend_from_slice(&AUDIO_FOCUS.abandon().to_ne_bytes()),
+            Some(crate::audiofocus::Operation::Unregister) => { AUDIO_FOCUS.abandon(); }
+            Some(crate::audiofocus::Operation::Current) => parcel.extend_from_slice(&AUDIO_FOCUS.current().to_ne_bytes()),
             _ => {}
         }
     }
-    if tr.target_handle == handle_for("input") && matches!(tr.code, 1..=7 | 22) {
+    if tr.target_handle == handle_for("input") {
+        let codes = INPUT_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner());
+        let operation = codes.iter().position(|&code| code != 0 && code == tr.code).map(|i| INPUT_OPERATIONS[i]);
+        drop(codes);
         let data = if tr.data_size > 0 && tr.data_ptr != 0 {
             std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize)
         } else { &[] };
         if let Some(args) = crate::virtual_input::arguments(data) {
             let device = VIRTUAL_INPUT_DEVICE.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(body) = crate::virtual_input::reply(tr.code, args, &device) {
+            if let Some(body) = operation.and_then(|code| crate::virtual_input::reply(code, args, &device)) {
                 parcel.extend_from_slice(&body);
             }
         }
@@ -2438,14 +2696,33 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
     if tr.target_handle == handle_for("surface_composer_client")
         && tr.code == ISCC_CREATE_SURFACE
     {
-        // `[handle][gbp][layerId][transformHint][status]`.
+        // `CreateSurfaceResult createSurface(@utf8InCpp String name, int flags,
+        //   @nullable IBinder parent, in LayerMetadata metadata)`
+        //
+        // The reply is `[Status][CreateSurfaceResult]` and the parcelable is
+        // written by `android::gui::CreateSurfaceResult::writeToParcel`
+        // (disassembled from the shipped `libgui.so`):
+        //
+        //   int32    size prefix
+        //   binder   handle    (+ stability word)
+        //   int32    layerId
+        //   String16 layerName
+        //   int32    transformHint
+        //
+        // `Parcel::readData(Parcelable*)` reads the `kNonNullParcelableFlag`
+        // word first and returns `UNEXPECTED_NULL` when it is not 1, which the
+        // proxy then turns into `PERMISSION_DENIED`.
+        parcel.extend_from_slice(&1i32.to_ne_bytes()); // kNonNullParcelableFlag
+        let size_at = parcel.len();
+        parcel.extend_from_slice(&0i32.to_ne_bytes()); // size placeholder
         push_flat_handle(&mut parcel, &mut objects, handle_for("surface_handle"));
-        push_flat_handle(&mut parcel, &mut objects, handle_for("graphic_buffer_producer"));
         parcel.extend_from_slice(&1i32.to_ne_bytes()); // layerId
+        parcel.extend_from_slice(&string16("pengudroid")); // layerName
         parcel.extend_from_slice(&0u32.to_ne_bytes()); // transformHint
-        parcel.extend_from_slice(&0i32.to_ne_bytes()); // status: NO_ERROR
+        let size = (parcel.len() - size_at) as u32;
+        parcel[size_at..size_at + 4].copy_from_slice(&size.to_ne_bytes());
         if trace_enabled() {
-            diag("[binder]   -> createSurface handle + gbp\n");
+            diag("[binder]   -> CreateSurfaceResult\n");
         }
     }
     if is_surface_flinger(tr.target_handle) && tr.code == ISC_AUTHENTICATE_SURFACE {
@@ -2530,7 +2807,7 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         // in a typical app (an activity and a dialog), and a reply that lands
         // for one but not the other is invisible without this.
         if trace_enabled()
-            && tr.code == IWS_ADD_TO_DISPLAY_AS_USER
+            && window_session_method(tr.code) == Some(WS_ADD_TO_DISPLAY_AS_USER)
             && tr.data_size > 0
             && tr.data_ptr != 0
         {
@@ -2550,7 +2827,7 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             std::sync::atomic::AtomicU64::new(1);
         let mut relayout_tick: Option<(u64, u64)> = None;
         if trace_enabled()
-            && tr.code == IWS_RELAYOUT_ASYNC
+            && window_session_method(tr.code) == Some(WS_RELAYOUT_ASYNC)
             && tr.data_size > 0
             && tr.data_ptr != 0
         {
@@ -2572,7 +2849,11 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             }
             diag(&dump);
         }
-        if trace_enabled() && tr.code == IWS_RELAYOUT && tr.data_size > 0 && tr.data_ptr != 0 {
+        if trace_enabled()
+            && window_session_method(tr.code) == Some(WS_RELAYOUT)
+            && tr.data_size > 0
+            && tr.data_ptr != 0
+        {
             let data =
                 std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
             let win = find_local_binder(data).map(|(_, cookie, _)| cookie).unwrap_or(0);
@@ -2613,7 +2894,7 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                 parcel.len() - reply_start
             ));
         }
-        if tr.code == IWS_RELAYOUT_ASYNC {
+        if window_session_method(tr.code) == Some(WS_RELAYOUT_ASYNC) {
             // `relayoutAsync` has no reply: the client expects the window manager
             // to call `IWindow.resized`, and it uses that call as the "layout is
             // settled" signal.
@@ -2969,7 +3250,7 @@ unsafe fn handle_write_read(wr: *mut WriteRead) -> c_int {
     let mut answered_transaction = false;
     let mut off = 0u64;
     while off + 4 <= wr.write_size {
-        let cmd = *((wr.write_buffer + off) as *const u32);
+        let cmd = std::ptr::read_unaligned((wr.write_buffer + off) as *const u32);
         off += 4;
         let Some(size) = command_payload(cmd) else { break };
         if off + size > wr.write_size {
@@ -3420,26 +3701,20 @@ pub unsafe extern "C" fn __pengudroid_binder_set_provider_entry(
         .insert(key, value);
 }
 
-/// `void __pengudroid_binder_set_insets_size(int size)`
-///
-/// # Safety
-/// Plain integer setter; safe to call from any thread.
-#[no_mangle]
-pub unsafe extern "C" fn __pengudroid_binder_set_insets_size(size: c_int) {
-    INSETS_SIZE.store(size.max(0) as u32, Ordering::Relaxed);
-}
-
-/// `void __pengudroid_binder_set_window_reply(const uint8_t *bytes, size_t len)`
+/// `void __pengudroid_binder_set_window_relayout_result(const uint8_t *bytes, size_t len)`
 ///
 /// # Safety
 /// `ptr` must point to `len` readable bytes.
 #[no_mangle]
-pub unsafe extern "C" fn __pengudroid_binder_set_window_reply(ptr: *const u8, len: usize) {
+pub unsafe extern "C" fn __pengudroid_binder_set_window_relayout_result(
+    ptr: *const u8,
+    len: usize,
+) {
     if ptr.is_null() || len == 0 {
         return;
     }
     let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
-    *WINDOW_REPLY.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
+    *WINDOW_RELAYOUT_RESULT.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
 }
 
 /// `void __pengudroid_binder_set_activity_info(const uint8_t *bytes, size_t len)`
@@ -3641,19 +3916,6 @@ pub unsafe extern "C" fn __pengudroid_binder_set_display_info(ptr: *const u8, le
     *DISPLAY_INFO.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
 }
 
-/// `void __pengudroid_binder_set_relayout_frames(const uint8_t *bytes, size_t len)`
-///
-/// # Safety
-/// `ptr` must point to `len` readable bytes.
-#[no_mangle]
-pub unsafe extern "C" fn __pengudroid_binder_set_relayout_frames(ptr: *const u8, len: usize) {
-    if ptr.is_null() || len == 0 {
-        return;
-    }
-    let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
-    *RELAYOUT_FRAMES.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
-}
-
 /// `void __pengudroid_binder_set_resized_payload(const uint8_t *bytes, size_t len)`
 ///
 /// Installs the body of `IWindow.resized` after the interface token. The host
@@ -3737,6 +3999,88 @@ mod tests {
         assert_eq!(command_payload(BC_FREE_BUFFER), Some(8));
         assert_eq!(command_payload(BC_ENTER_LOOPER), Some(0));
         assert_eq!(command_payload(0xdead_beef), None);
+        assert_eq!(command_payload(0x0000_720c), None);
+        assert_eq!(command_payload(0x8004_6302), None);
+        assert_eq!(command_payload(0x0004_6302), None);
+        assert_eq!(command_payload(BC_INCREFS_DONE), Some(16));
+        assert_eq!(command_payload(BC_ATTEMPT_ACQUIRE), Some(8));
+    }
+
+    /// Compile the reference UAPI, rather than comparing two handwritten tables.
+    #[test]
+    fn android17_kernel_uapi_matches() {
+        use std::process::Command;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let kernel = std::env::var_os("PENGUDROID_TEST_KERNEL_SOURCE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| root.join(".toolchain/references/kernel-android17-6.18-2026-06_r1"));
+        let header = kernel.join("include/uapi/linux/android/binder.h");
+        if !header.exists() {
+            eprintln!("reference kernel absent; set PENGUDROID_TEST_KERNEL_SOURCE for UAPI verification");
+            return;
+        }
+        let temp = std::env::temp_dir().join(format!("pd-binder-uapi-{}", std::process::id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let source = temp.join("probe.c");
+        let executable = temp.join("probe");
+        let mut c = format!("#include <stdio.h>\n#include \"{}\"\nint main(void) {{\n", header.display());
+        c.push_str("printf(\"%u\\n\", (unsigned)BC_TRANSACTION);\n");
+        c.push_str("printf(\"%u\\n\", (unsigned)BC_REPLY);\n");
+        c.push_str("printf(\"%u\\n\", (unsigned)BC_ACQUIRE_RESULT);\n");
+        c.push_str("printf(\"%u\\n\", (unsigned)BC_FREE_BUFFER);\n");
+        c.push_str("printf(\"%u\\n\", (unsigned)BC_INCREFS);\n");
+        c.push_str("printf(\"%u\\n\", (unsigned)BC_ACQUIRE);\n");
+        c.push_str("printf(\"%u\\n\", (unsigned)BC_RELEASE);\n");
+        c.push_str("printf(\"%u\\n\", (unsigned)BC_DECREFS);\n");
+        c.push_str("printf(\"%u\\n\", (unsigned)BC_INCREFS_DONE);\n");
+        c.push_str("printf(\"%u\\n\", (unsigned)BC_ACQUIRE_DONE);\n");
+        c.push_str("printf(\"%u\\n\", (unsigned)BC_ATTEMPT_ACQUIRE);\n");
+        c.push_str("printf(\"%u\\n\", (unsigned)BC_REGISTER_LOOPER);\n");
+        c.push_str("printf(\"%u\\n\", (unsigned)BC_ENTER_LOOPER);\n");
+        c.push_str("printf(\"%u\\n\", (unsigned)BC_EXIT_LOOPER);\n");
+        c.push_str("printf(\"%u\\n\", (unsigned)BC_REQUEST_DEATH_NOTIFICATION);\n");
+        c.push_str("printf(\"%u\\n\", (unsigned)BC_CLEAR_DEATH_NOTIFICATION);\n");
+        c.push_str("printf(\"%u\\n\", (unsigned)BC_DEAD_BINDER_DONE);\n");
+        c.push_str("printf(\"%u\\n\", (unsigned)BC_TRANSACTION_SG);\n");
+        c.push_str("printf(\"%u\\n\", (unsigned)BC_REPLY_SG);\n");
+        c.push_str("printf(\"%u\\n\", (unsigned)BR_TRANSACTION_COMPLETE);\n");
+        c.push_str("printf(\"%u\\n\", (unsigned)BR_REPLY);\n");
+        c.push_str("printf(\"%u\\n\", (unsigned)BR_TRANSACTION);\n");
+        c.push_str("printf(\"%zu\\n%zu\\n\", sizeof(struct binder_transaction_data), sizeof(struct binder_write_read));\nreturn 0;}\n");
+        std::fs::write(&source, c).unwrap();
+        assert!(Command::new("cc").arg(&source).arg("-o").arg(&executable).status().unwrap().success());
+        let output = Command::new(&executable).output().unwrap();
+        assert!(output.status.success());
+        let actual: Vec<u64> = String::from_utf8(output.stdout).unwrap()
+            .lines().map(|s| s.parse().unwrap()).collect();
+        let expected: Vec<u64> = vec![
+            BC_TRANSACTION as u64,
+            BC_REPLY as u64,
+            BC_ACQUIRE_RESULT as u64,
+            BC_FREE_BUFFER as u64,
+            BC_INCREFS as u64,
+            BC_ACQUIRE as u64,
+            BC_RELEASE as u64,
+            BC_DECREFS as u64,
+            BC_INCREFS_DONE as u64,
+            BC_ACQUIRE_DONE as u64,
+            BC_ATTEMPT_ACQUIRE as u64,
+            BC_REGISTER_LOOPER as u64,
+            BC_ENTER_LOOPER as u64,
+            BC_EXIT_LOOPER as u64,
+            BC_REQUEST_DEATH_NOTIFICATION as u64,
+            BC_CLEAR_DEATH_NOTIFICATION as u64,
+            BC_DEAD_BINDER_DONE as u64,
+            BC_TRANSACTION_SG as u64,
+            BC_REPLY_SG as u64,
+            BR_TRANSACTION_COMPLETE as u64,
+            BR_REPLY as u64,
+            BR_TRANSACTION as u64,
+            std::mem::size_of::<TransactionData>() as u64,
+            std::mem::size_of::<WriteRead>() as u64,
+        ];
+        assert_eq!(actual, expected);
+        std::fs::remove_dir_all(temp).unwrap();
     }
 
     /// Build the parcel shape `writeInterfaceToken` + `writeString(name)`
@@ -3878,7 +4222,7 @@ mod tests {
         }
     }
 
-    /// `Settings.NameValueCache` reads `Bundle.getString(key)` from the
+    /// `Settings.NameValueCache` reads `Bundle.getString("value")` from the
     /// provider's `call` reply, so the reply has to be the Bundle installed for
     /// *that* key — an empty one makes every setting read return null.
     #[test]
@@ -3894,17 +4238,31 @@ mod tests {
                 value.len(),
             );
         }
-        let data: Vec<u8> = key.encode_utf16().flat_map(|u| u.to_ne_bytes()).collect();
+        let request = |values: &[&str]| {
+            let mut data = Vec::new();
+            for value in values {
+                let units: Vec<u16> = value.encode_utf16().collect();
+                data.extend_from_slice(&(units.len() as u32).to_le_bytes());
+                data.extend(units.iter().flat_map(|u| u.to_le_bytes()));
+                data.extend_from_slice(&[0, 0]);
+                while data.len() % 4 != 0 { data.push(0); }
+            }
+            data
+        };
+        let data = request(&["GET_secure", key]);
         let mut parcel = Vec::new();
         let mut objects = Vec::new();
         provider_reply(ICP_CALL, Some(&data), &mut parcel, &mut objects);
         assert_eq!(parcel, value);
 
+        // A list prefix mentioning a known key must not select its scalar reply.
+        let data = request(&["LIST_config", "android_id"]);
+        let mut parcel = Vec::new();
+        provider_reply(ICP_CALL, Some(&data), &mut parcel, &mut objects);
+        assert_eq!(parcel, (-1i32).to_ne_bytes());
+
         // A key nobody installed must not borrow another key's Bundle.
-        let data: Vec<u8> = "no_such_setting"
-            .encode_utf16()
-            .flat_map(|u| u.to_ne_bytes())
-            .collect();
+        let data = request(&["GET_secure", "prefix_android_id_suffix"]);
         let mut parcel = Vec::new();
         provider_reply(ICP_CALL, Some(&data), &mut parcel, &mut objects);
         assert_ne!(parcel, value);

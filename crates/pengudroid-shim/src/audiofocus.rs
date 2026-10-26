@@ -3,6 +3,30 @@
 //! listener callbacks still require a shared audio policy service.
 use std::sync::atomic::{AtomicI32, Ordering};
 
+/// Semantic operations are independent of generated AIDL transaction numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Operation { Request, Abandon, Unregister, Current }
+
+#[derive(Clone, Copy, Debug)]
+pub struct Transactions([u32; 4]);
+impl Transactions {
+    /// Fallback for the historically supported local framework. ART replaces
+    /// these with constants read from its own generated IAudioService Stub.
+    pub const LEGACY: Self = Self([66, 67, 68, 69]);
+    pub fn new(codes: [u32; 4]) -> Option<Self> {
+        if codes.iter().any(|&c| c == 0 || c >= 0x00ff_fffe)
+            || codes.iter().enumerate().any(|(i, c)| codes[..i].contains(c)) {
+            return None;
+        }
+        Some(Self(codes))
+    }
+    pub fn operation(self, code: u32) -> Option<Operation> {
+        self.0.iter().position(|&c| c == code).map(|i| [
+            Operation::Request, Operation::Abandon, Operation::Unregister, Operation::Current,
+        ][i])
+    }
+}
+
 pub struct AudioFocus(AtomicI32);
 impl AudioFocus {
     pub const fn new() -> Self { Self(AtomicI32::new(0)) }
@@ -21,6 +45,22 @@ impl AudioFocus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn remapped_transactions_do_not_dispatch_legacy_numbers() {
+        let table = Transactions::new([101, 203, 307, 409]).unwrap();
+        for (code, op) in [(101, Operation::Request), (203, Operation::Abandon),
+            (307, Operation::Unregister), (409, Operation::Current)] {
+            assert_eq!(table.operation(code), Some(op));
+        }
+        assert_eq!(table.operation(66), None);
+        assert_eq!(Transactions::LEGACY.operation(66), Some(Operation::Request));
+        assert!(Transactions::new([1, 1, 2, 3]).is_none());
+        assert!(Transactions::new([0, 1, 2, 3]).is_none());
+        assert!(Transactions::new([0x00ff_fffe, 1, 2, 3]).is_none());
+        assert!(Transactions::new([0x00ff_ffff, 1, 2, 3]).is_none());
+        assert!(Transactions::new([0x0100_0000, 1, 2, 3]).is_none());
+    }
+
     #[test]
     fn playback_focus_is_granted_then_released() {
         let focus = AudioFocus::new();

@@ -2,9 +2,164 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
+## Android 17 hard lock: window, input and surface gates pass (2026-10-26)
+
+The runtime is now **Android 17 only**. The API-33 reply shapes and the legacy
+`IWindowSession` transaction table were deleted, not kept as a fallback:
+`WINDOW_SESSION_CODES` starts empty and is filled from the loaded framework's
+own `IWindowSession$Stub.TRANSACTION_*` constants. There is no "old Android"
+branch left in the window/input path.
+
+Two measured API-37 wire contracts were wrong and are now derived from the
+shipped libraries rather than guessed:
+
+1. **AIDL parcelables carry a self-size prefix.** `android::os::InputChannelCore`
+   is written as
+   `[int32 isInitialized=1][int32 coreSize][String16 name][int32 kNonNullParcelableFlag=1][int32 hasComm=0][flat fd][null binder + stability]`.
+   Source of truth: disassembly of `InputChannelCore::writeToParcel` /
+   `readFromParcel` in `libinput.so`, plus `Parcel::writeData(const Parcelable&)`
+   in `libs/binder/include/binder/Parcel.h`. The missing `coreSize` and the
+   missing parcelable flag were exactly the two reasons the client logged
+   `channel '' ~ Could not make socket (-1) non-blocking`.
+2. **`ISurfaceComposerClient` is AIDL on Android 17.** `createSurface` returns
+   `gui::CreateSurfaceResult` (`[Status][flag][size][handle+stability][layerId]`
+   `[String16 layerName][transformHint]`), not the old
+   `[handle][gbp][layerId][transformHint][status]`. The old reply made the client
+   fail with `SurfaceComposerClient::createSurface error Operation not permitted`
+   / `PERMISSION_DENIED`.
+
+Verified in `/tmp/a17-run7.log`: NewPipe creates **two** real input channels
+(`Input channel constructed: name='pengudroid', fd=107` / `fd=109`), both windows
+receive a `SurfaceControl`, `mSurface.isValid()` is true, the frame is 720×1280,
+and the app reaches `Looper.loop()`. The next failure is a SIGSEGV immediately
+after the loop starts (`art: helper killed by signal Some(11)`); that is the
+current blocker.
+
+Removed with the hard lock: `ViewRootImpl.mForceDisableBLAST` (the field does not
+exist in Android 17; BLAST is the only render path), `InsetsState.SIZE`, the
+`RELAYOUT_FRAMES`/`ClientWindowFrames` reply prefix, and the
+`surface_composer_client` "status last" special case.
+
+## Android 17 actual runtime checkpoint (2026-10-26)
+
+A real, checksum-verified API-37 x86_64 GSI is now extracted separately at
+`.toolchain/sysroot-android17`. Its ART boots (JNI_OK, imageless fallback), and
+174 framework + 2 HWUI groups register. Core CheckJNI probes pass for modern
+ServiceManager unions, settings, audio-focus token signatures, WindowLayout,
+native keyboard maps and native ApplicationSharedMemory. The legacy full
+framework gate still passes. See [ANDROID17.md](ANDROID17.md) for source
+provenance, commands and exact coverage.
+
+NewPipe's Application and Activity.onCreate are reached under API 37. Its real
+targetSdk is preserved; default-disabled and target-gated compat changes now
+come from the image XML instead of an empty disabled list. Modern EGL telemetry
+hint handling fixes the measured EGL_BAD_ATTRIBUTE failure.
+
+The latest API-37 app run is `/tmp/pd-android17/newpipe-egl17.log`: graphics
+context creation succeeds, then window/input-channel setup fails with socket -1.
+The full API-37 BLAST lifecycle gate still fails because new libgui acquire/release
+signatures add libc++ optional/function arguments. These are the next concrete
+integration boundaries; do not report completed migration, a rendered API-37
+NewPipe window, or API-37 media playback. Default app runtime remains API 33
+until these gates pass. The API-37 tree is selected explicitly with --sysroot.
+
+Checkpoint verification: **251 workspace tests passed**, including the local
+API-33 full framework test and API-37 core/shared-memory test. Build and
+`git diff --check` passed. The separately requested full API-37 lifecycle gate
+still fails at the libgui boundary; it is not included in that green claim.
+Logs: `/tmp/pd-android17/workspace-checkpoint.log`, `shared-framework-tests.log`,
+`full-framework17-current.log`, and `egl-tests.log`.
+
+Additional open work: Aconfig storage provisioning, readonly/shared app bootstrap
+state across processes, display/insets/session parcels, Binder callbacks/death,
+boot-image GC compatibility, Codec2 AIDL, ARM64 and the broader old/new APK matrix.
+
+## Platform target: Android 17 / API 37
+
+The user requested migration of Binder, media and the platform layer to Android
+17 while retaining backward app compatibility. This extends the existing broad
+Linux Android compatibility goal; the NewPipe/desktop milestone remains work
+within that goal. See [ANDROID17.md](ANDROID17.md) for pinned source findings,
+implemented code and migration gates. The default app runtime is still API 33;
+reporting API 37 without its framework is not a completed migration.
+
+The first code change resolves audio-focus transaction numbers from the loaded
+framework's generated Stub, installs all four as one validated table and uses
+semantic dispatch in the Rust broker. This removes one legacy numeric dependency;
+it does not port the complete service or establish Android 17 support.
+The migration build and **248 workspace tests passed**; logs are in
+`/tmp/pd-android17/`. Previous milestone counts below are historical.
+
 ## Active goal: stable NewPipe and a reliable desktop shell (2026-10-26)
 
 The requested product target is end-to-end stable NewPipe playback and interaction, a responsive launcher with real app icons/names and per-app controls, desktop-compatible movable/resizable/closable windows, forced termination of hung guests, and a PenguDroid-owned transparent keymapper control outside the Android renderer. A real game, ultimately Genshin Impact, follows this foundation. This goal remains active.
+
+### Settings provider reply contract corrected (2026-10-26)
+
+Live keyboard input produced repeated `Bundle` type warnings in
+`Settings.NameValueCache.getStringForUser`. The default response had a serialized
+map under `value`, even for scalar GET calls. Installed per-key responses also
+used the setting name as their Bundle key, although Android 13 reads `value`.
+
+- Scalar settings now carry their string under `value`; unknown scalar settings
+  receive an empty Bundle and use the framework's default.
+- Unsupported `LIST_config` returns a null Bundle. Android 13 explicitly treats
+  this as an empty result, instead of reading a scalar or a missing map.
+- The real ART integration probe transacts through BinderProxy, reads replies
+  with Java Parcel/Bundle, and verifies a known scalar, an unknown scalar and
+  an unsupported list. A list containing a known setting name is also covered
+  by the broker regression. This probe uses the hosted provider's request-key
+  matching, not a complete IContentProvider AIDL argument parser.
+- Build and **247 workspace tests passed**; logs are
+  `/tmp/pd-resume/settings-build.log`, `settings-probe.log`,
+  `settings-tests-exact.log`, and `checkjni-probe.log`.
+
+Matching now requires a whole aligned Parcel String16 field, so an unknown key
+such as `prefix_android_id_suffix` cannot select `android_id`'s reply. Both the
+broker regression and the real framework probe cover this case.
+
+The updated NewPipe run (`settings-live.log`) has **zero** instances of the
+previous scalar Bundle type warning or LazyValue-to-String cast error,
+including delivered keyboard events. The actual ART integration test also
+passes with `-Xcheck:jni`, now enabled permanently in that test. An independent
+NewPipe startup under CheckJNI reached its UI without a JNI fatal diagnostic;
+that temporary diagnostic guest was then stopped. Log: `checkjni.log`.
+This is startup/probe coverage, not a full pause/seek/reconfiguration test.
+
+Source contract: [Android 13 Settings.java](https://android.googlesource.com/platform/frameworks/base/+/android-13.0.0_r1/core/java/android/provider/Settings.java),
+`getStringForUser` and `getStringsForPrefix`.
+
+The resume daemon also needed restarting after the workspace rebuild: leaving
+an older daemon running while loading newer guest libraries closed the first
+presentation connection. The matched runtime is logged in
+`/tmp/pd-resume/daemon-current.log` and `new.log`. This run submitted over
+4,000 software video frames. The ART shadow-frame failure has not recurred;
+pause/seek/resize/exit/relaunch coverage is still incomplete.
+
+### Resume verification and launcher preference fix (2026-10-26)
+
+The desktop keymapper checkbox was persisted but not forwarded to the guest:
+any saved profile could remain active even when the UI showed it disabled.
+The GUI now passes `PENGUDROID_KEYMAPPER=0/1` per app. The ART pump skips
+profile loading for `0`, so ordinary key delivery remains active. CLI launches
+retain automatic profile loading by default. Changes apply on the next launch;
+live profile reload and the external transparent button remain open.
+A real child-process test verifies enabled/disabled preferences override an
+inherited environment. A fresh NewPipe run logged
+`input: keymap disabled for org.schabi.newpipe`.
+
+The first resume check found stale top-level runtime shared libraries:
+`cargo test` had rebuilt `target/debug/deps/libpengudroid_shim.so`, but the
+launcher loaded the older `target/debug/libpengudroid_shim.so`. After
+`cargo build --workspace --offline`, the real ART BLAST lifecycle check passed.
+Build runtime artifacts before running integration checks; test compilation
+alone does not guarantee these dynamically loaded libraries are refreshed.
+The hung-child test also now polls its actual process state with a one-second
+bound, because SIGKILL delivery to descendants is asynchronous.
+
+New runtime evidence is under `/tmp/pd-resume/`. The fresh guest retains
+`PENGUDROID_TRACE_BT=top_shadow_frame_`; no recurrence has yet been captured.
+This does not resolve or disprove the previously observed ART failure.
 
 ### Runtime per-app keymapper
 
@@ -166,7 +321,9 @@ These observations verify the listed app and run only. They do not establish gen
 
 ## Build and verification history
 
-- The current full workspace build and test run passed: 235 tests, zero failures.
+- The latest resume workspace build and test run passed: **247 tests, zero failures**.
+  Logs: `/tmp/pd-resume/build-final.log` and `/tmp/pd-resume/tests-final.log`.
+  Optional hardware fixtures still require the explicit environment described in HARDWARE_VIDEO.md.
 - Earlier BLAST and parent-lifecycle changes passed 226 tests. The orientation-sizing work was included in the latest full run.
 - `git diff --check` was clean after the last edit.
 - Build warnings remain in the existing codebase.

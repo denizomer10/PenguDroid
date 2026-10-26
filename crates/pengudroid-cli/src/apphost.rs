@@ -728,12 +728,92 @@ pub fn font_debug(env: &JniEnv) {
 /// parameter through the JNI setup.
 static APP_PACKAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// API 37's ApplicationThread.bindApplication initializes this before posting
+/// AppBindData. We call handleBindApplication directly, so reproduce that step.
+fn install_system_features_cache(env: &JniEnv) -> Option<()> {
+    let _frame = env.local_frame(32)?;
+    let version = env.find_class("android/os/Build$VERSION")?;
+    let sdk = env.static_field_id(version, "SDK_INT", "I")?;
+    if env.static_int_field(version, sdk) < 37 { return Some(()); }
+    let class = env.find_class("android/content/pm/SystemFeaturesCache")?;
+    let has = env.static_method_id(class, "hasInstance", "()Z")?;
+    if env.call_static_boolean(class, has, &[])? { return Some(()); }
+    let (list_class, list) = new_instance(env, "java/util/ArrayList")?;
+    let add = env.method_id(list_class, "add", "(Ljava/lang/Object;)Z")?;
+    // Describe implemented virtual input/audio and screen modes. Do not claim
+    // camera, sensors, telephony, multitouch, or Vulkan hardware capabilities.
+    for name in ["android.hardware.audio.output", "android.hardware.touchscreen",
+        "android.hardware.screen.portrait", "android.hardware.screen.landscape"] {
+        let (feature_class, feature) = new_instance(env, "android/content/pm/FeatureInfo")?;
+        let name_field = env.field_id(feature_class, "name", "Ljava/lang/String;")?;
+        env.set_object_field(feature, name_field, env.new_string(name));
+        if env.call_boolean(list, add, &[JValue { l: feature }])? != true { return None; }
+    }
+    let ctor = env.method_id(class, "<init>", "(Ljava/util/Collection;)V")?;
+    let cache = env.new_object(class, ctor, &[JValue { l: list }])?;
+    let install = env.static_method_id(class, "setInstance", "(Landroid/content/pm/SystemFeaturesCache;)V")?;
+    if !env.call_static_void(class, install, &[JValue { l: cache }]) { return None; }
+    // Normal bindApplication receives this descriptor from system_server.
+    // Our hosted bootstrap creates the real native mapping locally for now.
+    let shared_class = env.find_class("com/android/internal/os/ApplicationSharedMemory")?;
+    let create = env.static_method_id(shared_class, "create", "()Lcom/android/internal/os/ApplicationSharedMemory;")?;
+    let shared = env.call_static_object(shared_class, create, &[])?;
+    if shared.is_null() { return None; }
+    let versions = env.method_id(class, "getSdkFeatureVersions", "()[I")?;
+    let versions = env.call_object(cache, versions, &[])?;
+    let write = env.method_id(shared_class, "writeSystemFeaturesCache", "([I)V")?;
+    if !env.call_void(shared, write, &[JValue { l: versions }]) { return None; }
+    let set_shared = env.static_method_id(shared_class, "setInstance", "(Lcom/android/internal/os/ApplicationSharedMemory;)V")?;
+    if !env.call_static_void(shared_class, set_shared, &[JValue { l: shared }]) { return None; }
+    println!("features: installed hosted system feature cache and native shared memory");
+    Some(())
+}
+
+pub fn probe_platform_state(env: &JniEnv) -> bool {
+    let run = || -> Option<()> {
+        let _frame = env.local_frame(32)?;
+        install_system_features_cache(env)?;
+        let class = env.find_class("android/content/pm/SystemFeaturesCache")?;
+        let get = env.static_method_id(class, "getInstance", "()Landroid/content/pm/SystemFeaturesCache;")?;
+        let cache = env.call_static_object(class, get, &[])?;
+        let get_versions = env.method_id(class, "getSdkFeatureVersions", "()[I")?;
+        let expected = env.call_object(cache, get_versions, &[])?;
+        let shared_class = env.find_class("com/android/internal/os/ApplicationSharedMemory")?;
+        let get_shared = env.static_method_id(shared_class, "getInstance", "()Lcom/android/internal/os/ApplicationSharedMemory;")?;
+        let shared = env.call_static_object(shared_class, get_shared, &[])?;
+        let read = env.method_id(shared_class, "readSystemFeaturesCache", "()[I")?;
+        let actual = env.call_object(shared, read, &[])?;
+        let arrays = env.find_class("java/util/Arrays")?;
+        let equals = env.static_method_id(arrays, "equals", "([I[I)Z")?;
+        if !env.call_static_boolean(arrays, equals, &[JValue { l: expected }, JValue { l: actual }])? { return None; }
+        println!("platform: feature cache native shared-memory roundtrip passed");
+        Some(())
+    };
+    run().is_some()
+}
+
 /// Bind the app into `thread`, the object returned by
 /// `ActivityThread.currentActivityThread()`.
 pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bool {
     let _ = APP_PACKAGE.set(spec.package.to_string());
+    if install_service_manager_abi(env).is_none() {
+        eprintln!("apphost: cannot resolve framework ServiceManager ABI");
+        return false;
+    }
+    if install_application_transactions(env).is_none() {
+        eprintln!("apphost: cannot resolve application service transactions");
+        return false;
+    }
+    if install_audio_focus_transactions(env).is_none() {
+        eprintln!("apphost: cannot resolve framework audio focus transactions");
+        return false;
+    }
     if install_virtual_keyboard(env).is_none() {
         eprintln!("apphost: cannot install the Android virtual keyboard");
+        return false;
+    }
+    if install_system_features_cache(env).is_none() {
+        eprintln!("apphost: cannot initialize the framework system feature cache");
         return false;
     }
     let Some((bind_class, data)) = new_instance(env, "android/app/ActivityThread$AppBindData") else {
@@ -813,12 +893,21 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
     if let Some(id) = env.field_id(bind_class, "debugMode", "I") {
         env.set_int_field(data, id, 0);
     }
-    // `handleBindApplication` dereferences these arrays without a null check.
+    // Respect the image's default compat policy for this APK, rather than
+    // implicitly enabling all optional platform changes with an empty list.
+    let disabled = match std::env::var_os("PENGUDROID_ROOT") {
+        Some(root) => match crate::compat::disabled_changes(std::path::Path::new(&root), spec.target_sdk.max(0) as u32) {
+            Ok(changes) => changes,
+            Err(e) => { eprintln!("apphost: platform compat policy: {e}"); return false; }
+        },
+        None => Vec::new(),
+    };
     if let Some(id) = env.field_id(bind_class, "disabledCompatChanges", "[J") {
-        if let Some(arr) = env.new_long_array(0) {
-            env.set_object_field(data, id, arr);
-        }
+        let Some(array) = env.new_long_array(disabled.len() as i32) else { return false; };
+        if !env.set_long_array_region(array, &disabled) { return false; }
+        env.set_object_field(data, id, array);
     }
+    println!("compat: {} changes disabled for APK targetSdk {}", disabled.len(), spec.target_sdk);
 
     let Some(thread_class) = env.find_class("android/app/ActivityThread") else {
         return false;
@@ -3858,6 +3947,12 @@ fn spawn_input_pump(env: &JniEnv) {
         // Per-app keymap: a bound key becomes a gesture instead of a key press.
         // The GUI writes this file, and a missing file simply means no mapping.
         let keymap = APP_PACKAGE.get().and_then(|package| {
+            // CLI launches keep automatic profile loading; the desktop launcher
+            // explicitly forwards the per-app checkbox, including its off state.
+            if std::env::var_os("PENGUDROID_KEYMAPPER").as_deref() == Some(std::ffi::OsStr::new("0")) {
+                println!("input: keymap disabled for {package}");
+                return None;
+            }
             // The launcher resolves the host path before the prefix overrides
             // the guest's HOME; fall back to the documented location otherwise.
             let path = std::env::var_os("PENGUDROID_KEYMAP_PATH")
@@ -4432,24 +4527,22 @@ fn launch_activity(
         let _ = config;
     }
 
-    let Some(handle) = env.method_id(
-        thread_class,
-        "handleLaunchActivity",
-        "(Landroid/app/ActivityThread$ActivityClientRecord;Landroid/app/servertransaction/PendingTransactionActions;Landroid/content/Intent;)Landroid/app/Activity;",
-    ) else {
-        eprintln!("apphost: ActivityThread.handleLaunchActivity not found");
-        return false;
+    let modern = env.method_id(thread_class, "handleLaunchActivity",
+        "(Landroid/app/ActivityThread$ActivityClientRecord;Landroid/app/servertransaction/PendingTransactionActions;ILandroid/content/Intent;)Landroid/app/Activity;");
+    let (handle, modern) = if let Some(handle) = modern { (handle, true) } else {
+        let Some(handle) = env.method_id(thread_class, "handleLaunchActivity",
+            "(Landroid/app/ActivityThread$ActivityClientRecord;Landroid/app/servertransaction/PendingTransactionActions;Landroid/content/Intent;)Landroid/app/Activity;") else {
+            eprintln!("apphost: ActivityThread.handleLaunchActivity not found");
+            return false;
+        };
+        (handle, false)
     };
+    let Some((_, pending)) = new_instance(env, "android/app/servertransaction/PendingTransactionActions") else { return false; };
+    let mut args = vec![JValue { l: record }, JValue { l: pending }];
+    if modern { args.push(JValue { i: 0 }); } // Context.DEVICE_ID_DEFAULT
+    args.push(JValue { l: std::ptr::null_mut() });
     println!("apphost: calling handleLaunchActivity for {activity_name}");
-    match env.call_object(
-        thread,
-        handle,
-        &[
-            JValue { l: record },
-            JValue { l: std::ptr::null_mut() },
-            JValue { l: std::ptr::null_mut() },
-        ],
-    ) {
+    match env.call_object(thread, handle, &args) {
         Some(activity) if activity.is_null() => {
             eprintln!("apphost: handleLaunchActivity returned null");
             false
@@ -4878,20 +4971,10 @@ fn force_visible(env: &JniEnv, record: JObject) {
                         env.set_object_field(root, sc_field, built);
                         println!("apphost: root {index} mSurfaceControl := built");
                     }
-                    // With BLAST enabled `relayoutWindow` builds a `BLASTBufferQueue`
-                    // (which needs a real consumer); disabling it makes the same
-                    // method take the plain `mSurface.copyFrom(mSurfaceControl)` path.
-                    // `PENGUDROID_BLAST=1` keeps BLAST enabled so the window root
-                    // builds a `BLASTBufferQueue` like a device does; the default
-                    // stays on the legacy `copyFrom` path, which is what the
-                    // window has been validated on so far.
-                    if std::env::var_os("PENGUDROID_BLAST").is_none() {
-                        if let Some(blast_field) = env.field_id(root_class, "mForceDisableBLAST", "Z") {
-                            env.set_boolean_field(root, blast_field, true);
-                            println!("apphost: root {index} mForceDisableBLAST := true");
-                        }
-                    } else {
-                        println!("apphost: root {index} BLAST left enabled (PENGUDROID_BLAST)");
+                    // Android 17 removed `ViewRootImpl.mForceDisableBLAST`: BLAST is
+                    // the only render path. There is no legacy fallback to select.
+                    if std::env::var_os("PENGUDROID_BLAST").is_some() {
+                        println!("apphost: root {index} BLAST is always enabled on Android 17");
                     }
                     if let Some(surface_field) =
                         env.field_id(root_class, "mSurface", "Landroid/view/Surface;")
@@ -5235,10 +5318,130 @@ fn probe_app_class(env: &JniEnv, data: JObject, name: &str) {
     }
 }
 
+/// Check settings reply types through real BinderProxy and framework Parcel.
+pub fn probe_settings(env: &JniEnv) -> bool {
+    let run = || -> Option<()> {
+        install_service_manager_abi(env)?;
+        let _frame = env.local_frame(64)?;
+        install_settings_replies(env);
+        let (_, empty) = new_instance(env, "android/os/Bundle")?;
+        install_reply(&marshal_object(env, empty, "android/os/Bundle")?,
+            "__pengudroid_binder_set_empty_bundle");
+        let sm = env.find_class("android/os/ServiceManager")?;
+        let get = env.static_method_id(sm, "getService", "(Ljava/lang/String;)Landroid/os/IBinder;")?;
+        let binder = env.call_static_object(sm, get, &[JValue { l: env.new_string("settings_provider") }])?;
+        if binder.is_null() { return None; }
+        let binder_class = env.find_class("android/os/IBinder")?;
+        let transact = env.method_id(binder_class, "transact", "(ILandroid/os/Parcel;Landroid/os/Parcel;I)Z")?;
+        let parcel_class = env.find_class("android/os/Parcel")?;
+        let obtain = env.static_method_id(parcel_class, "obtain", "()Landroid/os/Parcel;")?;
+        let write = env.method_id(parcel_class, "writeString", "(Ljava/lang/String;)V")?;
+        let exception = env.method_id(parcel_class, "readException", "()V")?;
+        let read = env.method_id(parcel_class, "readBundle", "()Landroid/os/Bundle;")?;
+        let recycle = env.method_id(parcel_class, "recycle", "()V")?;
+        let bundle_class = env.find_class("android/os/Bundle")?;
+        let string = env.method_id(bundle_class, "getString", "(Ljava/lang/String;)Ljava/lang/String;")?;
+        for (method, key, expected) in [
+            ("GET_secure", "android_id", Some("a1b2c3d4e5f60718")),
+            ("GET_system", "pengudroid_missing_setting", None),
+            ("GET_secure", "prefix_android_id_suffix", None),
+            ("LIST_config", "android_id", None),
+        ] {
+            let request = env.call_static_object(parcel_class, obtain, &[])?;
+            let reply = env.call_static_object(parcel_class, obtain, &[])?;
+            // The hosted provider selects the method/key in this parcel; the
+            // complete IContentProvider request argument parser is separate work.
+            if !env.call_void(request, write, &[JValue { l: env.new_string(method) }])
+                || !env.call_void(request, write, &[JValue { l: env.new_string(key) }]) { return None; }
+            if env.call_boolean(binder, transact, &[
+                JValue { i: 21 }, JValue { l: request }, JValue { l: reply }, JValue { i: 0 },
+            ])? != true || !env.call_void(reply, exception, &[]) { return None; }
+            let bundle = env.call_object(reply, read, &[])?;
+            if method == "LIST_config" {
+                if !bundle.is_null() { return None; }
+            } else {
+                if bundle.is_null() { return None; }
+                let value = env.call_object(bundle, string, &[JValue { l: env.new_string("value") }])?;
+                let actual = if value.is_null() { None } else { Some(env.get_string(value)?) };
+                if actual.as_deref() != expected { return None; }
+            }
+            env.call_void(request, recycle, &[]);
+            env.call_void(reply, recycle, &[]);
+        }
+        println!("settings: Binder/Parcel scalar value, missing key and unsupported list passed");
+        Some(())
+    };
+    if run().is_some() { true } else { env.describe_exception(); false }
+}
+
+fn install_application_transactions(env: &JniEnv) -> Option<()> {
+    let _frame = env.local_frame(16)?;
+    let mut codes = [0u32; 2];
+    for (index, (class, field)) in [
+        ("android/app/IActivityTaskManager$Stub", "TRANSACTION_getActivityClientController"),
+        ("android/app/IActivityManager$Stub", "TRANSACTION_getContentProvider"),
+    ].into_iter().enumerate() {
+        let class = env.find_class(class)?;
+        let field = env.static_field_id(class, field, "I")?;
+        codes[index] = u32::try_from(env.static_int_field(class, field)).ok()?;
+    }
+    let setter = shim_symbol("__pengudroid_binder_set_application_transactions")?;
+    let setter: unsafe extern "C" fn(u32, u32) -> bool = unsafe { std::mem::transmute(setter) };
+    if !unsafe { setter(codes[0], codes[1]) } { return None; }
+    println!("binder: framework application transaction codes = {codes:?}");
+    Some(())
+}
+
+/// ServiceManager gained Service/ServiceWithMetadata union replies. Preserve
+/// legacy strong-binder replies while discovering both sets of Stub methods.
+fn install_service_manager_abi(env: &JniEnv) -> Option<()> {
+    let _frame = env.local_frame(16)?;
+    let class = env.find_class("android/os/IServiceManager$Stub")?;
+    let code = |name: &str| -> Option<u32> {
+        let field = env.static_field_id(class, name, "I")?;
+        u32::try_from(env.static_int_field(class, field)).ok()
+    };
+    let get = code("TRANSACTION_getService")?;
+    let check = code("TRANSACTION_checkService")?;
+    let get2 = code("TRANSACTION_getService2");
+    let check2 = code("TRANSACTION_checkService2");
+    if get2.is_some() != check2.is_some() { return None; }
+    let setter = shim_symbol("__pengudroid_binder_set_service_manager_codes")?;
+    let setter: unsafe extern "C" fn(u32, u32, u32, u32) -> bool =
+        unsafe { std::mem::transmute(setter) };
+    let codes = [get, check, get2.unwrap_or(0), check2.unwrap_or(0)];
+    if !unsafe { setter(codes[0], codes[1], codes[2], codes[3]) } { return None; }
+    println!("binder: framework ServiceManager codes = {codes:?}");
+    Some(())
+}
+
+/// Read generated framework constants instead of assuming a platform release's
+/// private AIDL method order. The APK's targetSdk never selects this wire ABI.
+fn install_audio_focus_transactions(env: &JniEnv) -> Option<()> {
+    let _frame = env.local_frame(16)?;
+    let stub = env.find_class("android/media/IAudioService$Stub")?;
+    let mut codes = [0u32; 4];
+    for (out, name) in codes.iter_mut().zip([
+        "TRANSACTION_requestAudioFocus", "TRANSACTION_abandonAudioFocus",
+        "TRANSACTION_unregisterAudioFocusClient", "TRANSACTION_getCurrentAudioFocus",
+    ]) {
+        let field = env.static_field_id(stub, name, "I")?;
+        *out = u32::try_from(env.static_int_field(stub, field)).ok()?;
+    }
+    let setter = shim_symbol("__pengudroid_binder_set_audio_focus_transactions")?;
+    let setter: unsafe extern "C" fn(u32, u32, u32, u32) -> bool =
+        unsafe { std::mem::transmute(setter) };
+    if !unsafe { setter(codes[0], codes[1], codes[2], codes[3]) } { return None; }
+    println!("audio: framework focus transaction codes = {codes:?}");
+    Some(())
+}
+
 /// Drive the real AIDL proxy so focus tests cover request argument parsing,
 /// rather than only the hosted policy's Rust state machine.
 pub fn probe_audio_focus(env: &JniEnv) -> bool {
     let run = || -> Option<()> {
+        install_service_manager_abi(env)?;
+        install_audio_focus_transactions(env)?;
         let _frame = env.local_frame(32)?;
         let sm = env.find_class("android/os/ServiceManager")?;
         let get = env.static_method_id(sm, "getService", "(Ljava/lang/String;)Landroid/os/IBinder;")?;
@@ -5256,22 +5459,43 @@ pub fn probe_audio_focus(env: &JniEnv) -> bool {
         let client_id = env.new_string("pengudroid-focus-probe");
         let package = env.new_string("org.pengudroid.probe");
         let class = env.find_class("android/media/IAudioService")?;
-        let request = env.method_id(class, "requestAudioFocus",
-            "(Landroid/media/AudioAttributes;ILandroid/os/IBinder;Landroid/media/IAudioFocusDispatcher;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ILandroid/media/audiopolicy/IAudioPolicyCallback;I)I")?;
         let null = std::ptr::null_mut();
-        let result = env.call_int(service, request, &[
+        let (current, tokenized) = if let Some(method) = env.method_id(class, "getCurrentAudioFocus", "()I") {
+            (method, false)
+        } else {
+            (env.method_id(class, "getCurrentAudioFocus", "(Landroid/os/IBinder;)I")?, true)
+        };
+        let request_signature = if tokenized {
+            "(Landroid/media/AudioAttributes;ILandroid/os/IBinder;Landroid/media/IAudioFocusDispatcher;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ILandroid/media/audiopolicy/IAudioPolicyCallback;ILandroid/os/IBinder;)I"
+        } else {
+            "(Landroid/media/AudioAttributes;ILandroid/os/IBinder;Landroid/media/IAudioFocusDispatcher;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ILandroid/media/audiopolicy/IAudioPolicyCallback;I)I"
+        };
+        let request = env.method_id(class, "requestAudioFocus", request_signature)?;
+        let version = env.find_class("android/os/Build$VERSION")?;
+        let sdk_field = env.static_field_id(version, "SDK_INT", "I")?;
+        let sdk = env.static_int_field(version, sdk_field);
+        println!("audio: probe framework SDK_INT={sdk}, focusEnvironmentToken={tokenized}");
+        let mut request_args = vec![
             JValue { l: attrs }, JValue { i: 1 }, JValue { l: client }, JValue { l: null },
             JValue { l: client_id }, JValue { l: package }, JValue { l: null },
-            JValue { i: 0 }, JValue { l: null }, JValue { i: 33 },
-        ])?;
-        let current = env.method_id(class, "getCurrentAudioFocus", "()I")?;
-        if result != 1 || env.call_int(service, current, &[])? != 1 { return None; }
-        let abandon = env.method_id(class, "abandonAudioFocus",
-            "(Landroid/media/IAudioFocusDispatcher;Ljava/lang/String;Landroid/media/AudioAttributes;Ljava/lang/String;)I")?;
-        let result = env.call_int(service, abandon, &[
+            JValue { i: 0 }, JValue { l: null }, JValue { i: sdk },
+        ];
+        let current_args = if tokenized { vec![JValue { l: null }] } else { vec![] };
+        if tokenized { request_args.push(JValue { l: null }); }
+        let result = env.call_int(service, request, &request_args)?;
+        if result != 1 || env.call_int(service, current, &current_args)? != 1 { return None; }
+        let abandon_signature = if tokenized {
+            "(Landroid/media/IAudioFocusDispatcher;Ljava/lang/String;Landroid/media/AudioAttributes;Ljava/lang/String;Landroid/os/IBinder;)I"
+        } else {
+            "(Landroid/media/IAudioFocusDispatcher;Ljava/lang/String;Landroid/media/AudioAttributes;Ljava/lang/String;)I"
+        };
+        let abandon = env.method_id(class, "abandonAudioFocus", abandon_signature)?;
+        let mut abandon_args = vec![
             JValue { l: null }, JValue { l: client_id }, JValue { l: attrs }, JValue { l: package },
-        ])?;
-        if result != 1 || env.call_int(service, current, &[])? != 0 { return None; }
+        ];
+        if tokenized { abandon_args.push(JValue { l: null }); }
+        let result = env.call_int(service, abandon, &abandon_args)?;
+        if result != 1 || env.call_int(service, current, &current_args)? != 0 { return None; }
         println!("audio: AIDL focus granted, current gain verified, abandon cleared");
         Some(())
     };
@@ -5342,15 +5566,24 @@ pub fn probe_window_configuration(env: &JniEnv) -> bool {
         let (_, safe) = new_instance(env, "android/graphics/Rect")?;
         let safe_method = env.method_id(insets_class, "getDisplayCutoutSafe", "(Landroid/graphics/Rect;)V")?;
         env.call_void(insets, safe_method, &[JValue { l: safe }]);
-        let (_, visible) = new_instance(env, "android/view/InsetsVisibilities")?;
         let (frames_class, frames) = new_instance(env, "android/window/ClientWindowFrames")?;
         let (layout_class, layout) = new_instance(env, "android/view/WindowLayout")?;
-        let compute = env.method_id(layout_class, "computeFrames",
-            "(Landroid/view/WindowManager$LayoutParams;Landroid/view/InsetsState;Landroid/graphics/Rect;Landroid/graphics/Rect;IIILandroid/view/InsetsVisibilities;FLandroid/window/ClientWindowFrames;)V")?;
+        let modern = env.method_id(layout_class, "computeFrames",
+            "(Landroid/view/WindowManager$LayoutParams;Landroid/view/InsetsState;Landroid/graphics/Rect;Landroid/graphics/Rect;IIIIFLandroid/window/ClientWindowFrames;)V");
+        let (compute, visible) = if let Some(compute) = modern {
+            let types = env.find_class("android/view/WindowInsets$Type")?;
+            let default_visible = env.static_method_id(types, "defaultVisible", "()I")?;
+            (compute, JValue { i: env.call_static_int(types, default_visible, &[])? })
+        } else {
+            let (_, visible) = new_instance(env, "android/view/InsetsVisibilities")?;
+            let compute = env.method_id(layout_class, "computeFrames",
+                "(Landroid/view/WindowManager$LayoutParams;Landroid/view/InsetsState;Landroid/graphics/Rect;Landroid/graphics/Rect;IIILandroid/view/InsetsVisibilities;FLandroid/window/ClientWindowFrames;)V")?;
+            (compute, JValue { l: visible })
+        };
         if !env.call_void(layout, compute, &[
             JValue { l: params }, JValue { l: insets }, JValue { l: safe }, JValue { l: bounds },
             JValue { i: 1 }, JValue { i: SURFACE_W }, JValue { i: SURFACE_H },
-            JValue { l: visible }, JValue { f: 1.0 }, JValue { l: frames },
+            visible, JValue { f: 1.0 }, JValue { l: frames },
         ]) { return None; }
         let frame = env.object_field(frames, env.field_id(frames_class, "frame", "Landroid/graphics/Rect;")?);
         if frame.is_null() { return None; }
@@ -5400,11 +5633,32 @@ pub fn probe_keyboard(env: &JniEnv) -> bool {
 /// Publish a real InputDevice and native KeyCharacterMap through IInputManager.
 /// The framework reads the map itself; key events still travel through VRI.
 fn install_virtual_keyboard(env: &JniEnv) -> Option<()> {
-    let _frame = env.local_frame(32)?;
+    install_service_manager_abi(env)?;
+    let _frame = env.local_frame(64)?;
+    let version = env.find_class("android/os/Build$VERSION")?;
+    let sdk_field = env.static_field_id(version, "SDK_INT", "I")?;
+    let sdk = env.static_int_field(version, sdk_field);
+    let modern = match sdk {
+        33 => false, 37 => true,
+        _ => { eprintln!("apphost: unvalidated native keyboard parcel ABI for SDK {sdk}"); return None; }
+    };
+    let input_stub = env.find_class("android/hardware/input/IInputManager$Stub")?;
+    let mut input_codes = Vec::new();
+    for name in ["getInputDevice", "getInputDeviceIds", "isInputDeviceEnabled", "enableInputDevice",
+        "disableInputDevice", "hasKeys", "getKeyCodeForKeyLocation", "registerInputDevicesChangedListener"] {
+        // API 37 moved enabled state into InputDevice itself.
+        if modern && name == "isInputDeviceEnabled" { input_codes.push(0); continue; }
+        let field = env.static_field_id(input_stub, &format!("TRANSACTION_{name}"), "I")?;
+        input_codes.push(u32::try_from(env.static_int_field(input_stub, field)).ok()?);
+    }
+    let setter = shim_symbol("__pengudroid_binder_set_input_transactions")?;
+    let setter: unsafe extern "C" fn(*const u32, usize) -> bool = unsafe { std::mem::transmute(setter) };
+    if !unsafe { setter(input_codes.as_ptr(), input_codes.len()) } { return None; }
+    println!("input: framework transaction codes = {input_codes:?}");
     let parcel_class = env.find_class("android/os/Parcel")?;
     let obtain = env.static_method_id(parcel_class, "obtain", "()Landroid/os/Parcel;")?;
     let parcel = env.call_static_object(parcel_class, obtain, &[])?;
-    let raw = crate::keyboard::virtual_character_map_parcel();
+    let raw = crate::keyboard::virtual_character_map_parcel(modern);
     let bytes = env.new_byte_array(raw.len() as i32)?;
     env.set_byte_array_region(bytes, 0, &raw);
     let unmarshall = env.method_id(parcel_class, "unmarshall", "([BII)V")?;
@@ -5431,16 +5685,34 @@ fn install_virtual_keyboard(env: &JniEnv) -> Option<()> {
         }
     }
     let device_class = env.find_class("android/view/InputDevice")?;
-    let ctor = env.method_id(device_class, "<init>",
-        "(IIILjava/lang/String;IILjava/lang/String;ZIILandroid/view/KeyCharacterMap;ZZZZZ)V")?;
     let name = env.new_string("PenguDroid Virtual Keyboard");
     let descriptor = env.new_string("pengudroid:virtual-keyboard");
-    let device = env.new_object(device_class, ctor, &[
-        JValue { i: -1 }, JValue { i: 1 }, JValue { i: 0 }, JValue { l: name },
-        JValue { i: 0 }, JValue { i: 0 }, JValue { l: descriptor }, JValue { z: 0 },
-        JValue { i: 0x101 }, JValue { i: 2 }, JValue { l: map },
-        JValue { z: 0 }, JValue { z: 0 }, JValue { z: 0 }, JValue { z: 0 }, JValue { z: 0 },
-    ])?;
+    let device = if modern {
+        let (class, builder) = new_instance(env, "android/view/InputDevice$Builder")?;
+        for (method, value) in [("setId", -1), ("setGeneration", 1), ("setSources", 0x101), ("setKeyboardType", 2)] {
+            let method = env.method_id(class, method, "(I)Landroid/view/InputDevice$Builder;")?;
+            env.call_object(builder, method, &[JValue { i: value }])?;
+        }
+        for (method, value) in [("setName", name), ("setDescriptor", descriptor)] {
+            let method = env.method_id(class, method, "(Ljava/lang/String;)Landroid/view/InputDevice$Builder;")?;
+            env.call_object(builder, method, &[JValue { l: value }])?;
+        }
+        let enabled = env.method_id(class, "setEnabled", "(Z)Landroid/view/InputDevice$Builder;")?;
+        env.call_object(builder, enabled, &[JValue { z: 1 }])?;
+        let set_map = env.method_id(class, "setKeyCharacterMap", "(Landroid/view/KeyCharacterMap;)Landroid/view/InputDevice$Builder;")?;
+        env.call_object(builder, set_map, &[JValue { l: map }])?;
+        let build = env.method_id(class, "build", "()Landroid/view/InputDevice;")?;
+        env.call_object(builder, build, &[])?
+    } else {
+        let ctor = env.method_id(device_class, "<init>",
+            "(IIILjava/lang/String;IILjava/lang/String;ZIILandroid/view/KeyCharacterMap;ZZZZZ)V")?;
+        env.new_object(device_class, ctor, &[
+            JValue { i: -1 }, JValue { i: 1 }, JValue { i: 0 }, JValue { l: name },
+            JValue { i: 0 }, JValue { i: 0 }, JValue { l: descriptor }, JValue { z: 0 },
+            JValue { i: 0x101 }, JValue { i: 2 }, JValue { l: map },
+            JValue { z: 0 }, JValue { z: 0 }, JValue { z: 0 }, JValue { z: 0 }, JValue { z: 0 },
+        ])?
+    };
     if device.is_null() { return None; }
     let data = marshal_object(env, device, "android/view/InputDevice")?;
     install_reply(&data, "__pengudroid_binder_set_input_device");
@@ -5761,87 +6033,127 @@ fn install_display_replies(env: &JniEnv) {
 /// `out InsetsSourceControl[]` argument and the AIDL proxy insists on an exact
 /// length match.
 fn install_window_replies(env: &JniEnv) {
-    let Some(insets_class) = env.find_class("android/view/InsetsState") else {
-        eprintln!("apphost: InsetsState not found");
-        return;
-    };
-    let Some(field) = env.static_field_id(insets_class, "SIZE", "I") else {
-        eprintln!("apphost: InsetsState.SIZE not found");
-        return;
-    };
-    let size = env.static_int_field(insets_class, field);
-    println!("apphost: InsetsState.SIZE = {size}");
-    if let Some(f) = shim_symbol("__pengudroid_binder_set_insets_size") {
-        let f: unsafe extern "C" fn(i32) = unsafe { std::mem::transmute(f) };
-        unsafe { f(size) };
-    }
-    install_relayout_frames_reply(env);
+    install_window_session_codes(env);
+    install_window_relayout_result(env);
     install_resized_payload(env);
 }
 
-/// Build the `ClientWindowFrames` half of the `relayout` reply.
+/// Semantic ids the shim uses for ``IWindowSession`` methods.
 ///
-/// `IWindowSession$Stub$Proxy.relayout` takes a `ClientWindowFrames` carrying
-/// the four rectangles the window manager computed. The shim cannot build it by
-/// hand reliably (the field order is a framework implementation detail), so the
-/// host writes it with the framework's own `writeToParcel` and hands the bytes
-/// over; the shim appends the `SurfaceControl` half, which carries binder
-/// objects and therefore cannot be marshalled.
+/// Keep in sync with the ``WS_*`` constants in
+/// `crates/pengudroid-shim/src/binder.rs`.
+const WINDOW_SESSION_METHODS: &[(&str, u32)] = &[
+    ("addToDisplay", 1),
+    ("addToDisplayAsUser", 2),
+    ("remove", 3),
+    ("relayout", 4),
+    ("relayout2", 5),
+    ("relayoutAsync", 6),
+    ("relayoutAsync2", 7),
+    ("outOfMemory", 8),
+    ("setInsets", 9),
+    ("finishDrawing", 10),
+    ("onRectangleOnScreenRequested", 13),
+    ("getWindowId", 14),
+    ("pokeDrawLock", 15),
+    ("updateTapExcludeRegion", 17),
+    ("updateInputChannel", 18),
+    ("clearTouchableRegion", 19),
+    ("cancelDraw", 20),
+    ("moveFocusToAdjacentWindow", 21),
+    ("grantInputChannel", 22),
+];
+
+/// Install the loaded framework's generated `IWindowSession$Stub` codes.
 ///
-/// The frame is the whole surface: `ViewRootImpl` copies it into `mWinFrame`,
-/// and a 0x0 frame makes every view measure to nothing and `performDraw` find
-/// an empty dirty region, so nothing is ever rendered.
-fn install_relayout_frames_reply(env: &JniEnv) {
-    let Some(frames) = build_client_window_frames(env) else {
+/// The numeric codes moved between releases (Android 17 inserted
+/// `relayout2`/`relayoutAsync2` and dropped `prepareToReplaceWindows` and
+/// `setInTouchMode`), so they are read from the class that will actually run
+/// instead of being hard-coded. Existing API-33 numbers stay in the shim as a
+/// fallback in case the fields are absent.
+fn install_window_session_codes(env: &JniEnv) {
+    let Some(stub) = env.find_class("android/view/IWindowSession$Stub") else {
+        eprintln!("apphost: IWindowSession$Stub not found");
         return;
     };
-    let Some(parcel_class) = env.find_class("android/os/Parcel") else {
-        return;
-    };
-    let Some(obtain) = env.static_method_id(parcel_class, "obtain", "()Landroid/os/Parcel;") else {
-        return;
-    };
-    let Some(parcel) = env.call_static_object(parcel_class, obtain, &[]) else {
-        return;
-    };
-    let Some(write_typed) = env.method_id(
-        parcel_class,
-        "writeTypedObject",
-        "(Landroid/os/Parcelable;I)V",
-    ) else {
-        eprintln!("apphost: Parcel.writeTypedObject not found");
-        return;
-    };
-    env.call_void(
-        parcel,
-        write_typed,
-        &[JValue { l: frames }, JValue { i: 0 }],
-    );
-    // A null `MergedConfiguration`: `ViewRootImpl` keeps the one it allocated.
-    env.call_void(
-        parcel,
-        write_typed,
-        &[JValue { l: std::ptr::null_mut() }, JValue { i: 0 }],
-    );
-    let Some(marshall) = env.method_id(parcel_class, "marshall", "()[B") else {
-        return;
-    };
-    let Some(bytes) = env.call_object(parcel, marshall, &[]) else {
-        eprintln!("apphost: Parcel.marshall for ClientWindowFrames failed");
-        return;
-    };
-    if let Some(data) = env.byte_array_copy(bytes) {
-        let words: Vec<String> = data
-            .chunks_exact(4)
-            .map(|w| format!("{}", i32::from_ne_bytes([w[0], w[1], w[2], w[3]])))
-            .collect();
-        println!(
-            "apphost: relayout frames parcel ({} bytes) = [{}]",
-            data.len(),
-            words.join(", ")
-        );
-        install_reply(&data, "__pengudroid_binder_set_relayout_frames");
+    let mut pairs: Vec<u32> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    for (name, id) in WINDOW_SESSION_METHODS {
+        let field_name = format!("TRANSACTION_{name}");
+        let Some(field) = env.static_field_id(stub, &field_name, "I") else {
+            continue;
+        };
+        let code = env.static_int_field(stub, field);
+        if code <= 0 {
+            continue;
+        }
+        pairs.push(code as u32);
+        pairs.push(*id);
+        names.push(format!("{name}={code}"));
     }
+    if pairs.is_empty() {
+        eprintln!("apphost: no IWindowSession transaction codes found");
+        return;
+    }
+    println!("apphost: IWindowSession codes [{}]", names.join(", "));
+    let Some(f) = shim_symbol("__pengudroid_binder_set_window_session_codes") else {
+        eprintln!("apphost: shim does not export the window session code setter");
+        return;
+    };
+    let f: unsafe extern "C" fn(*const u32, usize) -> bool = unsafe { std::mem::transmute(f) };
+    if unsafe { f(pairs.as_ptr(), pairs.len()) } {
+        println!("apphost: installed {} window session codes", pairs.len() / 2);
+    } else {
+        eprintln!("apphost: the shim rejected the window session code table");
+    }
+}
+
+/// Install a marshalled Android 17 `WindowRelayoutResult`.
+///
+/// API 37 replaced the four separate `relayout`/`addToDisplay` out-parameters
+/// with this one parcelable
+/// (`core/java/android/view/WindowRelayoutResult.java`, pinned revision
+/// `94b4c16`). Writing it by hand would hard-code five nested framework
+/// layouts, so the host lets each object serialize itself and hands the bytes
+/// over.
+fn install_window_relayout_result(env: &JniEnv) {
+    let Some(result_class) = env.find_class("android/view/WindowRelayoutResult") else {
+        println!("apphost: WindowRelayoutResult absent (pre-API-37 framework)");
+        return;
+    };
+    let Some(ctor) = env.method_id(result_class, "<init>", "()V") else {
+        eprintln!("apphost: WindowRelayoutResult has no default constructor");
+        return;
+    };
+    let Some(result) = env.new_object(result_class, ctor, &[]) else {
+        eprintln!("apphost: cannot allocate WindowRelayoutResult");
+        return;
+    };
+    let Some(frames) = build_client_window_frames(env) else {
+        eprintln!("apphost: WindowRelayoutResult: no ClientWindowFrames");
+        return;
+    };
+    let Some(frames_field) = env.field_id(
+        result_class,
+        "frames",
+        "Landroid/window/ClientWindowFrames;",
+    ) else {
+        eprintln!("apphost: WindowRelayoutResult.frames not found");
+        return;
+    };
+    env.set_object_field(result, frames_field, frames);
+    // `mergedConfiguration`, `insetsState` are freshly allocated by the
+    // constructor; `activeControls` and `activityWindowInfo` are nullable and
+    // stay null, `syncSeqId` is 0 and `usesSyncedInsetsAnimation` false.
+    let Some(bytes) = marshal_object(env, result, "android/view/WindowRelayoutResult") else {
+        eprintln!("apphost: WindowRelayoutResult.marshall failed");
+        return;
+    };
+    println!(
+        "apphost: WindowRelayoutResult parcel ({} bytes)",
+        bytes.len()
+    );
+    install_reply(&bytes, "__pengudroid_binder_set_window_relayout_result");
 }
 
 /// Build the `ClientWindowFrames` the window manager reports for a window.
@@ -6134,23 +6446,9 @@ fn install_provider_replies(env: &JniEnv, app_info: JObject, package: &str) {
         install_reply(&data, "__pengudroid_binder_set_provider_info");
     }
     if let Some((_, bundle)) = new_instance(env, "android/os/Bundle") {
-        // `Settings.NameValueCache.getStringsForPrefix` casts
-        // `Bundle.getSerializable("value")` to a `HashMap` and iterates it, so
-        // an empty bundle NPEs inside `DeviceConfig`. Put an empty map there;
-        // `getString("value")` still returns null (it swallows the cast).
-        if let Some((_, map)) = new_instance(env, "java/util/HashMap") {
-            let Some(bundle_class) = env.find_class("android/os/Bundle") else {
-                return;
-            };
-            if let Some(put) = env.method_id(
-                bundle_class,
-                "putSerializable",
-                "(Ljava/lang/String;Ljava/io/Serializable;)V",
-            ) {
-                let key = env.new_string("value");
-                env.call_void(bundle, put, &[JValue { l: key }, JValue { l: map }]);
-            }
-        }
+        // Scalar GET replies must not contain the map used by LIST_config.
+        // An empty Bundle means an unknown scalar value; LIST_config is
+        // separately reported unsupported (null Bundle) by the broker.
         if let Some(data) = marshal_object(env, bundle, "android/os/Bundle") {
             install_reply(&data, "__pengudroid_binder_set_empty_bundle");
         }
@@ -6177,8 +6475,8 @@ const SETTINGS_VALUES: &[(&str, &str)] = &[
 /// Install one marshalled `Bundle` per `Settings` key.
 ///
 /// `Settings.NameValueCache.getStringForUser` asks the provider with
-/// `call("GET_secure", key, null)` and reads `reply.getString(key)`, so the
-/// reply Bundle has to carry that key.
+/// `call("GET_secure", key, null)` and reads `reply.getString("value")`; the requested setting name selects
+/// the installed reply, not the Bundle entry name.
 fn install_settings_replies(env: &JniEnv) {
     for (key, value) in SETTINGS_VALUES {
         let Some((bundle_class, bundle)) = new_instance(env, "android/os/Bundle") else {
@@ -6191,7 +6489,7 @@ fn install_settings_replies(env: &JniEnv) {
         ) else {
             return;
         };
-        let k = env.new_string(key);
+        let k = env.new_string("value");
         let v = env.new_string(value);
         env.call_void(bundle, put, &[JValue { l: k }, JValue { l: v }]);
         let Some(data) = marshal_object(env, bundle, "android/os/Bundle") else {

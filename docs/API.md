@@ -32,6 +32,14 @@ This document describes PenguDroid's control protocol and CLI. See [LIMITATIONS.
 | `pengudroid-daemon --dmabuf-selftest` | Render on the GPU and submit the dma-buf to the compositor. | Working |
 | `pengudroid video-decode-test <one-frame.h264> [--device NODE] [--verify-gradient]` | Require VA-API H.264 decode and synchronized multi-plane GPU export; optional fixture readback. | Host-only test; guest Codec2 adapter pending |
 
+## Runtime keymapper preference
+
+ART launches load the package's saved keymap automatically. Set
+`PENGUDROID_KEYMAPPER=0` to disable profile loading and retain ordinary key
+input. The desktop launcher sends `0` or `1` from the selected app's checkbox;
+changes apply on the next launch. `PENGUDROID_KEYMAP_PATH` is the resolved
+profile path passed to the guest before its prefix changes HOME.
+
 ## Protocol (v2)
 
 Transport uses a non-empty `PENGUDROID_SOCKET` when set; otherwise it uses `$XDG_RUNTIME_DIR/pengudroid/daemon.sock` with mode `0600`. Set `PENGUDROID_SOCKET` to run a private daemon while keeping `XDG_RUNTIME_DIR` pointed at the real Wayland/PipeWire session. The CLI, daemon, and guest must use the same socket value.
@@ -74,3 +82,18 @@ Tests call the daemon dispatch table through a real `Daemon` instance without op
 `pengudroid_hostgpu::video::Decoder` loads the optional host-native bridge and accepts complete compressed access units, flush/EOS and microsecond timestamps. `receive` returns a GPU-owned `HardwareFrame`, input/EOS status, or bounded-frame backpressure. `HardwareFrame::export` duplicates DMA-BUF descriptors and preserves all plane metadata. A frame can outlive the decoder.
 
 `Graphics::present_video_dmabuf` imports a synchronized top-down multi-plane frame directly. Its returned release flag becomes true only at `wl_buffer.release`; the caller must retain the source hardware frame until then. `None` means the frame was dropped before import due to compositor backpressure. This direct host API is not a new socket message and is not yet used by NewPipe. See [HARDWARE_VIDEO.md](HARDWARE_VIDEO.md).
+
+## Hosted settings provider
+
+Known scalar GET replies contain the string under Bundle key `value`. Unknown
+scalar values return an empty Bundle. Unsupported `LIST_config` returns a null
+Bundle, which Android 13 treats as an empty result. Settings writes and complete
+IContentProvider AIDL argument parsing are not implemented.
+
+## Platform migration target
+
+The forward platform target is Android 17 / API 37. A separate local API-37 tree
+boots and passes core probes; the default app runtime remains API 33 until the
+window/media migration gates pass. See [ANDROID17.md](ANDROID17.md). Hosted audio-focus transaction numbers
+are resolved from the loaded framework's generated Stub at ART binding, not from
+the APK targetSdk. A complete Android 17 Binder/media adapter is still pending.

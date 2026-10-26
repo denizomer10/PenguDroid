@@ -1110,31 +1110,21 @@ fn seeded_props() -> BTreeMap<String, String> {
     let Ok(text) = std::fs::read_to_string(&path) else {
         return props;
     };
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        // Only the version identity is taken from the sysroot; everything else
-        // (product name, ABI list, ...) stays PenguDroid's own.
-        if matches!(
-            key,
-            "ro.build.version.sdk"
-                | "ro.build.version.release"
-                | "ro.build.version.release_or_codename"
-                | "ro.build.version.release_or_preview_display"
-                | "ro.build.version.codename"
-                | "ro.build.version.incremental"
-                | "ro.build.version.security_patch"
-                | "ro.build.version.preview_sdk"
-        ) {
-            props.insert(key.to_string(), value.trim().to_string());
+    overlay_version_properties(&mut props, &text);
+    props
+}
+
+/// Version identity is one set, including API 36+ major.minor SDK fields.
+/// Host hardware/device identity must not be overwritten by image properties.
+fn overlay_version_properties(props: &mut BTreeMap<String, String>, text: &str) {
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('#') { continue; }
+        if let Some((key, value)) = line.split_once('=') {
+            if key.starts_with("ro.build.version.") {
+                props.insert(key.to_string(), value.trim().to_string());
+            }
         }
     }
-    props
 }
 
 /// Mutation counter for the property store, mirroring Bionic's per-area serial.
@@ -1213,6 +1203,10 @@ pub fn default_props() -> BTreeMap<String, String> {
         // `libhidlbase` waits for `hwservicemanager.ready` before it will hand
         // out any HIDL service. The manager is emulated in-process (the broker
         // answers handle 0), so it is always ready.
+        // API 37 libbinder waits for this before using the hosted context
+        // manager. Its in-process dispatcher is available from shim startup.
+        ("servicemanager.ready", "true"),
+        ("init.svc.servicemanager", "running"),
         ("hwservicemanager.ready", "true"),
         ("init.svc.hwservicemanager", "running"),
     ];
@@ -1236,8 +1230,22 @@ fn props_lock() -> std::sync::MutexGuard<'static, BTreeMap<String, String>> {
 }
 
 /// Safe accessor: look up a property, returning `None` if unset.
+static APPCOMPAT_PROPERTIES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn appcompat_properties_enabled() -> bool {
+    APPCOMPAT_PROPERTIES.load(Ordering::Acquire)
+        || std::env::var_os("BIONIC_APPCOMPAT_OVERRIDE").is_some()
+}
+
 pub fn get_prop(name: &str) -> Option<String> {
-    props_lock().get(name).cloned()
+    let props = props_lock();
+    if appcompat_properties_enabled() && !name.starts_with("ro.appcompat_override.") {
+        if let Some(value) = props.get(&format!("ro.appcompat_override.{name}")) {
+            return Some(value.clone());
+        }
+    }
+    props.get(name).cloned()
 }
 
 /// Safe mutator: insert or update a property.
@@ -1369,7 +1377,11 @@ pub unsafe extern "C" fn __system_property_find(name: *const c_char) -> *const c
         return std::ptr::null();
     }
     let name = CStr::from_ptr(name).to_string_lossy();
-    let found = fake_prop_for(&name);
+    let override_name = format!("ro.appcompat_override.{name}");
+    let effective = if appcompat_properties_enabled() && props_lock().contains_key(&override_name) {
+        override_name.as_str()
+    } else { name.as_ref() };
+    let found = fake_prop_for(effective);
     if std::env::var_os("PENGUDROID_TRACE_PROPS").is_some() {
         eprintln!(
             "[props] find({name}) -> {}\n",
@@ -1472,6 +1484,21 @@ pub unsafe extern "C" fn __system_property_area_serial() -> *mut u32 {
 /// this reports success.
 #[no_mangle]
 pub unsafe extern "C" fn __system_properties_init() -> c_int {
+    0
+}
+
+/// API 35+ zygote hook. The hosted store has no SELinux property-area mappings
+/// to remap; enable its app-compat view and propagate that view to descendants.
+#[no_mangle]
+pub unsafe extern "C" fn __system_properties_zygote_reload() -> c_int {
+    if libc::syscall(libc::SYS_gettid) != libc::getpid() as libc::c_long {
+        *libc::__errno_location() = libc::EINVAL;
+        return -1;
+    }
+    if libc::setenv(c"BIONIC_APPCOMPAT_OVERRIDE".as_ptr(), c"1".as_ptr(), 1) != 0 {
+        return -1;
+    }
+    APPCOMPAT_PROPERTIES.store(true, Ordering::Release);
     0
 }
 
@@ -2916,17 +2943,59 @@ pub unsafe extern "C" fn __cxa_demangle(
     std::ptr::null_mut()
 }
 
-/// Bionic's stack canary.
-///
-/// Bionic declares `extern uintptr_t* __stack_chk_guard` (a *pointer* to the
-/// canary), while glibc keeps its own hidden. Code compiled for Android reads
-/// the canary through this symbol, so the shim has to provide it; a private
-/// value that nothing writes is enough for the check to pass.
-static mut STACK_CHK_GUARD_VALUE: usize = 0;
-
-/// See [`STACK_CHK_GUARD_VALUE`].
+/// The linker compatibility switch is unnecessary on a native 4 KiB host:
+/// its loader can already map ELF segments aligned to 4 KiB. A larger-page
+/// host needs a real loader adapter; do not silently claim to emulate it.
 #[no_mangle]
-pub static mut __stack_chk_guard: *mut usize = core::ptr::addr_of_mut!(STACK_CHK_GUARD_VALUE);
+pub unsafe extern "C" fn android_set_16kb_appcompat_mode(enabled: bool) {
+    if enabled && libc::sysconf(libc::_SC_PAGESIZE) > 4096 {
+        let _ = log_to_stderr(ANDROID_LOG_FATAL, "linker",
+            "16 KiB host app-compat mapping is not implemented");
+        libc::abort();
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __loader_android_set_16kb_appcompat_mode(enabled: bool) {
+    android_set_16kb_appcompat_mode(enabled);
+}
+
+/// Bionic exposes a scalar uintptr_t, not a pointer to separate storage.
+/// Initialize it from the host TLS canary before Android code can use it.
+#[no_mangle]
+pub static __stack_chk_guard: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn host_stack_guard() -> usize {
+    let value: usize;
+    core::arch::asm!("mov {}, fs:[0x28]", out(reg) value, options(nostack, readonly, preserves_flags));
+    value
+}
+
+/// Zygote-only operation: replace the current thread's canary using kernel
+/// entropy. Like Bionic, callers must never unwind/return through existing
+/// stack-protected frames after this call. Ordinary app launches do not call it.
+#[no_mangle]
+pub unsafe extern "C" fn android_reset_stack_guards() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut value = 0usize;
+        let mut received = 0usize;
+        while received < std::mem::size_of::<usize>() {
+            let rc = libc::syscall(libc::SYS_getrandom,
+                (&mut value as *mut usize).cast::<u8>().add(received),
+                std::mem::size_of::<usize>() - received, 0) as isize;
+            if rc < 0 && *libc::__errno_location() == libc::EINTR { continue; }
+            if rc <= 0 { libc::abort(); }
+            received += rc as usize;
+        }
+        __stack_chk_guard.store(value, Ordering::Relaxed);
+        core::arch::asm!("mov fs:[0x28], {}", in(reg) value, options(nostack, preserves_flags));
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    libc::abort(); // no validated host TLS layout for another architecture yet
+}
 
 // ---------------------------------------------------------------------------
 // `AndroidRuntime` entry points
@@ -3354,6 +3423,39 @@ pub unsafe extern "C" fn sigwait(set: *const BionicSigset, sig: *mut c_int) -> c
         Some(sigset_to_glibc(*set))
     };
     real(gset.as_ref().map_or(std::ptr::null(), |s| s as *const _), sig)
+}
+
+/// LP64 Bionic and glibc use the Linux siginfo and timespec layouts here;
+/// signal masks still require widening from 8 to 128 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn sigtimedwait(
+    set: *const BionicSigset, info: *mut libc::siginfo_t, timeout: *const libc::timespec,
+) -> c_int {
+    type Real = unsafe extern "C" fn(*const libc::sigset_t, *mut libc::siginfo_t,
+        *const libc::timespec) -> c_int;
+    let Some(real) = dlsym_next::<Real>(b"sigtimedwait\0") else {
+        *libc::__errno_location() = libc::ENOSYS;
+        return -1;
+    };
+    let mask = set.as_ref().map(|mask| sigset_to_glibc(*mask));
+    real(mask.as_ref().map_or(std::ptr::null(), |m| m), info, timeout)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sigwaitinfo(set: *const BionicSigset, info: *mut libc::siginfo_t) -> c_int {
+    sigtimedwait(set, info, std::ptr::null())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sigtimedwait64(
+    set: *const BionicSigset, info: *mut libc::siginfo_t, timeout: *const libc::timespec,
+) -> c_int {
+    sigtimedwait(set, info, timeout)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sigwaitinfo64(set: *const BionicSigset, info: *mut libc::siginfo_t) -> c_int {
+    sigwaitinfo(set, info)
 }
 
 /// `sigaltstack(ss, old_ss)` — `stack_t` has the same layout in both libcs.
@@ -3918,6 +4020,8 @@ pub unsafe extern "C" fn fclose(stream: *mut c_void) -> c_int {
 static PENGUDROID_CTOR: extern "C" fn() = pengudroid_init;
 
 extern "C" fn pengudroid_init() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe { __stack_chk_guard.store(host_stack_guard(), Ordering::Relaxed); }
     // Android's libc++ (and ART) import the Itanium unwinder (`_Unwind_*`),
     // which lives in libgcc_s on glibc. The host binary may not link it, so load
     // it globally here; otherwise a Bionic C++ library fails with
@@ -4980,6 +5084,15 @@ pub static __pengudroid_ver_ld: u8 = 0;
 mod tests {
     use super::*;
     use std::os::unix::io::FromRawFd;
+
+    #[test]
+    fn image_version_identity_includes_full_sdk_and_preserves_host_device() {
+        let mut props = BTreeMap::from([("ro.product.model".into(), "PenguDroid".into())]);
+        overlay_version_properties(&mut props, "# image identity\nro.build.version.sdk=37\nro.build.version.sdk_full=37.0\nro.build.version.release=17\nro.build.version.all_codenames=REL\nro.product.model=Image Device\n");
+        assert_eq!(props.get("ro.build.version.sdk_full").map(String::as_str), Some("37.0"));
+        assert_eq!(props.get("ro.build.version.sdk").map(String::as_str), Some("37"));
+        assert_eq!(props.get("ro.product.model").map(String::as_str), Some("PenguDroid"));
+    }
 
     #[test]
     fn host_audio_helpers_do_not_inherit_the_guest_loader() {

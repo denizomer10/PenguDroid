@@ -73,11 +73,13 @@ mod slot {
     pub const NEW_FLOAT_ARRAY: usize = 181;
     pub const NEW_BYTE_ARRAY: usize = 176;
     pub const SET_BYTE_ARRAY_REGION: usize = 208;
+    pub const SET_LONG_ARRAY_REGION: usize = 212;
     pub const SET_FLOAT_ARRAY_REGION: usize = 213;
     pub const CALL_VOID_METHOD_A: usize = 63;
     pub const GET_STATIC_METHOD_ID: usize = 113;
     pub const GET_STATIC_FIELD_ID: usize = 144;
     pub const CALL_STATIC_OBJECT_METHOD_A: usize = 116;
+    pub const CALL_STATIC_BOOLEAN_METHOD_A: usize = 119;
     pub const CALL_STATIC_INT_METHOD_A: usize = 131;
     pub const CALL_STATIC_LONG_METHOD_A: usize = 134;
     pub const CALL_STATIC_VOID_METHOD_A: usize = 143;
@@ -428,6 +430,13 @@ impl JniEnv {
         self.exception_check().then_some(v)
     }
 
+    pub fn set_long_array_region(&self, array: JObject, values: &[i64]) -> bool {
+        let f: unsafe extern "C" fn(*mut c_void, JObject, i32, i32, *const i64) =
+            unsafe { self.func(slot::SET_LONG_ARRAY_REGION) };
+        unsafe { f(self.0, array, 0, values.len() as i32, values.as_ptr()) };
+        self.exception_check()
+    }
+
     /// Copy a `byte[]` out of the VM.
     pub fn byte_array_copy(&self, array: JObject) -> Option<Vec<u8>> {
         if array.is_null() {
@@ -527,6 +536,14 @@ impl JniEnv {
             unsafe { self.func(slot::CALL_STATIC_VOID_METHOD_A) };
         unsafe { f(self.0, class, method, args.as_ptr()) };
         self.exception_check()
+    }
+
+    /// `CallStaticBooleanMethodA(clazz, method, args)`.
+    pub fn call_static_boolean(&self, class: JClass, method: JMethodId, args: &[JValue]) -> Option<bool> {
+        let f: unsafe extern "C" fn(*mut c_void, JClass, JMethodId, *const JValue) -> u8 =
+            unsafe { self.func(slot::CALL_STATIC_BOOLEAN_METHOD_A) };
+        let value = unsafe { f(self.0, class, method, args.as_ptr()) };
+        self.exception_check().then_some(value != 0)
     }
 
     /// `CallStaticIntMethodA(clazz, method, args)`.

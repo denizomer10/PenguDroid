@@ -1263,6 +1263,31 @@ pub unsafe extern "C" fn eglCreateContext(
     share_context: EGLContext,
     attribs: *const c_int,
 ) -> EGLContext {
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() && !attribs.is_null() {
+        let mut pairs = Vec::new();
+        for index in 0..64 {
+            let key = *attribs.add(index * 2);
+            if key == 0x3038 { break; }
+            pairs.push((format!("{key:#x}"), format!("{:#x}", *attribs.add(index * 2 + 1))));
+        }
+        eprintln!("[gleshim] eglCreateContext attrs={pairs:?}");
+    }
+    // Android 17 HWUI sends EGL_TELEMETRY_HINT_ANDROID even when the host
+    // display does not advertise it. It controls Android GPU-stats collection,
+    // which this host renderer does not perform. Consume this one hint here;
+    // retain every rendering/safety attribute for the host's own validation.
+    let mut translated = Vec::new();
+    if !attribs.is_null() {
+        let mut index = 0;
+        loop {
+            let key = *attribs.add(index);
+            if key == 0x3038 { translated.push(key); break; }
+            let value = *attribs.add(index + 1);
+            if key != 0x3570 { translated.extend([key, value]); }
+            index += 2;
+        }
+    }
+    let attribs = if translated.is_empty() { attribs } else { translated.as_ptr() };
     match host() {
         // SAFETY: forwarded verbatim.
         Ok(host) => (host.create_context)(dpy, config, share_context, attribs),
@@ -2169,7 +2194,10 @@ mod tests {
             );
             assert!(num_configs >= 1 && !config.is_null(), "no config returned");
 
-            let context_attribs: [c_int; 3] = [0x3098, 2, 0x3038]; // client version 2
+            let invalid_attribs = [0x3098, 2, 0x7fff_ffff, 1, 0x3038];
+            assert!(eglCreateContext(dpy, config, std::ptr::null_mut(), invalid_attribs.as_ptr()).is_null());
+            assert_eq!(eglGetError(), 0x3004, "unknown attributes must still be rejected");
+            let context_attribs = [0x3098, 2, 0x3570, 1, 0x3038]; // HWUI's Android telemetry hint
             let ctx = eglCreateContext(
                 dpy,
                 config,
