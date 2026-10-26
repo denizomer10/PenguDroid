@@ -69,8 +69,13 @@ def nal(header, rbsp):
 def sps(mb_w=1, mb_h=1):
     b = Bits()
     b.u(66, 8)  # profile_idc: baseline
-    b.u(0, 8)  # constraint flags
-    b.u(10, 8)  # level_idc: 1.0
+    b.u(0xC0, 8)  # constrained baseline (no B slices/FMO), supported by VA-API
+    # Choose a level that can represent the generated macroblock dimensions.
+    # The fixture has no VUI timing; these bounds cover up to 30 fps.
+    macroblocks = mb_w * mb_h
+    level = next((level for capacity, level in [(99, 10), (1620, 30), (3600, 31),
+        (8192, 40), (36864, 51), (139264, 60)] if macroblocks <= capacity), 62)
+    b.u(level, 8)  # level_idc
     b.ue(0)  # seq_parameter_set_id
     b.ue(0)  # log2_max_frame_num_minus4
     b.ue(0)  # pic_order_cnt_type

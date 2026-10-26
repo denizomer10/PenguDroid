@@ -454,6 +454,26 @@ impl EventReader {
         Ok(unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const InputEvent) })
     }
 
+    /// Wait for at most `timeout`, then consume one physical input record.
+    /// Key auto-repeat is ignored here: mapping a held key must not repeatedly
+    /// fire tap/swipe actions, and idle keyboards must not prevent shutdown.
+    pub fn read_key_timeout(&mut self, timeout: std::time::Duration) -> io::Result<Option<(u16, bool)>> {
+        let mut fd = libc::pollfd { fd: self.file.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        let rc = unsafe { libc::poll(&mut fd, 1, timeout.as_millis().min(i32::MAX as u128) as i32) };
+        if rc < 0 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::Interrupted { Ok(None) } else { Err(error) };
+        }
+        if rc == 0 { return Ok(None); }
+        if fd.revents & (libc::POLLERR | libc::POLLNVAL | libc::POLLHUP) != 0 {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "input device disconnected"));
+        }
+        let event = self.read_event()?;
+        if event.kind == EV_KEY && (event.value == 0 || event.value == 1) {
+            Ok(Some((event.code, event.value == 1)))
+        } else { Ok(None) }
+    }
+
     /// Block until a key event, returning `(code, pressed)`.
     pub fn read_key(&mut self) -> io::Result<(u16, bool)> {
         loop {
@@ -498,6 +518,22 @@ pub fn keyboards() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_input_timeout_and_repeat_filtering_allow_mapper_shutdown() {
+        use std::io::Write;
+        use std::os::fd::OwnedFd;
+        let (read, mut write) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut reader = EventReader { file: File::from(OwnedFd::from(read)), path: PathBuf::new() };
+        let timeout = std::time::Duration::from_millis(10);
+        assert_eq!(reader.read_key_timeout(timeout).unwrap(), None);
+        for (value, expected) in [(1, Some((17, true))), (2, None), (0, Some((17, false)))] {
+            let event = InputEvent { sec: 0, usec: 0, kind: EV_KEY, code: 17, value };
+            let bytes = unsafe { std::slice::from_raw_parts((&event as *const InputEvent).cast::<u8>(), std::mem::size_of::<InputEvent>()) };
+            write.write_all(bytes).unwrap();
+            assert_eq!(reader.read_key_timeout(timeout).unwrap(), expected);
+        }
+    }
 
     #[test]
     fn ioctl_numbers_match_the_kernel_headers() {

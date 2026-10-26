@@ -29,7 +29,7 @@ miniz_oxide = "0.8"
 # build time). We deliberately disable the system "sys" backend so this builds
 # on machines without wayland dev packages.
 wayland-client = { version = "0.31", default-features = false }
-wayland-protocols = { version = "0.31", default-features = false, features = ["client", "unstable"] }
+wayland-protocols = { version = "0.31", default-features = false, features = ["client", "unstable", "staging"] }
 
 pengudroid-proto = { path = "crates/pengudroid-proto" }
 pengudroid-socket = { path = "crates/pengudroid-socket" }

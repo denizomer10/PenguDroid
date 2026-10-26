@@ -802,7 +802,7 @@ fn ensure_surface_id(st: &mut State, rec: &mut SurfaceRec) -> Result<u32, String
     let request = Message::CreateSurface {
         width: w,
         height: h,
-        title: "PenguDroid EGL".into(),
+        title: std::env::var("PENGUDROID_APP_LABEL").unwrap_or_else(|_| "PenguDroid".into()),
     };
     let send_result = match st.conn.as_ref() {
         Some(conn) => conn.send_message(&request, &[]),
@@ -829,6 +829,14 @@ fn ensure_surface_id(st: &mut State, rec: &mut SurfaceRec) -> Result<u32, String
         Message::SurfaceCreated { surface_id, .. } => {
             rec.surface_id = surface_id;
             rec.owns_surface = true;
+            if let Some(conn) = st.conn.as_ref() {
+                let fps_meter = std::env::var("PENGUDROID_FPS_METER").is_ok_and(|value| value == "1" || value == "true");
+                conn.send_message(&Message::SetSurfaceOptions { surface_id, fps_meter }, &[])
+                    .map_err(|e| format!("surface preferences: {e}"))?;
+                let (reply, fds) = conn.recv_message().map_err(|e| e.to_string())?;
+                close_fds(&fds);
+                if let Message::Error { message, .. } = reply { return Err(message); }
+            }
             subscribe_input(surface_id);
             Ok(surface_id)
         }

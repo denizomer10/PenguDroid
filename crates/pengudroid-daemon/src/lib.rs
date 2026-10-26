@@ -27,5 +27,6 @@ pub mod server;
 pub mod services;
 pub mod stubs;
 mod software;
+mod lifecycle;
 
 pub use server::Daemon;

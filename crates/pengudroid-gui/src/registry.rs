@@ -36,7 +36,10 @@ pub struct Registry {
 
 impl Registry {
     pub fn load() -> Registry {
-        let base = data_dir();
+        Self::load_from(&data_dir())
+    }
+
+    fn load_from(base: &Path) -> Registry {
         let path = base.join("apps.txt");
         let settings_path = base.join("settings.txt");
         let mut entries = Vec::new();
@@ -104,17 +107,24 @@ impl Registry {
             .unwrap_or(default)
     }
 
-    pub fn set_setting(&mut self, key: &str, value: bool) {
-        match self.settings.iter_mut().find(|(k, _)| k == key) {
+    pub fn app_setting(&self, package: &str, key: &str, default: bool) -> bool {
+        self.setting(&format!("{package}/{key}"), self.setting(key, default))
+    }
+
+    pub fn set_app_setting(&mut self, package: &str, key: &str, value: bool) -> Result<(), String> {
+        self.set_setting(&format!("{package}/{key}"), value)
+    }
+
+    pub fn set_setting(&mut self, key: &str, value: bool) -> Result<(), String> {
+        let mut next = self.settings.clone();
+        match next.iter_mut().find(|(k, _)| k == key) {
             Some(slot) => slot.1 = value,
-            None => self.settings.push((key.to_string(), value)),
+            None => next.push((key.to_string(), value)),
         }
-        let text: String = self
-            .settings
-            .iter()
-            .map(|(k, v)| format!("{k}={v}\n"))
-            .collect();
-        let _ = std::fs::write(&self.settings_path, text);
+        let text: String = next.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+        write_atomic(&self.settings_path, &text)?;
+        self.settings = next;
+        Ok(())
     }
 
     /// Install an APK (or a bundle) and remember it.
@@ -127,6 +137,8 @@ impl Registry {
             return Err(format!("{} does not exist", apk.display()));
         }
         let (package, activity, label) = describe(apk)?;
+        let resolved_label = cache_metadata(apk, &package);
+        let label = resolved_label.or(label);
         // The manifest's own label is what the user recognises ("NewPipe", not
         // "newpipe"); fall back to the last package segment when it is absent.
         let label = label.unwrap_or_else(|| {
@@ -147,21 +159,32 @@ impl Registry {
         // Re-installing replaces the old entry rather than duplicating it.
         self.entries.retain(|e| e.package != package);
         self.entries.push(entry.clone());
-        self.save();
+        self.save()?;
         Ok(entry)
     }
 
+    /// Merge worker results without losing the live process state held by the UI.
+    pub fn merge_installed(&mut self, mut entry: Entry) {
+        if let Some(old) = self.entries.iter().find(|old| old.package == entry.package) {
+            entry.running = old.running;
+            entry.pid = old.pid;
+        }
+        self.entries.retain(|old| old.package != entry.package);
+        self.entries.push(entry);
+    }
+
     pub fn uninstall(&mut self, package: &str) -> Result<(), String> {
+        let backup = self.entries.clone();
         let before = self.entries.len();
         self.entries.retain(|e| e.package != package);
         if self.entries.len() == before {
             return Err(format!("{package} is not installed"));
         }
-        self.save();
+        if let Err(e) = self.save() { self.entries = backup; return Err(e); }
         Ok(())
     }
 
-    fn save(&self) {
+    fn save(&self) -> Result<(), String> {
         let text: String = self
             .entries
             .iter()
@@ -175,10 +198,7 @@ impl Registry {
                 )
             })
             .collect();
-        if let Some(dir) = self.path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(&self.path, text);
+        write_atomic(&self.path, &text)
     }
 
     /// Ask the desktop to pick one or more packages.
@@ -227,38 +247,14 @@ impl Registry {
         None
     }
 
-    /// Find an APK to install without a file dialog.
-    ///
-    /// Fallback for a session where no native chooser exists: looks at
-    /// `~/Downloads` and the working directory, newest first.
-    pub fn pick_apk(&self) -> Option<PathBuf> {
-        let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-        let mut dirs = vec![std::env::current_dir().unwrap_or_default()];
-        if let Some(home) = std::env::var_os("HOME") {
-            dirs.push(PathBuf::from(home).join("Downloads"));
-        }
-        for dir in dirs {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let is_apk = path
-                    .extension()
-                    .is_some_and(|e| matches!(e.to_str(), Some("apk" | "apkm" | "xapk")));
-                if !is_apk {
-                    continue;
-                }
-                let modified = entry
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .unwrap_or(std::time::UNIX_EPOCH);
-                candidates.push((modified, path));
-            }
-        }
-        candidates.sort_by(|a, b| b.0.cmp(&a.0));
-        candidates.into_iter().next().map(|(_, p)| p)
-    }
+
+}
+
+fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
+    if let Some(dir) = path.parent() { std::fs::create_dir_all(dir).map_err(|e| e.to_string())?; }
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&temporary, text).map_err(|e| e.to_string())?;
+    std::fs::rename(&temporary, path).map_err(|e| e.to_string())
 }
 
 /// `$XDG_DATA_HOME/pengudroid`, or `~/.local/share/pengudroid`.
@@ -334,6 +330,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn per_app_preferences_survive_reload_without_bleeding_into_other_apps() {
+        let dir = std::env::temp_dir().join(format!("pd-app-preferences-{}", std::process::id()));
+        let mut registry = Registry::load_from(&dir);
+        registry.set_app_setting("org.example.first", "fps_meter", true).unwrap();
+        registry.set_app_setting("org.example.second", "fps_meter", false).unwrap();
+        registry.set_app_setting("org.example.second", "keymapper", true).unwrap();
+        let restored = Registry::load_from(&dir);
+        assert!(restored.app_setting("org.example.first", "fps_meter", false));
+        assert!(!restored.app_setting("org.example.second", "fps_meter", true));
+        assert!(!restored.app_setting("org.example.first", "keymapper", false));
+        assert!(restored.app_setting("org.example.second", "keymapper", false));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn parses_and_renders_entries() {
         let dir = std::env::temp_dir().join(format!("pd-registry-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -368,8 +379,95 @@ mod tests {
         assert_eq!(registry.running_count(), 1);
         registry.set_running("org.example", None);
         assert_eq!(registry.running_count(), 0);
-        registry.set_setting("keymapper", false);
+        registry.set_setting("keymapper", false).unwrap();
         assert!(!registry.setting("keymapper", true));
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// Cached launcher icon; absent icons are rendered as an explicit UI fallback.
+pub fn icon_path(package: &str) -> PathBuf {
+    data_dir().join("icons").join(format!("{package}.png"))
+}
+
+fn aapt_binary() -> Option<PathBuf> {
+    let mut roots = Vec::new();
+    for name in ["ANDROID_HOME", "ANDROID_SDK_ROOT"] {
+        if let Some(root) = std::env::var_os(name) { roots.push(PathBuf::from(root)); }
+    }
+    if let Some(home) = std::env::var_os("HOME") { roots.push(PathBuf::from(home).join("Android/Sdk")); }
+    for root in roots {
+        let Ok(dirs) = std::fs::read_dir(root.join("build-tools")) else { continue };
+        let mut paths: Vec<_> = dirs.flatten().map(|entry| entry.path().join("aapt")).filter(|path| path.is_file()).collect();
+        paths.sort();
+        if let Some(path) = paths.pop() { return Some(path); }
+    }
+    std::process::Command::new("aapt").arg("version").output().ok()
+        .filter(|out| out.status.success()).map(|_| PathBuf::from("aapt"))
+}
+
+/// Resolve resource-backed names and launcher icons with the optional Android
+/// build-tools. Extract a legacy raster variant of the manifest's icon resource
+/// when badging selects an adaptive XML icon. Never substitute unrelated artwork.
+fn cache_metadata(apk: &Path, package: &str) -> Option<String> {
+    let aapt = aapt_binary()?;
+    let cache = data_dir().join("icons");
+    std::fs::create_dir_all(&cache).ok()?;
+    let mut base = None;
+    let apk = if apk.extension().and_then(|e| e.to_str()) == Some("apk") { apk } else {
+        let listing = std::process::Command::new("unzip").args(["-Z1"]).arg(apk).output().ok()?;
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        let entry = listing.lines().find(|line| *line == "base.apk" || line.ends_with("/base.apk"))?;
+        let bytes = std::process::Command::new("unzip").arg("-p").arg(apk).arg(entry).output().ok()?;
+        if !bytes.status.success() { return None; }
+        let path = cache.join(format!("{package}.base.apk"));
+        std::fs::write(&path, bytes.stdout).ok()?;
+        base = Some(path);
+        base.as_deref()?
+    };
+    let dump = |kind: &str, extra: Option<&str>| -> Option<String> {
+        let mut command = std::process::Command::new(&aapt);
+        command.arg("dump");
+        if kind == "resources" { command.arg("--values"); }
+        command.arg(kind).arg(apk);
+        if let Some(extra) = extra { command.arg(extra); }
+        let out = command.output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let badging = dump("badging", None)?;
+    let label = badging.lines().find_map(|line| line.strip_prefix("application-label:'")?.strip_suffix("'").map(str::to_owned));
+    let mut icon = badging.lines().filter_map(|line| {
+        if !line.starts_with("application-icon-") { return None; }
+        let (_, value) = line.split_once(":'")?;
+        let path = value.strip_suffix("'")?;
+        path.ends_with(".png").then(|| path.to_owned())
+    }).last();
+    if icon.is_none() {
+        if let Some(manifest) = dump("xmltree", Some("AndroidManifest.xml")) {
+            if let Some(resource) = manifest.lines().find_map(|line| {
+                if !line.contains("android:icon(") { return None; }
+                line.split_once("=@").map(|(_, id)| id.trim().to_owned())
+            }) {
+                if let Some(resources) = dump("resources", None) {
+                    let mut matching = false;
+                    for line in resources.lines() {
+                        let trimmed = line.trim();
+                        if trimmed.starts_with("resource ") { matching = trimmed.starts_with(&format!("resource {resource} ")); }
+                        if matching && trimmed.starts_with("(string8)") {
+                            if let Some(value) = trimmed.split('"').nth(1).filter(|value| value.ends_with(".png")) { icon = Some(value.to_owned()); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(icon) = icon {
+        if let Ok(out) = std::process::Command::new("unzip").arg("-p").arg(apk).arg(icon).output() {
+            if out.status.success() && out.stdout.starts_with(b"\x89PNG\r\n\x1a\n") && out.stdout.len() < 4 * 1024 * 1024 {
+                let _ = std::fs::write(icon_path(package), out.stdout);
+            }
+        }
+    }
+    if let Some(path) = base { let _ = std::fs::remove_file(path); }
+    label
 }

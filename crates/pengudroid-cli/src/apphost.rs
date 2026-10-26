@@ -889,12 +889,37 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
 /// a frame and a `ViewRootImpl`, and it bails silently otherwise. These are the
 /// fields that decide it, so printing them says exactly which precondition is
 /// missing instead of guessing from the absence of a log line.
-fn surface_dimension(var: &str, default: i32) -> i32 {
-    std::env::var(var)
-        .ok()
-        .and_then(|v| v.trim().parse::<i32>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(default)
+fn surface_video_dimensions(env: &JniEnv, view: JObject) -> (i32, i32) {
+    let configured = |name: &str| {
+        std::env::var(name).ok().and_then(|v| v.trim().parse::<i32>().ok())
+            .filter(|v| *v > 0)
+    };
+    if let (Some(w), Some(h)) = (configured("PENGUDROID_VIDEO_W"), configured("PENGUDROID_VIDEO_H")) {
+        return (w, h);
+    }
+
+    // The root frame is refreshed by relayout/dispatchResized. Use it to adapt
+    // the forced 16:9 video frame when Android rotates the window. During early
+    // startup this can still be 0x0, so retain the documented portrait default.
+    let root_size = (|| -> Option<(i32, i32)> {
+        let view_class = env.find_class("android/view/View")?;
+        let get_root = env.method_id(view_class, "getViewRootImpl", "()Landroid/view/ViewRootImpl;")?;
+        let root = env.call_object(view, get_root, &[])?;
+        if root.is_null() { return None; }
+        let class = env.find_class("android/view/ViewRootImpl")?;
+        let width = env.field_id(class, "mWidth", "I").map(|f| env.int_field(root, f))?;
+        let height = env.field_id(class, "mHeight", "I").map(|f| env.int_field(root, f))?;
+        (width > 0 && height > 0).then_some((width, height))
+    })();
+    let (container_w, container_h) = root_size.unwrap_or((720, 1280));
+    let (mut w, mut h) = if container_w.saturating_mul(9) > container_h.saturating_mul(16) {
+        (container_h.saturating_mul(16) / 9, container_h)
+    } else {
+        (container_w, container_w.saturating_mul(9) / 16)
+    };
+    if let Some(configured_w) = configured("PENGUDROID_VIDEO_W") { w = configured_w; }
+    if let Some(configured_h) = configured("PENGUDROID_VIDEO_H") { h = configured_h; }
+    (w.max(1), h.max(1))
 }
 
 /// Milliseconds on `CLOCK_MONOTONIC`, the same clock the binder trace stamps its
@@ -1341,8 +1366,10 @@ fn report_surface_views(env: &JniEnv, verbose: bool) {
                 // `PENGUDROID_SURFACE_W`/`_H` are the *window* size (the CLI
                 // exports them for the guest), so the video layer needs its own
                 // pair.
-                let w = surface_dimension("PENGUDROID_VIDEO_W", 720);
-                let h = surface_dimension("PENGUDROID_VIDEO_H", 405);
+                // Derive a 16:9 fit from the current root frame so the forced
+                // SurfaceView size follows orientation relayout. Explicit video
+                // dimensions remain available for controlled runs.
+                let (w, h) = surface_video_dimensions(env, view);
                 // `SurfaceView.onMeasure` prefers `mRequestedWidth`/`Height`
                 // over the parent's spec, so writing those two fields is enough
                 // to make the view measure non-zero. They are written directly
@@ -3507,6 +3534,43 @@ fn spawn_service_host(env: &JniEnv) {
 /// drains that queue and turns each one into a `MotionEvent` delivered through
 /// `ViewRootImpl.dispatchInputEvent`, which is the same entry point the input
 /// channel uses on a device.
+/// Detect display/window size changes after launch. A rotation can resize an
+/// existing ViewRoot without creating a new BLASTBufferQueue, so revisit the
+/// SurfaceView constraints only when the root geometry actually changes.
+fn refresh_surface_views_after_resize(env: &JniEnv, previous: &mut Option<Vec<(i32, i32)>>) {
+    let Some(wmg_class) = env.find_class("android/view/WindowManagerGlobal") else { return };
+    let (Some(get_instance), Some(roots_field)) = (
+        env.static_method_id(wmg_class, "getInstance", "()Landroid/view/WindowManagerGlobal;"),
+        env.field_id(wmg_class, "mRoots", "Ljava/util/ArrayList;"),
+    ) else { return };
+    let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else { return };
+    let roots = env.object_field(wmg, roots_field);
+    if roots.is_null() { return; }
+    let Some(list_class) = env.find_class("java/util/ArrayList") else { return };
+    let (Some(size_method), Some(get_method)) = (
+        env.method_id(list_class, "size", "()I"),
+        env.method_id(list_class, "get", "(I)Ljava/lang/Object;"),
+    ) else { return; };
+    let Some(root_class) = env.find_class("android/view/ViewRootImpl") else { return };
+    let (Some(width_field), Some(height_field)) = (
+        env.field_id(root_class, "mWidth", "I"),
+        env.field_id(root_class, "mHeight", "I"),
+    ) else { return; };
+    let count = env.call_int(roots, size_method, &[]).unwrap_or(0).max(0);
+    let mut sizes = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let Some(root) = env.call_object(roots, get_method, &[JValue { i: index }]) else { continue };
+        if root.is_null() { continue; }
+        sizes.push((env.int_field(root, width_field), env.int_field(root, height_field)));
+    }
+    let changed = previous.as_ref().is_some_and(|old| old != &sizes);
+    *previous = Some(sizes);
+    if changed {
+        println!("apphost: root geometry changed; refreshing SurfaceView constraints");
+        report_surface_views(env, false);
+    }
+}
+
 fn spawn_input_pump(env: &JniEnv) {
     let Some(vm) = env.get_java_vm() else {
         return;
@@ -3795,7 +3859,15 @@ fn spawn_input_pump(env: &JniEnv) {
         let mut last_roots = std::time::Instant::now();
         let trace_input = std::env::var_os("PENGUDROID_TRACE_INPUT").is_some();
         let mut input_heartbeat = std::time::Instant::now();
+        let mut last_geometry = std::time::Instant::now();
+        let mut root_sizes = None;
         loop {
+            if last_geometry.elapsed() >= std::time::Duration::from_millis(500) {
+                last_geometry = std::time::Instant::now();
+                if let Some(_frame) = env.local_frame(64) {
+                    refresh_surface_views_after_resize(&env, &mut root_sizes);
+                }
+            }
             if trace_input && input_heartbeat.elapsed() >= std::time::Duration::from_secs(2) {
                 input_heartbeat = std::time::Instant::now();
                 println!("input: pump alive");
@@ -5129,6 +5201,46 @@ pub fn probe_audio_focus(env: &JniEnv) -> bool {
 /// Exercise Android's local layout, the path that used to turn a good frame
 /// into 0x0 after a subsequent relayout. This checks computed output, not just
 /// the configuration fields written by the host.
+/// Exercise the real framework constructor and destroy path twice, as a
+/// SurfaceView recreation would. Consumer exit is checked by the ART test log.
+pub fn probe_blast_lifecycle(env: &JniEnv) -> bool {
+    let run = || -> Option<()> {
+        let _frame = env.local_frame(32)?;
+        let class = env.find_class("android/graphics/BLASTBufferQueue")?;
+        let ctor = env.method_id(class, "<init>", "(Ljava/lang/String;Z)V")?;
+        let destroy = env.method_id(class, "destroy", "()V")?;
+        let native = env.field_id(class, "mNativeObject", "J")?;
+        let update = env.static_method_id(class, "nativeUpdate", "(JJJJI)V")?;
+        let mut previous = 0;
+        for _ in 0..2 {
+            let name = env.new_string("PenguDroid lifecycle probe");
+            let queue = env.new_object(class, ctor, &[JValue { l: name }, JValue { z: 0 }])?;
+            let pointer = env.long_field(queue, native);
+            if pointer == 0 || pointer == previous { return None; }
+            previous = pointer;
+            for (width, height) in [(720, 405), (1280, 720)] {
+                if !env.call_static_void(class, update, &[
+                    JValue { j: pointer }, JValue { j: 0 },
+                    JValue { j: width }, JValue { j: height }, JValue { i: 4 },
+                ]) { return None; }
+            }
+            // Exercise destruction after the consumer has had a chance to start.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if !env.call_void(queue, destroy, &[]) || env.long_field(queue, native) != 0 {
+                return None;
+            }
+        }
+        // Also cover a consumer waiting between daemon connection attempts.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        println!("blast: real framework create/destroy/recreate passed");
+        Some(())
+    };
+    if run().is_some() { true } else {
+        env.describe_exception();
+        false
+    }
+}
+
 pub fn probe_window_configuration(env: &JniEnv) -> bool {
     let run = || -> Option<()> {
         let _frame = env.local_frame(48)?;

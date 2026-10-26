@@ -41,6 +41,15 @@ pub struct SurfaceInfo {
 mod imp {
     use super::SurfaceInfo;
     use crate::ashmem::AshmemRegion;
+    use std::num::NonZeroU32;
+    use std::sync::Arc;
+    use sctk_adwaita::{AdwaitaFrame, FrameConfig};
+    use smithay_client_toolkit::{compositor::{CompositorState, SurfaceData},
+        subcompositor::SubcompositorState, shm::Shm, shell::WaylandSurface};
+    use smithay_client_toolkit::reexports::csd_frame::{DecorationsFrame, FrameAction, FrameClick, WindowState, CursorIcon, WindowManagerCapabilities};
+    use wayland_protocols::wp::viewporter::client::{wp_viewporter, wp_viewport};
+    use wayland_protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zxdg_output_v1};
+    use wayland_protocols::wp::cursor_shape::v1::client::{wp_cursor_shape_manager_v1, wp_cursor_shape_device_v1};
     use std::collections::HashMap;
     use std::os::fd::AsFd;
 
@@ -68,6 +77,7 @@ mod imp {
         pub xdg_toplevel: Option<xdg_toplevel::XdgToplevel>,
         /// Set when this surface is a child layer of another one.
         pub subsurface: Option<wl_subsurface::WlSubsurface>,
+        pub parent_id: Option<u32>,
         pub buffer: wl_buffer::WlBuffer,
         /// Kept alive so the memfd is not closed while the compositor may read
         /// it, and so `present` can repaint.
@@ -76,10 +86,20 @@ mod imp {
         /// here (the compositor holds its own reference, but the buffer's memory
         /// must stay valid while attached).
         pub dmabuf_fd: Option<std::os::fd::OwnedFd>,
+        pending_frames: Vec<wl_buffer::WlBuffer>,
         pub width: u32,
         pub height: u32,
         pub configured: bool,
         pub closed: bool,
+        pub fps_meter: bool,
+        pub title: String,
+        /// Guest pixels are independent of the compositor's content dimensions.
+        pub display_width: u32,
+        pub display_height: u32,
+        pub viewport: Option<wp_viewport::WpViewport>,
+        pub position: (i32, i32),
+        pub window_state: WindowState,
+        desktop_configured: bool,
     }
 
     /// The broker's surface id, carried as a toplevel's user data so events can
@@ -97,6 +117,31 @@ mod imp {
         /// Read through the region's fd on `finalize_surface`.
         region: AshmemRegion,
         stride: u32,
+        title: String,
+    }
+
+    #[derive(Default)]
+    struct OutputSize {
+        pixels: (u32, u32),
+        scale: u32,
+        rotated: bool,
+        logical: Option<(u32, u32)>,
+    }
+
+    fn fit_window(source: (u32, u32), bounds: (u32, u32)) -> (u32, u32) {
+        let (w, h) = (source.0.max(1), source.1.max(1));
+        let (max_w, max_h) = (bounds.0.max(1), bounds.1.max(1));
+        if w <= max_w && h <= max_h { return (w, h); }
+        if (w as u64 * max_h as u64) > (h as u64 * max_w as u64) {
+            (max_w, (h as u64 * max_w as u64 / w as u64).max(1) as u32)
+        } else {
+            ((w as u64 * max_h as u64 / h as u64).max(1) as u32, max_h)
+        }
+    }
+
+    struct FrameSurface(wl_surface::WlSurface);
+    impl WaylandSurface for FrameSurface {
+        fn wl_surface(&self) -> &wl_surface::WlSurface { &self.0 }
     }
 
     #[derive(Default)]
@@ -104,12 +149,26 @@ mod imp {
         pub compositor: Option<wl_compositor::WlCompositor>,
         pub shm: Option<wl_shm::WlShm>,
         pub wm_base: Option<xdg_wm_base::XdgWmBase>,
+        viewporter: Option<wp_viewporter::WpViewporter>,
+        cursor_manager: Option<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1>,
+        cursor: Option<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
+        pointer_serial: u32,
+        output_manager: Option<zxdg_output_manager_v1::ZxdgOutputManagerV1>,
+        outputs: HashMap<u32, OutputSize>,
+        output_proxies: HashMap<u32, (wl_output::WlOutput, Option<zxdg_output_v1::ZxdgOutputV1>)>,
+        frame_compositor: Option<Arc<CompositorState>>,
+        frame_subcompositor: Option<Arc<SubcompositorState>>,
+        frame_shm: Option<Shm>,
+        frames: HashMap<u32, AdwaitaFrame<State>>,
+        client_decorated: std::collections::HashSet<u32>,
+        configured: HashMap<u32, (i32, i32, WindowState)>,
+        wm_capabilities: HashMap<u32, WindowManagerCapabilities>,
+        frame_focus: Option<(u32, wayland_client::backend::ObjectId)>,
         /// `zxdg_decoration_manager_v1`, when the compositor offers it.
         ///
-        /// Without a decoration object the window has no title bar on XFCE or
-        /// KDE (GNOME draws its own), so there is no close or maximise button —
-        /// the user can only kill the guest. Asking for server-side decorations
-        /// is what makes the window behave like a normal application window.
+        /// Compositors offering server-side decorations can supply a native
+        /// title bar. GNOME/Mutter usually requires client-side decorations;
+        /// that fallback must be supplied by this client, not the compositor.
         pub decoration: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
         /// `zwp_linux_dmabuf_v1`, when the compositor advertises it (v3+, which
         /// carries format modifiers).
@@ -143,6 +202,8 @@ mod imp {
         pub keyboard: Option<wl_keyboard::WlKeyboard>,
         /// Surface under the pointer, and the last position in surface pixels.
         pointer_focus: Option<u32>,
+        keyboard_focus: Option<u32>,
+        held_keys: std::collections::HashSet<u32>,
         pointer_pos: (f64, f64),
         /// Input waiting to be forwarded to the guest that owns the surface.
         pub input: Vec<(u32, pengudroid_proto::InputKind)>,
@@ -166,6 +227,235 @@ mod imp {
             if let Some(id) = self.pointer_focus {
                 self.input.push((id, event));
             }
+        }
+
+        fn keyboard_key(&mut self, keycode: u32, pressed: bool) {
+            if pressed { self.held_keys.insert(keycode); } else { self.held_keys.remove(&keycode); }
+            if let Some(id) = self.keyboard_focus {
+                self.input.push((id, pengudroid_proto::InputKind::Key { keycode, pressed }));
+            }
+        }
+
+        fn release_keyboard(&mut self) {
+            if let Some(id) = self.keyboard_focus {
+                for keycode in self.held_keys.drain() {
+                    self.input.push((id, pengudroid_proto::InputKind::Key { keycode, pressed: false }));
+                }
+            }
+            self.held_keys.clear();
+            self.keyboard_focus = None;
+        }
+
+        fn request_close(&mut self, id: u32) {
+            if let Some(surface) = self.surfaces.get_mut(&id) {
+                if !surface.closed {
+                    surface.closed = true;
+                    self.close_requests.push(id);
+                }
+            }
+        }
+
+        fn redraw_frame(&mut self, id: u32) {
+            if let Some(frame) = self.frames.get_mut(&id) {
+                if frame.is_dirty() { frame.draw(); }
+            }
+            if let Some(surface) = self.surfaces.get(&id) { surface.wl_surface.commit(); }
+        }
+
+        fn scale_children(&mut self, parent: u32) {
+            let Some(root) = self.surfaces.get(&parent) else { return };
+            let (source, display) = ((root.width, root.height), (root.display_width, root.display_height));
+            for surface in self.surfaces.values_mut().filter(|s| s.parent_id == Some(parent)) {
+                let scale = |value: u32, axis: usize| -> u32 {
+                    let (from, to) = if axis == 0 { (source.0, display.0) } else { (source.1, display.1) };
+                    ((value as u64 * to as u64) / from.max(1) as u64).max(1) as u32
+                };
+                surface.display_width = scale(surface.width, 0);
+                surface.display_height = scale(surface.height, 1);
+                if let Some(viewport) = &surface.viewport {
+                    viewport.set_destination(surface.display_width as i32, surface.display_height as i32);
+                }
+                if let Some(sub) = &surface.subsurface {
+                    sub.set_position(
+                        (surface.position.0 as i64 * display.0 as i64 / source.0.max(1) as i64) as i32,
+                        (surface.position.1 as i64 * display.1 as i64 / source.1.max(1) as i64) as i32,
+                    );
+                }
+                surface.wl_surface.commit();
+            }
+        }
+
+        fn configure_window(&mut self, id: u32, qh: &QueueHandle<Self>) {
+            let (width, height, flags) = self.configured.remove(&id).unwrap_or((0, 0, WindowState::empty()));
+            let Some(surface) = self.surfaces.get(&id) else { return };
+            if self.client_decorated.contains(&id) && !self.frames.contains_key(&id) {
+                if let (Some(shm), Some(compositor), Some(subcompositor)) =
+                    (&self.frame_shm, &self.frame_compositor, &self.frame_subcompositor) {
+                    match AdwaitaFrame::new(&FrameSurface(surface.wl_surface.clone()), shm,
+                        Arc::clone(compositor), Arc::clone(subcompositor), qh.clone(), FrameConfig::auto()) {
+                        Ok(mut frame) => {
+                            frame.set_title(surface.title.clone());
+                            frame.set_resizable(self.viewporter.is_some());
+                            let mut capabilities = self.wm_capabilities.get(&id).copied().unwrap_or(WindowManagerCapabilities::all());
+                            if self.viewporter.is_none() { capabilities.remove(WindowManagerCapabilities::MAXIMIZE | WindowManagerCapabilities::FULLSCREEN); }
+                            frame.update_wm_capabilities(capabilities);
+                            self.frames.insert(id, frame);
+                            crate::info!("host client-side frame created for surface {id}");
+                        }
+                        Err(e) => crate::warn!("cannot create desktop frame for {id}: {e}"),
+                    }
+                }
+            }
+            let (mut content_w, mut content_h) = (surface.display_width, surface.display_height);
+            // Start portrait Android windows inside the desktop instead of
+            // putting their bottom controls below the monitor's visible area.
+            if !surface.desktop_configured && surface.viewport.is_some() && width <= 0 && height <= 0 {
+                let logical: Vec<_> = self.outputs.values().filter_map(|output| {
+                    if let Some(size) = output.logical { return Some(size); }
+                    let (w, h) = if output.rotated { (output.pixels.1, output.pixels.0) } else { output.pixels };
+                    (w > 0 && h > 0).then_some((w / output.scale.max(1), h / output.scale.max(1)))
+                }).collect();
+                if let (Some(max_w), Some(max_h)) = (logical.iter().map(|(w, _)| *w).min(), logical.iter().map(|(_, h)| *h).min()) {
+                    let header = self.frames.get(&id).map(|frame| frame.add_borders(0, 0).1).unwrap_or(0);
+                    (content_w, content_h) = fit_window((content_w, content_h),
+                        ((max_w * 85 / 100).max(1), (max_h * 85 / 100).saturating_sub(header).max(1)));
+                }
+            }
+            if let Some(frame) = self.frames.get_mut(&id) {
+                frame.update_state(flags);
+                frame.set_hidden(flags.contains(WindowState::FULLSCREEN));
+                if let (Some(w), Some(h)) = (NonZeroU32::new(width.max(0) as u32), NonZeroU32::new(height.max(0) as u32)) {
+                    let (w, h) = frame.subtract_borders(w, h);
+                    if let Some(w) = w { content_w = w.get(); }
+                    if let Some(h) = h { content_h = h.get(); }
+                } else {
+                    if width > 0 { content_w = width as u32; }
+                    if height > 0 {
+                        let header = frame.add_borders(0, 0).1;
+                        content_h = (height as u32).saturating_sub(header).max(1);
+                    }
+                }
+                if surface.viewport.is_none() { content_w = surface.width; content_h = surface.height; }
+                if !frame.is_hidden() {
+                    frame.resize(NonZeroU32::new(content_w.max(1)).unwrap(), NonZeroU32::new(content_h.max(1)).unwrap());
+                }
+            } else {
+                if width > 0 { content_w = width as u32; }
+                if height > 0 { content_h = height as u32; }
+            }
+            let surface = self.surfaces.get_mut(&id).unwrap();
+            surface.window_state = flags;
+            surface.desktop_configured = true;
+            if let Some(viewport) = &surface.viewport {
+                surface.display_width = content_w.max(1);
+                surface.display_height = content_h.max(1);
+                viewport.set_destination(surface.display_width as i32, surface.display_height as i32);
+            }
+            let (x, y, w, h) = match self.frames.get(&id) {
+                Some(frame) => {
+                    let (x, y) = frame.location();
+                    let (w, h) = frame.add_borders(surface.display_width, surface.display_height);
+                    (x, y, w, h)
+                }
+                None => (0, 0, surface.display_width, surface.display_height),
+            };
+            if let Some(xdg) = &surface.xdg_surface { xdg.set_window_geometry(x, y, w as i32, h as i32); }
+            if surface.viewport.is_none() {
+                if let Some(top) = &surface.xdg_toplevel {
+                    top.set_min_size(w as i32, h as i32); top.set_max_size(w as i32, h as i32);
+                }
+            }
+            self.scale_children(id);
+            self.redraw_frame(id);
+        }
+
+        fn guest_coordinates(&self, id: u32, x: f64, y: f64) -> (f32, f32) {
+            let Some(surface) = self.surfaces.get(&id) else { return (x as f32, y as f32) };
+            (x as f32 * surface.width as f32 / surface.display_width.max(1) as f32,
+             y as f32 * surface.height as f32 / surface.display_height.max(1) as f32)
+        }
+
+        fn set_cursor(&self, icon: CursorIcon) {
+            use wp_cursor_shape_device_v1::Shape as S;
+            use CursorIcon as C;
+            let shape = match icon {
+                C::NResize => S::NResize, C::SResize => S::SResize,
+                C::EResize => S::EResize, C::WResize => S::WResize,
+                C::NeResize => S::NeResize, C::NwResize => S::NwResize,
+                C::SeResize => S::SeResize, C::SwResize => S::SwResize,
+                C::EwResize => S::EwResize, C::NsResize => S::NsResize,
+                C::NeswResize => S::NeswResize, C::NwseResize => S::NwseResize,
+                _ => S::Default,
+            };
+            if let Some(cursor) = &self.cursor { cursor.set_shape(self.pointer_serial, shape); }
+        }
+
+        fn update_frame_title(&mut self, id: u32, title: String) {
+            if let Some(surface) = self.surfaces.get(&id) {
+                if let Some(top) = &surface.xdg_toplevel { top.set_title(title.clone()); }
+            }
+            if let Some(frame) = self.frames.get_mut(&id) { frame.set_title(title); }
+            self.redraw_frame(id);
+        }
+
+        fn frame_enter(&mut self, surface: &wl_surface::WlSurface, x: f64, y: f64) -> bool {
+            let mut found = None;
+            for (id, frame) in &mut self.frames {
+                if let Some(cursor) = frame.click_point_moved(std::time::Duration::ZERO, &surface.id(), x, y) {
+                    found = Some((*id, cursor)); break;
+                }
+            }
+            if let Some((id, cursor)) = found {
+                self.set_cursor(cursor);
+                self.frame_focus = Some((id, surface.id()));
+                self.redraw_frame(id);
+                true
+            } else { false }
+        }
+
+        fn frame_motion(&mut self, time: u32, x: f64, y: f64) -> bool {
+            let Some((id, surface)) = self.frame_focus.clone() else { return false };
+            let cursor = self.frames.get_mut(&id).and_then(|frame|
+                frame.click_point_moved(std::time::Duration::from_millis(time as u64), &surface, x, y));
+            if let Some(cursor) = cursor { self.set_cursor(cursor); }
+            self.redraw_frame(id);
+            true
+        }
+
+        fn frame_button(&mut self, button: u32, pressed: bool, time: u32, serial: u32) -> bool {
+            let Some((id, _)) = &self.frame_focus else { return false };
+            let id = *id;
+            let click = match button { 0x110 => FrameClick::Normal, 0x111 => FrameClick::Alternate, _ => return true };
+            let action = self.frames.get_mut(&id).and_then(|frame|
+                frame.on_click(std::time::Duration::from_millis(time as u64), click, pressed));
+            if let Some(action) = action {
+                if matches!(action, FrameAction::Close) { self.request_close(id); }
+                else if let (Some(surface), Some(seat)) = (self.surfaces.get(&id), &self.seat) {
+                    if let Some(top) = &surface.xdg_toplevel {
+                        match action {
+                            FrameAction::Move => top._move(seat, serial),
+                            FrameAction::Minimize => top.set_minimized(),
+                            FrameAction::Maximize => top.set_maximized(),
+                            FrameAction::UnMaximize => top.unset_maximized(),
+                            FrameAction::ShowMenu(x, y) => top.show_window_menu(seat, serial, x, y),
+                            FrameAction::Resize(edge) => {
+                                use smithay_client_toolkit::reexports::csd_frame::ResizeEdge as E;
+                                let edge = match edge {
+                                    E::Top => xdg_toplevel::ResizeEdge::Top, E::Bottom => xdg_toplevel::ResizeEdge::Bottom,
+                                    E::Left => xdg_toplevel::ResizeEdge::Left, E::Right => xdg_toplevel::ResizeEdge::Right,
+                                    E::TopLeft => xdg_toplevel::ResizeEdge::TopLeft, E::TopRight => xdg_toplevel::ResizeEdge::TopRight,
+                                    E::BottomLeft => xdg_toplevel::ResizeEdge::BottomLeft, E::BottomRight => xdg_toplevel::ResizeEdge::BottomRight,
+                                    _ => xdg_toplevel::ResizeEdge::None,
+                                };
+                                top.resize(seat, serial, edge);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            self.redraw_frame(id);
+            true
         }
 
         /// Build the `wl_shm` buffer for a pending surface once the compositor
@@ -231,17 +521,27 @@ mod imp {
             self.surfaces.insert(
                 p.id,
                 Surface {
-                    wl_surface: p.wl_surface,
+                    wl_surface: p.wl_surface.clone(),
                     xdg_surface: Some(p.xdg_surface),
                     xdg_toplevel: self.toplevels.remove(&p.id),
                     subsurface: None,
+                    parent_id: None,
                     buffer,
                     region: p.region,
                     dmabuf_fd: None,
+                    pending_frames: Vec::new(),
                     width: p.width,
                     height: p.height,
                     configured: true,
                     closed: false,
+                    fps_meter: false,
+                    title: p.title,
+                    display_width: p.width,
+                    display_height: p.height,
+                    viewport: self.viewporter.as_ref().map(|v| v.get_viewport(&p.wl_surface, qh, ())),
+                    position: (0, 0),
+                    window_state: WindowState::empty(),
+                    desktop_configured: false,
                 },
             );
             crate::info!("surface {} configured ({}×{})", p.id, p.width, p.height);
@@ -259,13 +559,16 @@ mod imp {
         /// Tear down a toplevel whose `configure` never arrived, so its proxies
         /// do not leak and its id is not reused while half-alive.
         fn abandon_pending(&mut self, id: u32) {
+            self.state.frames.remove(&id);
+            self.state.client_decorated.remove(&id);
+            self.state.configured.remove(&id);
+            self.state.wm_capabilities.remove(&id);
+            if let Some(decoration) = self.state.decorations.remove(&id) { decoration.destroy(); }
+            if let Some(t) = self.state.toplevels.remove(&id) { t.destroy(); }
             if let Some(pos) = self.state.pending.iter().position(|p| p.id == id) {
                 let p = self.state.pending.remove(pos);
                 p.xdg_surface.destroy();
                 p.wl_surface.destroy();
-            }
-            if let Some(t) = self.state.toplevels.remove(&id) {
-                t.destroy();
             }
             let _ = self.conn.flush();
         }
@@ -296,11 +599,29 @@ mod imp {
             if state.decoration.is_some() {
                 crate::info!("server-side decorations available (xdg-decoration)");
             } else {
-                crate::info!("no xdg-decoration; the compositor draws its own title bar");
+                crate::info!("no xdg-decoration; client-side title bar support is required");
             }
             // v3 adds format modifiers, which we need to import GPU buffers.
-            state.dmabuf = globals.bind(&qh, 3..=4, ()).ok();
+            // Bind v3 for the format/modifier events. v4 requires the feedback
+            // protocol instead and no longer guarantees these advertisements.
+            state.dmabuf = globals.bind(&qh, 3..=3, ()).ok();
             state.subcompositor = globals.bind(&qh, 1..=1, ()).ok();
+            state.viewporter = globals.bind(&qh, 1..=1, ()).ok();
+            state.cursor_manager = globals.bind(&qh, 1..=1, ()).ok();
+            state.frame_compositor = CompositorState::bind(&globals, &qh).ok().map(Arc::new);
+            if let Some(compositor) = state.frame_compositor.as_ref() {
+                state.frame_subcompositor = SubcompositorState::bind(compositor.wl_compositor().clone(), &globals, &qh).ok().map(Arc::new);
+            }
+            state.frame_shm = state.shm.clone().map(Shm::from);
+            state.output_manager = globals.bind(&qh, 1..=3, ()).ok();
+            globals.contents().with_list(|list| {
+                for global in list.iter().filter(|global| global.interface == "wl_output") {
+                    let output: wl_output::WlOutput = globals.registry().bind(global.name, global.version.min(4), &qh, global.name);
+                    let logical = state.output_manager.as_ref().map(|manager| manager.get_xdg_output(&output, &qh, global.name));
+                    state.outputs.insert(global.name, OutputSize::default());
+                    state.output_proxies.insert(global.name, (output, logical));
+                }
+            });
             // Input: the seat gives us pointer and keyboard events, which are
             // forwarded to whichever guest owns the surface under the cursor.
             state.seat = globals.bind(&qh, 1..=7, ()).ok();
@@ -405,17 +726,28 @@ mod imp {
             let qh = self.queue.handle();
 
             let id = self.state.alloc_id();
-            let wl_surface = compositor.create_surface(&qh, ());
+            let wl_surface = match self.state.frame_compositor.as_ref() {
+                Some(compositor) => compositor.create_surface(&qh),
+                None => compositor.create_surface(&qh, ()),
+            };
             let xdg_surface = wm_base.get_xdg_surface(&wl_surface, &qh, ());
             let xdg_toplevel = xdg_surface.get_toplevel(&qh, SurfaceId(id));
             xdg_toplevel.set_title(title.to_string());
-            // Ask for a real title bar. The compositor may ignore it (GNOME
-            // always draws client-side), which is why the request is best-effort.
+            // Prefer server-side framing where it is offered, and use a host
+            // client-side frame when the compositor declines or lacks it.
             if let Some(manager) = self.state.decoration.clone() {
-                let decoration = manager.get_toplevel_decoration(&xdg_toplevel, &qh, ());
+                let decoration = manager.get_toplevel_decoration(&xdg_toplevel, &qh, SurfaceId(id));
                 decoration.set_mode(zxdg_toplevel_decoration_v1::Mode::ServerSide);
                 self.state.decorations.insert(id, decoration);
+            } else {
+                self.state.client_decorated.insert(id);
             }
+            // A viewport can scale existing guest buffers during interactive
+            // resize. Without it, do not advertise unsupported resizing.
+            if self.state.viewporter.is_none() {
+                xdg_toplevel.set_min_size(width as i32, height as i32);
+                xdg_toplevel.set_max_size(width as i32, height as i32);
+            } else { xdg_toplevel.set_min_size(160, 120); }
             wl_surface.commit();
 
             self.state.pending.push(Pending {
@@ -426,6 +758,7 @@ mod imp {
                 wl_surface,
                 region,
                 stride,
+                title: title.to_owned(),
             });
             // Stash the toplevel proxy so `finalize_surface` can complete the
             // Surface without a second lookup path.
@@ -438,6 +771,7 @@ mod imp {
                 return None;
             }
 
+            if let Some(surface) = self.state.surfaces.get_mut(&id) { surface.title = title.to_owned(); }
             let info = SurfaceInfo {
                 id,
                 shm_name: self
@@ -474,11 +808,13 @@ mod imp {
             }
             s.wl_surface.attach(Some(&s.buffer), 0, 0);
             // A zero-area damage rect is a protocol violation.
-            s.wl_surface.damage(0, 0, s.width as i32, s.height as i32);
+            s.wl_surface.damage(0, 0, s.display_width as i32, s.display_height as i32);
             s.wl_surface.commit();
             // Flush errors mean the compositor is gone; report the frame as lost
             // rather than pretending it was shown.
-            self.conn.flush().is_ok()
+            let presented = self.conn.flush().is_ok();
+            if presented { self.record_frame(id); }
+            presented
         }
 
         /// Create a child layer of `parent` at `(x, y)`.
@@ -543,19 +879,31 @@ mod imp {
             self.state.surfaces.insert(
                 id,
                 Surface {
-                    wl_surface,
+                    wl_surface: wl_surface.clone(),
                     xdg_surface: None,
                     xdg_toplevel: None,
                     subsurface: Some(subsurface),
+                    parent_id: Some(parent),
                     buffer,
                     region,
                     dmabuf_fd: None,
+                    pending_frames: Vec::new(),
                     width: width.max(1),
                     height: height.max(1),
                     configured: true,
                     closed: false,
+                    fps_meter: false,
+                    title: String::new(),
+                    display_width: width.max(1),
+                    display_height: height.max(1),
+                    viewport: self.state.viewporter.as_ref().map(|v| v.get_viewport(&wl_surface, &qh, ())),
+                    position: (x, y),
+                    window_state: WindowState::empty(),
+                    desktop_configured: true,
                 },
             );
+            self.state.scale_children(parent);
+            self.state.surfaces.get(&parent)?.wl_surface.commit();
             let _ = self.conn.flush();
             crate::info!("created subsurface {id} of {parent} at {x},{y} size={width}x{height} (input transparent)");
             Some(id)
@@ -563,17 +911,75 @@ mod imp {
 
         /// Move an existing subsurface inside its parent.
         pub fn set_subsurface_position(&mut self, id: u32, x: i32, y: i32) -> bool {
-            let Some(s) = self.state.surfaces.get(&id) else { return false };
-            let Some(sub) = s.subsurface.as_ref() else { return false };
-            sub.set_position(x, y);
-            s.wl_surface.commit();
+            let Some(s) = self.state.surfaces.get_mut(&id) else { return false };
+            if s.subsurface.is_none() { return false; }
+            s.position = (x, y);
+            let Some(parent) = s.parent_id else { return false };
+            self.state.scale_children(parent);
+            self.state.surfaces.get(&parent).unwrap().wl_surface.commit();
             let _ = self.conn.flush();
             true
+        }
+
+        pub fn set_surface_options(&mut self, id: u32, enabled: bool) -> bool {
+            let Some(surface) = self.state.surfaces.get_mut(&id) else { return false };
+            surface.fps_meter = enabled;
+            let title = surface.title.clone();
+            if !enabled { self.state.update_frame_title(id, title); }
+            let _ = self.conn.flush();
+            true
+        }
+
+        fn record_frame(&mut self, id: u32) {
+            let Some(surface) = self.state.surfaces.get(&id) else { return };
+            let parent = surface.parent_id.unwrap_or(id);
+            let Some(root) = self.state.surfaces.get(&parent) else { return };
+            if !root.fps_meter { return; }
+            // If video has a separate child layer, count decoder frames rather
+            // than summing UI swaps with video frames.
+            if id == parent && self.state.surfaces.values().any(|s| s.parent_id == Some(parent)) { return; }
+            let now = std::time::Instant::now();
+            let entry = self.state.fps.entry(id).or_insert((0, now));
+            entry.0 += 1;
+            let elapsed = now.duration_since(entry.1).as_secs_f32();
+            if elapsed >= 1.0 {
+                let fps = entry.0 as f32 / elapsed;
+                entry.0 = 0; entry.1 = now;
+                let title = format!("{} · {fps:.0} FPS", root.title);
+                self.state.update_frame_title(parent, title);
+                let _ = self.conn.flush();
+            }
+        }
+
+        pub fn contains_surface(&self, id: u32) -> bool {
+            self.state.surfaces.contains_key(&id)
+        }
+
+        pub fn is_toplevel(&self, id: u32) -> bool {
+            self.state.surfaces.get(&id)
+                .is_some_and(|s| s.xdg_toplevel.is_some() && !s.closed)
         }
 
         /// Destroy a surface and its Wayland objects (the compositor closed the
         /// window, or the guest went away). Idempotent.
         pub fn destroy_surface(&mut self, id: u32) -> bool {
+            // Retire children before their parent. Otherwise their commits are
+            // still Acked even though Wayland can no longer display them.
+            let children: Vec<u32> = self.state.surfaces.iter()
+                .filter_map(|(child, s)| (s.parent_id == Some(id)).then_some(*child))
+                .collect();
+            for child in children {
+                self.destroy_surface(child);
+            }
+            if self.state.keyboard_focus == Some(id) { self.state.release_keyboard(); }
+            if self.state.pointer_focus == Some(id) { self.state.pointer_focus = None; }
+            self.state.fps.remove(&id);
+            self.state.frames.remove(&id);
+            self.state.client_decorated.remove(&id);
+            self.state.configured.remove(&id);
+            self.state.wm_capabilities.remove(&id);
+            if self.state.frame_focus.as_ref().is_some_and(|(owner, _)| *owner == id) { self.state.frame_focus = None; }
+            if let Some(decoration) = self.state.decorations.remove(&id) { decoration.destroy(); }
             let Some(surface) = self.state.surfaces.remove(&id) else { return false };
             if let Some(t) = surface.xdg_toplevel {
                 t.destroy();
@@ -584,7 +990,14 @@ mod imp {
             if let Some(sub) = surface.subsurface {
                 sub.destroy();
             }
+            for buffer in surface.pending_frames {
+                // A leased decode surface cannot be recycled until the real
+                // compositor release, even after its wl_surface is destroyed.
+                let leased = buffer.data::<FrameBuffer>().is_some_and(|data| data.released.is_some());
+                if buffer.is_alive() && !leased { buffer.destroy(); }
+            }
             surface.buffer.destroy();
+            if let Some(viewport) = surface.viewport { viewport.destroy(); }
             surface.wl_surface.destroy();
             let _ = self.conn.flush();
             crate::debug!("destroyed surface {id}");
@@ -711,17 +1124,25 @@ mod imp {
             Ok(())
         }
 
+        // Keep compositor backpressure bounded, including when a window is hidden.
+        fn frame_slot_available(&mut self, id: u32) -> Result<bool, String> {
+            self.drain_wayland();
+            let surface = self.state.surfaces.get_mut(&id).ok_or_else(|| format!("unknown surface {id}"))?;
+            surface.pending_frames.retain(|buffer| buffer.is_alive());
+            Ok(surface.pending_frames.len() < 3)
+        }
+
         /// Snapshot decoder-owned CPU memory and submit it through wl_shm.
         /// Every frame has separate storage until the compositor releases it.
         pub fn present_shm(&mut self, id: u32, fd: std::os::fd::OwnedFd,
             width: u32, height: u32, stride: u32, format: u32) -> Result<(), String> {
-            if !self.state.surfaces.contains_key(&id) {
-                return Err(format!("unknown surface {id}"));
-            }
+            if !self.frame_slot_available(id)? { return Ok(()); }
             let pixels = crate::software::snapshot(fd, width, height, stride, format)?;
             let source_size = (width, height);
             let surface = self.state.surfaces.get(&id).unwrap();
-            let (width, height) = if surface.subsurface.is_some() {
+            // wp_viewporter scales on the compositor/GPU. Only the legacy
+            // path without a viewport needs a CPU-resized snapshot.
+            let (width, height) = if surface.subsurface.is_some() && surface.viewport.is_none() {
                 (surface.width, surface.height)
             } else { (width, height) };
             let pixels = crate::software::resize(pixels, source_size.0, source_size.1, width, height)?;
@@ -733,16 +1154,53 @@ mod imp {
             let duplicate = region.try_clone_fd().map_err(|e| e.to_string())?;
             let pool = shm.create_pool(duplicate.as_fd(), pixels.len() as i32, &qh, ());
             let buffer = pool.create_buffer(0, width as i32, height as i32,
-                (width * 4) as i32, wl_shm::Format::Xrgb8888, &qh, SoftwareFrame);
+                (width * 4) as i32, wl_shm::Format::Xrgb8888, &qh, FrameBuffer::default());
             pool.destroy();
             let s = self.state.surfaces.get_mut(&id).unwrap();
             s.wl_surface.set_buffer_transform(wl_output::Transform::Normal);
             s.wl_surface.attach(Some(&buffer), 0, 0);
-            s.wl_surface.damage(0, 0, width as i32, height as i32);
+            s.wl_surface.damage(0, 0, s.display_width as i32, s.display_height as i32);
             s.wl_surface.commit();
+            s.pending_frames.push(buffer);
             // The pool request sends its own fd. Wayland retains the snapshot
             // independently of the Android buffer, which may now be recycled.
-            self.conn.flush().map_err(|e| e.to_string())
+            self.conn.flush().map_err(|e| e.to_string())?;
+            self.record_frame(id);
+            Ok(())
+        }
+
+        /// Import a synchronized, top-down multi-plane video frame without CPU
+        /// conversion. Keep the source HardwareFrame until the returned flag is
+        /// true (wl_buffer.release). None means dropped before import.
+        pub fn present_video_dmabuf(&mut self, id: u32, frame: pengudroid_hostgpu::video::ExportedFrame)
+            -> Result<Option<Arc<std::sync::atomic::AtomicBool>>, String> {
+            frame.validate()?;
+            if !self.frame_slot_available(id)? { return Ok(None); }
+            for plane in &frame.planes {
+                if !self.state.dmabuf_supported.contains(&(frame.fourcc, plane.modifier)) {
+                    return Err(format!("compositor did not advertise video format {:#x} modifier {:#x}", frame.fourcc, plane.modifier));
+                }
+            }
+            let dmabuf = self.state.dmabuf.as_ref().ok_or("compositor lacks linux-dmabuf")?;
+            let qh = self.queue.handle();
+            let params = dmabuf.create_params(&qh, ());
+            for (index, plane) in frame.planes.iter().enumerate() {
+                params.add(frame.objects[plane.object_index as usize].as_fd(), index as u32,
+                    plane.offset, plane.stride, (plane.modifier >> 32) as u32, plane.modifier as u32);
+            }
+            let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let buffer = params.create_immed(frame.width as i32, frame.height as i32, frame.fourcc,
+                zwp_linux_buffer_params_v1::Flags::empty(), &qh, FrameBuffer { released: Some(released.clone()) });
+            params.destroy();
+            let surface = self.state.surfaces.get_mut(&id).ok_or("video surface disappeared")?;
+            surface.wl_surface.set_buffer_transform(wl_output::Transform::Normal);
+            surface.wl_surface.attach(Some(&buffer), 0, 0);
+            surface.wl_surface.damage(0, 0, surface.display_width as i32, surface.display_height as i32);
+            surface.wl_surface.commit();
+            surface.pending_frames.push(buffer);
+            self.conn.flush().map_err(|e| e.to_string())?;
+            self.record_frame(id);
+            Ok(Some(released))
         }
 
         /// Present a GPU-rendered dma-buf on an existing surface (zero-copy).
@@ -761,6 +1219,7 @@ mod imp {
             modifier: u64,
             offset: u32,
         ) -> Result<(), String> {
+            if !self.frame_slot_available(id)? { return Ok(()); }
             let dmabuf = self
                 .state
                 .dmabuf
@@ -785,7 +1244,7 @@ mod imp {
                 fourcc,
                 zwp_linux_buffer_params_v1::Flags::empty(),
                 &qh,
-                (),
+                FrameBuffer::default(),
             );
             params.destroy();
 
@@ -809,30 +1268,13 @@ mod imp {
                     .set_buffer_transform(wl_output::Transform::Flipped180);
             }
             s.wl_surface.attach(Some(&buffer), 0, 0);
-            s.wl_surface.damage(0, 0, width as i32, height as i32);
+            s.wl_surface.damage(0, 0, s.display_width as i32, s.display_height as i32);
             s.wl_surface.commit();
-            s.buffer = buffer;
+            s.pending_frames.push(buffer);
             s.dmabuf_fd = Some(fd);
             let _ = self.conn.flush();
 
-            // FPS meter: the daemon is the only component that sees every
-            // presented frame, so it is the honest place to count them. The
-            // window title is used as the display because it needs no overlay
-            // rendering and every compositor shows it.
-            if std::env::var_os("PENGUDROID_FPS_METER").is_some() {
-                let now = std::time::Instant::now();
-                let entry = self.state.fps.entry(id).or_insert((0, now));
-                entry.0 += 1;
-                let elapsed = now.duration_since(entry.1).as_secs_f32();
-                if elapsed >= 1.0 {
-                    let fps = entry.0 as f32 / elapsed;
-                    entry.0 = 0;
-                    entry.1 = now;
-                    if let Some(toplevel) = self.state.toplevels.get(&id) {
-                        toplevel.set_title(format!("PenguDroid \u{2014} {fps:.0} fps"));
-                    }
-                }
-            }
+            self.record_frame(id);
             Ok(())
         }
     }
@@ -885,15 +1327,26 @@ mod imp {
     // --- Dispatch implementations -------------------------------------------
 
     impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
-        fn event(
-            _: &mut Self,
-            _: &wl_registry::WlRegistry,
-            _: wl_registry::Event,
-            _: &GlobalListContents,
-            _: &Connection,
-            _: &QueueHandle<Self>,
-        ) {
-            // Global discovery is handled by `registry_queue_init`.
+        fn event(state: &mut Self, registry: &wl_registry::WlRegistry, event: wl_registry::Event,
+            _: &GlobalListContents, _: &Connection, qh: &QueueHandle<Self>) {
+            match event {
+                wl_registry::Event::Global { name, interface, version } if interface == "wl_output" => {
+                    if !state.output_proxies.contains_key(&name) {
+                        let output: wl_output::WlOutput = registry.bind(name, version.min(4), qh, name);
+                        let logical = state.output_manager.as_ref().map(|manager| manager.get_xdg_output(&output, qh, name));
+                        state.outputs.insert(name, OutputSize::default());
+                        state.output_proxies.insert(name, (output, logical));
+                    }
+                }
+                wl_registry::Event::GlobalRemove { name } => {
+                    state.outputs.remove(&name);
+                    if let Some((output, logical)) = state.output_proxies.remove(&name) {
+                        if let Some(logical) = logical { logical.destroy(); }
+                        if output.version() >= 3 { output.release(); }
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -913,13 +1366,63 @@ mod imp {
         };
     }
 
-    /// Snapshot buffers are immutable and retired only after wl_buffer.release.
-    struct SoftwareFrame;
-    impl Dispatch<wl_buffer::WlBuffer, SoftwareFrame> for State {
+    /// Per-frame imports are retired only after wl_buffer.release.
+    #[derive(Default)]
+    struct FrameBuffer { released: Option<Arc<std::sync::atomic::AtomicBool>> }
+    impl Dispatch<wl_buffer::WlBuffer, FrameBuffer> for State {
         fn event(_: &mut Self, buffer: &wl_buffer::WlBuffer, event: wl_buffer::Event,
-            _: &SoftwareFrame, _: &Connection, _: &QueueHandle<Self>) {
+            data: &FrameBuffer, _: &Connection, _: &QueueHandle<Self>) {
             if let wl_buffer::Event::Release = event {
+                if let Some(released) = &data.released { released.store(true, std::sync::atomic::Ordering::Release); }
                 buffer.destroy();
+            }
+        }
+    }
+
+    ignore_events!(zxdg_output_manager_v1::ZxdgOutputManagerV1, ());
+    impl Dispatch<wl_output::WlOutput, u32> for State {
+        fn event(state: &mut Self, _: &wl_output::WlOutput, event: wl_output::Event,
+            id: &u32, _: &Connection, _: &QueueHandle<Self>) {
+            let output = state.outputs.entry(*id).or_default();
+            match event {
+                wl_output::Event::Mode { flags, width, height, .. } => {
+                    if matches!(flags, wayland_client::WEnum::Value(flags) if flags.contains(wl_output::Mode::Current)) {
+                        output.pixels = (width.max(0) as u32, height.max(0) as u32);
+                    }
+                }
+                wl_output::Event::Scale { factor } => output.scale = factor.max(1) as u32,
+                wl_output::Event::Geometry { transform, .. } => {
+                    output.rotated = matches!(transform, wayland_client::WEnum::Value(
+                        wl_output::Transform::_90 | wl_output::Transform::_270 |
+                        wl_output::Transform::Flipped90 | wl_output::Transform::Flipped270));
+                }
+                _ => {}
+            }
+        }
+    }
+    impl Dispatch<zxdg_output_v1::ZxdgOutputV1, u32> for State {
+        fn event(state: &mut Self, _: &zxdg_output_v1::ZxdgOutputV1, event: zxdg_output_v1::Event,
+            id: &u32, _: &Connection, _: &QueueHandle<Self>) {
+            if let zxdg_output_v1::Event::LogicalSize { width, height } = event {
+                if width > 0 && height > 0 { state.outputs.entry(*id).or_default().logical = Some((width as u32, height as u32)); }
+            }
+        }
+    }
+
+    ignore_events!(wp_viewporter::WpViewporter, ());
+    ignore_events!(wp_cursor_shape_manager_v1::WpCursorShapeManagerV1, ());
+    ignore_events!(wp_cursor_shape_device_v1::WpCursorShapeDeviceV1, ());
+    ignore_events!(wp_viewport::WpViewport, ());
+    ignore_events!(wl_compositor::WlCompositor, smithay_client_toolkit::globals::GlobalData);
+    smithay_client_toolkit::delegate_subcompositor!(State);
+    impl Dispatch<wl_surface::WlSurface, SurfaceData> for State {
+        fn event(state: &mut Self, surface: &wl_surface::WlSurface, event: wl_surface::Event,
+            _: &SurfaceData, _: &Connection, _: &QueueHandle<Self>) {
+            if let wl_surface::Event::PreferredBufferScale { factor } = event {
+                if let Some(id) = state.surface_id_of(surface) {
+                    if let Some(frame) = state.frames.get_mut(&id) { frame.set_scaling_factor(factor as f64); }
+                    state.redraw_frame(id);
+                }
             }
         }
     }
@@ -948,7 +1451,9 @@ mod imp {
                 use wayland_client::WEnum;
                 let has = |c: Capability| matches!(capabilities, WEnum::Value(v) if v.contains(c));
                 if has(Capability::Pointer) && state.pointer.is_none() {
-                    state.pointer = Some(seat.get_pointer(qh, ()));
+                    let pointer = seat.get_pointer(qh, ());
+                    state.cursor = state.cursor_manager.as_ref().map(|manager| manager.get_pointer(&pointer, qh, ()));
+                    state.pointer = Some(pointer);
                     crate::info!("seat: pointer available");
                 }
                 if has(Capability::Keyboard) && state.keyboard.is_none() {
@@ -970,36 +1475,45 @@ mod imp {
         ) {
             use pengudroid_proto::InputKind;
             match event {
-                wl_pointer::Event::Enter { surface, surface_x, surface_y, .. } => {
+                wl_pointer::Event::Enter { surface, surface_x, surface_y, serial } => {
+                    state.pointer_serial = serial;
+                    state.set_cursor(CursorIcon::Default);
+                    state.frame_focus = None;
+                    if state.frame_enter(&surface, surface_x, surface_y) {
+                        state.pointer_focus = None;
+                        return;
+                    }
                     state.pointer_focus = state.surface_id_of(&surface);
                     state.pointer_pos = (surface_x, surface_y);
                     crate::info!(
                         "pointer entered surface {:?} at {surface_x:.0},{surface_y:.0}",
                         state.pointer_focus
                     );
-                    state.push_input(InputKind::PointerEnter {
-                        x: surface_x as f32,
-                        y: surface_y as f32,
-                    });
+                    let (x, y) = state.pointer_focus.map(|id| state.guest_coordinates(id, surface_x, surface_y))
+                        .unwrap_or((surface_x as f32, surface_y as f32));
+                    state.push_input(InputKind::PointerEnter { x, y });
                 }
                 wl_pointer::Event::Leave { .. } => {
+                    if let Some((id, _)) = state.frame_focus.take() {
+                        if let Some(frame) = state.frames.get_mut(&id) { frame.click_point_left(); }
+                        state.redraw_frame(id);
+                    }
                     state.push_input(InputKind::PointerLeave);
                     state.pointer_focus = None;
                 }
-                wl_pointer::Event::Motion { surface_x, surface_y, .. } => {
+                wl_pointer::Event::Motion { surface_x, surface_y, time } => {
+                    if state.frame_motion(time, surface_x, surface_y) { return; }
                     state.pointer_pos = (surface_x, surface_y);
-                    state.push_input(InputKind::PointerMotion {
-                        x: surface_x as f32,
-                        y: surface_y as f32,
-                    });
+                    let (x, y) = state.pointer_focus.map(|id| state.guest_coordinates(id, surface_x, surface_y))
+                        .unwrap_or((surface_x as f32, surface_y as f32));
+                    state.push_input(InputKind::PointerMotion { x, y });
                 }
-                wl_pointer::Event::Button { button, state: button_state, .. } => {
+                wl_pointer::Event::Button { button, state: button_state, time, serial } => {
                     use wayland_client::protocol::wl_pointer::ButtonState;
                     use wayland_client::WEnum;
-                    state.push_input(InputKind::PointerButton {
-                        button,
-                        pressed: matches!(button_state, WEnum::Value(ButtonState::Pressed)),
-                    });
+                    let pressed = matches!(button_state, WEnum::Value(ButtonState::Pressed));
+                    if state.frame_button(button, pressed, time, serial) { return; }
+                    state.push_input(InputKind::PointerButton { button, pressed });
                 }
                 wl_pointer::Event::Axis { axis, value, .. } => {
                     use wayland_client::protocol::wl_pointer::Axis;
@@ -1023,13 +1537,29 @@ mod imp {
             _: &Connection,
             _: &QueueHandle<Self>,
         ) {
-            if let wl_keyboard::Event::Key { key, state: key_state, .. } = event {
-                use wayland_client::protocol::wl_keyboard::KeyState;
-                use wayland_client::WEnum;
-                state.push_input(pengudroid_proto::InputKind::Key {
-                    keycode: key,
-                    pressed: matches!(key_state, WEnum::Value(KeyState::Pressed)),
-                });
+            use pengudroid_proto::InputKind;
+            use wayland_client::protocol::wl_keyboard::KeyState;
+            use wayland_client::WEnum;
+            match event {
+                wl_keyboard::Event::Enter { surface, keys, .. } => {
+                    state.release_keyboard();
+                    state.keyboard_focus = state.surface_id_of(&surface);
+                    // Compositor-provided held modifiers are physical keycodes,
+                    // not characters. Restore them on this keyboard focus only.
+                    if let Some(id) = state.keyboard_focus {
+                        for key in keys.chunks_exact(4) {
+                            let keycode = u32::from_ne_bytes(key.try_into().unwrap());
+                            state.held_keys.insert(keycode);
+                            state.input.push((id, InputKind::Key { keycode, pressed: true }));
+                        }
+                    }
+                }
+                wl_keyboard::Event::Leave { .. } => state.release_keyboard(),
+                wl_keyboard::Event::Key { key, state: key_state, .. } => {
+                    let pressed = matches!(key_state, WEnum::Value(KeyState::Pressed));
+                    state.keyboard_key(key, pressed);
+                }
+                _ => {}
             }
         }
     }
@@ -1062,6 +1592,10 @@ mod imp {
             if let xdg_surface::Event::Configure { serial } = event {
                 proxy.ack_configure(serial);
                 state.finalize_surface(proxy, qh);
+                if let Some(id) = state.surfaces.iter().find_map(|(id, s)|
+                    (s.xdg_surface.as_ref() == Some(proxy)).then_some(*id)) {
+                    state.configure_window(id, qh);
+                }
             }
         }
     }
@@ -1079,20 +1613,15 @@ mod imp {
         }
     }
 
-    impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, ()> for State {
-        fn event(
-            _: &mut Self,
-            _: &zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
-            event: zxdg_toplevel_decoration_v1::Event,
-            _: &(),
-            _: &Connection,
-            _: &QueueHandle<Self>,
-        ) {
-            // `Configure` reports which mode the compositor settled on. We asked
-            // for server-side and cannot draw client-side decorations, so there
-            // is nothing to react to; the event is consumed to keep the queue
-            // clean.
-            let _ = event;
+    impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, SurfaceId> for State {
+        fn event(state: &mut Self, _: &zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
+            event: zxdg_toplevel_decoration_v1::Event, id: &SurfaceId, _: &Connection, _: &QueueHandle<Self>) {
+            if let zxdg_toplevel_decoration_v1::Event::Configure { mode } = event {
+                if matches!(mode, wayland_client::WEnum::Value(zxdg_toplevel_decoration_v1::Mode::ServerSide)) {
+                    state.client_decorated.remove(&id.0);
+                    state.frames.remove(&id.0);
+                } else { state.client_decorated.insert(id.0); }
+            }
         }
     }
 
@@ -1105,24 +1634,180 @@ mod imp {
             _: &Connection,
             _: &QueueHandle<Self>,
         ) {
-            if let xdg_toplevel::Event::Close = event {
-                // The toplevel is created with the surface id as its user data,
-                // so a close is attributed to *its* window (picking "the first
-                // open surface" would be wrong with several windows).
-                match proxy.data::<SurfaceId>().map(|d| d.0) {
-                    Some(id) => {
-                        if let Some(s) = state.surfaces.get_mut(&id) {
-                            if !s.closed {
-                                s.closed = true;
-                                state.close_requests.push(id);
-                            }
-                        }
+            let Some(id) = proxy.data::<SurfaceId>().map(|data| data.0) else { return };
+            match event {
+                xdg_toplevel::Event::Close => state.request_close(id),
+                xdg_toplevel::Event::Configure { width, height, states } => {
+                    let mut flags = WindowState::empty();
+                    for value in states.chunks_exact(4) {
+                        flags |= match u32::from_ne_bytes(value.try_into().unwrap()) {
+                            1 => WindowState::MAXIMIZED, 2 => WindowState::FULLSCREEN,
+                            3 => WindowState::RESIZING, 4 => WindowState::ACTIVATED,
+                            5 => WindowState::TILED_LEFT, 6 => WindowState::TILED_RIGHT,
+                            7 => WindowState::TILED_TOP, 8 => WindowState::TILED_BOTTOM,
+                            _ => WindowState::empty(),
+                        };
                     }
-                    None => crate::warn!("close event from an untracked toplevel"),
+                    state.configured.insert(id, (width, height, flags));
                 }
+                xdg_toplevel::Event::WmCapabilities { capabilities } => {
+                    let mut flags = WindowManagerCapabilities::empty();
+                    for value in capabilities.chunks_exact(4) {
+                        flags |= match u32::from_ne_bytes(value.try_into().unwrap()) {
+                            1 => WindowManagerCapabilities::WINDOW_MENU,
+                            2 => WindowManagerCapabilities::MAXIMIZE,
+                            3 => WindowManagerCapabilities::FULLSCREEN,
+                            4 => WindowManagerCapabilities::MINIMIZE,
+                            _ => WindowManagerCapabilities::empty(),
+                        };
+                    }
+                    if state.viewporter.is_none() { flags.remove(WindowManagerCapabilities::MAXIMIZE | WindowManagerCapabilities::FULLSCREEN); }
+                    state.wm_capabilities.insert(id, flags);
+                    if let Some(frame) = state.frames.get_mut(&id) { frame.update_wm_capabilities(flags); }
+                    state.redraw_frame(id);
+                }
+                _ => {}
             }
         }
     }
+    #[cfg(test)]
+    mod focus_tests {
+        use super::*;
+        use pengudroid_proto::InputKind;
+        #[test]
+        fn initial_portrait_window_fits_small_and_rotated_desktops() {
+            assert_eq!(fit_window((720, 1280), (1000, 700)), (393, 700));
+            assert_eq!(fit_window((1280, 720), (700, 1000)), (700, 393));
+            assert_eq!(fit_window((320, 240), (1000, 700)), (320, 240));
+        }
+
+        #[test]
+        fn hardware_video_import_preserves_planes_and_waits_for_release() {
+            use pengudroid_hostgpu::video::{Decoder, ReceiveStatus, SendStatus};
+            use std::sync::atomic::Ordering;
+            let (Some(plugin), Some(fixture)) = (std::env::var_os("PENGUDROID_TEST_VIDEO_BRIDGE"),
+                std::env::var_os("PENGUDROID_TEST_VIDEO_FIXTURE")) else { return; };
+            let bytes = std::fs::read(fixture).unwrap();
+            let device = std::env::var_os("PENGUDROID_TEST_VIDEO_DEVICE").unwrap_or_else(|| "/dev/dri/renderD128".into());
+            let mut decoder = Decoder::open_plugin(std::path::Path::new(&plugin), "h264", std::path::Path::new(&device), &[]).unwrap();
+            let mut graphics = Graphics::connect().expect("real compositor required for GPU video import test");
+            graphics.refresh();
+            let id = graphics.create_toplevel(128, 128, "PenguDroid hardware video test").unwrap().id;
+            for pts in 0..32 {
+                decoder.flush();
+                assert_eq!(decoder.send(&bytes, pts).unwrap(), SendStatus::Accepted);
+                assert_eq!(decoder.end_of_stream().unwrap(), SendStatus::Accepted);
+                let frame = match decoder.receive().unwrap() {
+                    ReceiveStatus::Frame(frame) => frame, _ => panic!("no hardware frame"),
+                };
+                let export = frame.export().unwrap();
+                assert_eq!(export.planes.len(), 2, "NV12 planes must reach the compositor unchanged");
+                let released = graphics.present_video_dmabuf(id, export).unwrap().expect("frame slot available");
+                graphics.refresh();
+                if pts == 31 { assert!(graphics.destroy_surface(id)); }
+                else { assert!(graphics.present(id)); } // detach the video buffer
+                for _ in 0..100 {
+                    graphics.refresh();
+                    if released.load(Ordering::Acquire) { break; }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                assert!(released.load(Ordering::Acquire), "source surface cannot be recycled before wl_buffer.release");
+                drop(frame);
+            }
+            graphics.destroy_surface(id);
+            graphics.refresh();
+        }
+
+        #[test]
+        fn software_frames_remain_bounded_and_release_wayland_objects() {
+            if std::env::var_os("WAYLAND_DISPLAY").is_none() { return; }
+            let mut graphics = Graphics::connect().expect("desktop compositor");
+            let id = graphics.create_toplevel(64, 64, "PenguDroid frame lifetime test").unwrap().id;
+            let source = AshmemRegion::create("pd-frame-lifetime", 128 * 72 * 4).unwrap();
+            let original = graphics.state.surfaces[&id].buffer.id();
+            for _ in 0..1000 {
+                graphics.present_shm(id, source.try_clone_fd().unwrap(), 128, 72, 512, 1).unwrap();
+                assert!(graphics.state.surfaces[&id].pending_frames.len() <= 3);
+            }
+            graphics.queue.roundtrip(&mut graphics.state).unwrap();
+            let surface = &graphics.state.surfaces[&id];
+            assert_eq!(surface.buffer.id(), original, "fallback buffer remains owned separately");
+            // At most the currently attached buffer may still be retained once
+            // the compositor has processed and released superseded commits.
+            assert!(surface.pending_frames.iter().filter(|b| b.is_alive()).count() <= 1);
+            graphics.destroy_surface(id);
+            graphics.queue.roundtrip(&mut graphics.state).unwrap();
+        }
+
+        #[test]
+        fn native_frame_resize_maximize_and_close_keep_video_and_input_aligned() {
+            if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+                eprintln!("skipping: no Wayland compositor"); return;
+            }
+            let mut graphics = Graphics::connect().expect("connect to desktop compositor");
+            if graphics.state.viewporter.is_none() {
+                eprintln!("skipping: compositor does not provide wp_viewporter"); return;
+            }
+            let info = graphics.create_toplevel(320, 240, "PenguDroid desktop lifecycle test").unwrap();
+            let id = info.id;
+            if let Some(decoration) = graphics.state.decorations.get(&id) {
+                decoration.set_mode(zxdg_toplevel_decoration_v1::Mode::ClientSide);
+                graphics.queue.roundtrip(&mut graphics.state).unwrap();
+            }
+            graphics.state.client_decorated.insert(id);
+            graphics.state.configured.insert(id, (640, 480, WindowState::ACTIVATED));
+            graphics.state.configure_window(id, &graphics.queue.handle());
+            graphics.queue.roundtrip(&mut graphics.state).unwrap();
+            assert!(graphics.state.frames.contains_key(&id), "desktop frame must exist");
+            let header = graphics.state.frames[&id].add_borders(0, 0).1;
+            let root = &graphics.state.surfaces[&id];
+            assert_eq!((root.width, root.height), (320, 240), "guest buffer remains valid");
+            assert_eq!((root.display_width, root.display_height), (640, 480 - header));
+            let (x, y) = graphics.state.guest_coordinates(id, 320., (480 - header) as f64 / 2.);
+            assert!((x - 160.).abs() < 0.001 && (y - 120.).abs() < 0.001);
+            let video = graphics.create_subsurface(id, 16, 20, 160, 90).unwrap();
+            let child = &graphics.state.surfaces[&video];
+            assert_eq!(child.display_width, 320);
+            assert_eq!(child.display_height, (90 * (480 - header) / 240).max(1));
+            let top = graphics.state.surfaces[&id].xdg_toplevel.clone().unwrap();
+            for maximized in [true, false] {
+                if maximized { top.set_maximized(); } else { top.unset_maximized(); }
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    graphics.queue.roundtrip(&mut graphics.state).unwrap();
+                    if graphics.state.surfaces[&id].window_state.contains(WindowState::MAXIMIZED) == maximized { break; }
+                    assert!(std::time::Instant::now() < deadline, "compositor did not configure maximize={maximized}");
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            graphics.state.request_close(id);
+            graphics.state.request_close(id);
+            assert_eq!(graphics.close_requests(), vec![id]);
+            assert!(!graphics.present(id), "closed windows reject new guest frames");
+            graphics.destroy_surface(id);
+            assert!(!graphics.state.frames.contains_key(&id));
+            assert!(!graphics.contains_surface(video));
+            graphics.queue.roundtrip(&mut graphics.state).unwrap();
+        }
+
+        #[test]
+        fn keyboard_focus_is_independent_of_mouse_and_leave_releases_modifiers() {
+            let mut state = State::default();
+            state.pointer_focus = Some(10);
+            state.keyboard_focus = Some(20);
+            state.keyboard_key(42, true);
+            state.keyboard_key(30, true);
+            assert!(state.input.iter().all(|(id, _)| *id == 20));
+            state.input.clear();
+            state.release_keyboard();
+            assert_eq!(state.input.len(), 2);
+            assert!(state.input.iter().all(|(id, event)| *id == 20 && matches!(event, InputKind::Key { pressed: false, .. })));
+            state.input.clear();
+            state.keyboard_key(48, true);
+            assert!(state.input.is_empty(), "no input after keyboard focus leaves");
+        }
+    }
+
 }
 
 #[cfg(feature = "wayland")]
@@ -1157,6 +1842,9 @@ mod imp {
         pub fn focused_surface(&self) -> Option<u32> {
             None
         }
+        pub fn set_surface_options(&mut self, _id: u32, _enabled: bool) -> bool { false }
+        pub fn contains_surface(&self, _id: u32) -> bool { false }
+        pub fn is_toplevel(&self, _id: u32) -> bool { false }
         pub fn destroy_surface(&mut self, _id: u32) -> bool {
             false
         }
@@ -1203,6 +1891,10 @@ mod imp {
         pub fn present_shm(&mut self, _id: u32, _fd: std::os::fd::OwnedFd,
             _width: u32, _height: u32, _stride: u32, _format: u32) -> Result<(), String> {
             Err("graphics built without the `wayland` feature".into())
+        }
+        pub fn present_video_dmabuf(&mut self, _id: u32, _frame: pengudroid_hostgpu::video::ExportedFrame)
+            -> Result<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, String> {
+            Err("graphics built without the wayland feature".into())
         }
         #[allow(clippy::too_many_arguments)]
         pub fn present_dmabuf(

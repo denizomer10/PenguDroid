@@ -34,6 +34,8 @@ fn real_art_keyboard_and_local_window_layout() {
         .env("PENGUDROID_PROBE_KEYBOARD", "1")
         .env("PENGUDROID_PROBE_WINDOW_CONFIG", "1")
         .env("PENGUDROID_PROBE_AUDIO_FOCUS", "1")
+        .env("PENGUDROID_PROBE_BLAST_LIFECYCLE", "1")
+        .env("PENGUDROID_TRACE_VIDEO", "1")
         .env("XDG_RUNTIME_DIR", &dir).env_remove("PENGUDROID_SOCKET")
         .stdin(Stdio::null()).stdout(output.try_clone().unwrap()).stderr(output)
         .spawn().unwrap();
@@ -46,6 +48,8 @@ fn real_art_keyboard_and_local_window_layout() {
     };
     let text = std::fs::read_to_string(log).unwrap();
     assert!(status.success(), "ART probe failed ({status}):\n{text}");
+    assert!(text.contains("blast: real framework create/destroy/recreate passed"), "{text}");
+    assert_eq!(text.matches("[blast] video: consumer stopped").count(), 2, "{text}");
     assert!(text.contains("window: local WindowLayout.computeFrames = 720x1280"), "{text}");
     assert!(text.contains("native KeyCharacterMap: 6 Unicode cases passed"), "{text}");
     assert!(text.contains("audio: AIDL focus granted, current gain verified, abandon cleared"), "{text}");

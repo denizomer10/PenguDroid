@@ -556,11 +556,19 @@ const MAX_SINK_RESTARTS: u32 = 5;
 
 /// Start the thread that drains the queue into `pw-cat`.
 fn start_pump(track: &mut Track) {
+    start_pump_with(track, crate::spawn_sink);
+}
+
+fn start_pump_with(
+    track: &mut Track,
+    mut spawn_sink: impl FnMut(u32, u32) -> Option<crate::Sink> + Send + 'static,
+) {
     if track.pump.is_some() {
         return;
     }
-    let Some(sink) = crate::spawn_sink(track.rate, track.channels) else {
+    let Some(sink) = spawn_sink(track.rate, track.channels) else {
         eprintln!("audio: no sink (pw-cat/aplay) for AudioTrack");
+        track.shared.lock().unwrap_or_else(|e| e.into_inner()).alive = false;
         return;
     };
     let shared = Arc::clone(&track.shared);
@@ -592,7 +600,16 @@ fn start_pump(track: &mut Track) {
                 }
                 bytes
             };
-            let wrote = match stdin.as_mut() {
+            // An exited sink may temporarily leave a pipe reader inherited by
+            // another child being spawned. A small write can then succeed even
+            // though the actual audio process is already gone. Check the owned
+            // child as well as the pipe so recovery cannot silently stall.
+            let sink_alive = match sink.child.try_wait() {
+                Ok(None) => true,
+                Ok(Some(status)) => { eprintln!("audio: AudioTrack sink exited: {status}"); false }
+                Err(e) => { eprintln!("audio: cannot read AudioTrack sink state: {e}"); false }
+            };
+            let wrote = sink_alive && match stdin.as_mut() {
                 Some(pipe) => {
                     use std::io::Write as _;
                     match pipe.write_all(&chunk) {
@@ -623,7 +640,7 @@ fn start_pump(track: &mut Track) {
                 // Give the audio server a moment to come back before retrying;
                 // a device change is not instantaneous.
                 std::thread::sleep(std::time::Duration::from_millis(150));
-                match crate::spawn_sink(rate, channels) {
+                match spawn_sink(rate, channels) {
                     Some(mut fresh) => {
                         stdin = fresh.stdin.take();
                         sink = fresh;
@@ -1057,6 +1074,90 @@ mod tests {
             })),
             pump: None,
         }
+    }
+
+    // Use actual child pipes, without touching the user's audio session or PATH.
+    fn dead_sink() -> crate::Sink {
+        let mut child = std::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn().unwrap();
+        let stdin = child.stdin.take();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        crate::Sink { child, stdin }
+    }
+
+    fn finish_pump(t: &mut Track, done: impl Fn(&Shared) -> bool) -> bool {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let reached = loop {
+            if done(&t.shared.lock().unwrap()) { break true; }
+            if Instant::now() >= deadline { break false; }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        t.shared.lock().unwrap().alive = false;
+        if let Some(pump) = t.pump.take() { pump.join().unwrap(); }
+        reached
+    }
+
+    #[test]
+    fn sink_restart_preserves_pcm_order_and_playback_head() {
+        let mut t = track(2, 2, SINK_CHUNK * 3);
+        let pcm: Vec<u8> = (0..SINK_CHUNK * 3).map(|i| (i % 251) as u8).collect();
+        assert_eq!(push_pcm(&t, &pcm), pcm.len() as i32);
+        let path = std::env::temp_dir().join(format!(
+            "pengudroid-audio-restart-{}-{}.pcm",
+            std::process::id(), NEXT_TRACK.fetch_add(1, Ordering::Relaxed),
+        ));
+        let output = std::fs::OpenOptions::new().write(true).create_new(true)
+            .open(&path).unwrap();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&attempts);
+        start_pump_with(&mut t, move |rate, channels| {
+            assert_eq!((rate, channels), (48_000, 2));
+            if count.fetch_add(1, Ordering::SeqCst) == 0 { return Some(dead_sink()); }
+            let mut child = std::process::Command::new("/bin/cat")
+                .stdin(std::process::Stdio::piped())
+                .stdout(output.try_clone().unwrap()).spawn().unwrap();
+            let stdin = child.stdin.take();
+            Some(crate::Sink { child, stdin })
+        });
+        let completed = finish_pump(&mut t, |sh| {
+            // cat can lag behind the pipe write; wait for the full captured file.
+            sh.played == (pcm.len() / 4) as u64
+                && std::fs::metadata(&path).unwrap().len() == pcm.len() as u64
+        });
+        let captured = std::fs::read(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(completed, "restarted pump must drain the queue");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(captured, pcm, "failed chunk must precede later queued PCM");
+        assert_eq!(t.position_frames(), (pcm.len() / 4) as u64);
+    }
+
+    #[test]
+    fn permanently_broken_sink_stops_after_the_restart_budget() {
+        let mut t = track(2, 2, 32);
+        assert_eq!(push_pcm(&t, &[0; 32]), 32);
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&attempts);
+        start_pump_with(&mut t, move |_, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Some(dead_sink())
+        });
+        let finished = finish_pump(&mut t, |sh| !sh.alive);
+        assert!(finished, "attempts={} played={} queued={}", attempts.load(Ordering::SeqCst), t.position_frames(), t.shared.lock().unwrap().queue.len());
+        assert_eq!(attempts.load(Ordering::SeqCst), MAX_SINK_RESTARTS as usize + 1);
+        assert_eq!(t.position_frames(), 0);
+        assert_eq!(push_pcm(&t, &[0; 4]), -6);
+    }
+
+    #[test]
+    fn missing_sink_reports_dead_object_instead_of_endless_backpressure() {
+        let mut t = track(2, 2, 32);
+        start_pump_with(&mut t, |_, _| None);
+        assert_eq!(push_pcm(&t, &[0; 4]), -6);
+        assert!(t.pump.is_none());
     }
 
     #[test]

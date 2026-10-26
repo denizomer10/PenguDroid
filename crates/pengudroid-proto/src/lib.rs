@@ -75,6 +75,7 @@ pub enum MsgKind {
     SetSubsurfacePosition = 66,
     DestroySurface = 67,
     PresentShm = 68,
+    SetSurfaceOptions = 69,
 
     GetProp = 70,
     PropValue = 71,
@@ -103,6 +104,13 @@ pub enum MsgKind {
 
     Shutdown = 90,
     Goodbye = 91,
+    VideoDecoderOpen = 92,
+    VideoDecoderReady = 93,
+    VideoPacket = 94,
+    VideoDecodeStatus = 95,
+    VideoDecoderFlush = 96,
+    VideoDecoderClose = 97,
+    VideoDecoderPoll = 98,
 }
 
 impl MsgKind {
@@ -134,6 +142,7 @@ impl MsgKind {
             66 => SetSubsurfacePosition,
             67 => DestroySurface,
             68 => PresentShm,
+            69 => SetSurfaceOptions,
             70 => GetProp,
             71 => PropValue,
             72 => SetProp,
@@ -154,6 +163,13 @@ impl MsgKind {
             80 => Ack,
             90 => Shutdown,
             91 => Goodbye,
+            92 => VideoDecoderOpen,
+            93 => VideoDecoderReady,
+            94 => VideoPacket,
+            95 => VideoDecodeStatus,
+            96 => VideoDecoderFlush,
+            97 => VideoDecoderClose,
+            98 => VideoDecoderPoll,
             other => return Err(ProtoError::BadKind(other)),
         })
     }
@@ -269,6 +285,7 @@ pub enum Message {
     SubsurfaceCreated { surface_id: u32 },
     SetSubsurfacePosition { surface_id: u32, x: i32, y: i32 },
     DestroySurface { surface_id: u32 },
+    SetSurfaceOptions { surface_id: u32, fps_meter: bool },
     /// Snapshot a CPU buffer (memfd passed out-of-band), never a GPU dma-buf.
     /// `format` is an Android HAL pixel format; `stride` is bytes per row.
     PresentShm { surface_id: u32, width: u32, height: u32, stride: u32, format: u32 },
@@ -282,6 +299,19 @@ pub enum Message {
         modifier: u64,
         offset: u32,
     },
+
+    /// One hardware decoder per connection, bound to an owned video surface.
+    VideoDecoderOpen { surface_id: u32, codec: String, device: String, extra: Vec<u8> },
+    VideoDecoderReady,
+    /// A complete access unit. EOS requires empty data; use Poll to drain.
+    VideoPacket { pts_us: i64, data: Vec<u8>, end_of_stream: bool },
+    /// Counters are cumulative since Open/Flush. Presented means submitted,
+    /// not proof of display; source reuse still waits for compositor release.
+    VideoDecodeStatus { input_accepted: bool, decoded: u64, presented: u64,
+        end_of_stream: bool, blocked: bool, last_pts_us: Option<i64> },
+    VideoDecoderFlush,
+    VideoDecoderClose,
+    VideoDecoderPoll,
 
     GetProp { name: String },
     PropValue { name: String, value: Option<String> },
@@ -358,8 +388,16 @@ impl Message {
             SubsurfaceCreated { .. } => MsgKind::SubsurfaceCreated,
             SetSubsurfacePosition { .. } => MsgKind::SetSubsurfacePosition,
             DestroySurface { .. } => MsgKind::DestroySurface,
+            SetSurfaceOptions { .. } => MsgKind::SetSurfaceOptions,
             PresentDmabuf { .. } => MsgKind::PresentDmabuf,
             PresentShm { .. } => MsgKind::PresentShm,
+            VideoDecoderOpen { .. } => MsgKind::VideoDecoderOpen,
+            VideoDecoderReady => MsgKind::VideoDecoderReady,
+            VideoPacket { .. } => MsgKind::VideoPacket,
+            VideoDecodeStatus { .. } => MsgKind::VideoDecodeStatus,
+            VideoDecoderFlush => MsgKind::VideoDecoderFlush,
+            VideoDecoderClose => MsgKind::VideoDecoderClose,
+            VideoDecoderPoll => MsgKind::VideoDecoderPoll,
             GetProp { .. } => MsgKind::GetProp,
             PropValue { .. } => MsgKind::PropValue,
             SetProp { .. } => MsgKind::SetProp,
@@ -488,6 +526,7 @@ impl Message {
                 e.i32(*y);
             }
             DestroySurface { surface_id } => e.u32(*surface_id),
+            SetSurfaceOptions { surface_id, fps_meter } => { e.u32(*surface_id); e.u8(u8::from(*fps_meter)); }
             PresentShm { surface_id, width, height, stride, format } => {
                 e.u32(*surface_id);
                 e.u32(*width);
@@ -504,6 +543,19 @@ impl Message {
                 e.u64(*modifier);
                 e.u32(*offset);
             }
+            VideoDecoderOpen { surface_id, codec, device, extra } => {
+                e.u32(*surface_id); e.str(codec); e.str(device); e.bytes(extra);
+            }
+            VideoPacket { pts_us, data, end_of_stream } => {
+                e.u64(*pts_us as u64); e.bytes(data); e.u8(u8::from(*end_of_stream));
+            }
+            VideoDecodeStatus { input_accepted, decoded, presented, end_of_stream, blocked, last_pts_us } => {
+                e.u8(u8::from(*input_accepted)); e.u64(*decoded); e.u64(*presented);
+                e.u8(u8::from(*end_of_stream)); e.u8(u8::from(*blocked));
+                e.u8(u8::from(last_pts_us.is_some()));
+                if let Some(pts) = last_pts_us { e.u64(*pts as u64); }
+            }
+            VideoDecoderReady | VideoDecoderFlush | VideoDecoderClose | VideoDecoderPoll => {}
             GetProp { name } => e.str(name),
             SetProp { name, value } => {
                 e.str(name);
@@ -674,6 +726,7 @@ impl Message {
                 y: d.i32()?,
             },
             K::DestroySurface => DestroySurface { surface_id: d.u32()? },
+            K::SetSurfaceOptions => SetSurfaceOptions { surface_id: d.u32()?, fps_meter: d.u8()? != 0 },
             K::PresentShm => PresentShm {
                 surface_id: d.u32()?, width: d.u32()?, height: d.u32()?,
                 stride: d.u32()?, format: d.u32()?,
@@ -687,6 +740,17 @@ impl Message {
                 modifier: d.u64()?,
                 offset: d.u32()?,
             },
+            K::VideoDecoderOpen => VideoDecoderOpen { surface_id: d.u32()?, codec: d.str()?, device: d.str()?, extra: d.bytes()?.to_vec() },
+            K::VideoDecoderReady => VideoDecoderReady,
+            K::VideoPacket => VideoPacket { pts_us: d.u64()? as i64, data: d.bytes()?.to_vec(), end_of_stream: d.u8()? != 0 },
+            K::VideoDecodeStatus => VideoDecodeStatus {
+                input_accepted: d.u8()? != 0, decoded: d.u64()?, presented: d.u64()?,
+                end_of_stream: d.u8()? != 0, blocked: d.u8()? != 0,
+                last_pts_us: if d.u8()? != 0 { Some(d.u64()? as i64) } else { None },
+            },
+            K::VideoDecoderFlush => VideoDecoderFlush,
+            K::VideoDecoderClose => VideoDecoderClose,
+            K::VideoDecoderPoll => VideoDecoderPoll,
             K::GetProp => GetProp { name: d.str()? },
             K::SetProp => SetProp { name: d.str()?, value: d.str()? },
             K::PropValue => {
@@ -965,6 +1029,24 @@ mod tests {
     }
 
     #[test]
+    fn hardware_video_commands_preserve_timestamps_configuration_and_status() {
+        roundtrip(Message::VideoDecoderOpen { surface_id: 42, codec: "h264".into(),
+            device: "/dev/dri/renderD128".into(), extra: vec![0, 1, 0, 255] });
+        roundtrip(Message::VideoDecoderReady);
+        for pts_us in [i64::MIN, -123456, 0, i64::MAX] {
+            roundtrip(Message::VideoPacket { pts_us, data: vec![0, 0, 1, 0x65], end_of_stream: false });
+            roundtrip(Message::VideoDecodeStatus { input_accepted: true, decoded: 9, presented: 7,
+                end_of_stream: false, blocked: true, last_pts_us: Some(pts_us) });
+        }
+        roundtrip(Message::VideoPacket { pts_us: 0, data: vec![], end_of_stream: true });
+        roundtrip(Message::VideoDecodeStatus { input_accepted: false, decoded: 0, presented: 0,
+            end_of_stream: true, blocked: false, last_pts_us: None });
+        roundtrip(Message::VideoDecoderFlush);
+        roundtrip(Message::VideoDecoderClose);
+        roundtrip(Message::VideoDecoderPoll);
+    }
+
+    #[test]
     fn explicit_control_socket_preserves_the_host_runtime_contract() {
         use std::ffi::OsStr;
         assert_eq!(socket_path(Some(OsStr::new("/tmp/private/daemon.sock")), Some(OsStr::new("/run/user/1000")), 1000),
@@ -984,6 +1066,8 @@ mod tests {
     #[test]
     fn roundtrip_complex() {
         roundtrip(Message::PresentShm { surface_id: 4, width: 426, height: 240, stride: 852, format: 4 });
+        roundtrip(Message::SetSurfaceOptions { surface_id: 4, fps_meter: true });
+        roundtrip(Message::SetSurfaceOptions { surface_id: 4, fps_meter: false });
         roundtrip(Message::RunApk {
             path: "/tmp/app.apk".into(),
             component: Some("com.x/.Main".into()),

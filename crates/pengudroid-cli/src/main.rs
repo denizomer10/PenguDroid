@@ -71,6 +71,7 @@ fn real_main() -> i32 {
         "__art" => sysroot::art_main(&args[2..]),
         "gpu-info" => gpu::info(),
         "gpu-test" => gpu::test(),
+        "video-decode-test" => gpu::video_test(&args[2..]),
         "audio-test" => audio::test(&args[2..]),
         "input-test" => input::test(&args[2..]),
         "libpath" => nativelib::libpath(&args[2..]),
@@ -689,6 +690,7 @@ fn print_help() {
          \x20     [--classpath <apk|jar>] [--find-class <C>] [--main <C>]\n\
          \x20     [--jni-lib <so>] [--register-natives <so>]\n\
          \x20   gpu-info                                    report host EGL/GLES/GPU capabilities\n\
+         \x20   video-decode-test <one-frame.h264>           verify hardware decode + GPU export\n\
          \x20   gpu-test                                    render offscreen on the GPU + export a dmabuf\n\
          \x20   audio-test [--seconds N] [--tone]           play silence (or a tone) through PipeWire\n\
          \x20   nativelib <lib.so> [--call SYM] [--lib-dir D]  de-bionic + dlopen (+ call) a .so\n\

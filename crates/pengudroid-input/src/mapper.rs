@@ -49,9 +49,17 @@ impl KeyMapper {
                 // one. `Hold` is the only action that spans two events.
                 let mut held: HashMap<u16, ()> = HashMap::new();
                 while !stop.load(Ordering::Relaxed) {
-                    let Ok((code, pressed)) = reader.read_key() else {
-                        break;
+                    let (code, pressed) = match reader.read_key_timeout(std::time::Duration::from_millis(25)) {
+                        Ok(Some(key)) => key,
+                        Ok(None) => continue,
+                        Err(_) => break,
                     };
+                    // Release ownership even when this binding was edited or
+                    // removed while the key was down.
+                    if !pressed && held.remove(&code).is_some() {
+                        let _ = touch.lock().unwrap_or_else(|e| e.into_inner()).up();
+                        continue;
+                    }
                     let action = bindings
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -88,6 +96,9 @@ impl KeyMapper {
                             }
                         }
                     }
+                }
+                if !held.is_empty() {
+                    let _ = touch.lock().unwrap_or_else(|e| e.into_inner()).up();
                 }
             }));
         }

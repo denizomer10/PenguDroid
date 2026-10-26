@@ -31,6 +31,25 @@ pub fn info() -> i32 {
             println!("dmabuf export:    {}", yesno(i.has_dmabuf_export));
             println!("dmabuf import:    {}", yesno(i.has_dmabuf_import));
             println!("zero-copy ready:  {}", yesno(i.can_export_dmabuf()));
+            match std::fs::read_dir("/dev/dri") {
+                Ok(nodes) => {
+                    let mut nodes: Vec<_> = nodes.flatten().filter(|n| n.file_name().to_string_lossy().starts_with("renderD")).collect();
+                    nodes.sort_by_key(|n| n.file_name());
+                    for node in nodes {
+                        match pengudroid_hostgpu::video::decode_info(&node.path()) {
+                            Ok(video) => {
+                                println!("video device:     {}", video.device);
+                                println!("VA-API vendor:    {}", video.vendor);
+                                println!("VA-API version:   {}.{}", video.version.0, video.version.1);
+                                println!("VLD profiles:     {}", video.profiles.join(", "));
+                            }
+                            Err(error) => println!("VA-API:           unavailable ({error}); other decode backends not probed"),
+                        }
+                    }
+                }
+                Err(error) => println!("video devices:    unavailable ({error})"),
+            }
+            println!("guest video path: Android software Codec2; host hardware decode adapter pending");
             0
         }
         Err(e) => {
@@ -102,4 +121,126 @@ pub fn test() -> i32 {
         Err(e) => println!("dmabuf export: unavailable ({e})"),
     }
     0
+}
+
+/// Decode one Annex-B H.264 access unit on VA-API and export GPU planes.
+/// The optional readback verifies a fixture; normal decode never downloads it.
+pub fn video_test(args: &[String]) -> i32 {
+    let mut device = std::path::PathBuf::from("/dev/dri/renderD128");
+    let mut verify = false;
+    let mut broker = false;
+    let mut path = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--device" => match args.next() { Some(p) => device = p.into(), None => return 2 },
+            "--verify-gradient" => verify = true,
+            "--broker" => broker = true,
+            value if !value.starts_with('-') && path.is_none() => path = Some(value.to_owned()),
+            _ => { eprintln!("unknown video-decode-test argument: {arg}"); return 2; }
+        }
+    }
+    let result = (|| -> Result<(), String> {
+        use pengudroid_hostgpu::video::{Decoder, ReceiveStatus, SendStatus};
+        let path = path.ok_or("usage: pengudroid video-decode-test <one-frame.h264> [--device /dev/dri/renderD128] [--verify-gradient]")?;
+        if std::fs::metadata(&path).map_err(|e| e.to_string())?.len() > 16 * 1024 * 1024 {
+            return Err("access unit exceeds 16 MiB".into());
+        }
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        if broker {
+            if verify { return Err("--verify-gradient uses diagnostic readback; run it without --broker".into()); }
+            return video_broker_test(&bytes, &device);
+        }
+        let mut decoder = Decoder::open("h264", &device, &[])?;
+        if decoder.send(&bytes, 123456)? != SendStatus::Accepted { return Err("initial packet was not accepted".into()); }
+        let mut eos = false;
+        let mut count = 0;
+        loop {
+            match decoder.receive()? {
+                ReceiveStatus::Frame(frame) => {
+                    count += 1;
+                    println!("hardware decoded: {}x{}, pts={} us, fourcc={:#010x}, objects={}, planes={}",
+                        frame.width(), frame.height(), frame.pts_us(), frame.fourcc(), frame.object_count(), frame.planes().len());
+                    for (index, plane) in frame.planes().iter().enumerate() {
+                        println!("plane {index}: object={} stride={} offset={} modifier={:#x}",
+                            plane.object_index, plane.stride, plane.offset,
+                            frame.object_modifier(plane.object_index as usize).unwrap());
+                    }
+                    if verify {
+                        let luma = frame.test_luma()?;
+                        if luma != 64 { return Err(format!("gradient verification failed: luma={luma}, expected 64")); }
+                        println!("diagnostic GPU readback: first luma=64, verified");
+                    }
+                }
+                ReceiveStatus::NeedsInput if !eos => {
+                    eos = decoder.end_of_stream()? == SendStatus::Accepted;
+                }
+                ReceiveStatus::EndOfStream => break,
+                _ => return Err("decoder made no progress".into()),
+            }
+        }
+        if count == 0 { return Err("no hardware-decoded frame received".into()); }
+        println!("VA-API decode and synchronized GPU export: OK ({count} frames); NewPipe adapter pending");
+        Ok(())
+    })();
+    match result { Ok(()) => 0, Err(error) => { eprintln!("pengudroid video: {error}"); 1 } }
+}
+
+/// Exercise the connection-local packet -> hardware decode -> compositor path.
+fn video_broker_test(bytes: &[u8], device: &std::path::Path) -> Result<(), String> {
+    use pengudroid_proto::{default_socket_path, Message, Role, PROTO_VERSION};
+    use pengudroid_socket::Connection;
+    use std::time::{Duration, Instant};
+    let conn = Connection::connect_endpoint(&default_socket_path()).map_err(|e| e.to_string())?;
+    conn.set_read_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
+    let exchange = |request: &Message| -> Result<Message, String> {
+        conn.send_message(request, &[]).map_err(|e| e.to_string())?;
+        let (reply, fds) = conn.recv_message().map_err(|e| e.to_string())?;
+        for fd in fds { unsafe { libc::close(fd); } }
+        if let Message::Error { message, .. } = reply { return Err(message); }
+        Ok(reply)
+    };
+    match exchange(&Message::Hello { version: PROTO_VERSION, role: Role::Cli, pid: std::process::id() as i32 })? {
+        Message::Welcome { .. } => {}, reply => return Err(format!("unexpected handshake: {reply:?}")),
+    }
+    let surface_id = match exchange(&Message::CreateSurface { width: 640, height: 360, title: "PenguDroid GPU video broker".into() })? {
+        Message::SurfaceCreated { surface_id, .. } => surface_id,
+        reply => return Err(format!("unexpected video surface reply: {reply:?}")),
+    };
+    let result = (|| -> Result<(), String> {
+        match exchange(&Message::VideoDecoderOpen { surface_id, codec: "h264".into(), device: device.display().to_string(), extra: vec![] })? {
+            Message::VideoDecoderReady => {}, reply => return Err(format!("unexpected decoder reply: {reply:?}")),
+        }
+        match exchange(&Message::VideoPacket { pts_us: 123456, data: bytes.to_vec(), end_of_stream: false })? {
+            Message::VideoDecodeStatus { input_accepted: true, .. } => {},
+            reply => return Err(format!("initial video access unit was not accepted: {reply:?}")),
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut eos_sent = false;
+        loop {
+            if Instant::now() >= deadline { return Err("hardware decoder broker timed out".into()); }
+            let command = if eos_sent { Message::VideoDecoderPoll }
+                else { Message::VideoPacket { pts_us: 0, data: vec![], end_of_stream: true } };
+            match exchange(&command)? {
+                Message::VideoDecodeStatus { input_accepted, decoded, presented, end_of_stream, last_pts_us, .. } => {
+                    if input_accepted { eos_sent = true; }
+                    if end_of_stream {
+                        if decoded == 0 || presented == 0 || last_pts_us != Some(123456) {
+                            return Err(format!("incomplete broker video output: decoded={decoded}, submitted={presented}, pts={last_pts_us:?}"));
+                        }
+                        println!("broker hardware decode: {decoded} frames, {presented} GPU imports, pts={last_pts_us:?} us, EOS drained");
+                        println!("compressed input reached the daemon; no CPU pixel transport; NewPipe Codec2 adapter pending");
+                        return Ok(());
+                    }
+                }
+                reply => return Err(format!("unexpected video status: {reply:?}")),
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    })();
+    // Explicit cleanup on both success and decoder/import failure.
+    let close = exchange(&Message::VideoDecoderClose);
+    let destroy = exchange(&Message::DestroySurface { surface_id });
+    result?; close?; destroy?;
+    Ok(())
 }

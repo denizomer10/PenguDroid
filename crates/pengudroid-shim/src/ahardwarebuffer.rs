@@ -15,6 +15,38 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicI32, Ordering};
 
+// Track mappings by native-handle identity; file descriptors can be reused.
+#[derive(Default)]
+struct CpuMapping { address: usize, length: usize, locks: usize }
+impl Drop for CpuMapping {
+    fn drop(&mut self) { unsafe { libc::munmap(self.address as *mut c_void, self.length); } }
+}
+fn mappings() -> &'static std::sync::Mutex<std::collections::HashMap<usize, CpuMapping>> {
+    static MAP: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, CpuMapping>>> = std::sync::OnceLock::new();
+    MAP.get_or_init(Default::default)
+}
+unsafe fn map_cpu(key: usize, fd: i32, length: usize) -> Result<*mut c_void, i32> {
+    let mut entries = mappings().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(mapping) = entries.get_mut(&key) {
+        mapping.locks += 1;
+        return Ok(mapping.address as *mut c_void);
+    }
+    let address = libc::mmap(std::ptr::null_mut(), length, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0);
+    if address == libc::MAP_FAILED { return Err(-12); }
+    entries.insert(key, CpuMapping { address: address as usize, length, locks: 1 });
+    Ok(address)
+}
+fn unmap_cpu(key: usize) {
+    let mut entries = mappings().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(mapping) = entries.get_mut(&key) {
+        mapping.locks -= 1;
+        if mapping.locks == 0 { entries.remove(&key); }
+    }
+}
+fn release_cpu(key: usize) {
+    mappings().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+}
+
 /// `AHardwareBuffer_Desc` (android/hardware_buffer.h).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -347,17 +379,9 @@ pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper4lockEPK13native_handle
         }
         return -22;
     }
-    let p = libc::mmap(
-        std::ptr::null_mut(),
-        size as usize,
-        libc::PROT_READ | libc::PROT_WRITE,
-        libc::MAP_SHARED,
-        fd,
-        0,
-    );
-    if p == libc::MAP_FAILED {
-        return -12;
-    }
+    let p = match map_cpu(handle as usize, fd, size as usize) {
+        Ok(p) => p, Err(error) => return error,
+    };
     *addr = p;
     if !bytes_per_pixel.is_null() {
         *bytes_per_pixel = 4;
@@ -378,8 +402,7 @@ pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper4lockEPK13native_handle
 
 /// `android::GraphicBufferMapper::unlock(handle)`.
 ///
-/// Nothing to undo for this mapper: `lock` is a plain `mmap` of the block's
-/// memfd and the mapping stays valid until `freeBuffer`. When
+/// The final matching unlock releases the CPU mapping. When
 /// `PENGUDROID_DUMP_GBUF` names a directory the block's *current contents* are
 /// written out here — the only point where "did anyone actually write pixels
 /// into this block?" can be answered. A decoded frame that never reaches the
@@ -422,6 +445,7 @@ pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper6unlockEPK13native_hand
             }
         }
     }
+    unmap_cpu(handle as usize);
     0
 }
 
@@ -457,6 +481,7 @@ pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper10freeBufferEPK13native
     if handle.is_null() {
         return -22;
     }
+    release_cpu(handle as usize);
     let h = &*handle;
     if h.num_fds > 0 && !h.data.is_empty() {
         libc::close(h.data[0]);
@@ -632,17 +657,9 @@ pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper9lockYCbCrEPK13native_h
     if size <= 0 {
         return -22;
     }
-    let p = libc::mmap(
-        std::ptr::null_mut(),
-        size as usize,
-        libc::PROT_READ | libc::PROT_WRITE,
-        libc::MAP_SHARED,
-        fd,
-        0,
-    );
-    if p == libc::MAP_FAILED {
-        return -12;
-    }
+    let p = match map_cpu(handle as usize, fd, size as usize) {
+        Ok(p) => p, Err(error) => return error,
+    };
     let base = p as *mut u8;
     let stride = h.data[1].max(0) as usize;
     let height = h.data[4].max(0) as usize;
@@ -733,13 +750,13 @@ pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper9lockAsyncEPK13native_h
 #[no_mangle]
 pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper11unlockAsyncEPK13native_handlePi(
     _this: *mut c_void,
-    _handle: *const NativeHandle,
+    handle: *const NativeHandle,
     fence: *mut i32,
 ) -> i32 {
     if !fence.is_null() {
         *fence = -1;
     }
-    0
+    _ZN7android19GraphicBufferMapper6unlockEPK13native_handle(_this, handle)
 }
 
 /// `GraphicBufferMapper::lockAsyncYCbCr(handle, usage, bounds, ycbcr*, fenceFd)`.
@@ -862,6 +879,7 @@ pub unsafe extern "C" fn AHardwareBuffer_release(buffer: *mut FakeHardwareBuffer
         return;
     }
     if b.refs.fetch_sub(1, Ordering::AcqRel) == 1 {
+        release_cpu(&b.handle as *const NativeHandle as usize);
         libc::close(b.fd);
         drop(Box::from_raw(buffer));
     }
@@ -1035,17 +1053,9 @@ pub unsafe extern "C" fn AHardwareBuffer_lock(
         return -22;
     }
     let size = bytes_for(&b.desc);
-    let p = libc::mmap(
-        std::ptr::null_mut(),
-        size,
-        libc::PROT_READ | libc::PROT_WRITE,
-        libc::MAP_SHARED,
-        b.fd,
-        0,
-    );
-    if p == libc::MAP_FAILED {
-        return -12;
-    }
+    let p = match map_cpu(&b.handle as *const NativeHandle as usize, b.fd, size) {
+        Ok(p) => p, Err(error) => return error,
+    };
     *out_addr = p;
     0
 }
@@ -1059,9 +1069,8 @@ pub unsafe extern "C" fn AHardwareBuffer_unlock(
     let Some(b) = as_buf(buffer) else {
         return -22;
     };
-    // The mapping is not tracked per buffer; the memfd stays alive as long as
-    // the buffer does, so there is nothing to unmap here.
-    let _ = b;
+    unmap_cpu(&b.handle as *const NativeHandle as usize);
+    if !_fence.is_null() { *_fence = -1; }
     0
 }
 
@@ -1098,6 +1107,31 @@ mod tests {
     /// still maps, so the decoder succeeds and only `C2GraphicBlock::handle()`
     /// comes back NULL. Pin the value so it cannot drift back to
     /// `size_of::<NativeHandle>()` (44).
+    #[test]
+    fn cpu_lock_cycles_do_not_accumulate_memfd_mappings() {
+        unsafe {
+            let fd = libc::memfd_create(c"pd-lock-regression".as_ptr(), libc::MFD_CLOEXEC);
+            assert!(fd >= 0);
+            assert_eq!(libc::ftruncate(fd, 1024 * 1024), 0);
+            let key = &fd as *const i32 as usize;
+            let count = || std::fs::read_to_string("/proc/self/maps").unwrap().lines()
+                .filter(|line| line.contains("pd-lock-regression")).count();
+            for _ in 0..2000 {
+                let address = map_cpu(key, fd, 1024 * 1024).unwrap();
+                std::ptr::write_bytes(address, 0x5a, 1024 * 1024);
+                assert_eq!(map_cpu(key, fd, 1024 * 1024).unwrap(), address);
+                unmap_cpu(key);
+                assert_eq!(count(), 1, "nested lock keeps a single mapping alive");
+                unmap_cpu(key);
+                assert_eq!(count(), 0, "final unlock must actually munmap");
+            }
+            map_cpu(key, fd, 1024 * 1024).unwrap();
+            release_cpu(key);
+            assert_eq!(count(), 0, "destruction releases outstanding locks");
+            libc::close(fd);
+        }
+    }
+
     #[test]
     fn native_handle_version_is_bionic_sizeof() {
         assert_eq!(NATIVE_HANDLE_VERSION, 12);

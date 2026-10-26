@@ -55,6 +55,10 @@ The path there was ABI translation, not environment emulation:
   (`sigaction`, `sigemptyset`/`fillset`/`addset`/`delset`/`ismember`,
   `sigprocmask`, `pthread_sigmask`, `sigpending`, `sigsuspend`, `sigwait`,
   `ppoll`, plus the `*64` variants) and converts between the two layouts.
+  The LP64 field order is also significant: flags at offset 0, handler at 8,
+  mask at 16, restorer at 24. Using the LP32 order left the real handler
+  uninstalled and reproduced NewPipe's fatal signal 34 during search. A C ABI
+  fixture now installs the handler and delivers the real kernel signal.
 * **Framework natives.** `libandroid_runtime.so` has no `JNI_OnLoad`; on a
   device its ~150 `register_android_*` entry points are called by `app_process`
   from a static table. `--register-natives` reads the library's exported

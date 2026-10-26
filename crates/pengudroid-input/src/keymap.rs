@@ -102,7 +102,11 @@ fn parse_action(text: &str) -> Result<Action, String> {
     let kind = parts.next().ok_or("missing action")?;
     let mut nums = || -> Result<Vec<f32>, String> {
         parts
-            .map(|p| p.parse::<f32>().map_err(|_| format!("`{p}` is not a number")))
+            .map(|p| {
+                let value = p.parse::<f32>().map_err(|_| format!("`{p}` is not a number"))?;
+                if !value.is_finite() || value < 0.0 { return Err(format!("`{p}` must be finite and non-negative")); }
+                Ok(value)
+            })
             .collect()
     };
     match kind {
@@ -130,14 +134,14 @@ fn parse_action(text: &str) -> Result<Action, String> {
                     y1: *y1,
                     steps: 12,
                 }),
-                [x0, y0, x1, y1, steps] => Ok(Action::Swipe {
+                [x0, y0, x1, y1, steps] if *steps >= 1.0 && *steps <= 240.0 && steps.fract() == 0.0 => Ok(Action::Swipe {
                     x0: *x0,
                     y0: *y0,
                     x1: *x1,
                     y1: *y1,
                     steps: steps.max(1.0) as u32,
                 }),
-                _ => Err("swipe needs x0 y0 x1 y1 [steps]".into()),
+                _ => Err("swipe needs x0 y0 x1 y1 [steps]; steps must be an integer from 1 to 240".into()),
             }
         }
         other => Err(format!("unknown action `{other}`")),
@@ -398,6 +402,10 @@ SHIFT = swipe 400 800 700 800 12
         assert!(Keymap::parse("W = tap 1").is_err());
         assert!(Keymap::parse("W tap 1 2").is_err());
         assert!(Keymap::parse("W = jump 1 2").is_err());
+        assert!(Keymap::parse("W = tap NaN 2").is_err());
+        assert!(Keymap::parse("W = hold -1 2").is_err());
+        assert!(Keymap::parse("W = swipe 0 0 1 1 999999").is_err());
+        assert!(Keymap::parse("W = swipe 0 0 1 1 1.5").is_err());
     }
 
     #[test]

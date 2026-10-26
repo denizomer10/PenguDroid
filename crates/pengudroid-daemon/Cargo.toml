@@ -22,6 +22,9 @@ libc.workspace = true
 wayland-client = { workspace = true, optional = true }
 wayland-protocols = { workspace = true, optional = true }
 
+smithay-client-toolkit = { version = "0.19.2", default-features = false, optional = true }
+sctk-adwaita = { version = "0.10.1", optional = true }
+
 [features]
 default = ["wayland"]
-wayland = ["dep:wayland-client", "dep:wayland-protocols"]
+wayland = ["dep:wayland-client", "dep:wayland-protocols", "dep:smithay-client-toolkit", "dep:sctk-adwaita"]

@@ -3004,6 +3004,8 @@ dependencies = [
  "pengudroid-hostgpu",
  "pengudroid-proto",
  "pengudroid-socket",
+ "sctk-adwaita",
+ "smithay-client-toolkit",
  "wayland-client",
  "wayland-protocols 0.31.2",
 ]

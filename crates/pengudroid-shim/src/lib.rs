@@ -3065,11 +3065,14 @@ pub type BionicSigset = u64;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct BionicSigAction {
+    /// Bionic LP64 puts flags first (unlike its LP32 layout). The handler
+    /// begins at offset 8, mask at 16, and restorer at 24.
+    /// https://android.googlesource.com/platform/bionic/+/android-13.0.0_r1/libc/include/bits/signal_types.h
+    pub sa_flags: c_int,
+    pub _pad: c_int,
     /// Union of `sa_handler` and `sa_sigaction`.
     pub sa_handler: usize,
     pub sa_mask: BionicSigset,
-    pub sa_flags: c_int,
-    pub _pad: c_int,
     pub sa_restorer: usize,
 }
 

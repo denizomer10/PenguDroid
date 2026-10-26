@@ -164,11 +164,13 @@ fn software_video_frames_keep_wayland_connection_alive() {
         reply
     };
     let parent = request(Message::CreateSurface { width: 64, height: 64, title: "Software video test".into() }, &[]);
-    assert!(matches!(parent, Message::SurfaceCreated { .. }), "{parent:?}");
+    let Message::SurfaceCreated { surface_id: parent_id, .. } = parent else { panic!("{parent:?}") };
     let child = request(Message::CreateSubsurface {
         parent_pid: std::process::id() as i32, x: 0, y: 0, width: 16, height: 16,
     }, &[]);
     let Message::SubsurfaceCreated { surface_id } = child else { panic!("{child:?}") };
+    assert_eq!(request(Message::SetSurfaceOptions { surface_id: parent_id, fps_meter: true }, &[]), Message::Ack);
+    assert!(matches!(request(Message::SetSurfaceOptions { surface_id: u32::MAX, fps_meter: false }, &[]), Message::Error { .. }));
     // RGB565 red. This is ordinary memfd storage, deliberately not DMA_BUF.
     let raw = unsafe { libc::memfd_create(c"software-video-test".as_ptr(), libc::MFD_CLOEXEC) };
     assert!(raw >= 0);
@@ -178,10 +180,36 @@ fn software_video_frames_keep_wayland_connection_alive() {
     for _ in 0..8 {
         assert_eq!(request(Message::PresentShm { surface_id, width: 32, height: 32, stride: 64, format: 4 }, &[fd.as_raw_fd()]), Message::Ack);
     }
+    // Two video queues in one window must be siblings, never nested under the
+    // newest video layer. Retiring the first queue must not retire the second.
+    let sibling = request(Message::CreateSubsurface {
+        parent_pid: std::process::id() as i32, x: 16, y: 0, width: 16, height: 16,
+    }, &[]);
+    let Message::SubsurfaceCreated { surface_id: sibling_id } = sibling else { panic!("{sibling:?}") };
+    assert_eq!(request(Message::DestroySurface { surface_id }, &[]), Message::Ack);
+    assert_eq!(request(Message::PresentShm {
+        surface_id: sibling_id, width: 32, height: 32, stride: 64, format: 4,
+    }, &[fd.as_raw_fd()]), Message::Ack);
+    // EGL window destruction must invalidate its video layers. Acking frames
+    // on an orphan would keep the BLAST consumer stuck on an invisible layer.
+    assert_eq!(request(Message::DestroySurface { surface_id: parent_id }, &[]), Message::Ack);
+    assert!(matches!(request(Message::PresentShm {
+        surface_id: sibling_id, width: 32, height: 32, stride: 64, format: 4,
+    }, &[fd.as_raw_fd()]), Message::Error { .. }));
+    assert!(matches!(request(Message::CreateSubsurface {
+        parent_pid: std::process::id() as i32, x: 0, y: 0, width: 16, height: 16,
+    }, &[]), Message::Error { .. }));
     // Creating another toplevel forces a compositor roundtrip. A bogus
     // linux-dmabuf import can appear Acked before its fatal protocol error is
     // dispatched; this must still succeed after all software frames.
     let after = request(Message::CreateSurface { width: 64, height: 64, title: "After software frames".into() }, &[]);
     assert!(matches!(after, Message::SurfaceCreated { .. }), "compositor connection was lost: {after:?}");
+    let child = request(Message::CreateSubsurface {
+        parent_pid: std::process::id() as i32, x: 0, y: 0, width: 16, height: 16,
+    }, &[]);
+    let Message::SubsurfaceCreated { surface_id: replacement } = child else { panic!("{child:?}") };
+    assert_eq!(request(Message::PresentShm {
+        surface_id: replacement, width: 32, height: 32, stride: 64, format: 4,
+    }, &[fd.as_raw_fd()]), Message::Ack);
     assert_eq!(request(Message::Shutdown, &[]), Message::Goodbye);
 }

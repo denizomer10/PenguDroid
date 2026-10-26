@@ -39,6 +39,8 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod video;
+
 use std::os::fd::OwnedFd;
 
 use ffi::{

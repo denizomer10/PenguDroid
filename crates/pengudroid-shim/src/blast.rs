@@ -271,10 +271,8 @@ struct Blast {
     /// `android::Surface*` — the native half of the Java `Surface` we hand out.
     surface: *mut c_void,
     /// Global reference to that Java `Surface`, created on first request.
-    java_surface: *mut c_void,
-    width: u32,
-    height: u32,
-    format: i32,
+    java_state: Mutex<JavaState>,
+    stopped: std::sync::atomic::AtomicBool,
     /// The daemon surface the consumer thread presents frames on (0 until the
     /// first frame).
     video_surface: std::sync::atomic::AtomicU32,
@@ -282,9 +280,14 @@ struct Blast {
     display_size: std::sync::atomic::AtomicU64,
 }
 
-// SAFETY: the pointers are only ever used from the thread that owns the object,
-// and the registry mutex serialises creation and lookup.
-unsafe impl Send for Blast {}
+// JNI metadata is serialized; the consumer reads only immutable native
+// pointers and atomics. Native BufferQueue methods provide their own locking.
+struct JavaState {
+    java_surface: usize,
+    width: u32,
+    height: u32,
+    format: i32,
+}
 
 /// Hosted objects, kept alive for the life of the process.
 ///
@@ -292,13 +295,13 @@ unsafe impl Send for Blast {}
 /// it must not move; `Box` gives us that.
 static BLASTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
-unsafe fn blast_at(ptr: i64) -> Option<&'static mut Blast> {
+unsafe fn blast_at(ptr: i64) -> Option<&'static Blast> {
     if ptr == 0 {
         return None;
     }
     let boxes = BLASTS.lock().unwrap_or_else(|e| e.into_inner());
     if boxes.iter().any(|&b| b == ptr as usize) {
-        return Some(&mut *(ptr as *mut Blast));
+        return Some(&*(ptr as *const Blast));
     }
     None
 }
@@ -382,10 +385,8 @@ unsafe extern "C" fn native_create(
         consumer,
         item_consumer,
         surface,
-        java_surface: std::ptr::null_mut(),
-        width,
-        height,
-        format,
+        java_state: Mutex::new(JavaState { java_surface: 0, width, height, format }),
+        stopped: std::sync::atomic::AtomicBool::new(false),
         video_surface: std::sync::atomic::AtomicU32::new(0),
         display_size: std::sync::atomic::AtomicU64::new(((width as u64) << 32) | height as u64),
     });
@@ -416,8 +417,12 @@ unsafe extern "C" fn native_get_surface(
     let Some(blast) = blast_at(ptr) else {
         return std::ptr::null_mut();
     };
-    if !blast.java_surface.is_null() {
-        return blast.java_surface;
+    let mut state = blast.java_state.lock().unwrap_or_else(|e| e.into_inner());
+    if blast.stopped.load(std::sync::atomic::Ordering::Acquire) {
+        return std::ptr::null_mut();
+    }
+    if state.java_surface != 0 {
+        return state.java_surface as *mut c_void;
     }
     let surface_class = jni_find_class(env, c"android/view/Surface");
     if surface_class.is_null() {
@@ -441,9 +446,9 @@ unsafe extern "C" fn native_get_surface(
         eprintln!("[blast] new Surface(long) threw");
         return std::ptr::null_mut();
     }
-    blast.java_surface = jni_new_global_ref(env, local);
+    state.java_surface = jni_new_global_ref(env, local) as usize;
     eprintln!("[blast] handed out a Surface for {:#x}", blast.surface as usize);
-    blast.java_surface
+    state.java_surface as *mut c_void
 }
 
 /// `BLASTBufferQueue.nativeUpdate(long ptr, long surfaceControl, long width,
@@ -467,17 +472,19 @@ unsafe extern "C" fn native_update(
     let Some(blast) = blast_at(ptr) else {
         return;
     };
+    let mut state = blast.java_state.lock().unwrap_or_else(|e| e.into_inner());
+    if blast.stopped.load(std::sync::atomic::Ordering::Acquire) { return; }
     let (w, h) = (width.max(1) as u32, height.max(1) as u32);
-    if format != blast.format {
+    if format != state.format {
         (gui.set_buffers_format)(blast.surface, format);
         (gui.set_default_format)(blast.item_consumer, format);
-        blast.format = format;
+        state.format = format;
     }
-    if w != blast.width || h != blast.height {
+    if w != state.width || h != state.height {
         (gui.set_user_dimensions)(blast.surface, w, h);
         (gui.set_default_size)(blast.item_consumer, w, h);
-        blast.width = w;
-        blast.height = h;
+        state.width = w;
+        state.height = h;
     }
     blast.display_size.store(((w as u64) << 32) | h as u64, std::sync::atomic::Ordering::Release);
     eprintln!("[blast] update {w}x{h} fmt={format:#x}");
@@ -485,9 +492,15 @@ unsafe extern "C" fn native_update(
 
 /// `BLASTBufferQueue.nativeDestroy(long ptr)`.
 ///
-/// The object is process-lifetime: the Java side may still hold the `Surface`
-/// we handed out, and freeing the queue under it would fault.
-unsafe extern "C" fn native_destroy(_env: *mut c_void, _class: *mut c_void, _ptr: i64) {}
+/// Keep native storage alive while Java may hold its Surface, but stop polling
+/// and retire the daemon layer. The consumer owns layer cleanup, so destruction
+/// never races a pending present or blocks the Java UI thread on IPC.
+unsafe extern "C" fn native_destroy(_env: *mut c_void, _class: *mut c_void, ptr: i64) {
+    if let Some(blast) = blast_at(ptr) {
+        let _state = blast.java_state.lock().unwrap_or_else(|e| e.into_inner());
+        blast.stopped.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
 
 /// The remaining natives are pure SurfaceFlinger bookkeeping.
 unsafe extern "C" fn native_noop(
@@ -529,6 +542,7 @@ unsafe extern "C" fn surface_from_blast(
         eprintln!("[blast] nativeGetFromBlastBufferQueue: unknown queue {queue_ptr:#x}");
         return 0;
     };
+    if blast.stopped.load(std::sync::atomic::Ordering::Acquire) { return 0; }
     // The Java `Surface` takes ownership of this reference and releases it in
     // `nativeRelease`, so hand out a new one.
     if let Some(gui) = gui() {
@@ -632,6 +646,47 @@ fn video_origin() -> (i32, i32) {
     (read("PENGUDROID_VIDEO_X"), read("PENGUDROID_VIDEO_Y"))
 }
 
+/// Layer IPC stays on the consumer thread, including layout replacement and
+/// final destruction. Decoder buffer size is independent of this layout.
+#[derive(Default)]
+struct VideoLayer {
+    id: u32,
+    layout: (u32, u32),
+}
+
+impl VideoLayer {
+    fn retire(&mut self, conn: &pengudroid_socket::Connection) -> Result<(), String> {
+        use pengudroid_proto::Message;
+        if self.id == 0 { return Ok(()); }
+        conn.send_message(&Message::DestroySurface { surface_id: self.id }, &[])
+            .map_err(|e| e.to_string())?;
+        match conn.recv_message().map_err(|e| e.to_string())?.0 {
+            Message::Ack => { self.id = 0; Ok(()) }
+            reply => Err(format!("DestroySurface: {reply:?}")),
+        }
+    }
+
+    fn ensure(&mut self, conn: &pengudroid_socket::Connection,
+        layout: (u32, u32), x: i32, y: i32) -> Result<(), String> {
+        use pengudroid_proto::Message;
+        if self.id != 0 && self.layout == layout { return Ok(()); }
+        self.retire(conn)?;
+        conn.send_message(&Message::CreateSubsurface {
+            parent_pid: std::process::id() as i32, x, y,
+            width: layout.0, height: layout.1,
+        }, &[]).map_err(|e| e.to_string())?;
+        match conn.recv_message().map_err(|e| e.to_string())?.0 {
+            Message::SubsurfaceCreated { surface_id } => {
+                self.id = surface_id;
+                self.layout = layout;
+                eprintln!("[blast] video surface {surface_id} at {x},{y} layout={}x{}", layout.0, layout.1);
+                Ok(())
+            }
+            reply => Err(format!("CreateSubsurface: {reply:?}")),
+        }
+    }
+}
+
 /// Start the thread that drains the queue and presents to the daemon.
 unsafe fn start_consumer(blast: *mut Blast) {
     let addr = blast as usize;
@@ -647,12 +702,16 @@ fn consumer_loop(addr: usize) {
 
     let trace = std::env::var_os("PENGUDROID_TRACE_VIDEO").is_some();
     let Some(gui) = gui() else { return };
-    let blast = unsafe { &mut *(addr as *mut Blast) };
+    let blast = unsafe { &*(addr as *const Blast) };
 
     // The daemon may not be up yet when the first `SurfaceView` appears; retry
     // for a while rather than giving up on the first refusal.
     let mut conn = None;
     for _ in 0..50 {
+        if blast.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            if trace { eprintln!("[blast] video: consumer stopped"); }
+            return;
+        }
         if let Ok(c) = Connection::connect_endpoint(&default_socket_path()) {
             let hello = Message::Hello {
                 version: PROTO_VERSION,
@@ -688,11 +747,11 @@ fn consumer_loop(addr: usize) {
     }
 
     let (x, y) = video_origin();
-    let mut surface_id = 0u32;
+    let mut layer = VideoLayer::default();
     let mut announced = false;
     let mut presented = 0u64;
 
-    loop {
+    while !blast.stopped.load(std::sync::atomic::Ordering::Acquire) {
         let rc = unsafe { (gui.acquire)(blast.item_consumer, item_ptr, 0, true) };
         if rc != 0 {
             // `NO_BUFFER_AVAILABLE`/`TIMED_OUT` — nothing queued yet.
@@ -714,34 +773,17 @@ fn consumer_loop(addr: usize) {
                     let height = h.data[4].max(1) as u32;
                     let (_fourcc, bpp) = fourcc_for(format);
 
-                    if surface_id == 0 {
-                        let display = blast.display_size.load(std::sync::atomic::Ordering::Acquire);
-                        let (display_w, display_h) = ((display >> 32) as u32, display as u32);
-                        let msg = Message::CreateSubsurface {
-                            parent_pid: std::process::id() as i32,
-                            x, y,
-                            width: display_w.max(1), height: display_h.max(1),
-                        };
-                        match conn.send_message(&msg, &[]).and_then(|_| conn.recv_message()) {
-                            Ok((Message::SubsurfaceCreated { surface_id: id }, _)) => {
-                                surface_id = id;
-                                blast
-                                    .video_surface
-                                    .store(id, std::sync::atomic::Ordering::Relaxed);
-                                eprintln!(
-                                    "[blast] video surface {id} at {x},{y} source={width}x{height} layout={display_w}x{display_h} fmt={format}"
-                                );
-                            }
-                            Ok((other, _)) => {
-                                eprintln!("[blast] video: CreateSubsurface refused: {other:?}");
-                                std::thread::sleep(std::time::Duration::from_millis(500));
-                            }
-                            Err(e) => {
-                                eprintln!("[blast] video: CreateSubsurface failed: {e}");
-                                std::thread::sleep(std::time::Duration::from_millis(500));
-                            }
+                    let display = blast.display_size.load(std::sync::atomic::Ordering::Acquire);
+                    let layout = (((display >> 32) as u32).max(1), (display as u32).max(1));
+                    let surface_id = match layer.ensure(&conn, layout, x, y) {
+                        Ok(()) => layer.id,
+                        Err(e) => {
+                            eprintln!("[blast] video: layer setup failed: {e}");
+                            std::thread::sleep(std::time::Duration::from_millis(150));
+                            0
                         }
-                    }
+                    };
+                    blast.video_surface.store(surface_id, std::sync::atomic::Ordering::Release);
 
                     if surface_id != 0 {
                         // Our GraphicBuffer allocator returns a CPU memfd, not
@@ -782,11 +824,13 @@ fn consumer_loop(addr: usize) {
                             }
                             Ok((Message::Error { message, .. }, _)) => {
                                 eprintln!("[blast] video: present rejected: {message}");
-                                surface_id = 0;
+                                layer.id = 0;
+                                blast.video_surface.store(0, std::sync::atomic::Ordering::Release);
                             }
                             Err(e) => {
                                 eprintln!("[blast] video: present failed: {e}");
-                                surface_id = 0;
+                                layer.id = 0;
+                                blast.video_surface.store(0, std::sync::atomic::Ordering::Release);
                             }
                             Ok(_) => {}
                         }
@@ -812,6 +856,12 @@ fn consumer_loop(addr: usize) {
         }
         unsafe { (gui.release)(blast.item_consumer, item_ptr, no_fence) };
     }
+    if let Err(e) = layer.retire(&conn) {
+        eprintln!("[blast] video: layer cleanup failed: {e}");
+    }
+    blast.video_surface.store(0, std::sync::atomic::Ordering::Release);
+    unsafe { (gui.item_dtor)(item_ptr) };
+    if trace { eprintln!("[blast] video: consumer stopped"); }
 }
 
 /// Write one queued video buffer as a binary PPM (P6).
@@ -1115,4 +1165,94 @@ pub unsafe extern "C" fn __pengudroid_register_surface_overrides(env: *mut c_voi
     let rc = register(env, class, table.as_ptr(), table.len() as i32);
     eprintln!("[blast] hosted Surface.nativeGetFromBlastBufferQueue (rc={rc})");
     rc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pengudroid_proto::Message;
+    use pengudroid_socket::Connection;
+    use std::os::unix::net::UnixStream;
+
+    fn pair() -> (Connection, Connection) {
+        let (a, b) = UnixStream::pair().unwrap();
+        let (a, b) = (Connection::from_stream(a), Connection::from_stream(b));
+        a.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        b.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        (a, b)
+    }
+
+    #[test]
+    fn layout_change_retires_old_layer_before_creating_replacement() {
+        let (client, server) = pair();
+        let peer = std::thread::spawn(move || {
+            for (expected, response) in [
+                (Message::CreateSubsurface { parent_pid: std::process::id() as i32,
+                    x: 3, y: 4, width: 720, height: 405 }, Message::SubsurfaceCreated { surface_id: 10 }),
+                (Message::DestroySurface { surface_id: 10 }, Message::Ack),
+                (Message::CreateSubsurface { parent_pid: std::process::id() as i32,
+                    x: 3, y: 4, width: 1280, height: 720 }, Message::SubsurfaceCreated { surface_id: 11 }),
+                (Message::DestroySurface { surface_id: 11 }, Message::Ack),
+            ] {
+                assert_eq!(server.recv_message().unwrap().0, expected);
+                server.send_message(&response, &[]).unwrap();
+            }
+        });
+        let mut layer = VideoLayer::default();
+        layer.ensure(&client, (720, 405), 3, 4).unwrap();
+        // Ordinary video frames must reuse their layer, with no IPC here.
+        layer.ensure(&client, (720, 405), 3, 4).unwrap();
+        layer.ensure(&client, (1280, 720), 3, 4).unwrap();
+        assert_eq!(layer.id, 11);
+        layer.retire(&client).unwrap();
+        layer.retire(&client).unwrap();
+        peer.join().unwrap();
+        assert_eq!(layer.id, 0);
+    }
+
+    #[test]
+    fn refused_replacement_does_not_reuse_retired_surface() {
+        let (client, server) = pair();
+        let peer = std::thread::spawn(move || {
+            assert_eq!(server.recv_message().unwrap().0, Message::DestroySurface { surface_id: 9 });
+            server.send_message(&Message::Ack, &[]).unwrap();
+            for response in [
+                Message::Error { code: -2, message: "no window yet".into() },
+                Message::SubsurfaceCreated { surface_id: 12 },
+            ] {
+                assert!(matches!(server.recv_message().unwrap().0,
+                    Message::CreateSubsurface { width: 1280, height: 720, .. }));
+                server.send_message(&response, &[]).unwrap();
+            }
+        });
+        let mut layer = VideoLayer { id: 9, layout: (720, 405) };
+        assert!(layer.ensure(&client, (1280, 720), 0, 0).is_err());
+        assert_eq!(layer.id, 0);
+        layer.ensure(&client, (1280, 720), 0, 0).unwrap();
+        assert_eq!(layer.id, 12);
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn native_destroy_stops_registered_queue_and_rejects_surface_handout() {
+        let blast = Box::leak(Box::new(Blast {
+            producer: [0; 2], consumer: [0; 2],
+            item_consumer: std::ptr::null_mut(), surface: std::ptr::null_mut(),
+            java_state: Mutex::new(JavaState { java_surface: 0, width: 1, height: 1, format: 0 }),
+            stopped: std::sync::atomic::AtomicBool::new(false),
+            video_surface: std::sync::atomic::AtomicU32::new(0),
+            display_size: std::sync::atomic::AtomicU64::new(0),
+        }));
+        let ptr = blast as *const Blast as i64;
+        BLASTS.lock().unwrap().push(ptr as usize);
+        unsafe {
+            native_destroy(std::ptr::null_mut(), std::ptr::null_mut(), ptr);
+            native_destroy(std::ptr::null_mut(), std::ptr::null_mut(), ptr);
+            assert!(native_get_surface(std::ptr::null_mut(), std::ptr::null_mut(), ptr, 0).is_null());
+            assert_eq!(surface_from_blast(std::ptr::null_mut(), std::ptr::null_mut(), 0, ptr), 0);
+        }
+        assert!(blast.stopped.load(std::sync::atomic::Ordering::Acquire));
+        BLASTS.lock().unwrap().retain(|p| *p != ptr as usize);
+        // Match production storage lifetime: readers may still hold a reference.
+    }
 }

@@ -1,56 +1,38 @@
-# pengudroid-gui
+# PenguDroid desktop launcher
 
-PenguDroid's desktop shell: install an APK, launch it, stop it, remove it, and
-toggle the in-game helpers (keymapper, FPS meter). Written in Rust with Slint.
+The desktop GUI is a workspace member built with Slint and the pinned stable Rust toolchain:
 
-## Status: written, not yet buildable on this toolchain
-
-The crate is **not** a workspace member yet, because Slint's dependency tree
-cannot be built with the toolchain in `.toolchain/`:
-
-```
-rustc 1.85.0
-slint 1.6/1.8 → accesskit/zbus → "requires rustc 1.87"
-             → icu_collections/icu_locale_core → uses `is_multiple_of` (1.87)
+```sh
+cargo build --workspace
+./target/debug/pengudroid-gui
+./target/debug/pengudroid-gui app.apk
 ```
 
-`--ignore-rust-version` gets past the version check and then fails inside
-`icu_collections`, so the requirement is real, not just declared.
+The library shows application names and cached launcher icons. Select an app to launch, stop, uninstall, or change its own FPS/keymapper preferences in the right pane. APK installation, file selection, and stopping run on workers so the desktop event loop remains responsive.
 
-Two ways to unblock it, both small:
+## Process lifecycle
 
-1. **Newer toolchain** (recommended):
-   ```sh
-   rustup toolchain install 1.87.0
-   rustup override set 1.87.0
-   ```
-   then add `"crates/pengudroid-gui"` back to the workspace `members` list.
-2. **Pin the transitive chain** to releases that predate the 1.87 requirement
-   (`zbus`, `zvariant`, `icu_*`), which is more fragile and needs re-pinning
-   whenever the tree is refreshed.
+One shared registry is used by all callbacks. The GUI owns the launcher `Child` handles and checks for exits every 250 ms. Each launch has a separate Linux process group. Stop sends SIGTERM and, after 300 ms, SIGKILL to that group; launcher and Android/audio children are reaped or terminated together. Closing PenguDroid with running apps offers a close-all action.
 
-## What it does
+The daemon also handles guest window close independently of Android responsiveness: it resolves the actual EGL window owner, removes that process's surfaces, sends SIGTERM using a Linux pidfd, and escalates to SIGKILL after 500 ms. The pidfd is captured at surface registration and also detects exits, so crashed apps do not leave frozen windows behind.
 
-* Left sidebar: installed apps, a `+` button, and a hint that dropping an `.apk`
-  on the window installs it. `pengudroid-gui game.apk` installs from the command
-  line too (and works as a file manager's "open with").
-* Detail pane: **Launch**, **Stop**, **Uninstall**, plus the keymapper and FPS
-  meter toggles.
-* Closing the window while an app is running asks first ("Quit all"), and only
-  then stops every instance.
-* The logo is the repository's `logo.png`.
+## Metadata and settings
 
-## Design notes
+- The registry is `$XDG_DATA_HOME/pengudroid/apps.txt`, or `~/.local/share/pengudroid/apps.txt`.
+- Per-app preferences are stored in `settings.txt` using `<package>/<setting>` keys. Registry/settings writes use a temporary file and rename.
+- Package names and launcher activities come from `pengudroid info --plain`.
+- When Android SDK `aapt` and `unzip` are available, installation resolves resource-backed application labels and caches the real launcher PNG under `icons/`. Adaptive icons use a legacy raster variant of the same manifest resource when available. Unsupported artwork uses a visible generic fallback.
+- Each application's launcher output is written to `logs/<package>.log`.
+- FPS preferences apply on the next launch and are sent to each surface, so they do not affect other apps sharing the daemon. The title counter uses video frames when a separate video layer exists.
 
-* The GUI does not reimplement launching: it runs `pengudroid launch`, so the
-  CLI and the GUI cannot drift. `runner::sysroot()` finds the Android tree from
-  `PENGUDROID_SYSROOT`, the in-repo `.toolchain/sysroot`, or the per-user
-  install location.
-* The registry is a plain text file (`$XDG_DATA_HOME/pengudroid/apps.txt`,
-  `package|label|activity|apk`), so it can be inspected and edited by hand.
-  Running state is never persisted — a pid from a previous session is
-  meaningless and a stale "running" flag would make the quit prompt lie.
-* `install()` asks `pengudroid info` for the package and launcher activity
-  instead of parsing the manifest a second time.
-* The software renderer is deliberate: the UI is flat rectangles, and it works
-  over a remote session where there may be no GL context.
+## Controls editor and remaining work
+
+Configure controls opens a separate PenguDroid window. It parses and saves the selected app's keymap under `$XDG_CONFIG_HOME/pengudroid/keymaps/<package>.keymap` (or `~/.config/pengudroid/keymaps/`). Keymapper preference persistence and profile editing work; runtime mapping and the requested transparent control attached to the guest window are still pending. The GUI does not inject its editor into the Android renderer.
+
+The old automatic evdev/uinput mapper startup is intentionally no longer invoked by the launcher. A profile checkbox does not claim that runtime touch routing is connected. Kernel uinput devices are virtual devices; direct physical touch forwarding and complete multitouch support remain open.
+
+Wayland keyboard routing now follows compositor keyboard focus independently of the mouse and releases held keys on focus loss. The Wayland broker now supplies an Adwaita client-side title bar on GNOME/Mutter, with host move/resize/close controls, and prefers compositor framing when available. Viewport resizing scales the guest image and video layers while translating pointer coordinates back to guest pixels; the Android framebuffer/configuration remains fixed. A real GNOME compositor test covers resize and maximize/restore. Interactive desktop coverage, true Android relayout, and an X11 window path remain open. Compatibility across GNOME, KDE, XFCE, and other desktops has not yet been established.
+
+## GUI review snapshot
+
+`PENGUDROID_GUI_SCREENSHOT=/absolute/path/launcher.ppm` captures the launcher window after three seconds. This diagnostic does not capture the rest of the desktop.

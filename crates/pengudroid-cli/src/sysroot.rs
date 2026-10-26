@@ -999,6 +999,9 @@ pub fn art_main(args: &[String]) -> i32 {
                 }
                 return run_main(&env, &class, &app_args);
             }
+            if std::env::var_os("PENGUDROID_PROBE_BLAST_LIFECYCLE").is_some() {
+                if !crate::apphost::probe_blast_lifecycle(&env) { return 1; }
+            }
             if std::env::var_os("PENGUDROID_PROBE_AUDIO_FOCUS").is_some() {
                 if !crate::apphost::probe_audio_focus(&env) {
                     eprintln!("audio: AIDL focus probe failed");
