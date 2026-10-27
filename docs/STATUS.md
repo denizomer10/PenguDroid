@@ -2,7 +2,109 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
-## Current handoff — API-37-only selection enforced, native bridge modularised (2026-10-27)
+## Current handoff — API-37 runtime restored, CheckJNI gates pass (2026-10-27)
+
+The pinned API-37 runtime is now present and exercised in this checkout. This
+pass restored it, made the two real API-37 CheckJNI gates pass, and fixed a
+frame-path NPE that aborted every fling traversal. It does **not** establish
+video playback, hardware decode, leak freedom, or a working BBR2 run.
+
+### Runtime restored from the pinned GSI
+
+`tools/prepare-android17.py` verified the official archive before extracting a
+single byte:
+
+* `aosp_x86_64-exp-CP2A.260605.012-15430684-3da2ca55.zip`, 1 022 217 967 bytes,
+  SHA-256 `3da2ca5599d304c4d92fe8c72f31d035a59db57c93ce073740ed4015ee034a8e`.
+* ext4 `system.img` expanded without mounts, 38 APEX payloads unpacked, 61
+  absolute symlinks relativised, output `.toolchain/sysroot-android17`.
+* The GSI keeps `/apex` as an **empty mount-point directory**. `sysroot-relink`
+  previously left it in place, so `/apex/...` links resolved outside the
+  extracted tree and `system/lib64/libc.so` looked missing. It now replaces only
+  that empty directory with `system/apex`, and refuses to touch a populated one.
+* Runtime identity enforced end to end: SDK 37 / release 17 / build
+  `CP2A.260605.012`, real ELF64 x86_64 `libart.so`, and per-file SHA-256 in
+  `pengudroid-runtime.json`. `prepare` also pins `system/lib64/libandroid.so` and
+  `system/lib64/libdl_android.so`, which the native-bridge build now imports.
+
+### Real API-37 CheckJNI gates: 2 passed, 0 skipped
+
+`PENGUDROID_TEST_ANDROID17_SYSROOT=… cargo test -p pengudroid-cli --test art_framework`
+now runs both gates instead of skipping:
+
+* `android17_core_services_under_checkjni` — window, input, settings, audio
+  focus, media session/metrics, user and thermal Stub codes, native
+  `KeyCharacterMap`, WindowLayout and the API-37 resized parcel.
+* `android17_blast_lifecycle_under_checkjni` — real framework
+  create/destroy/recreate with native display discovery.
+
+Two runtime gaps had to be closed first, both found by the gates:
+
+* **`memset_explicit` was an undefined symbol.** Android's `libbinder.so`
+  imports this Bionic/C23 entry point; this glibc has no `memset_explicit`.
+  The shim now exports one whose stores cannot be dead-code-eliminated
+  (`write_volatile` + return of `dst`), with unit tests for fill, partial-fill,
+  zero length and the `c as u8` truncation rule.
+* **`DisplayInfo.frameRateVelocityMapping` was null.** Android 17 added this
+  `List` field and `Display.getFrameRateVelocityMapping()` calls
+  `List.isEmpty()` on it unconditionally, so every `View.updateDisplayListIfDirty`
+  during a fling threw and aborted the traversal. The observed
+  `invoke-interface List.isEmpty()` fixes the declared type as `java.util.List`;
+  an empty `ArrayList` is the truthful value for this synthetic display
+  (`hasArrSupport = false`, one fixed 60 Hz mode). A missing contract now fails
+  loudly instead of being guessed.
+
+### NewPipe UI verified on the restored runtime
+
+Bounded 35 s Wayland run with a private daemon socket
+(`target/newpipe-api37-final/`, logs and `result.json` retained):
+
+* The guest survived the **whole** window (`app_exit_before_cleanup: null`)
+  where the pre-fix run died at 25.2 s with only 2 frames. 3 frames were dumped
+  across 2 surfaces.
+* The captured 720x1280 frame is the real NewPipe UI: red header, tab strip and
+  feed spinner. This is UI rendering evidence, **not** video decode or a
+  frame-rate claim.
+* Both test broker and guest process groups were reaped (`cleanup_complete`).
+
+### Measured remaining runtime gaps
+
+1. **Boot image does not load; ART runs imageless.** Exact ART error: `ValidateOatFile
+   found read barrier state mismatch (oat file: false, runtime: true)`. The
+   GSI's `framework/x86_64/boot.art` (image v119) and `boot.oat` are present and
+   reachable; the mismatch is not configurable — all 154 `-X`/`-XX` options
+   exported by this `libart.so` were enumerated and **none** mentions read
+   barriers. `-Ximage:` semantics were also measured: it is a location whose
+   directory gains `<arch>/<basename>`, so `framework/boot.art` resolves to the
+   real `framework/x86_64/boot.art`, while passing the arch dir directly makes
+   ART look for `framework/x86_64/x86_64/boot.art`. Imageless running works but
+   costs startup time and removes boot-image sharing.
+2. **Three non-fatal NPEs remain** (the guest keeps running through all of them):
+   `ServiceManager.rawGetService` from `ActivityManager$4.create`,
+   `JobSchedulerImpl.getAllPendingJobs` on a null `ParceledListSlice`, and
+   `HardwareRenderer$ProcessInitializer.requestBuffer` on a null
+   `ParcelFileDescriptor` in `initGraphicsStats`.
+3. **No real translator `.so`.** See [NATIVE_BRIDGE.md](NATIVE_BRIDGE.md).
+4. Playback, MediaCodec/Codec2, gralloc allocation, hardware decode and the
+   memory-lifetime audit are unchanged and still open.
+
+### Validation on this checkout
+
+* `cargo build --workspace --offline`: passed.
+* `cargo test --workspace --offline`: **307 tests, 0 failures**, including the
+  `memset_explicit` ABI tests, the C++ GraphicBuffer fixture and the bridge ABI
+  tests.
+* `python3 -B -m unittest discover -s tools -p 'test_*.py'`: **111 tests, 0
+  failures** — runtime preparation, sparse-image expansion, APEX mount-point
+  relinking, and the native-bridge dependency/build drivers.
+* Negative check unchanged: `.toolchain/sysroot` (API 33) is rejected before ART
+  loads; it is not a fixture.
+* Native-bridge dependency preflight: `PASS (compile/link only)`.
+
+Logs: `target/android17-restored-checkjni.log`, `target/workspace-tests-final.log`,
+`target/tools-tests-latest.log`, `target/newpipe-api37-final/`.
+
+## Prior handoff — API-37-only selection enforced, native bridge modularised (2026-10-27)
 
 **Only Android 17 / API 37 x86_64 is a runtime target.** This pass removed
 remaining selectable old runtime contracts and isolated ARM64 translation behind

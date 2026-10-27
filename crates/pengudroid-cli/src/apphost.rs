@@ -6084,6 +6084,25 @@ fn install_display_replies(env: &JniEnv) {
     set_int("layerStack", 0);
     set_int("displayGroupId", 0);
     set_int("colorMode", 0);
+    // Android 17 adds `DisplayInfo.frameRateVelocityMapping`.
+    // `Display.getFrameRateVelocityMapping()` calls `List.isEmpty()` on it
+    // unconditionally, so a null field turns every `View.updateDisplayListIfDirty`
+    // during a fling into a NullPointerException that aborts the traversal. The
+    // observed `List.isEmpty()` invoke-interface fixes the declared type as
+    // `java.util.List`; an empty list is also the truthful answer for a synthetic
+    // display with `hasArrSupport = false` and a fixed 60 Hz mode.
+    let velocity = (|| -> Option<()> {
+        let class = env.find_class("java/util/ArrayList")?;
+        let ctor = env.method_id(class, "<init>", "()V")?;
+        let list = env.new_object(class, ctor, &[])?;
+        let field = env.field_id(info_class, "frameRateVelocityMapping", "Ljava/util/List;")?;
+        env.set_object_field(info, field, list);
+        Some(())
+    })();
+    if velocity.is_none() {
+        eprintln!("apphost: required Android 17 DisplayInfo.frameRateVelocityMapping (java.util.List) contract missing");
+        return;
+    }
 
     if let Some(data) = marshal_object(env, info, "android/view/DisplayInfo") {
         install_reply(&data, "__pengudroid_binder_set_display_info");

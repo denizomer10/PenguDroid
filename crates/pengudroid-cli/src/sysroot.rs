@@ -873,9 +873,11 @@ pub fn art_main(args: &[String]) -> i32 {
             layout.boot_classpath_locations()
         ))
         .unwrap_or_default(),
-        // ART appends `<arch>/boot.art` to the image *directory*, so pass the
-        // framework dir, not the arch dir (otherwise it looks for
-        // `framework/x86_64/x86_64/boot.art`).
+        // Measured on the API-37 GSI: `-Ximage:` is a *location* whose directory
+        // gets `<arch>/<basename>` appended, so `framework/boot.art` resolves to
+        // `framework/x86_64/boot.art` (the file this image really has). Passing
+        // `framework/x86_64/boot.art` instead makes ART look for
+        // `framework/x86_64/x86_64/boot.art` and miss.
         CString::new(format!("-Ximage:{}", layout.framework.join("boot.art").display()))
             .unwrap_or_default(),
         CString::new(format!("-Djava.library.path={}", layout.ld_library_path())).unwrap_or_default(),

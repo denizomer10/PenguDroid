@@ -165,6 +165,47 @@ The `@LIBC` versions are exactly what the translator's guest linker and libc
 proxy must resolve. The fixture is **not** run on the host; it is the input to
 translation.
 
+## Build progress (native-only driver)
+
+`tools/build-nativebridge.py` reproduces a narrow, Android-only subset of the
+pinned Digitalis Blueprint rules with LLVM 22 and the API-37 platform CRT. It is
+**not** a Soong replacement: unsupported rules fail closed. All compiler runs are
+serial, capped in address space/CPU/wall time/output size, and recorded in
+`.toolchain/nativebridge-build/report.json`.
+
+Built and verified as little-endian ELF64 x86_64, compiled for
+`x86_64-linux-android37` against the Android platform libc++ (`std::__1`):
+
+| Artifact | Kind | SHA-256 (prefix) |
+| --- | --- | --- |
+| `libberberis_exec_region.so` | shared | `1f7a8dff044b…` |
+| `libberberis_assembler.a` | static | `1b46c8bca1c1…` |
+| `libberberis_base.a` (11 objects) | static | `871128168148…` |
+| `libberberis_native_bridge_arm64.a` (3 objects) | static | `8ddcc7049323…` |
+| `libberberis_guest_abi_arm64.a` | static | `e8f5bc3356e4…` |
+
+`libberberis_native_bridge_arm64.a` contains the **archive definition**
+`0000000000000000 D NativeBridgeItf`. That is an object-file symbol, **not** a
+translator `.so` export and **not** evidence of ARM64 execution.
+
+Platform inputs are imported only from the completed API-37 extraction and only
+after a read-only gate (`--check-platform`) that checks the runtime manifest
+identity, per-file SHA-256, in-tree symlinks, ELF machine/SONAME and required
+defined exports. That gate verifies **link inputs only** — not their transitive
+loader closure, and nothing is executed.
+
+**Still blocked:** no `libberberis_arm64.so` exists. The towards-bridge build
+stops at a real header/default closure that is not guessed or stubbed:
+
+```
+libberberis_arm64 -> libandroid -> libandroid_common
+                  -> android.hardware.power-ndk_shared
+```
+
+Whole-static dependency merging and the native host-codegen generator are also
+unimplemented. **No guest instruction has been translated.** Nothing here
+establishes that Beach Buggy Racing 2 runs.
+
 ## Verified, and not verified
 
 Verified in this checkout, with no Android runtime:
@@ -183,11 +224,12 @@ Verified in this checkout, with no Android runtime:
 * An API-37 AArch64 guest library cross-builds and links with Bionic versions.
 
 **Not verified:** no real bridge binary exists on this machine, so no guest
-instruction has been translated by PenguDroid. Building the bridge requires an
-AOSP checkout and `m berberis_all` with the ARM64-to-x86_64 configuration
-(`enable_arm64_to_x86_64.mk`); the sources are present, the Android build
-system and its toolchain are not. Nothing here establishes that Beach Buggy
-Racing 2 runs.
+instruction has been translated by PenguDroid. The native-only driver builds
+individual Android variants (above) but does not yet link
+`libberberis_arm64.so`; a full AOSP `m berberis_all` with
+`enable_arm64_to_x86_64.mk` remains the supported upstream route. The sources
+are present, the Android build system is not. Nothing here establishes that
+Beach Buggy Racing 2 runs.
 
 ## What Beach Buggy Racing 2 needs
 
@@ -196,7 +238,8 @@ native libraries, all `lib/arm64-v8a/*.so` with ELF machine 183 (AArch64).
 Offline inventory across every APK member found no x86_64 payload. Reaching that
 code therefore needs, in order:
 
-1. An Android 17 / API 37 x86_64 runtime (absent from this checkout).
+1. An Android 17 / API 37 x86_64 runtime. **Present** — see
+   [ANDROID17.md](ANDROID17.md); it currently runs imageless.
 2. A built Digitalis ARM64 bridge, prepared for glibc.
 3. Guest libraries staged where the bridge accepts them.
 4. Graphics, input and audio proxying for an SDL3/Unity-class engine — the

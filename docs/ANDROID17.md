@@ -20,16 +20,36 @@ memory/resource growth, GPU graphics and hardware video decode across Intel,
 AMD and NVIDIA, and Beach Buggy Racing 2. None is established merely by building
 the workspace or reporting a GPU capability.
 
-## Current checkout: 2026-10-27
+## Current checkout: 2026-10-27 (runtime restored)
 
-The runtime/reference directories recorded by an earlier machine are **not
-present in this checkout**: `.toolchain/sysroot-android17`,
-`.toolchain/references`, and `.tools` are absent. The existing
-`.toolchain/sysroot/system/build.prop` reports SDK 33. The CLI now rejects it
-before loading ART; it was not used for execution or as a substitute fixture.
-The Android-17 CheckJNI gates currently skip when no runtime is supplied.
-Explicitly configuring a missing runtime makes those gates fail instead of
-silently skipping.
+`.toolchain/sysroot-android17` now exists in this checkout. It was produced by
+`tools/prepare-android17.py` from the archive below after verifying its SHA-256,
+and is validated on every use: SDK 37 / release 17 / build `CP2A.260605.012`, an
+actual ELF64 x86_64 `libart.so`, and per-file hashes in
+`pengudroid-runtime.json`. Both real API-37 CheckJNI gates **pass** against it.
+
+`.toolchain/sysroot` (SDK 33) is still present and is **not** a target and not a
+fixture; the CLI rejects it before ART loads.
+
+Two extraction details matter for anyone reproducing this:
+
+* The GSI stores `/apex` as an **empty directory** standing in for a mount point,
+  so absolute `/apex/...` links did not resolve inside the extracted tree and
+  `system/lib64/libc.so` appeared missing. `tools/art/sysroot-relink.py` now
+  replaces exactly that empty directory with `system/apex` and refuses to touch
+  a populated one.
+* `-Ximage:` is a *location*, not a file: ART appends `<arch>/<basename>` to its
+  directory. `framework/boot.art` therefore resolves to the real
+  `framework/x86_64/boot.art`; passing `framework/x86_64/boot.art` makes ART look
+  for `framework/x86_64/x86_64/boot.art` and miss.
+
+**Open at this checkpoint:** the boot image does not load — ART reports
+`ValidateOatFile found read barrier state mismatch (oat file: false, runtime:
+true)` and falls back to imageless running. All 154 `-X`/`-XX` options exported
+by this `libart.so` were enumerated and none controls read barriers, so this is
+not currently configurable. Imageless mode works (NewPipe runs) but costs
+startup time and boot-image sharing. See [STATUS.md](STATUS.md) for the measured
+gaps.
 
 An earlier checkpoint recorded real API-37 bringup using the official x86_64
 GSI `CP2A.260605.012`, SHA-256
@@ -156,10 +176,11 @@ retained inventory: `target/beach-buggy-2-native-inventory.json`.
 ```sh
 cargo build --workspace --offline
 cargo test --workspace --offline
+python3 -B -m unittest discover -s tools -p 'test_*.py' -v
 cargo test -p pengudroid-shim --test graphicbuffer_native --offline
 PENGUDROID_TEST_KERNEL_SOURCE=/absolute/kernel-source cargo test -p pengudroid-shim --lib android17_kernel_uapi_matches --offline
-PENGUDROID_TEST_ANDROID17_SYSROOT=/absolute/api37-x86_64-tree cargo test -p pengudroid-cli --test art_framework --offline -- --nocapture
-pengudroid launch NewPipe_v0.29.1.apk --sysroot .toolchain/sysroot-android17
+PENGUDROID_TEST_ANDROID17_SYSROOT=$PWD/.toolchain/sysroot-android17 cargo test -p pengudroid-cli --test art_framework --offline -- --nocapture
+./target/debug/pengudroid launch NewPipe_v0.29.1.apk --sysroot .toolchain/sysroot-android17
 ```
 
 Build all runtime shared libraries before invoking the framework probes. Live

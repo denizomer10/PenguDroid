@@ -2185,6 +2185,16 @@ pub unsafe extern "C" fn __memmove_chk(
     libc::memmove(dst, src, len)
 }
 
+/// Bionic/C23 `memset_explicit`: unlike memset, dead stores must be retained.
+#[no_mangle]
+pub unsafe extern "C" fn memset_explicit(dst: *mut c_void, c: c_int, len: usize) -> *mut c_void {
+    let bytes = dst.cast::<u8>();
+    for offset in 0..len {
+        bytes.add(offset).write_volatile(c as u8);
+    }
+    dst
+}
+
 /// `__memset_chk(dst, c, len, dst_size)`.
 #[no_mangle]
 pub unsafe extern "C" fn __memset_chk(
@@ -5300,6 +5310,28 @@ pub static __pengudroid_ver_ld: u8 = 0;
 mod tests {
     use super::*;
     use std::os::unix::io::FromRawFd;
+
+    #[test]
+    fn memset_explicit_returns_destination_and_fills_only_requested_bytes() {
+        for value in [0, 0x123, -1, c_int::MIN, c_int::MAX] {
+            let mut bytes = [0xa5u8; 19];
+            let dst = unsafe { bytes.as_mut_ptr().add(3).cast::<c_void>() };
+            assert_eq!(unsafe { memset_explicit(dst, value, 13) }, dst);
+            assert_eq!(&bytes[..3], &[0xa5; 3]);
+            assert_eq!(&bytes[3..16], &[value as u8; 13]);
+            assert_eq!(&bytes[16..], &[0xa5; 3]);
+        }
+    }
+
+    #[test]
+    fn memset_explicit_zero_length_does_not_access_destination() {
+        let dst = std::ptr::NonNull::<u8>::dangling().as_ptr().cast::<c_void>();
+        assert_eq!(unsafe { memset_explicit(dst, 0x55, 0) }, dst);
+        let mut bytes = [0xa5u8; 8];
+        let dst = bytes.as_mut_ptr().cast::<c_void>();
+        assert_eq!(unsafe { memset_explicit(dst, 0, 0) }, dst);
+        assert_eq!(bytes, [0xa5; 8]);
+    }
 
     const PLATFORM_OVERRIDE_REJECTIONS: &[(&str, &str)] = &[
         ("ro.build.version.sdk", "33"),

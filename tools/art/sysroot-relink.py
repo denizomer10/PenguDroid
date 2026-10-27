@@ -24,8 +24,13 @@ def main(argv):
     # Android normally has /apex as a mount point; the image keeps the APEXes
     # under /system/apex, so expose them at the top level too.
     apex = os.path.join(root, "apex")
-    if not os.path.lexists(apex) and os.path.isdir(os.path.join(root, "system", "apex")):
-        os.symlink("system/apex", apex)
+    if os.path.isdir(os.path.join(root, "system", "apex")):
+        # GSIs may retain an empty /apex mount-point directory. It must expose
+        # the extracted packages too, but never replace populated user data.
+        if os.path.isdir(apex) and not os.path.islink(apex) and not os.listdir(apex):
+            os.rmdir(apex)
+        if not os.path.lexists(apex):
+            os.symlink("system/apex", apex)
 
     rewritten = broken = 0
     for dirpath, dirnames, filenames in os.walk(root):
