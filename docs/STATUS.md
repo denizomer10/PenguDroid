@@ -2,6 +2,186 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
+## HANDOFF — the next agent continues here (2026-10-27)
+
+**This session ends at this note. Work resumes in a NEW agent session; the next
+agent starts by reading this section and the hard-lock checklist below.**
+
+### Non-negotiable hard lock: Android 17 / API 37 x86_64 only
+
+Android 17 / API 37 on x86_64 is the **only** runtime target. When this work
+resumes:
+
+- No API-33 code path, wire default, layout retry, symbol fallback or test gate
+  may remain anywhere. "Try both layouts" is forbidden; a missing contract must
+  **fail loudly** instead of guessing.
+- Wire contracts are derived from the loaded framework's own `Stub` constants,
+  measured binaries, or AOSP sources under `.toolchain/references/`
+  (`native-refs_heads_android17-release` = `frameworks/native`,
+  `libhybris/compat/ui/ui_compatibility_layer.cpp` = gralloc/GraphicBuffer
+  contract). Never fabricate vtables or guess transaction numbers.
+- The only runtime sysroot is `.toolchain/sysroot-android17`
+  (GSI `CP2A.260605.012`, SHA-256 `3da2ca55…`). `.toolchain/sysroot` (API 33)
+  is not a target and not a fixture.
+
+### Verified state at handoff
+
+- Workspace build clean; **255 tests, 0 failures** (the API-33 full-framework
+  gate `real_art_keyboard_and_local_window_layout` was deleted with the hard
+  lock; its assertions are covered by the two API-37 CheckJNI gates).
+- PlayerService binds end to end on API 37 (see the next section): service
+  transaction codes installed from the framework Stub
+  (`[16, 35, 40, 42, 43]`), 7-field Intent walk (`mExtendedFlags`),
+  4-arg `ServiceDispatcher.connected` with null `IBinderSession`.
+- Hard-lock edits applied this session (uncommitted at the time of writing):
+  `binder.rs` application codes empty until the framework installs them,
+  `apphost.rs` intent walk + `connected` signature, `art_framework.rs` API-33
+  gate deleted, `pengudroid-gui/src/runner.rs` default sysroot →
+  `sysroot-android17`.
+
+### Remaining hard-lock checklist (the next agent's FIRST task)
+
+1. `pengudroid-shim/src/binder.rs`: `send_vsync` (~L1583) and the AIDL
+   SurfaceFlinger reply path (~L2146) still branch on
+   `ro.build.version.sdk == 37` choosing a 224-byte vs legacy
+   `DISPLAY_EVENT_SIZE` — always 224 and assert the property. Delete the legacy
+   `android.ui.ISurfaceComposer` dual-interface handling (~L1966, ~L2051) and
+   the `ISC_*_LEGACY` dual codes (~L653, both 3 and 54 answered) unless a live
+   API-37 trace proves they are still needed. `SERVICE_MANAGER_CODES` default
+   `[1, 2, 0, 0]` and `apphost.rs` `get2.unwrap_or(0)` → require `getService2`/
+   `checkService2`, empty default. `ISM_CREATE_SESSION`, `ISESSION_*`,
+   `IMM_GET_PLAYBACK_SESSION_ID` are derived from android-13 AIDL order → load
+   them from the framework's `Stub` constants instead.
+2. `pengudroid-cli/src/keyboard.rs`: `virtual_character_map_parcel(modern:
+   bool)` — drop the parameter, always write the API-37 `String8` form (the
+   `if modern { words.push(0); }` C-string variant is API 33). Related
+   `match sdk { 33 => …, 37 => …, _ => … }` in `apphost.rs` (~L5753) and
+   `if modern && name == "isInputDeviceEnabled"` (~L5765) go the same way.
+3. `pengudroid-cli/src/apphost.rs` `force_window_frame` (~L4635): "Try both"
+   `mClientWindowFrames.frame` and `mWinFrame` → `mClientWindowFrames.frame`
+   only.
+4. `pengudroid-cli/src/sysroot.rs` (~L245): drop the hardcoded boot-jar
+   fallback list, require the `bootclasspath.pb` fragment;
+   `target_sdk: …unwrap_or(35)` (~L1903) → 37.
+5. Reported platform identity: `pengudroid-shim/src/lib.rs` `default_props`
+   (~L1274) advertises `ro.build.version.sdk=36`/release 16 and
+   `pengudroid-proto/src/lib.rs` (~L960) `ANDROID_API_LEVEL=36` /
+   `ANDROID_RELEASE="16"` → **37 / 17** (also the `identity_reports_api_36`
+   test and `lib.rs:5418`).
+6. `pengudroid-shim/src/audiofocus.rs` (~L15): delete
+   `Transactions::LEGACY = [66, 67, 68, 69]` (API-33 codes).
+7. `apphost.rs` (~L734) `install_system_features_cache` silently returns when
+   `SDK_INT < 37` → fail loudly; `disabled_changes(root, target_sdk)`
+   (`apphost.rs` ~L898, `compat.rs` ~L46) must not select policy from the APK's
+   `targetSdk`.
+8. Stale "API-33 … fallback" comments: `binder.rs:712`, `apphost.rs:6185`.
+
+Re-verify after the checklist: `cargo build --workspace --offline`, then
+`cargo test --workspace --offline` (expect 255 passing; a clean
+`git diff --check`).
+
+### Product targets (after the hard lock is complete), in order
+
+1. **NewPipe flawless, no leaks**: launch → search → deterministic VOD playback
+   → pause/seek → resize → exit → relaunch. The synthetic-tap harness
+   (`PENGUDROID_SYNTH_CLICK="x,y@delayMs[;…]"`, `PENGUDROID_CLICK_TEXT`) must
+   reach a *playing* stream — `target/newpipe-api37-player-final/` shows the
+   last tap ended on the feed/drawer. Then the API-37 `MediaCodec`/Codec2 path
+   with retained logs, gralloc/GraphicBuffer allocator+mapper contracts
+   (contract source: `libhybris/compat/ui/ui_compatibility_layer.cpp`), and a
+   memory lifetime audit (BLAST native queue + Java global refs) with RSS+PSS
+   over sustained playback, seek/reconfigure, minimize/restore, reopen.
+2. **HW acceleration (decode + 3D) on Intel, AMD and NVIDIA** (Intel VA-API
+   works; AMD needs validation, NVIDIA needs NVDEC; Vulkan WSI stays separate).
+3. **Beach Buggy Racing 2** eventually. It is arm64-only and needs
+   `system_server`; nothing is implemented and no compatibility is claimed.
+   See [LIMITATIONS.md](LIMITATIONS.md) §2.1 for the ARM64 execution gap
+   (`libndk_translation` dies in `ndk_translation_HandleNoExec`; the
+   `gbos-x86/isa-emu` trap-and-emulate pattern in `.toolchain/references/` is
+   x86-on-x86 SIMD, not ARM64).
+
+### Verification commands
+
+```sh
+cd /home/asus/PenguDroid
+/home/asus/.cargo/bin/cargo build --workspace --offline   # run first: refreshes libpengudroid_shim.so
+/home/asus/.cargo/bin/cargo test --workspace --offline
+/home/asus/.cargo/bin/cargo test -p pengudroid-cli --test art_framework --offline -- --nocapture
+git --no-optional-locks diff --check
+```
+
+Live runs are always bounded: private socket via
+`PENGUDROID_SOCKET=<dir>/daemon.sock`, daemon started first
+(`target/debug/pengudroid-daemon --socket <dir>/daemon.sock`), launch with
+`--sysroot .toolchain/sysroot-android17`, then kill both process groups
+(SIGTERM → SIGKILL) and retain `<dir>/app.log` + `daemon.log`.
+
+## Android 17 PlayerService binds end to end (2026-10-27)
+
+The API-37 service path now delivers NewPipe's `PlayerService` binding. A bounded
+Wayland run (`target/newpipe-api37-player-final/`) captured the bind request,
+unmarshalled the real `Intent`, created the service, ran `onBind`, and delivered
+`LoadedApk$ServiceDispatcher.connected`. Three measured API-37 contracts were
+wrong and are now derived from the loaded framework and AOSP sources:
+
+1. **Service transaction codes are dynamic.** `IActivityManager$Stub` no longer
+   uses the API-33 numbers: the loaded framework reports
+   `[16, 35, 40, 42, 43]` for `getActivityClientController`,
+   `getContentProvider`, `startService`, `bindService` and `bindServiceInstance`.
+   `bindIsolatedService` has no Stub constant in Android 17; NewPipe's
+   `ContextImpl.bindService` arrives as code 43, i.e. `bindServiceInstance`.
+   The broker now installs all five from the generated Stub (source:
+   `IActivityManager.aidl`, android17-release) instead of fixed 27/30.
+2. **`Intent` gained `mExtendedFlags`.** `Intent.writeToParcel` writes
+   `action`, `data`, `type`, `identifier`, `flags`, **`extendedFlags`**,
+   `package`, then `ComponentName`. The broker's back-walk over six fields
+   therefore landed four bytes late (`Uri` type `-1`, "Unknown URI type").
+   It now walks seven fields; the old `offset+4` API-33 retry is removed with
+   the hard lock. The result is
+   `act=bind_player_holder_action cmp=org.schabi.newpipe/.player.PlayerService`
+   rather than the bare fallback intent that made `onStartCommand` report a
+   "useless intent" and stop the service.
+3. **`ServiceDispatcher.connected` gained an `IBinderSession`.** The signature
+   is `(ComponentName, IBinder, android.app.IBinderSession, boolean)` — note
+   `android.app`, not `android.os`. The session is nullable and
+   `ServiceConnection` forwards to the two-argument `onServiceConnected` when it
+   is null, so ordinary binds pass null. The API-33 three-argument form was
+   removed with the hard lock.
+
+Verified in `target/newpipe-api37-player-final/app.log`:
+`binder: framework application transaction codes = [16, 35, 40, 42, 43]`,
+`[binder] service request: bind .../PlayerService`, the unmarshalled Intent,
+`service: creating .../PlayerService`, `created`, `onBind returned a binder`,
+`service: connected 1 pending binding(s) for .../PlayerService`. A
+`MediaSessionCompat` media-button warning is expected with no system UI.
+
+**Playback and `MediaCodec` remain unverified on API 37.** No ExoPlayer,
+`MediaCodec` or Codec2 activity appeared in this bounded run (the synthetic tap
+ended on the feed/drawer, not in a playing stream), so no decode, frame or A/V
+claim is made. A regression in `crates/pengudroid-shim/src/binder.rs`
+(`android17_intent_location_includes_extended_flags`) pins the new Intent field
+order; 16 Binder tests and the workspace build pass.
+
+## BLAST loader is Android-17-only; the API-33 gate is deleted (2026-10-27)
+
+`blast.rs`'s `libgui` loader resolves the Android 17 symbols only: the
+`std::optional<std::function<…>>` trailing forms of
+`BufferItemConsumer::acquireBuffer`/`releaseBuffer`, and the Android-17-only
+`BLASTBufferQueue` constructor and `update` (both **required** — a missing
+entry point fails the load loudly with
+`[blast] libgui/libutils is missing a required entry point`). A session
+experiment that added an API-33 `guest_sym_first` fallback to the short
+`acquireBuffer`/`releaseBuffer` forms and made `bbq_ctor`/`bbq_update`
+optional was **reverted**: it fixed the API-33 fixture but violates the hard
+lock. The API-33 full-framework gate
+(`real_art_keyboard_and_local_window_layout`) that demanded it is deleted
+instead; its assertions are covered against the real API-37 runtime by
+`android17_core_services_under_checkjni` and
+`android17_blast_lifecycle_under_checkjni`.
+
+Validation: both API-37 CheckJNI gates and 3 BLAST unit tests pass; the
+workspace run is **255 tests, zero failures**.
+
 ## Android 17 NewPipe UI renders and continues drawing (2026-10-27)
 
 The immediate mapper abort was triggered by `ANativeWindow_tryAllocateBuffers`,
@@ -239,8 +419,10 @@ The user requested migration of Binder, media and the platform layer to Android
 17 while retaining backward app compatibility. This extends the existing broad
 Linux Android compatibility goal; the NewPipe/desktop milestone remains work
 within that goal. See [ANDROID17.md](ANDROID17.md) for pinned source findings,
-implemented code and migration gates. The default app runtime is still API 33;
-reporting API 37 without its framework is not a completed migration.
+implemented code and migration gates. **The runtime is hard-locked to API 37**:
+`.toolchain/sysroot-android17` is the only sysroot, and the API-33 sysroot is
+neither a target nor a fixture. See the HANDOFF section above for the remaining
+hard-lock checklist.
 
 The first code change resolves audio-focus transaction numbers from the loaded
 framework's generated Stub, installs all four as one validated table and uses
@@ -480,17 +662,24 @@ These observations verify the listed app and run only. They do not establish gen
 
 ## Build and verification history
 
-- The latest resume workspace build and test run passed: **247 tests, zero failures**.
-  Logs: `/tmp/pd-resume/build-final.log` and `/tmp/pd-resume/tests-final.log`.
-  Optional hardware fixtures still require the explicit environment described in HARDWARE_VIDEO.md.
+- The latest workspace build and test run passed: **255 tests, zero failures**
+  (the API-33 full-framework gate was deleted with the Android 17 hard lock;
+  the two API-37 CheckJNI gates remain).
+  Build runtime shared libraries before integration checks: test compilation
+  alone does not refresh `target/debug/libpengudroid_shim.so`.
+- Optional hardware fixtures still require the explicit environment described in HARDWARE_VIDEO.md.
 - Earlier BLAST and parent-lifecycle changes passed 226 tests. The orientation-sizing work was included in the latest full run.
 - `git diff --check` was clean after the last edit.
 - Build warnings remain in the existing codebase.
 
 ## Next work
 
+0. Finish the remaining hard-lock checklist in the HANDOFF section above
+   (binder/SurfaceFlinger legacy paths, keyboard parcel, `force_window_frame`,
+   boot-jar list, props 37/17, `audiofocus` LEGACY codes, compat-policy
+   targetSdk). Nothing below starts before this is done and re-verified.
 1. Diagnose the observed ART `top_shadow_frame_` failure using the retained native-backtrace hook. Validate the new frame interactively on GNOME, then test KDE/Wayland and an X11 desktop path. Android configuration/relayout propagation remains distinct from the implemented compositor scaling.
-2. Exercise NewPipe from launch through keyboard search, deterministic VOD playback, pause/seek, resize, exit, and relaunch. Include hung-guest close and retained logs; do not call the app stable until that flow is covered.
+2. Verify the API-37 `MediaCodec`/Codec2 path with retained logs now that `PlayerService` binds, then implement the required GraphicBuffer allocator/mapper contracts for real video buffers. Exercise NewPipe from launch through keyboard search, deterministic VOD playback, pause/seek, resize, exit, and relaunch. Include hung-guest close and retained logs; do not call the app stable until that flow is covered.
 3. Route physical touch/multitouch from the native seat, then connect focus-scoped per-app keymaps to the host controls editor and transparent button outside the guest renderer.
 4. Finish guest-exit cleanup and JNI/RefBase lifetime management, then return to ARM64 native execution. The NDK translator still fails during lazy code translation; see [LIMITATIONS.md](LIMITATIONS.md) §2.1.
 5. Attempt a real game after the NewPipe/desktop foundation is stable, with Genshin Impact as the later target. It has not been launched or claimed compatible.

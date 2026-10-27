@@ -533,11 +533,15 @@ const IPM_GET_PROVIDER_INFO: u32 = 15;
 /// `ActivityClient.getDisplayId` calls it through a `Singleton`; with no system
 /// server the reply is empty, the singleton caches null and the next call NPEs
 /// inside `createBaseContextForActivity`.
-const ATM_GET_ACTIVITY_CLIENT_CONTROLLER: u32 = 18;
-/// ActivityTaskManager controller, then IActivityManager provider/start/bind/
-/// bind-isolated. The defaults cover the API-33 regression fixture; ART replaces
-/// all five from the loaded framework before an application can issue them.
-static APPLICATION_TRANSACTION_CODES: Mutex<[u32; 5]> = Mutex::new([18, 23, 27, 30, 30]);
+/// ActivityTaskManager `getActivityClientController`, then IActivityManager
+/// `getContentProvider`/`startService`/`bindService`/`bindServiceInstance`.
+/// Android 17 replaced `bindIsolatedService` with `bindServiceInstance`.
+///
+/// Hard-locked to API 37: the table is all-`u32::MAX` (unknown) until ART
+/// installs the loaded framework's own `Stub` constants. No API-33 number is
+/// ever guessed, so a native-only launch never mistakes an unrelated
+/// transaction for a service call and a missing table fails binding loudly.
+static APPLICATION_TRANSACTION_CODES: Mutex<[u32; 5]> = Mutex::new([u32::MAX; 5]);
 
 #[no_mangle]
 pub extern "C" fn __pengudroid_binder_set_application_transactions(
@@ -545,21 +549,14 @@ pub extern "C" fn __pengudroid_binder_set_application_transactions(
     provider: u32,
     start_service: u32,
     bind_service: u32,
-    bind_isolated_service: u32,
+    bind_service_instance: u32,
 ) -> bool {
-    let codes = [controller, provider, start_service, bind_service, bind_isolated_service];
+    let codes = [controller, provider, start_service, bind_service, bind_service_instance];
     if codes.iter().any(|&code| code == 0 || code >= 0x00ff_fffe) { return false; }
     *APPLICATION_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner()) = codes;
     true
 }
 
-
-/// `IActivityManager` transaction code for `getContentProvider` in API 33.
-///
-/// Arguments are `(IApplicationThread, String opPackageName, String auth,
-/// int userId, boolean stable)`; `Activity.attach` needs the `settings`
-/// provider and NPEs on a null `IContentProvider` without it.
-const IAM_GET_CONTENT_PROVIDER: u32 = 23;
 
 /// `ISessionManager` transaction code for `createSession`.
 ///
@@ -2504,11 +2501,11 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         .unwrap_or_else(|e| e.into_inner());
     let start_service = application_codes[2];
     let bind_service = application_codes[3];
-    let bind_isolated_service = application_codes[4];
+    let bind_service_instance = application_codes[4];
     if tr.target_handle == handle_for("activity")
         && (tr.code == start_service
             || tr.code == bind_service
-            || tr.code == bind_isolated_service)
+            || tr.code == bind_service_instance)
     {
         // The player lives in the app's own process (`PlayerService`), and with
         // no system_server nothing schedules its creation, so these two calls
@@ -2562,7 +2559,7 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             note_service_request(
                 &pkg,
                 &cls,
-                tr.code == bind_service || tr.code == bind_isolated_service,
+                tr.code == bind_service || tr.code == bind_service_instance,
                 data,
                 intent_offset,
             );

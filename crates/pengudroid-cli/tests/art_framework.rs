@@ -53,24 +53,11 @@ fn run_framework_probe(sysroot: &Path, label: &str, blast: bool, native_display:
     text
 }
 
-#[test]
-fn real_art_keyboard_and_local_window_layout() {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
-    let sysroot = std::env::var_os("PENGUDROID_TEST_SYSROOT").map(PathBuf::from)
-        .unwrap_or_else(|| workspace.join(".toolchain/sysroot"));
-    if !sysroot.join("system/framework/framework.jar").exists() {
-        eprintln!("skipping: no Android sysroot (set PENGUDROID_TEST_SYSROOT)");
-        return;
-    }
-    let text = run_framework_probe(&sysroot, "full", true, false);
-    assert!(text.contains("settings: Binder/Parcel scalar value, missing key and unsupported list passed"), "{text}");
-    assert!(text.contains("blast: real framework create/destroy/recreate passed"), "{text}");
-    assert_eq!(text.matches("[blast] video: consumer stopped").count(), 2, "{text}");
-    assert!(text.contains("window: local WindowLayout.computeFrames = 720x1280"), "{text}");
-    assert!(text.contains("native KeyCharacterMap: 6 Unicode cases passed"), "{text}");
-    assert!(text.contains("audio: framework focus transaction codes ="), "{text}");
-    assert!(text.contains("audio: AIDL focus granted, current gain verified, abandon cleared"), "{text}");
-}
+// The API-33 full-framework gate (`real_art_keyboard_and_local_window_layout`)
+// was removed with the Android 17 hard lock. Runtime is Android 17 / API 37
+// only; every assertion it carried is covered against the API-37 runtime by
+// `android17_core_services_under_checkjni` and
+// `android17_blast_lifecycle_under_checkjni`.
 
 #[test]
 fn android17_blast_lifecycle_under_checkjni() {

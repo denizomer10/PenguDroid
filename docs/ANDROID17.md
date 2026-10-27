@@ -3,8 +3,10 @@
 The runtime target is **Android 17 / API 37 only**. Existing APKs keep their
 declared minSdk/targetSdk; the platform level is not substituted for either.
 The Android 17 runtime boots and passes core framework and BLAST lifecycle
-probes. Window/media integration remains incomplete. API-33 artifacts are
-historical regression fixtures, not a window/input fallback. See STATUS.md
+probes. Window/media integration remains incomplete. **Hard lock: API-33 is
+out entirely** — the API-33 sysroot (`.toolchain/sysroot`) is no longer a
+target, fixture or fallback, its regression gate is deleted, and
+`.toolchain/sysroot-android17` is the only runtime sysroot. See STATUS.md
 for the latest handoff; earlier checkpoints below record migration history.
 
 ## Actual API-37 runtime bringup

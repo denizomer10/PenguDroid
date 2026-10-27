@@ -91,7 +91,7 @@ pub fn sysroot() -> Option<PathBuf> {
     }
     let mut candidates = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join(".toolchain/sysroot"));
+        candidates.push(cwd.join(".toolchain/sysroot-android17"));
     }
     if let Some(data) = std::env::var_os("XDG_DATA_HOME") {
         candidates.push(PathBuf::from(data).join("pengudroid/sysroot"));

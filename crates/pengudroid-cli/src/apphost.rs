@@ -3197,16 +3197,11 @@ impl ServiceHost {
             && request.intent_offset > 0
             && request.intent_offset < request.parcel.len()
         {
-            // Android 17 added `mExtendedFlags` before `mPackage`. The broker
-            // locates that layout first; four bytes later is the API-33 layout.
-            // Trying both keeps the older framework regression fixture honest
-            // without selecting parcel semantics from the APK's targetSdk.
-            for offset in [request.intent_offset, request.intent_offset + 4] {
-                if offset < request.parcel.len() {
-                    if let Some(intent) = self.unmarshall_intent(request, offset) {
-                        return Some(intent);
-                    }
-                }
+            // Hard-locked to Android 17: `Intent` writes `mExtendedFlags`
+            // between `mFlags` and `mPackage`, so the broker's back-walk already
+            // lands on `action`. There is no API-33 layout to try.
+            if let Some(intent) = self.unmarshall_intent(request, request.intent_offset) {
+                return Some(intent);
             }
             eprintln!(
                 "service: cannot unmarshall the Intent of {}; using a bare one",
@@ -3552,10 +3547,16 @@ impl ServiceHost {
             eprintln!("service: LoadedApk$ServiceDispatcher not found");
             return;
         };
+        // Hard-locked to Android 17: `connected` takes a nullable
+        // `IBinderSession` before `dead` so a binding created with
+        // `BIND_ALLOW_FREEZE` can keep the remote unfrozen. Ordinary binds pass
+        // null, and `ServiceConnection` forwards to the two-argument
+        // `onServiceConnected` in that case. There is no API-33 three-argument
+        // form to fall back to.
         let Some(connected) = self.env.method_id(
             dispatcher_class,
             "connected",
-            "(Landroid/content/ComponentName;Landroid/os/IBinder;Z)V",
+            "(Landroid/content/ComponentName;Landroid/os/IBinder;Landroid/app/IBinderSession;Z)V",
         ) else {
             eprintln!("service: LoadedApk$ServiceDispatcher.connected not found");
             return;
@@ -3585,7 +3586,12 @@ impl ServiceHost {
                 if self.env.call_void(
                     dispatcher,
                     connected,
-                    &[JValue { l: component }, JValue { l: binder }, JValue { z: 0 }],
+                    &[
+                        JValue { l: component },
+                        JValue { l: binder },
+                        JValue { l: std::ptr::null_mut() },
+                        JValue { z: 0 },
+                    ],
                 ) {
                     dispatched += 1;
                 }
@@ -5412,7 +5418,7 @@ fn install_application_transactions(env: &JniEnv) -> Option<()> {
         ("android/app/IActivityManager$Stub", "TRANSACTION_getContentProvider"),
         ("android/app/IActivityManager$Stub", "TRANSACTION_startService"),
         ("android/app/IActivityManager$Stub", "TRANSACTION_bindService"),
-        ("android/app/IActivityManager$Stub", "TRANSACTION_bindIsolatedService"),
+        ("android/app/IActivityManager$Stub", "TRANSACTION_bindServiceInstance"),
     ].into_iter().enumerate() {
         let class = env.find_class(class)?;
         let field = env.static_field_id(class, field, "I")?;
