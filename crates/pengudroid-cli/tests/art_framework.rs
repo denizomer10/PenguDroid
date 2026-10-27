@@ -14,7 +14,8 @@ impl Drop for Run {
     }
 }
 
-fn run_framework_probe(sysroot: &Path, label: &str, blast: bool, native_display: bool) -> String {
+fn run_framework_probe(sysroot: &Path, label: &str, blast: bool, native_display: bool,
+    extra_env: &[(&str, &str)]) -> String {
     let binary = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("pengudroid");
     let dir = std::env::temp_dir().join(format!("pd-framework-{}-{label}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -40,6 +41,7 @@ fn run_framework_probe(sysroot: &Path, label: &str, blast: bool, native_display:
         command.env_remove("PENGUDROID_PROBE_BLAST_LIFECYCLE")
             .env("PENGUDROID_PROBE_PLATFORM_STATE", "1");
     }
+    command.envs(extra_env.iter().copied());
     let child = command.spawn().unwrap();
     let mut run = Run { child, dir };
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -69,11 +71,28 @@ fn optional_android17_sysroot() -> Option<PathBuf> {
 #[test]
 fn android17_blast_lifecycle_under_checkjni() {
     let Some(sysroot) = optional_android17_sysroot() else { return; };
-    let text = run_framework_probe(&sysroot, "api37-blast", true, true);
+    let text = run_framework_probe(&sysroot, "api37-blast", true, true, &[]);
     assert!(text.contains("display: native internal 720x1280 @ 60 Hz, SDR RGBA_8888 passed"), "{text}");
     assert!(text.contains("binder: framework ServiceManager codes = [1, 3, 2, 4]"), "{text}");
     assert!(text.contains("blast: real framework create/destroy/recreate passed"), "{text}");
     assert_eq!(text.matches("[blast] video: consumer stopped").count(), 2, "{text}");
+}
+
+/// This used to abort in Codec2Client's manager cast, or retry its manifest
+/// query forever. An absent backend must be a successful empty discovery, not
+/// a fake codec list, an incompatible manager or an unsupported transaction.
+#[test]
+fn android17_media_discovery_without_codec2_under_checkjni() {
+    let Some(sysroot) = optional_android17_sysroot() else { return; };
+    let text = run_framework_probe(&sysroot, "api37-media", false, false, &[
+        ("PENGUDROID_PROBE_MEDIA_LIST", "1"),
+        ("PENGUDROID_NO_CODEC2_SERVICE", "1"),
+        ("PENGUDROID_TRACE_BINDER", "1"),
+    ]);
+    assert!(text.contains("media: API-37 codec enumeration repeated 16 times:"), "{text}");
+    assert!(text.contains("hidl instances code=13 android.hardware.media.c2@1.0::IComponentStore: []"), "{text}");
+    assert!(!text.contains("received incompatible service"), "{text}");
+    assert!(!text.contains("Retrying..."), "{text}");
 }
 
 /// Core API-37 migration gate. BLAST lifecycle has its own gate; neither test
@@ -81,7 +100,14 @@ fn android17_blast_lifecycle_under_checkjni() {
 #[test]
 fn android17_core_services_under_checkjni() {
     let Some(sysroot) = optional_android17_sysroot() else { return; };
-    let text = run_framework_probe(&sysroot, "api37-core", false, true);
+    let text = run_framework_probe(&sysroot, "api37-core", false, true, &[
+        ("PENGUDROID_PROBE_MAIN_THREAD", "1"),
+    ]);
+    let installed = text.find("binder: framework ServiceManager codes = [1, 3, 2, 4]").unwrap();
+    let attached = text.find("apphost: ActivityThread attached on the main thread")
+        .unwrap_or_else(|| panic!("ActivityThread.attach did not succeed:\n{text}"));
+    assert!(installed < attached, "ServiceManager must be installed before attach:\n{text}");
+    assert!(!text.contains("IServiceManager codes not installed"), "{text}");
     for expected in [
         "display: native internal 720x1280 @ 60 Hz, SDR RGBA_8888 passed",
         "platform: feature cache native shared-memory roundtrip passed",

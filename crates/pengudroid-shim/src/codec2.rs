@@ -472,8 +472,8 @@ unsafe fn build() -> Option<Api> {
 
 fn api() -> Option<&'static Api> {
     // Native Codec2 replies are only available when this service can be built.
-    // Disabling it or failing initialization now makes Binder reject discovery
-    // and component calls; there is no fabricated codec list or handle fallback.
+    // Disabling it or failing initialization makes manager discovery return
+    // typed absence and component calls fail; no codec list or handle is faked.
     // The private C++ ABI below still needs target-matched API-37 validation.
     if std::env::var_os("PENGUDROID_NO_CODEC2_SERVICE").is_some() {
         return None;

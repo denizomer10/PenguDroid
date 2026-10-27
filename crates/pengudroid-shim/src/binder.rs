@@ -198,6 +198,25 @@ const PING_TRANSACTION: u32 = 0x5F50_4E47;
 /// `IBinder::INTERFACE_TRANSACTION` ("FTN_").
 const INTERFACE_TRANSACTION: u32 = 0x5F4E_5446;
 
+// Stable HIDL reserved transactions, not IBinder's system transactions.
+// system/libhwbinder@2f528244/include/hwbinder/IBinder.h.
+const HIDL_INTERFACE_CHAIN: u32 = 0x0F43_484E;
+const HIDL_INTERFACE_DESCRIPTOR: u32 = 0x0F44_5343;
+const HIDL_PING: u32 = 0x0F50_4E47;
+const HIDL_BASE: &str = "android.hidl.base@1.0::IBase";
+const HIDL_MANAGER_HANDLE: &str = "hidl.service_manager";
+const HIDL_MANAGER_CHAIN: [&str; 4] = [
+    "android.hidl.manager@1.2::IServiceManager",
+    "android.hidl.manager@1.1::IServiceManager",
+    "android.hidl.manager@1.0::IServiceManager",
+    HIDL_BASE,
+];
+const HIDL_COMPONENT_STORE: &str = "android.hardware.media.c2@1.0::IComponentStore";
+const HIDL_GET: u32 = 1;
+const HIDL_GET_TRANSPORT: u32 = 3;
+const HIDL_LIST_BY_INTERFACE: u32 = 5;
+const HIDL_LIST_MANIFEST_BY_INTERFACE: u32 = 13;
+
 /// Is this transaction a HIDL call rather than a Java `Parcel` one?
 ///
 /// A Java parcel is `[u32 strictModePolicy][i32 workSourceUid][String16
@@ -316,167 +335,168 @@ fn push_hidl_string_vec(parcel: &mut Vec<u8>, objects: &mut Vec<u64>, names: &[&
     }
 }
 
-/// Write a `hidl_string` the way libhidlbase does.
-///
-/// Measured from a live `getTransport` request: a string is a 40-byte struct
-/// `[u32 tag][u32 heap][u64 data][u32 size][20 bytes inline]` followed by the
-/// string bytes **inline in the parcel** (that is what `writeEmbeddedToParcel`
-/// does). The reader takes the size from the struct and then reads `size + 1`
-/// bytes in place, so the pointer field is irrelevant.
-fn push_hidl_string(parcel: &mut Vec<u8>, s: &str) {
-    const TAG: u32 = 0x7074_2a85;
-    parcel.extend_from_slice(&TAG.to_ne_bytes());
-    parcel.extend_from_slice(&1u32.to_ne_bytes()); // heap
-    parcel.extend_from_slice(&0u64.to_ne_bytes()); // data pointer: unused
-    parcel.extend_from_slice(&(s.len() as u32).to_ne_bytes());
-    parcel.extend_from_slice(&[0u8; 20]);
-    parcel.extend_from_slice(s.as_bytes());
-    parcel.push(0);
-    while parcel.len() % 4 != 0 {
-        parcel.push(0);
+/// LP64 hidl_string/hidl_vec header. `owns_buffer` and its padding stay zero.
+/// system/libhidl@061055fc/base/include/hidl/HidlSupport.h.
+#[repr(C)]
+struct HidlHeader {
+    data: u64,
+    size: u32,
+    owns_buffer: u32,
+}
+
+/// Immutable backing storage shared by replies. The transfer area copies only
+/// object records, not their pointees; these allocations must outlive every
+/// read. A finite set of LazyLocks avoids leaking fresh buffers on each query.
+struct HidlStrings {
+    strings: Vec<Box<[u8]>>,
+    elements: Box<[HidlHeader]>,
+    header: HidlHeader,
+}
+
+impl HidlStrings {
+    fn new(names: &[&str]) -> Self {
+        let strings: Vec<Box<[u8]>> = names.iter().map(|name| {
+            let mut bytes = name.as_bytes().to_vec();
+            bytes.push(0);
+            bytes.into_boxed_slice()
+        }).collect();
+        let elements: Box<[HidlHeader]> = strings.iter().map(|bytes| HidlHeader {
+            data: bytes.as_ptr() as u64,
+            size: (bytes.len() - 1) as u32,
+            owns_buffer: 0,
+        }).collect();
+        let header = HidlHeader {
+            data: if elements.is_empty() { 0 } else { elements.as_ptr() as u64 },
+            size: elements.len() as u32,
+            owns_buffer: 0,
+        };
+        Self { strings, elements, header }
+    }
+
+    fn write_vec(&self, parcel: &mut Vec<u8>, objects: &mut Vec<u64>) {
+        let root = push_buffer_object(parcel, objects, 0,
+            &self.header as *const HidlHeader as u64, 16, 0, 0);
+        let array = push_buffer_object(parcel, objects, 1, self.header.data,
+            (self.elements.len() * 16) as u64, root, 0);
+        if self.elements.is_empty() {
+            // libhwbinder Parcel::writeObject keeps the null record in the
+            // parcel, but omits it from the object-offset table.
+            objects.pop();
+        }
+        for (index, bytes) in self.strings.iter().enumerate() {
+            push_buffer_object(parcel, objects, 1, bytes.as_ptr() as u64,
+                bytes.len() as u64, array, (index * 16) as u64);
+        }
+    }
+
+    fn write_string(&self, parcel: &mut Vec<u8>, objects: &mut Vec<u64>) {
+        assert_eq!(self.elements.len(), 1);
+        let root = push_buffer_object(parcel, objects, 0,
+            self.elements.as_ptr() as u64, 16, 0, 0);
+        let bytes = &self.strings[0];
+        push_buffer_object(parcel, objects, 1, bytes.as_ptr() as u64,
+            bytes.len() as u64, root, 0);
     }
 }
 
-/// Read a `hidl_string` from `data` at `*pos`.
-fn read_hidl_string(data: &[u8], pos: &mut usize) -> Option<String> {
-    if *pos + 4 > data.len() {
-        return None;
-    }
-    let len = u32::from_ne_bytes(data[*pos..*pos + 4].try_into().ok()?) as usize;
-    *pos += 4;
-    if *pos + len > data.len() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&data[*pos..*pos + len]).into_owned();
-    *pos += len;
-    // Skip the NUL and the padding to the next four-byte boundary.
-    *pos += 1;
-    while *pos % 4 != 0 {
-        *pos += 1;
-    }
-    Some(s)
+static HIDL_MANAGER_STRINGS: std::sync::LazyLock<HidlStrings> =
+    std::sync::LazyLock::new(|| HidlStrings::new(&HIDL_MANAGER_CHAIN));
+static HIDL_MANAGER_DESCRIPTOR: std::sync::LazyLock<HidlStrings> =
+    std::sync::LazyLock::new(|| HidlStrings::new(&HIDL_MANAGER_CHAIN[..1]));
+static HIDL_EMPTY_INSTANCES: std::sync::LazyLock<HidlStrings> =
+    std::sync::LazyLock::new(|| HidlStrings::new(&[]));
+static HIDL_DEFAULT_INSTANCE: std::sync::LazyLock<HidlStrings> =
+    std::sync::LazyLock::new(|| HidlStrings::new(&["default"]));
+
+unsafe fn hidl_token(tr: &TransactionData) -> Option<&str> {
+    if tr.data_ptr == 0 || tr.data_size == 0 { return None; }
+    let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
+    let end = data.iter().take(512).position(|&b| b == 0)?;
+    std::str::from_utf8(&data[..end]).ok()
 }
 
-/// Answer the HIDL calls that reach the hardware service manager (handle 0).
-///
-/// `libhidlbase` first pings the manager and then asks for its interface chain;
-/// both have to succeed before `defaultServiceManager1_1()` returns anything,
-/// and without it `Codec2Client` aborts with "Hardware service manager is not
-/// running".
+fn hosted_hidl_service(fq: &str, instance: &str) -> Option<&'static str> {
+    if instance != "default" { return None; }
+    if HIDL_MANAGER_CHAIN[..3].contains(&fq) {
+        Some(HIDL_MANAGER_HANDLE)
+    } else if fq == HIDL_COMPONENT_STORE && crate::codec2::available() {
+        Some("codec2")
+    } else {
+        None
+    }
+}
+
+/// HIDL binders do not carry AIDL's extra stability word. In particular a
+/// nullable result is BINDER_TYPE_BINDER with zero flags/pointers, and has no
+/// entry in the offsets table; handle 0 would mean the context object instead.
+fn push_hidl_binder(parcel: &mut Vec<u8>, objects: &mut Vec<u64>, handle: Option<u32>) {
+    if let Some(handle) = handle {
+        objects.push(parcel.len() as u64);
+        parcel.extend_from_slice(&BINDER_TYPE_HANDLE.to_ne_bytes());
+        parcel.extend_from_slice(&0x100u32.to_ne_bytes()); // ACCEPTS_FDS
+        parcel.extend_from_slice(&(handle as u64).to_ne_bytes());
+        parcel.extend_from_slice(&0u64.to_ne_bytes());
+    } else {
+        parcel.extend_from_slice(&BINDER_TYPE_BINDER.to_ne_bytes());
+        parcel.extend_from_slice(&[0u8; 20]);
+    }
+}
+
+/// The context object and every manager-version self-lookup share this
+/// dispatcher. Source contracts: libhwbinder@2f528244, libhidl@061055fc,
+/// hwservicemanager@60271965. Unsupported calls fail; absent services are typed
+/// successful results, otherwise Codec2Client retries manifest discovery forever.
 unsafe fn hidl_service_manager_reply(
-    code: u32,
-    parcel: &mut Vec<u8>,
-    objects: &mut Vec<u64>,
-    tr: &TransactionData,
-) {
-    if trace_enabled() && tr.data_size > 0 && tr.data_ptr != 0 {
-        let n = (tr.data_size as usize).min(256);
-        let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, n);
-        // The parcel starts with the interface token (a NUL-terminated string
-        // padded to four bytes), then 40-byte `hidl_string` blocks:
-        // `[u32 hash][u32 flag][u64 data][u32 size][20 bytes inline]`.
-        let mut off = 0usize;
-        while off < data.len() && data[off] != 0 {
-            off += 1;
-        }
-        off = (off + 1 + 3) & !3;
-        let mut line = format!("[binder]   hidl args from {off}:\n");
-        while off + 40 <= data.len() {
-            let block = &data[off..off + 40];
-            let flag = u32::from_ne_bytes(block[4..8].try_into().unwrap());
-            let ptr = u64::from_ne_bytes(block[8..16].try_into().unwrap()) as usize;
-            let size = u32::from_ne_bytes(block[16..20].try_into().unwrap()) as usize;
-            let text = if ptr != 0 && size > 0 && size < 256 {
-                let bytes = std::slice::from_raw_parts(ptr as *const u8, size);
-                String::from_utf8_lossy(bytes).into_owned()
+    tr: &TransactionData, parcel: &mut Vec<u8>, objects: &mut Vec<u64>,
+) -> Result<(), &'static str> {
+    let expected_token = match tr.code {
+        PING_TRANSACTION if tr.data_size == 0 => return Ok(()),
+        HIDL_INTERFACE_CHAIN | HIDL_INTERFACE_DESCRIPTOR | HIDL_PING => HIDL_BASE,
+        HIDL_GET | HIDL_GET_TRANSPORT | HIDL_LIST_BY_INTERFACE => HIDL_MANAGER_CHAIN[2],
+        HIDL_LIST_MANIFEST_BY_INTERFACE => HIDL_MANAGER_CHAIN[0],
+        _ => return Err("unsupported HIDL IServiceManager method"),
+    };
+    if hidl_token(tr) != Some(expected_token) {
+        return Err("HIDL method requires its declaring interface token");
+    }
+    match tr.code {
+        HIDL_INTERFACE_CHAIN => HIDL_MANAGER_STRINGS.write_vec(parcel, objects),
+        HIDL_INTERFACE_DESCRIPTOR => HIDL_MANAGER_DESCRIPTOR.write_string(parcel, objects),
+        HIDL_PING => {},
+        HIDL_GET | HIDL_GET_TRANSPORT => {
+            let fq = hidl_arg_string(tr, 0).ok_or("missing HIDL service descriptor")?;
+            let instance = hidl_arg_string(tr, 1).ok_or("missing HIDL service instance")?;
+            let service = hosted_hidl_service(&fq, &instance);
+            if tr.code == HIDL_GET {
+                push_hidl_binder(parcel, objects, service.map(handle_for));
             } else {
-                String::new()
-            };
-            line.push_str(&format!("      flag={flag} size={size} text={text:?}\n"));
-            off += 40;
-        }
-        diag(&line);
-    }
-    match code {
-        PING_TRANSACTION => {
-            // `make_reply` already wrote the status word for this handle.
-        }
-        // `IServiceManager::getTransport(fqName, name)` returns a `Transport`
-        // enum, which HIDL serialises as a single byte (`readUint8`).
-        3 => {
-            parcel.push(1); // Transport::HWBINDER (EMPTY is 0)
+                // Transport is uint8_t, but Parcel::writeUint8/readUint8 use
+                // write/read with four-byte padding, not a raw byte stream.
+                parcel.extend_from_slice(&u32::from(service.is_some()).to_ne_bytes());
+            }
             if trace_enabled() {
-                diag("[binder]   -> hidl getTransport: hwbinder\n");
+                diag(&format!("[binder] hidl discovery code={} {fq}/{instance}: {service:?}\n", tr.code));
             }
         }
-        INTERFACE_TRANSACTION => {
-            // `make_reply` already wrote the status word for this handle.
-            let chain = [
-                "android.hidl.manager@1.0::IServiceManager",
-                "android.hidl.manager@1.1::IServiceManager",
-                "android.hidl.base@1.0::IBase",
-            ];
-            parcel.extend_from_slice(&(chain.len() as u32).to_ne_bytes());
-            for name in chain {
-                push_hidl_string(parcel, name);
-            }
-        }
-        // `IServiceManager::get(fqName, name)`.
-        1 => {
-            let fq = hidl_arg_string(tr, 0).unwrap_or_default();
-            // `make_reply` already wrote the status word for this handle.
-            let handle = if fq.contains("media.c2") || fq.contains("ICodec2") {
-                handle_for("codec2")
+        HIDL_LIST_BY_INTERFACE | HIDL_LIST_MANIFEST_BY_INTERFACE => {
+            let fq = hidl_arg_string(tr, 0).ok_or("missing HIDL list interface")?;
+            // Code 5 lists registered instances; code 13 lists declared ones.
+            // PenguDroid has no lazy HALs, so both use the actual hosted set,
+            // never a GSI manifest whose services cannot run on the host.
+            let available = hosted_hidl_service(&fq, "default").is_some();
+            if available {
+                HIDL_DEFAULT_INSTANCE.write_vec(parcel, objects);
             } else {
-                handle_for(fq.as_str())
-            };
-            push_flat_handle(parcel, objects, handle);
+                HIDL_EMPTY_INSTANCES.write_vec(parcel, objects);
+            }
             if trace_enabled() {
-                diag(&format!("[binder]   -> hidl get({fq}) handle {handle}\n"));
+                diag(&format!("[binder] hidl instances code={} {fq}: {}\n", tr.code,
+                    if available { "[default]" } else { "[]" }));
             }
         }
-        // `IServiceManager::listManifestByInterface(fqName)` (code 5 on the
-        // wire; HIDL 1.2 numbers it 13).
-        //
-        // `Codec2Client::GetServiceNames()` calls this with
-        // `IComponentStore::descriptor` and expects the *instance names* back
-        // (`vec<hidl_string>`), not `InstanceDebugInfo` records.
-        5 | 13 => {
-            // `make_reply` already wrote the status word for this handle.
-            // `hidl_vec<hidl_string>`: a 16-byte vec struct, a 16-byte element
-            // array, and the string bytes — each one a `binder_buffer_object`
-            // recorded in the offsets array.
-            // `verifyBufferObject` requires `flags == nullable` (always 1 here)
-            // and an exact `length`, and it checks that the parent's buffer
-            // holds the child's pointer at `parentOffset`.
-            let (data_ptr, data_len) = leak_cstr("default");
-            let mut arr = Vec::with_capacity(16);
-            arr.extend_from_slice(&data_ptr.to_ne_bytes()); // mData
-            arr.extend_from_slice(&(data_len - 1).to_ne_bytes()); // mSize
-            let arr: &'static [u8] = Box::leak(arr.into_boxed_slice());
-
-            let mut vec = Vec::with_capacity(16);
-            vec.extend_from_slice(&(arr.as_ptr() as u64).to_ne_bytes()); // mData
-            vec.extend_from_slice(&1u32.to_ne_bytes()); // mSize
-            vec.extend_from_slice(&0u32.to_ne_bytes()); // padding
-            let vec: &'static [u8] = Box::leak(vec.into_boxed_slice());
-
-            // `readBuffer` verifies `flags == 0`; the embedded reads verify 1.
-            let vec_idx = push_buffer_object(parcel, objects, 0, vec.as_ptr() as u64, 16, 0, 0);
-            let arr_idx =
-                push_buffer_object(parcel, objects, 1, arr.as_ptr() as u64, 16, vec_idx, 0);
-            push_buffer_object(parcel, objects, 1, data_ptr, data_len, arr_idx, 0);
-            if trace_enabled() {
-                diag(&format!("[binder]   -> hidl listManifestByInterface (code {code}): [default]\n"));
-            }
-        }
-        _ => {
-            // `make_reply` already wrote the status word for this handle.
-        }
+        _ => unreachable!(),
     }
-    if trace_enabled() {
-        diag(&format!("[binder]   -> hidl manager code {code:#x}\n"));
-    }
+    Ok(())
 }
 
 /// API-37 IServiceManager get/check binder replies, followed by get/check
@@ -2053,6 +2073,14 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
     }
     let mut parcel = Vec::new();
     let mut objects = Vec::new();
+    if is_hidl_request(tr) && (tr.target_handle == 0
+        || name_for_handle(tr.target_handle).as_deref() == Some(HIDL_MANAGER_HANDLE)) {
+        parcel.extend_from_slice(&0i32.to_ne_bytes()); // HIDL Status::EX_NONE
+        if let Err(reason) = hidl_service_manager_reply(tr, &mut parcel, &mut objects) {
+            return Reply::unknown_transaction(tr, reason);
+        }
+        return Reply { parcel, objects, flags: 0 };
+    }
     if is_surface_flinger(tr.target_handle) {
         if let Err(error) = require_api37() {
             return Reply::unknown_transaction(tr, &error);
@@ -2151,7 +2179,7 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         // Preserve the existing versioned base-interface chain only for a real
         // store. Forwarding its synchronous native reply would leave borrowed
         // hidl_vec storage dangling after onTransact returns.
-        if tr.code == 0x0F43_484E {
+        if tr.code == HIDL_INTERFACE_CHAIN {
             let chain = [
                 "android.hardware.media.c2@1.0::IComponentStore",
                 "android.hardware.media.c2@1.0::ICodec2",
@@ -2162,17 +2190,7 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             return Reply::unknown_transaction(tr, "native Codec2 dispatch unavailable or method unsupported; no fabricated reply");
         }
     }
-    if tr.target_handle == 0 && is_hidl_request(tr) {
-        if matches!(tr.code, 1 | 3 | 5 | 13) { // get/getTransport/listManifestByInterface
-            let Some(fq) = hidl_arg_string(tr, 0) else {
-                return Reply::unknown_transaction(tr, "HIDL service discovery requires an interface name");
-            };
-            if (fq.contains("media.c2") || fq.contains("ICodec2")) && !crate::codec2::available() {
-                return Reply::unknown_transaction(tr, "native Codec2 component store unavailable; no instance advertised");
-            }
-        }
-        unsafe { hidl_service_manager_reply(tr.code, &mut parcel, &mut objects, tr) };
-    }
+
     if tr.target_handle == handle_for("activity_task") && tr.code == APPLICATION_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner())[0] {
         push_flat_handle(
             &mut parcel,
@@ -4539,26 +4557,173 @@ mod tests {
         }
         assert!(!SERVICE_HANDLES.lock().unwrap().contains_key("codec2_component"));
 
-        // Discovery must not advertise a default instance or HWBINDER transport
-        // and must not mint a service result for an absent component store.
-        let (fq_ptr, fq_len) = leak_cstr("android.hardware.media.c2@1.0::IComponentStore");
-        let mut data = b"android.hidl.manager@1.0::IServiceManager\0".to_vec();
+        // Absence is a successful, typed discovery result, not a transport
+        // error: Codec2Client retries a failed manifest query in a tight loop.
+        // OMX and unknown interfaces must not receive fabricated handles either.
+        for fq in [HIDL_COMPONENT_STORE, "android.hardware.media.omx@1.0::IOmxStore",
+            "unsupported.media.c2@9.0::ICodec2"] {
+            let transport = hidl_reply(0, HIDL_GET_TRANSPORT, HIDL_MANAGER_CHAIN[2], &[fq, "default"]);
+            assert_eq!(transport.flags, 0);
+            assert!(transport.objects.is_empty());
+            assert_eq!(transport.parcel, [0; 8]); // status + padded Transport::EMPTY
+            let get = hidl_reply(0, HIDL_GET, HIDL_MANAGER_CHAIN[2], &[fq, "default"]);
+            assert_eq!(get.flags, 0);
+            assert!(get.objects.is_empty());
+            assert_eq!(get.parcel.len(), 4 + 24); // no AIDL stability word
+            assert_eq!(&get.parcel[..4], &[0; 4]);
+            assert_eq!(&get.parcel[4..8], &BINDER_TYPE_BINDER.to_ne_bytes());
+            assert_eq!(&get.parcel[8..], &[0; 20]);
+            for (code, token) in [(HIDL_LIST_BY_INTERFACE, HIDL_MANAGER_CHAIN[2]),
+                (HIDL_LIST_MANIFEST_BY_INTERFACE, HIDL_MANAGER_CHAIN[0])] {
+                assert!(decode_hidl_vec(&hidl_reply(0, code, token, &[fq])).is_empty());
+            }
+            assert!(!SERVICE_HANDLES.lock().unwrap().contains_key(fq));
+        }
+        assert_eq!(decode_hidl_vec(&hidl_reply(0, HIDL_INTERFACE_CHAIN, HIDL_BASE, &[])),
+            HIDL_MANAGER_CHAIN);
+    }
+
+    fn hidl_reply(target: u32, code: u32, token: &str, args: &[&str]) -> Reply {
+        let backing = HidlStrings::new(args);
+        let mut data = token.as_bytes().to_vec();
+        data.push(0);
         while data.len() % 4 != 0 { data.push(0); }
         let mut offsets = Vec::new();
-        push_buffer_object(&mut data, &mut offsets, 0, 0, 16, 0, 0);
-        push_buffer_object(&mut data, &mut offsets, 1, fq_ptr, fq_len, 0, 0);
-        for code in [1, 3, 5, 13] {
-            let mut tr = transaction(0, code, &data);
-            tr.offsets_size = (offsets.len() * 8) as u64;
-            tr.offsets_ptr = offsets.as_ptr() as u64;
-            assert_unknown_transaction(unsafe { make_reply(&tr, 1) });
+        for (index, bytes) in backing.strings.iter().enumerate() {
+            let parent = push_buffer_object(&mut data, &mut offsets, 0,
+                &backing.elements[index] as *const HidlHeader as u64, 16, 0, 0);
+            push_buffer_object(&mut data, &mut offsets, 1, bytes.as_ptr() as u64,
+                bytes.len() as u64, parent, 0);
         }
-        // The manager's own base descriptors remain available independently of
-        // Codec2; keeping them does not claim any decoder implementation.
-        let reply = unsafe { make_reply(&transaction(0, INTERFACE_TRANSACTION, &[]), 1) };
+        let mut tr = transaction(target, code, &data);
+        tr.offsets_size = (offsets.len() * 8) as u64;
+        tr.offsets_ptr = offsets.as_ptr() as u64;
+        unsafe { make_reply(&tr, 1) }
+    }
+
+    fn hidl_buffer(reply: &Reply, record: usize) -> (u64, u64, u64, u64) {
         assert_eq!(reply.flags, 0);
-        let base = b"android.hidl.base@1.0::IBase";
-        assert!(reply.parcel.windows(base.len()).any(|bytes| bytes == base));
+        assert_eq!(&reply.parcel[..4], &[0; 4]);
+        let at = 4 + record * 40;
+        let bytes = &reply.parcel[at..at + 40];
+        assert_eq!(&bytes[..4], &0x7074_2a85u32.to_ne_bytes());
+        assert_eq!(&bytes[4..8], &u32::from(record != 0).to_ne_bytes());
+        let word = |offset| u64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        let data = word(8);
+        if data != 0 { assert!(reply.objects.contains(&(at as u64))); }
+        else { assert!(!reply.objects.contains(&(at as u64))); }
+        (data, word(16), word(24), word(32))
+    }
+
+    fn decode_hidl_vec(reply: &Reply) -> Vec<String> {
+        let (root, length, _, _) = hidl_buffer(reply, 0);
+        assert_ne!(root, 0);
+        assert_eq!(length, 16);
+        let header = unsafe { &*(root as *const HidlHeader) };
+        assert_eq!(header.owns_buffer, 0);
+        assert!(header.size <= 4);
+        let count = header.size as usize;
+        let (array, length, parent, offset) = hidl_buffer(reply, 1);
+        assert_eq!((array, length, parent, offset), (header.data, (count * 16) as u64, 0, 0));
+        assert_eq!(reply.parcel.len(), 4 + (2 + count) * 40);
+        if count == 0 {
+            assert_eq!(array, 0);
+            assert_eq!(reply.objects, [4]);
+            return Vec::new();
+        }
+        assert_eq!(reply.objects.len(), count + 2);
+        let elements = unsafe { std::slice::from_raw_parts(array as *const HidlHeader, count) };
+        elements.iter().enumerate().map(|(index, element)| {
+            let (ptr, length, parent, offset) = hidl_buffer(reply, index + 2);
+            assert_eq!((ptr, length, parent, offset),
+                (element.data, element.size as u64 + 1, 1, (index * 16) as u64));
+            assert_eq!(element.owns_buffer, 0);
+            let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, length as usize) };
+            assert_eq!(bytes.last(), Some(&0));
+            std::str::from_utf8(&bytes[..bytes.len() - 1]).unwrap().to_owned()
+        }).collect()
+    }
+
+    #[test]
+    fn hidl_manager_self_lookup_routes_every_version_to_the_same_dispatcher() {
+        let mut target = None;
+        for version in &HIDL_MANAGER_CHAIN[..3] {
+            let reply = hidl_reply(0, HIDL_GET, HIDL_MANAGER_CHAIN[2], &[version, "default"]);
+            assert_eq!(reply.flags, 0);
+            assert_eq!(reply.parcel.len(), 28); // status + HIDL binder, no stability
+            assert_eq!(reply.objects, [4]);
+            assert_eq!(&reply.parcel[4..8], &BINDER_TYPE_HANDLE.to_ne_bytes());
+            let handle = u32::from_ne_bytes(reply.parcel[12..16].try_into().unwrap());
+            assert_ne!(handle, 0);
+            assert_eq!(*target.get_or_insert(handle), handle);
+            assert_eq!(name_for_handle(handle).as_deref(), Some(HIDL_MANAGER_HANDLE));
+            for at in [0, handle] {
+                let chain = hidl_reply(at, HIDL_INTERFACE_CHAIN, HIDL_BASE, &[]);
+                assert_eq!(decode_hidl_vec(&chain), HIDL_MANAGER_CHAIN);
+                let ping = hidl_reply(at, HIDL_PING, HIDL_BASE, &[]);
+                assert_eq!(ping.parcel, [0; 4]);
+                assert!(ping.objects.is_empty());
+                let transport = hidl_reply(at, HIDL_GET_TRANSPORT, HIDL_MANAGER_CHAIN[2],
+                    &[version, "default"]);
+                assert_eq!(transport.parcel, [0, 0, 0, 0, 1, 0, 0, 0]);
+                let registered = hidl_reply(at, HIDL_LIST_BY_INTERFACE, HIDL_MANAGER_CHAIN[2], &[version]);
+                assert_eq!(decode_hidl_vec(&registered), ["default"]);
+                let declared = hidl_reply(at, HIDL_LIST_MANIFEST_BY_INTERFACE, HIDL_MANAGER_CHAIN[0], &[version]);
+                assert_eq!(decode_hidl_vec(&declared), ["default"]);
+            }
+        }
+    }
+
+    #[test]
+    fn hidl_descriptor_is_a_string_not_a_vector_or_aidl_descriptor() {
+        let reply = hidl_reply(0, HIDL_INTERFACE_DESCRIPTOR, HIDL_BASE, &[]);
+        let (header, length, _, _) = hidl_buffer(&reply, 0);
+        assert_eq!(length, 16);
+        let header = unsafe { &*(header as *const HidlHeader) };
+        let (data, length, parent, offset) = hidl_buffer(&reply, 1);
+        assert_eq!((data, length, parent, offset), (header.data, header.size as u64 + 1, 0, 0));
+        let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, length as usize) };
+        assert_eq!(&bytes[..bytes.len() - 1], HIDL_MANAGER_CHAIN[0].as_bytes());
+        assert_eq!(bytes.last(), Some(&0));
+        assert_eq!(reply.objects, [4, 44]);
+        assert_unknown_transaction(hidl_reply(0, INTERFACE_TRANSACTION, HIDL_BASE, &[]));
+    }
+
+    #[test]
+    fn hidl_discovery_rejects_wrong_tokens_and_malformed_arguments() {
+        for code in [HIDL_GET, HIDL_GET_TRANSPORT, HIDL_LIST_BY_INTERFACE,
+            HIDL_LIST_MANIFEST_BY_INTERFACE, HIDL_INTERFACE_CHAIN, HIDL_PING] {
+            assert_unknown_transaction(hidl_reply(0, code, "wrong.interface", &[]));
+        }
+        assert_unknown_transaction(hidl_reply(0, HIDL_GET, HIDL_MANAGER_CHAIN[2], &[]));
+        assert_unknown_transaction(hidl_reply(0, HIDL_GET, HIDL_MANAGER_CHAIN[2], &[HIDL_MANAGER_CHAIN[0]]));
+        assert_unknown_transaction(hidl_reply(0, HIDL_LIST_MANIFEST_BY_INTERFACE, HIDL_MANAGER_CHAIN[2],
+            &[HIDL_MANAGER_CHAIN[0]]));
+        for instance in ["", "missing", "default_extra"] {
+            let reply = hidl_reply(0, HIDL_GET_TRANSPORT, HIDL_MANAGER_CHAIN[2],
+                &[HIDL_MANAGER_CHAIN[0], instance]);
+            assert_eq!(reply.parcel, [0; 8]);
+        }
+        assert_unknown_transaction(hidl_reply(0, 9999, HIDL_MANAGER_CHAIN[2], &[]));
+    }
+
+    #[test]
+    fn hidl_manager_repeated_queries_reuse_finite_backing_storage() {
+        for (code, token, args) in [
+            (HIDL_INTERFACE_CHAIN, HIDL_BASE, &[][..]),
+            (HIDL_INTERFACE_DESCRIPTOR, HIDL_BASE, &[][..]),
+            (HIDL_LIST_MANIFEST_BY_INTERFACE, HIDL_MANAGER_CHAIN[0], &["unknown.interface"][..]),
+            (HIDL_LIST_MANIFEST_BY_INTERFACE, HIDL_MANAGER_CHAIN[0], &HIDL_MANAGER_CHAIN[..1]),
+        ] {
+            let baseline = hidl_reply(0, code, token, args);
+            for _ in 0..1024 {
+                let reply = hidl_reply(0, code, token, args);
+                // Identical embedded addresses as well as identical payloads:
+                // no freshly leaked header/array/strings for every query.
+                assert_eq!(reply.parcel, baseline.parcel);
+                assert_eq!(reply.objects, baseline.objects);
+            }
+        }
     }
 
     #[test]

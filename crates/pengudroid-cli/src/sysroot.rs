@@ -1045,12 +1045,26 @@ pub fn art_main(args: &[String]) -> i32 {
                     // main Looper (androidx enforces it), so set the main thread
                     // up here and bind from it instead of calling
                     // `ActivityThread.main`, which would block in Looper.loop().
-                    crate::apphost::prepare_main_thread(&env);
+                    if !crate::apphost::prepare_main_thread(&env) {
+                        eprintln!("apphost: main-thread preparation failed; not binding the app");
+                        return 1;
+                    }
                     bind_application_now(&env, &classpath);
                     crate::apphost::loop_forever(&env);
                     return 0;
                 }
                 return run_main(&env, &class, &app_args);
+            }
+            if std::env::var_os("PENGUDROID_PROBE_MAIN_THREAD").is_some()
+                && !crate::apphost::prepare_main_thread(&env) {
+                eprintln!("apphost: main-thread probe failed");
+                return 1;
+            }
+            if std::env::var_os("PENGUDROID_PROBE_MEDIA_LIST").is_some() {
+                if !crate::apphost::probe_media_codec_list(&env) {
+                    eprintln!("media: API-37 codec enumeration failed");
+                    return 1;
+                }
             }
             if std::env::var_os("PENGUDROID_PROBE_NATIVE_DISPLAY").is_some() {
                 if !crate::apphost::probe_native_display(&env) { return 1; }

@@ -2,7 +2,91 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
-## Current handoff — API-37 runtime restored, CheckJNI gates pass (2026-10-27)
+## Current handoff — API-37 media discovery no longer aborts (2026-10-27)
+
+Android 17 / API 37 / x86_64 remains the only runtime. The next real NewPipe
+playback blocker was a fatal HIDL manager cast, not graphics-stats telemetry.
+It is now fixed and covered by a new headless CheckJNI gate. Playback itself
+is **not** complete.
+
+### Corrected discovery, without inventing codecs
+
+`crates/pengudroid-shim/src/binder.rs` now implements the pinned HIDL manager
+contracts rather than treating them as AIDL:
+
+- `get(manager-version, "default")` returns one canonical manager handle, and
+  that handle routes to the same dispatcher as the context object. Previously
+  it became an unrelated handle whose `interfaceChain` returned only zeros.
+- `interfaceChain`, `interfaceDescriptor` and `ping` use the actual reserved
+  HIDL codes (`0x0f43484e`, `0x0f445343`, `0x0f504e47`). The chain is
+  `manager@1.2`, `@1.1`, `@1.0`, `IBase`; these are HIDL interface versions
+  present on Android 17, not older Android runtime selections.
+- Strings/vectors use real LP64 pointer-buffer records, including parents,
+  offsets, NULs and the nullable empty-array record. The finite immutable
+  manager payloads are cached once, not leaked on every query. Tests decode
+  the pointees and repeat each query 1,024 times with identical backing pointers.
+- Missing HALs return successful typed absence: `Transport::EMPTY`, null HIDL
+  Binder, or an empty vector. They do not receive arbitrary handles or fake
+  `[default]` declarations. Unsupported methods/tokens still fail explicitly.
+  `uint8_t Transport` is four-byte padded in Parcel; HIDL binders have no AIDL
+  stability word. Code 5 (`listByInterface`) and 13 (`listManifestByInterface`)
+  are distinct methods, not alternate platform layouts.
+
+Pinned sources and reproduction are in [ANDROID17.md](ANDROID17.md). The native
+Codec2 backend is not made available by this discovery fix.
+
+### Attach order and real-runtime validation
+
+`ServiceManager` Stub codes are now installed **before** `ActivityThread.attach`.
+The CLI stops if main-thread preparation fails instead of continuing with a
+half-attached thread. The core CheckJNI gate now exercises this ordering.
+
+- Workspace build and **312 Rust tests passed**, zero failures.
+- **All three** API-37 CheckJNI gates ran and passed: core services/attach,
+  BLAST lifecycle, and `android17_media_discovery_without_codec2_under_checkjni`.
+  The latter enumerates the real codec list 16 times with the hosted HIDL
+  Codec2 backend disabled and asserts successful empty HIDL discovery, no
+  incompatible-manager error and no discovery retry loop. Independently
+  available APEX codecs are not suppressed or fabricated.
+- **111 Python tool tests passed**; `git diff --check` passed.
+
+Logs: `target/hidl-discovery-{workspace-build,workspace-tests,checkjni,shim-tests,tools-tests}.log`.
+The standalone default-backend probe is
+`target/api37-media-discovery-native-backend.log`.
+
+### NewPipe reached AAC decoding; audio initialization is next
+
+A new bounded run, `target/newpipe-api37-hidl-discovery/`, injected a measured
+feed tap at `360,300` after 8 s. The guest stayed alive for **35.18 s** until
+cleanup, with five sampled UI frames. Logs contain **zero** fatal messages,
+incompatible-service errors or Codec2 discovery retries. `ActivityThread.attach`
+succeeds and the earlier `rawGetService` NPE is absent.
+
+The real framework discovers one APEX AAC codec through `__ApexCodecs__` (the
+old HIDL service loader stops at missing `Parcel::setData` symbol). AAC work
+reports **14 positive output events / 57,344 output bytes**, then ExoPlayer
+reports `AudioSink$InitializationException` / `Invalid audio session ID -1`.
+This is decoder progress, **not successful audio playback or video decoding**.
+No AVC/HW decode, pause/seek or leak-free soak is claimed.
+
+**Next concrete work:** a descriptor-checked API-37 AudioSystem/AudioTrack JNI
+adapter. The exported registration hook is bypassed by this runtime's internal
+registration path; there are no `audio: hosted` lines. Do **not** simply revive
+its name-only table: the existing `native_setup` function has an incompatible
+signature (separate mask integers instead of `ChannelMasks`, missing attribution
+Parcel and provenance string), and its output-rate helper interprets stream
+number 3 as 3 Hz. It also misses seven current natives, which could send an
+integer hosted handle to C++ as an AudioTrack pointer. The pinned-source/runtime
+contract audit is retained in `target/audio-contract-*-20261027.log`; use a
+closed, correctly typed registration boundary and a new CheckJNI audio gate.
+
+Other blockers remain: API-37 video Codec2/gralloc integration, the boot-image
+read-barrier mismatch, real hardware media integration, ARM64 translation, and
+resource lifetime auditing. In particular the Binder transfer area's 16-slot
+wraparound does not track `BC_FREE_BUFFER`; caching these HIDL pointees does
+not prove transfer-buffer ownership or whole-app leak freedom.
+
+## Prior handoff — API-37 runtime restored, CheckJNI gates pass (2026-10-27)
 
 The pinned API-37 runtime is now present and exercised in this checkout. This
 pass restored it, made the two real API-37 CheckJNI gates pass, and fixed a

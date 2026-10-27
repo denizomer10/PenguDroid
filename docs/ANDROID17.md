@@ -26,7 +26,9 @@ the workspace or reporting a GPU capability.
 `tools/prepare-android17.py` from the archive below after verifying its SHA-256,
 and is validated on every use: SDK 37 / release 17 / build `CP2A.260605.012`, an
 actual ELF64 x86_64 `libart.so`, and per-file hashes in
-`pengudroid-runtime.json`. Both real API-37 CheckJNI gates **pass** against it.
+`pengudroid-runtime.json`. All **three** real API-37 CheckJNI gates pass against
+it: core services/main-thread attach, BLAST lifecycle, and media discovery
+without a hosted HIDL Codec2 backend.
 
 `.toolchain/sysroot` (SDK 33) is still present and is **not** a target and not a
 fixture; the CLI rejects it before ART loads.
@@ -54,8 +56,9 @@ gaps.
 An earlier checkpoint recorded real API-37 bringup using the official x86_64
 GSI `CP2A.260605.012`, SHA-256
 `3da2ca5599d304c4d92fe8c72f31d035a59db57c93ce073740ed4015ee034a8e`.
-That is historical evidence, not a claim that its binaries or logs are on this
-machine. Source: [Android GSI releases](https://developer.android.com/topic/generic-system-image/releases).
+That checkpoint was historical; this checkout has since restored the same
+verified archive and rerun the gates above. Source:
+[Android GSI releases](https://developer.android.com/topic/generic-system-image/releases).
 
 ### Implemented hard-lock boundaries
 
@@ -88,17 +91,55 @@ machine. Source: [Android GSI releases](https://developer.android.com/topic/gene
   C++ fixture exercises a deliberately unrelated GraphicBuffer layout, reference
   counting, imports, and mapping cleanup. It is not a target-runtime test.
 
+### HIDL discovery corrected on the real runtime
+
+The HIDL manager returned by `get()` is the manager itself, under one canonical
+handle for all its version aliases. Its `IBase.interfaceChain` code is
+`0x0f43484e`, **not** IBinder's `INTERFACE_TRANSACTION`; the descriptor and ping
+codes are `0x0f445343` and `0x0f504e47`. The reply is HIDL Status followed by
+pointer-backed LP64 string/vector records, not inline strings. Empty vectors
+retain the null child record without adding its offset. `Transport` occupies
+four bytes after Parcel padding, and HIDL binders omit the AIDL stability word.
+
+Code 5 lists registered instances; code 13 lists manifest-declared ones.
+PenguDroid has no lazy hosted HALs, so both use its actual hosted set, not the
+unstartable services listed in the GSI. An unavailable OMX/Codec2 service is a
+successful typed absence (EMPTY/null/empty vector). Returning a transport error
+for an understood manifest query makes `Codec2Client` retry forever. Unsupported
+methods and wrong interface tokens still return `UNKNOWN_TRANSACTION`.
+
+Source pins (source contracts, not an attestation of the GSI's entire build):
+
+- libhwbinder `2f5282448223b97c541181a5b94a05c2ac17ff17`:
+  [reserved transaction codes](https://android.googlesource.com/platform/system/libhwbinder/+/2f5282448223b97c541181a5b94a05c2ac17ff17/include/hwbinder/IBinder.h),
+  [Parcel padding/null/embedded-buffer rules](https://android.googlesource.com/platform/system/libhwbinder/+/2f5282448223b97c541181a5b94a05c2ac17ff17/Parcel.cpp).
+- libhidl `061055fc4dad78e5d25a77d9217001794656f16b`:
+  [manager 1.2](https://android.googlesource.com/platform/system/libhidl/+/061055fc4dad78e5d25a77d9217001794656f16b/transport/manager/1.2/IServiceManager.hal).
+- hwservicemanager `60271965cf6b055ed82b2e1ae0bf74b2c34a6af2`:
+  [manager lookup and list semantics](https://android.googlesource.com/platform/system/hwservicemanager/+/60271965cf6b055ed82b2e1ae0bf74b2c34a6af2/ServiceManager.cpp).
+- frameworks/av `475269ec44acec82792be6b01fb8e16357d4d2c8`:
+  [Codec2Client manifest discovery and retry loop](https://android.googlesource.com/platform/frameworks/av/+/475269ec44acec82792be6b01fb8e16357d4d2c8/media/codec2/hal/client/client.cpp).
+
+32 verified source/license blobs and provenance are local under
+`.toolchain/references/hidl-android17/`. These HIDL interface versions coexist
+on Android 17; none selects an older Android runtime. The new CheckJNI gate
+queries MediaCodecList 16 times without an APK or compositor. The default
+runtime currently finds a real APEX AAC codec, but no usable HIDL video store.
+
 ### Still open — do not call the migration complete
 
-1. Restore/provide a verified API-37 x86_64 runtime, then execute the CheckJNI
-   gates and a bounded NewPipe UI/playback run. Newly changed wire/native paths
-   have source/host-test coverage but have not been revalidated on that runtime.
+1. Stable NewPipe playback. The restored runtime passes all three CheckJNI
+   gates and a 35.18 s UI/playback-attempt run without the HIDL fatal. APEX AAC
+   produces output, but AudioTrack initialization fails. Implement a closed,
+   descriptor-checked API-37 audio JNI adapter; the bypassed legacy name-only
+   hook has an incompatible `native_setup` and must not be reenabled unchanged.
 2. Replace/audit the remaining private native ABI assumptions. BLAST retains
    RefBase virtual-base/refcount handling, opaque allocation capacities and
    libc++ representation assumptions. Codec2 still fabricates C++ HIDL callback
    objects and accesses private Parcel layouts. The fabricated decoder-list and
-   component-handle fallback has been removed: missing/failed native service
-   discovery and dispatch now reject explicitly. A frozen HIDL HAL version alone
+   component-handle fallback has been removed: missing services are not
+   advertised, understood discovery returns typed absence, and unsupported or
+   failed component dispatch rejects explicitly. A frozen HIDL HAL version alone
    does not validate those implementation-private C++ layouts.
 3. Implement and validate the Codec2 adapter and bounded compressed-packet /
    GPU-frame ownership pipeline. Preserve timestamps, flush/EOS, reconfiguration,

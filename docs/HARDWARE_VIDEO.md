@@ -2,7 +2,7 @@
 
 ## Current scope
 
-PenguDroid has a host-only VA-API decoder and a direct multi-plane Wayland import path. They have been tested together on Intel UHD 630 with the iHD driver and GNOME/Mutter. **NewPipe still uses Android's software Codec2 plugins.** The host decoder is not yet registered as an Android Codec2 component, and no compressed-packet broker protocol has been added.
+PenguDroid has a host-only VA-API decoder and a direct multi-plane Wayland import path. Earlier tests exercised them together on Intel UHD 630 with the iHD driver and GNOME/Mutter; they were not rerun as part of the latest API-37 discovery fix. **Current NewPipe playback is not working end to end.** The latest runtime discovers a real in-process APEX AAC codec and produces decoded output, then fails AudioTrack initialization. The hosted HIDL video store is unavailable. The host decoder is not yet registered as an Android Codec2 component, and no compressed-packet broker protocol has been added.
 
 | Path | Evidence / status |
 | --- | --- |
@@ -54,13 +54,15 @@ The compositor test preserves both NV12 planes, waits for release after replacin
 
 ## NewPipe component selection and output surface
 
-The captured NewPipe run selected `c2.android.avc.decoder` (`video/avc`). Its current BLAST consumer receives 1280×720 buffers in Android HAL format 4 (`RGB_565`) and presents them through software `wl_shm`. The app therefore requests an H.264 decoder through the Android Codec2 surface path; the independent VA-API fixture result does not affect that running pipeline.
+An earlier captured NewPipe run selected `c2.android.avc.decoder` (`video/avc`), with 1280×720 HAL format 4 (`RGB_565`) buffers reaching BLAST and software `wl_shm`. That is a historical checkpoint, not current API-37 video validation.
+
+The latest API-37 run (`target/newpipe-api37-hidl-discovery/`) no longer aborts in HIDL manager discovery. It finds `__ApexCodecs__` and one real AAC codec, reports 14 positive codec output events / 57,344 output bytes, then fails with `AudioSink$InitializationException` and invalid audio session ID `-1`. It does not establish audible playback or video decode. The existing native HIDL store loader stops at missing `android::hardware::Parcel::setData` export; do not substitute another private signature or fabricate codec entries. The audio registration hook is also bypassed; its old `native_setup` ABI does not match Android 17, so enabling it unchanged is unsafe. See [STATUS.md](STATUS.md) for the next typed JNI boundary and retained contract audit.
 
 A Codec2 replacement has to return the exact work and graphic-buffer ownership the framework expects. Directly presenting a host DMA-BUF as a separate Wayland video layer would still require the Codec2 work to complete, the Android output surface not to cover or discard that frame, and format/flush/reconfigure behavior to remain correct. Returning a YUV frame through the existing RGB565 memfd allocator would reintroduce a CPU copy and conversion. Component advertisement must only happen when that full contract is implemented; a name in the codec list alone is not a working decoder.
 
 ## Next integration boundary
 
-The existing shim's `codec2.rs` builds the real Android `C2PlatformComponentStore`, which currently opens `libcodec2_soft_*` plugins. Advertising a hardware codec name without implementing its component would be incorrect. The next adapter must connect complete compressed access units and codec configuration to the host decoder while preserving Android work completion, timestamps, flush/EOS, surface association, color metadata and ownership. Its packet queues and returned frames must remain bounded. Per-frame presentation pacing/audio synchronization and resolution changes need real playback coverage.
+The existing shim's `codec2.rs` attempts to build the real Android `C2PlatformComponentStore`, which opens `libcodec2_soft_*` plugins when its ABI requirements are met. That attempted HIDL path is not currently available on the restored API-37 runtime. Advertising a hardware codec name without implementing its component would be incorrect. The next adapter must connect complete compressed access units and codec configuration to the host decoder while preserving Android work completion, timestamps, flush/EOS, surface association, color metadata and ownership. Its packet queues and returned frames must remain bounded. Per-frame presentation pacing/audio synchronization and resolution changes need real playback coverage.
 
 The current decoder can request H.264, HEVC, VP8, VP9 and AV1 from FFmpeg, but only H.264 has been tested with compressed input. Driver profile discovery does not establish end-to-end support for the other codecs. Color-space/range metadata and HDR handling are not yet carried into compositor presentation. Host Vulkan, GLES and multi-GPU selection must be validated independently of media decode.
 

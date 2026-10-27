@@ -2289,6 +2289,39 @@ fn probe_audio_track(env: &JniEnv) {
     }
 }
 
+/// Enumerate through the real MediaCodecList JNI path without creating a
+/// decoder or needing an APK/Wayland. Discovery must finish even when no hosted
+/// Codec2 store exists; its result is not evidence that decoding works.
+pub fn probe_media_codec_list(env: &JniEnv) -> bool {
+    let run = || -> Option<()> {
+        install_service_manager_abi(env)?;
+        let _frame = env.local_frame(32)?;
+        let class = env.find_class("android/media/MediaCodecList")?;
+        let count = env.static_method_id(class, "getCodecCount", "()I")?;
+        let ctor = env.method_id(class, "<init>", "(I)V")?;
+        let infos = env.method_id(class, "getCodecInfos", "()[Landroid/media/MediaCodecInfo;")?;
+        let all = env.static_field_id(class, "ALL_CODECS", "I")?;
+        let kind = env.static_int_field(class, all);
+        let mut previous = None;
+        for _ in 0..16 {
+            let _iteration = env.local_frame(8)?;
+            let regular = env.call_static_int(class, count, &[])?;
+            let list = env.new_object(class, ctor, &[JValue { i: kind }])?;
+            let array = env.call_object(list, infos, &[])?;
+            if array.is_null() { return None; }
+            let total = env.array_length(array);
+            if regular < 0 || total < regular { return None; }
+            let result = (regular, total);
+            if previous.is_some_and(|old| old != result) { return None; }
+            previous = Some(result);
+        }
+        let (regular, total) = previous?;
+        println!("media: API-37 codec enumeration repeated 16 times: regular={regular}, all={total}");
+        Some(())
+    };
+    if run().is_some() { true } else { env.describe_exception(); false }
+}
+
 /// `PENGUDROID_PROBE_MEDIA=1`: ask the framework how many codecs it sees.
 ///
 /// `MediaCodecList` reaches the codec service through `libmedia_jni` →
@@ -2922,6 +2955,15 @@ pub fn prepare_main_thread(env: &JniEnv) -> bool {
         eprintln!("apphost: ActivityThread.attach missing");
         return false;
     };
+    // `ActivityThread.attach` already reaches `ServiceManager`, so the loaded
+    // framework's IServiceManager transaction codes have to be installed before
+    // it runs. Installing them from `bind_application` is too late: the early
+    // call gets `UNKNOWN_TRANSACTION`, `rawGetService` sees a null `Service` and
+    // the guest throws before the app is ever bound.
+    if install_service_manager_abi(env).is_none() {
+        eprintln!("apphost: cannot resolve framework ServiceManager ABI before attach");
+        return false;
+    }
     if !env.call_void(thread, attach, &[JValue { z: 0 }, JValue { j: 0 }]) {
         eprintln!("apphost: ActivityThread.attach threw");
         return false;
