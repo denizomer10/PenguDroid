@@ -1,185 +1,169 @@
-# Android 17 migration target
+# Android 17 / API 37 x86_64
 
-The runtime target is **Android 17 / API 37 only**. Existing APKs keep their
-declared minSdk/targetSdk; the platform level is not substituted for either.
-The Android 17 runtime boots and passes core framework and BLAST lifecycle
-probes. Window/media integration remains incomplete. **Hard lock: API-33 is
-out entirely** — the API-33 sysroot (`.toolchain/sysroot`) is no longer a
-target, fixture or fallback, its regression gate is deleted, and
-`.toolchain/sysroot-android17` is the only runtime sysroot. See STATUS.md
-for the latest handoff; earlier checkpoints below record migration history.
+## Runtime contract
 
-## Actual API-37 runtime bringup
+**Android 17 / API 37 on x86_64 is the only runtime target.** There is no
+API-33/36 runtime selection, ABI retry, or old framework test fixture. An
+incompatible runtime must be rejected, not made to look compatible by changing
+its advertised SDK. The expected local tree is `.toolchain/sysroot-android17`;
+`PENGUDROID_ART_SYSROOT`/`--sysroot` may name another tree satisfying the same
+contract.
 
-The official x86_64 GSI `CP2A.260605.012` is downloaded and verified locally.
-SHA-256: `3da2ca5599d304c4d92fe8c72f31d035a59db57c93ce073740ed4015ee034a8e`.
-Source: [Android 17 GSI releases](https://developer.android.com/topic/generic-system-image/releases).
-Archive metadata is `.toolchain/android17/source.json`; binaries stay outside
-Git. The separate tree is `.toolchain/sysroot-android17`; its own build.prop
-reports SDK 37, SDK_FULL 37.0 and release 17. No API-level spoofing was used.
+An APK's declared `minSdk` and `targetSdk` are application metadata, not a
+runtime selection mechanism. Android 17 itself has target-SDK-dependent
+application behavior. PenguDroid keeps that metadata and reads the selected
+image's compat XML against it; it does not substitute the platform level for
+an application's declared target. Missing target metadata defaults to 37.
 
-38 APEX packages are expanded, including compressed CAPEX and an EROFS package.
-`tools/art/unpack-apex.py` handles both payload filesystems without mounting
-anything. The EROFS utility was extracted locally from a distribution package;
-no system package or kernel configuration was changed. Fresh ext4 and EROFS
-extraction smoke checks passed (`/tmp/pd-android17/extractor-test.log`).
+The product goals are stable NewPipe playback and interaction without unbounded
+memory/resource growth, GPU graphics and hardware video decode across Intel,
+AMD and NVIDIA, and Beach Buggy Racing 2. None is established merely by building
+the workspace or reporting a GPU capability.
 
-Verified on the real API-37 ART with CheckJNI:
+## Current checkout: 2026-10-27
 
-- `JNI_CreateJavaVM` returns JNI_OK. 174 framework native groups and two HWUI
-  native groups register. SystemProperties registration now precedes groups
-  whose class initializers query it.
-- ServiceManager legacy binder replies coexist with the new typed
-  Service/ServiceWithMetadata union. Generated codes are `[1, 3, 2, 4]`.
-- Settings scalar/missing/list replies pass Java Binder/Parcel validation.
-- Audio-focus AIDL request/current/abandon pass with the API-37 nullable token
-  parameter and generated transaction codes `[82, 83, 84, 85]`.
-- WindowLayout's requested-visible-types signature computes 720x1280.
-- InputDevice.Builder, the new native KeyCharacterMap String8/remapping format,
-  and generated input codes `[2, 3, 0, 4, 5, 6, 7, 39]` pass six Unicode cases.
-  Zero marks the removed isInputDeviceEnabled transaction; API 37 stores that
-  state on InputDevice itself.
-- SystemFeaturesCache and ApplicationSharedMemory initialize and pass a real
-  native shared-memory write/read roundtrip. This mapping is currently local
-  to each hosted guest, not a shared system-server mapping across all apps.
+The runtime/reference directories recorded by an earlier machine are **not
+present in this checkout**: `.toolchain/sysroot-android17`,
+`.toolchain/references`, and `.tools` are absent. The existing
+`.toolchain/sysroot/system/build.prop` reports SDK 33. The CLI now rejects it
+before loading ART; it was not used for execution or as a substitute fixture.
+The Android-17 CheckJNI gates currently skip when no runtime is supplied.
+Explicitly configuring a missing runtime makes those gates fail instead of
+silently skipping.
 
-Bionic additions were validated with an independent C fixture: real queued
-signal payloads through sigwaitinfo/64, timed-wait errno/timeout behavior,
-canary-protected buffers, and stack-guard regeneration in a forked child that
-never returns through old protected frames. `__stack_chk_guard` is now a scalar
-initialized from host TLS. The API-35+ property reload hook enables the hosted
-app-compat property view. The 16 KiB app-compat linker switch is unnecessary on
-this 4 KiB host; larger-page host emulation remains unsupported.
+An earlier checkpoint recorded real API-37 bringup using the official x86_64
+GSI `CP2A.260605.012`, SHA-256
+`3da2ca5599d304c4d92fe8c72f31d035a59db57c93ce073740ed4015ee034a8e`.
+That is historical evidence, not a claim that its binaries or logs are on this
+machine. Source: [Android GSI releases](https://developer.android.com/topic/generic-system-image/releases).
 
-NewPipe on API 37 now creates its Application and reaches Activity.onCreate.
-The image's framework bootclasspath metadata supplies newly split framework
-jars. Default compat changes are read from the image XML against the APK's
-actual targetSdk (35 here); 143 changes are disabled, including the optional
-virtual-gamepad override. Per-package user overrides are not implemented.
-The modern SurfaceComposer status/method mapping and 224-byte vsync packet
-replace the incompatible legacy paths for the covered API-37 calls.
+### Implemented hard-lock boundaries
 
-HWUI's EGL_TELEMETRY_HINT_ANDROID (0x3570) is consumed by the host boundary:
-this renderer does not collect Android GPU stats. Other context attributes
-continue to receive host validation. The real GPU regression accepts this
-HWUI hint and still rejects an unknown attribute.
+- Shared platform identity is API 37 / Android 17 / x86_64. Shim and daemon
+  reject platform-property downgrades, 32-bit ABI enabling and appcompat aliases
+  that would override this identity. Old persisted daemon properties cannot
+  replace it. Ordinary configuration remains writable.
+- Sysroot detection checks SDK metadata and the actual ART ELF class,
+  endianness and machine. The framework boot classpath must come from valid
+  `bootclasspath.pb` metadata; no hardcoded framework-jar fallback is used.
+- Keyboard parcels always use the API-37 String8/remapping representation and
+  `InputDevice.Builder`. Activity launch, WindowLayout and audio-focus probes
+  use their API-37 signatures only.
+- ServiceManager, application, input, audio-focus, media-session/metrics, user
+  and thermal transaction tables are installed from the loaded framework's
+  generated Stub constants. Uninstalled tables do not substitute old numbers.
+  ServiceManager requires both binder and Service-union methods because both
+  are present on API 37; these are not alternate platform selections.
+- SurfaceComposer uses the covered `android.gui.ISurfaceComposer` AIDL
+  contracts only. The display event layout is 224 bytes and requires API 37.
+  Unsupported revised contracts return `UNKNOWN_TRANSACTION`, not fake success.
+- `ContentProviderHolder` includes the API-37 third trailing flag,
+  `noReleaseNeededIfUnstable`. Resized callbacks carry a framework-marshalled
+  `WindowRelayoutResult` followed by the five API-37 scalar arguments. The
+  CheckJNI window probe now decodes that payload with the framework's CREATOR.
+- BLAST obtains the native C buffer through
+  `GraphicBuffer::getNativeBuffer() const`; the old private C++ handle offset
+  was removed. `ANativeWindowBuffer` follows the pinned native C declaration.
+  Unknown allocator handles are rejected before payload dereference. A host
+  C++ fixture exercises a deliberately unrelated GraphicBuffer layout, reference
+  counting, imports, and mapping cleanup. It is not a target-runtime test.
 
-**API-37 NewPipe UI now renders; playback remains unverified.** Input-channel and SurfaceControl
-reply contracts were subsequently corrected (see STATUS.md). The real native
-BLAST create/update/destroy/recreate gate now passes with CheckJNI, after mapping
-the C++ queue handle to separate Rust state and installing the framework's
-ServiceManager ABI before construction. This headless probe does not exercise
-frame presentation or transaction/release callbacks. A subsequent bounded
-Wayland run passed native BLAST update and hwui's physical-display discovery
-after correcting API-37 static/dynamic display and composition-preference
-parcelables. The native `ADisplay` API now has a CheckJNI regression verifying
-the synthetic internal 720x1280/60 Hz SDR display. The subsequent gralloc abort
-came from the optional `ANativeWindow_tryAllocateBuffers` preallocation hint.
-The shim now declines that hint, as allowed by the NDK contract; host EGL renders
-into its own FBOs. A real 20-second Wayland run remained alive and reached UI
-frame counter 550, with 52 distinct hashes among 55 sampled images. See
-`screenshots/newpipe-android17.png` and STATUS.md. This does not implement
-mandatory API-37 GraphicBuffer allocation: LTO-inlined mapper/backend accesses
-still require an ABI-matched backend. No video decode/playback success is claimed.
+### Still open — do not call the migration complete
 
-Other observed limits: boot images have a read-barrier mismatch; ART successfully
-falls back to imageless execution. Aconfig metadata under /metadata/aconfig is
-not provisioned, Binder death/threadpool semantics remain incomplete, and some
-service calls still return incomplete replies. Neither API-37 video playback
-nor broad backward application compatibility has been verified.
+1. Restore/provide a verified API-37 x86_64 runtime, then execute the CheckJNI
+   gates and a bounded NewPipe UI/playback run. Newly changed wire/native paths
+   have source/host-test coverage but have not been revalidated on that runtime.
+2. Replace/audit the remaining private native ABI assumptions. BLAST retains
+   RefBase virtual-base/refcount handling, opaque allocation capacities and
+   libc++ representation assumptions. Codec2 still fabricates C++ HIDL callback
+   objects and accesses private Parcel layouts. The fabricated decoder-list and
+   component-handle fallback has been removed: missing/failed native service
+   discovery and dispatch now reject explicitly. A frozen HIDL HAL version alone
+   does not validate those implementation-private C++ layouts.
+3. Implement and validate the Codec2 adapter and bounded compressed-packet /
+   GPU-frame ownership pipeline. Preserve timestamps, flush/EOS, reconfiguration,
+   color metadata and A/V pacing. The host decoder is not yet NewPipe hardware
+   decoding. See [HARDWARE_VIDEO.md](HARDWARE_VIDEO.md).
+4. Measure RSS/PSS, mappings, descriptors and retained native/JNI objects during
+   sustained playback, seek, resize, minimize/restore, exit and repeated reopen.
+   Passing isolated mapping tests is not proof of leak-free application playback.
+5. Validate hardware paths separately on Intel, AMD and NVIDIA. This host reports
+   Intel UHD 630, Mesa GLES 3.2 and Intel iHD VA-API VLD profiles. This is capability
+   discovery, not an end-to-end decode test. AMD and NVIDIA remain unvalidated
+   here; NVDEC and Android Vulkan WSI are separate work.
+6. Supply a working ARM64 execution path for the available BBR2 package and
+   exercise its framework/graphics/input/audio requirements. Do not infer that
+   booting system_server or adopting another OS is necessary from metadata alone.
 
-Reproduction (build runtime shared libraries before tests):
+## Reference use
+
+Available local source trees inspected in this checkout:
+
+| Source | Useful boundary | Not evidence of |
+| --- | --- | --- |
+| `.toolchain/manifest-refs_heads_android17-release/default.xml` | AOSP project index | Framework implementation or extracted runtime binaries |
+| `.toolchain/native-refs_heads_main-libs-binder-rust` | Userspace Rust Binder interfaces | A complete Android runtime or identical private transaction numbers |
+| `.toolchain/common-30c0eaeef78d5c19f687ad8418c27b76353ab261/include/uapi/linux/android/binder.h` | Actual LP64 Binder ioctl/structure regression | Android framework AIDL method order |
+| `.toolchain/common-refs_heads_android-mainline-drivers-android-binder` | Kernel Binder driver design | A userspace service implementation |
+| `.toolchain/gbos-x86-main/README.md`, `HANDOFF.md`, `kernel/`, `isa-emu/` | PC hardware bringup, memfd/ashmem constraints, CPU instruction gaps | An ARM64 translator or a no-boot compatibility layer |
+
+Googlebook/gbos-x86 boots a complete Android OS using its own kernel, mounts and
+Android init. PenguDroid does not import that boot/container architecture. Its
+instruction emulator handles missing **x86 SIMD instructions on x86**; it is not
+ARM64-to-x86_64 translation. Its hardware findings are references, not validation
+of PenguDroid on the same drivers.
+
+Pinned official source contracts used for this migration:
+
+- frameworks/base `94b4c163b7dfe5ce3607f7bb8456f9573f7de57d`:
+  [IWindow](https://android.googlesource.com/platform/frameworks/base/+/94b4c163b7dfe5ce3607f7bb8456f9573f7de57d/core/java/android/view/IWindow.aidl),
+  [ContentProviderHolder](https://android.googlesource.com/platform/frameworks/base/+/94b4c163b7dfe5ce3607f7bb8456f9573f7de57d/core/java/android/app/ContentProviderHolder.java),
+  [IUserManager](https://android.googlesource.com/platform/frameworks/base/+/94b4c163b7dfe5ce3607f7bb8456f9573f7de57d/core/java/android/os/IUserManager.aidl),
+  [IThermalService](https://android.googlesource.com/platform/frameworks/base/+/94b4c163b7dfe5ce3607f7bb8456f9573f7de57d/core/java/android/os/IThermalService.aidl).
+- frameworks/native android17-release
+  `ae266dcb706d083868578cfedce381ef44488a07`:
+  [GraphicBuffer accessor](https://android.googlesource.com/platform/frameworks/native/+/ae266dcb706d083868578cfedce381ef44488a07/libs/ui/GraphicBuffer.cpp),
+  [native buffer C ABI](https://android.googlesource.com/platform/frameworks/native/+/ae266dcb706d083868578cfedce381ef44488a07/libs/nativebase/include/nativebase/nativebase.h).
+- hardware/interfaces `0162af698935100a590b7359581ac8b1b80693e5`:
+  [Codec2 AIDL ComponentStore](https://android.googlesource.com/platform/hardware/interfaces/+/0162af698935100a590b7359581ac8b1b80693e5/media/c2/aidl/android/hardware/media/c2/IComponentStore.aidl).
+
+Kernel Binder protocol version **8** is distinct from Android API level **37**.
+Stable NDK C/JNI/kernel contracts are not removed simply because an older
+Android release also used them. Private framework contracts require independent
+source/runtime evidence.
+
+## Beach Buggy Racing 2 artifact boundary
+
+Offline ZIP/ELF-header inventory of
+`Beach+Buggy+Racing+2_2026.10.05_APKPure.xapk`:
+
+- SHA-256: `ce9a6c4ae00ec749166e72504e8ee831b6929356576eb783e9f419226cb6cd00`.
+- XAPK manifest: `com.vectorunit.cobalt.googleplay`, version `2026.10.05`,
+  min SDK 24, target SDK 36.
+- All **18** packaged native libraries are in `config.arm64_v8a.apk`,
+  `lib/arm64-v8a/`; their ELF machine is **183 (AArch64)**. No x86_64 native
+  payload was found across the package's APK members.
+- This is ordinary offline archive/header inspection, not decompilation, REA
+  Evidence, an app launch, or proof of runtime compatibility.
+
+The package's target SDK does not change the API-37 runtime goal. The native
+architecture is an additional, independent blocker. The bridge ABI, the guest
+path rule and the ordered requirements are in [NATIVE_BRIDGE.md](NATIVE_BRIDGE.md);
+retained inventory: `target/beach-buggy-2-native-inventory.json`.
+
+## Verification
 
 ```sh
 cargo build --workspace --offline
-cargo test -p pengudroid-cli --test art_framework --offline
-# Includes dedicated API-37 core-services and BLAST lifecycle gates.
-# Explicit full API-37 gate:
-PENGUDROID_TEST_SYSROOT="$PWD/.toolchain/sysroot-android17" cargo test -p pengudroid-cli --test art_framework real_art_keyboard_and_local_window_layout --offline
+cargo test --workspace --offline
+cargo test -p pengudroid-shim --test graphicbuffer_native --offline
+PENGUDROID_TEST_KERNEL_SOURCE=/absolute/kernel-source cargo test -p pengudroid-shim --lib android17_kernel_uapi_matches --offline
+PENGUDROID_TEST_ANDROID17_SYSROOT=/absolute/api37-x86_64-tree cargo test -p pengudroid-cli --test art_framework --offline -- --nocapture
 pengudroid launch NewPipe_v0.29.1.apk --sysroot .toolchain/sysroot-android17
 ```
 
-The earlier workspace checkpoint had **251 passing tests**, with both installed
-runtime fixtures exercised. The API-37 lifecycle probe now passes separately;
-this is not a claim that API-37 window/media integration works. See STATUS.md
-for the current validation scope.
-
-Logs are under `/tmp/pd-android17/`: `shared-framework-tests.log`,
-`full-framework17-test.log`, `guard-abi.log`, `properties-abi.log`,
-`newpipe-egl17.log`, and workspace/build logs. Historical pre-bringup text below
-records the first transaction-table change, not the final migration state.
-
-## Reference review (2026-10-26)
-
-The AOSP manifest is a repository index, not the platform implementation. The
-inspected android-latest-release manifest selects android17-release. Its ART,
-Bionic, frameworks/base, frameworks/native, frameworks/av and hardware/interfaces
-projects must be tracked together, with pinned revisions for reproducibility.
-
-The linked Rust Binder is a **Linux kernel driver**, using kernel memory,
-locking, task and file APIs. It does not establish that Android framework or
-media services have been rewritten in Rust. PenguDroid's host service broker and
-Bionic interception layer run in userspace and have different responsibilities.
-We use published interfaces and behavior as references and write our own code;
-no driver or service implementation from these references is vendored here.
-
-Inspected source revisions:
-
-| Reference | Pinned revision | What was inspected |
-| --- | --- | --- |
-| platform/manifest | ad156f32caaa06dae91c02d443f6a8fe210eaa54 | default.xml and project boundaries |
-| kernel/common android-mainline | 721ad43cbf3c182a07edf6a2a8127c587313f6a7 | Rust driver entry, defs, public Binder UAPI |
-| frameworks/base android17-release | 94b4c163b7dfe5ce3607f7bb8456f9573f7de57d | IAudioService AIDL |
-| hardware/interfaces android17-release | 0162af698935100a590b7359581ac8b1b80693e5 | media/c2 AIDL IComponentStore |
-
-Source links: [manifest](https://android.googlesource.com/platform/manifest/+/ad156f32caaa06dae91c02d443f6a8fe210eaa54/default.xml),
-[Rust Binder](https://android.googlesource.com/kernel/common/+/721ad43cbf3c182a07edf6a2a8127c587313f6a7/drivers/android/binder/rust_binder_main.rs),
-[Binder UAPI](https://android.googlesource.com/kernel/common/+/721ad43cbf3c182a07edf6a2a8127c587313f6a7/include/uapi/linux/android/binder.h),
-[IAudioService](https://android.googlesource.com/platform/frameworks/base/+/94b4c163b7dfe5ce3607f7bb8456f9573f7de57d/media/java/android/media/IAudioService.aidl),
-[Codec2 IComponentStore](https://android.googlesource.com/platform/hardware/interfaces/+/0162af698935100a590b7359581ac8b1b80693e5/media/c2/aidl/android/hardware/media/c2/IComponentStore.aidl).
-
-## First implemented boundary: audio-focus transaction dispatch
-
-Hosted audio focus now uses semantic operations. During ART binding, the host
-reads all four TRANSACTION constants from the loaded IAudioService Stub and
-installs the validated table atomically. Duplicate, zero and reserved codes are
-rejected. A missing table fails binding with a diagnostic rather than using
-old method numbers against a different framework. The historical local mapping
-remains the native-only fallback. APK targetSdk does not select Binder wire ABI.
-
-The Android 17 source adds focusEnvToken arguments to request/abandon/current
-focus. The current host policy is still per-process: token-specific environments,
-listener callbacks, shared arbitration and ducking are not implemented. The
-Java AIDL focus probe now exercises both API-33 and API-37 frameworks. Its
-nullable token test does not establish token-scoped arbitration or API-37 playback.
-
-Validation: workspace build and **248 tests passed**, including the existing
-real ART/CheckJNI audio AIDL probe and a remapped-table regression. Runtime
-verification is API 33, not API 37. Logs: `/tmp/pd-android17/{build,tests}.log`.
-
-## Remaining migration gates
-
-1. Finish the prepared API-37 runtime environment: resolve boot-image/GC
-   compatibility, provision Aconfig storage, and retain the API-33 regression
-   fixture. The API-37 image acquisition, APEX extraction and basic ART boot
-   steps are complete.
-2. Extend the passing core CheckJNI probes to actual window/input and BLAST
-   lifecycles. Version private parcel layouts, object/vtable offsets and
-   service operations by the **loaded framework**, using generated constants
-   where possible. Core native registration is already verified.
-3. Port input, window/activity/configuration, settings, package and audio service
-   contracts; test old and new APK targetSdk behavior independently.
-4. Implement the Codec2 stable AIDL adapter and its ownership/error/version
-   contracts. The inspected source contains a VINTF-stable AIDL ComponentStore;
-   PenguDroid currently hosts HIDL objects with measured legacy C++ layouts.
-   Do not reinterpret a new AIDL object as one of those HIDL objects.
-5. Connect compressed packets to the existing host GPU decoder, preserve frame
-   leases, timestamps, flush/EOS, format changes and color metadata; validate
-   audio/video pacing with real playback. See HARDWARE_VIDEO.md.
-6. Expand the compatibility matrix across API-33 and API-37 runtimes and APKs
-   with older/newer minSdk/targetSdk, including native games, arm64, input,
-   resize, pause/seek, exit and relaunch. No all-app compatibility claim yet.
-
-Kernel Binder protocol version 8 (LP64) is distinct from API level 37 and private
-AIDL transaction numbering. A Rust driver does not remove those userspace ABI
-requirements. No kernel module replacement is required for this first step.
+Build all runtime shared libraries before invoking the framework probes. Live
+runs must have their daemon running first on a private `PENGUDROID_SOCKET`, be
+bounded, and retain logs. See [STATUS.md](STATUS.md) for current validation and
+next action. A workspace run that skips the optional image/hardware gates must
+not be reported as a successful Android-17 or hardware playback run.

@@ -159,6 +159,10 @@ static APP_TX_QUEUE: std::sync::LazyLock<std::sync::Mutex<std::collections::VecD
 
 /// Transaction flag: no reply is expected.
 const TF_ONE_WAY: u32 = 0x1;
+/// The reply contains a transport `status_t`, not an AIDL exception parcel.
+const TF_STATUS_CODE: u32 = 0x8;
+/// `utils/Errors.h`: an unimplemented Binder transaction.
+const UNKNOWN_TRANSACTION: i32 = -libc::EBADMSG;
 
 /// Number of reply regions carved out of the transfer area.
 ///
@@ -475,26 +479,27 @@ unsafe fn hidl_service_manager_reply(
     }
 }
 
-/// `android.os.IServiceManager` transaction codes.
-const ISM_GET_SERVICE: u32 = 1;
-const ISM_CHECK_SERVICE: u32 = 2;
-// get/check legacy binder replies, followed by get/check Service-union replies.
-static SERVICE_MANAGER_CODES: Mutex<[u32; 4]> = Mutex::new([1, 2, 0, 0]);
+/// API-37 IServiceManager get/check binder replies, followed by get/check
+/// Service-union replies. No transaction is known until the host installs all four.
+static SERVICE_MANAGER_CODES: Mutex<[u32; 4]> = Mutex::new([0; 4]);
 
 fn service_manager_shape(codes: [u32; 4], code: u32) -> Option<bool> {
+    if code == 0 || codes.contains(&0) { return None; }
     if codes[..2].contains(&code) { Some(false) }
-    else if code != 0 && codes[2..].contains(&code) { Some(true) }
+    else if codes[2..].contains(&code) { Some(true) }
     else { None }
 }
 
+/// Install getService/checkService/getService2/checkService2 from the loaded Stub.
+/// All four must be nonzero, distinct user transaction codes. Failure leaves the
+/// previously installed table unchanged.
 #[no_mangle]
 pub extern "C" fn __pengudroid_binder_set_service_manager_codes(
     get: u32, check: u32, get2: u32, check2: u32,
 ) -> bool {
     let codes = [get, check, get2, check2];
-    if get == 0 || check == 0 || (get2 == 0) != (check2 == 0)
-        || codes.iter().any(|&c| c >= 0x00ff_fffe)
-        || codes.iter().enumerate().any(|(i, &c)| c != 0 && codes[..i].contains(&c)) {
+    if codes.iter().any(|&c| c == 0 || c >= 0x00ff_fffe)
+        || codes.iter().enumerate().any(|(i, c)| codes[..i].contains(c)) {
         return false;
     }
     *SERVICE_MANAGER_CODES.lock().unwrap_or_else(|e| e.into_inner()) = codes;
@@ -558,38 +563,64 @@ pub extern "C" fn __pengudroid_binder_set_application_transactions(
 }
 
 
-/// `ISessionManager` transaction code for `createSession`.
-///
-/// From `android-13.0.0_r1`'s `ISessionManager.aidl`: `createSession` is the
-/// first method, so it is `FIRST_CALL_TRANSACTION` (1).
-const ISM_CREATE_SESSION: u32 = 1;
+/// ISessionManager.createSession, ISession.getController/getBinderForSetQueue,
+/// IMediaMetricsManager.getPlaybackSessionId, installed from the API-37 Stubs.
+static MEDIA_TRANSACTION_CODES: Mutex<Option<[u32; 4]>> = Mutex::new(None);
 
-/// `ISession` transaction code for `getController`.
+/// `bool __pengudroid_binder_set_media_transactions(const u32 *codes, size_t len)`
 ///
-/// Second method in `ISession.aidl` (`sendEvent` comes first).
-const ISESSION_GET_CONTROLLER: u32 = 2;
-
-/// `ISession` transaction code for `getBinderForSetQueue`.
+/// `len` must be 4 (u32 elements, not bytes). The order is createSession,
+/// getController, getBinderForSetQueue, getPlaybackSessionId, from the loaded
+/// android.media.session.ISessionManager$Stub, android.media.session.ISession$Stub
+/// (the middle two), and android.media.metrics.IMediaMetricsManager$Stub.
+/// Every code must be in 1..0x00ff_fffe. Only the middle pair must be distinct:
+/// different Stub types may reuse the same code. The table is copied and
+/// replaced atomically; false leaves the previous table unchanged. No media
+/// methods dispatch before a successful installation.
 ///
-/// Twelfth method in `ISession.aidl` (`sendEvent`, `getController`, then nine
-/// setters). `MediaSession.setQueue` calls `ParcelableListBinder.send` on the
-/// binder it returns, and that helper dereferences it without a null check.
-const ISESSION_GET_BINDER_FOR_SET_QUEUE: u32 = 12;
+/// # Safety
+/// For a non-null pointer and len == 4, `codes` must point to four aligned,
+/// readable u32s for the duration of this call. The pointer is not retained.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_media_transactions(
+    codes: *const u32,
+    len: usize,
+) -> bool {
+    if codes.is_null() || len != 4 { return false; }
+    let codes: [u32; 4] = std::slice::from_raw_parts(codes, len).try_into().unwrap();
+    if codes.iter().any(|&code| code == 0 || code >= 0x00ff_fffe)
+        || codes[1] == codes[2] {
+        return false;
+    }
+    *MEDIA_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner()) = Some(codes);
+    true
+}
 
-/// `IMediaMetricsManager` transaction code for `getPlaybackSessionId(int)`.
+/// API-37 IUserManager unlock queries, unknown until installed from its Stub.
+static USER_TRANSACTION_CODES: Mutex<Option<[u32; 2]>> = Mutex::new(None);
+
+/// Install IUserManager$Stub codes in isUserUnlocked/isUserUnlockingOrUnlocked
+/// order. `len` must be 2 u32 elements; both codes must be distinct and in
+/// 1..0x00ff_fffe. The table is copied and replaced as one unit. False preserves
+/// the previous table; no user method dispatches before installation.
 ///
-/// Second method in `android-13.0.0_r1`'s `IMediaMetricsManager.aidl`
-/// (`reportPlaybackMetrics` comes first).
-const IMM_GET_PLAYBACK_SESSION_ID: u32 = 2;
-
-/// `IUserManager` transaction code for `isUserUnlocked(int)`.
-const IUM_IS_USER_UNLOCKED: u32 = 79;
-
-/// `IUserManager` transaction code for `isUserUnlockingOrUnlocked(int)`.
-///
-/// `ContextImpl.getSharedPreferences` refuses credential-encrypted storage
-/// until this reports true, which is what NewPipe hits on `onCreate`.
-const IUM_IS_USER_UNLOCKING_OR_UNLOCKED: u32 = 71;
+/// # Safety
+/// For a non-null pointer and len == 2, `codes` must point to two aligned,
+/// readable u32s for this call. The pointer is not retained.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_user_transactions(
+    codes: *const u32,
+    len: usize,
+) -> bool {
+    if codes.is_null() || len != 2 { return false; }
+    let codes: [u32; 2] = std::slice::from_raw_parts(codes, len).try_into().unwrap();
+    if codes.iter().any(|&code| code == 0 || code >= 0x00ff_fffe)
+        || codes[0] == codes[1] {
+        return false;
+    }
+    *USER_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner()) = Some(codes);
+    true
+}
 
 /// `IContentProvider` transaction codes, read out of this framework.jar with
 /// `--dump-class android.content.IContentProvider`.
@@ -618,67 +649,19 @@ const ICP_CHECK_URI_PERMISSION: u32 = 28;
 const IBC_GET_CURSOR_WINDOW: u32 = 1;
 const IBC_CLOSE: u32 = 4;
 
-/// `ISurfaceComposer` transaction code for `createConnection`.
-///
-/// Like `createDisplayEventConnection` this is a hand-written interface, so the
-/// reply is a bare `strongBinder` with no status word.
-const ISC_CREATE_CONNECTION: u32 = 2;
+/// Measured API-37 android.gui.ISurfaceComposer AIDL transactions. Every reply
+/// starts with binder::Status, regardless of the SurfaceFlinger service alias.
+const ISC_CREATE_DISPLAY_EVENT_CONNECTION: u32 = 2;
+const ISC_CREATE_CONNECTION: u32 = 3;
+const ISC_GET_PHYSICAL_DISPLAY_IDS: u32 = 6;
+const ISC_GET_PHYSICAL_DISPLAY_TOKEN: u32 = 7;
+const ISC_GET_STATIC_DISPLAY_INFO: u32 = 12;
+const ISC_GET_DYNAMIC_DISPLAY_INFO: u32 = 13;
+const ISC_GET_COMPOSITION_PREFERENCE: u32 = 34;
+const ISC_GET_MAX_ACQUIRED_BUFFER_COUNT: u32 = 69;
 
-/// Legacy `ISurfaceComposer::authenticateSurfaceTexture(IGraphicBufferConsumer)`.
-///
-/// Measured, not guessed: `TextureView` triggers it right after
-/// `SurfaceUtils: connecting to surface … (reconnect)`, and the transaction is
-/// `code=9` on the `android.ui.ISurfaceComposer` handle. Code 8 is
-/// `setTransactionState` (it also carries binders, which is what made 8 look
-/// plausible at first).
-const ISC_AUTHENTICATE_SURFACE: u32 = 9;
-
-/// `ISurfaceComposerClient` transaction code for `createSurface`.
-///
-/// `ISurfaceComposerClient` is hand-written too, and `callRemote` reads the out
-/// parameters *first* and the status word *last*:
-/// `[handle][gbp][layerId][transformHint][status]`.
+/// API-37 android.gui.ISurfaceComposerClient.createSurface (generated AIDL).
 const ISCC_CREATE_SURFACE: u32 = 1;
-
-/// `ISurfaceComposer` transaction code for `getPhysicalDisplayIds`.
-///
-/// hwui's `EglManager::initialize` aborts with "Failed to acquire physical
-/// displays for WCG support!" unless this returns at least one id. The method
-/// is AIDL-generated (the legacy tag 34 is deprecated). The trace shows a
-/// no-argument transaction on the `SurfaceFlinger` handle at code 54, but
-/// answering it with a `long[]` did not clear the abort, so the code still has
-/// to be pinned down.
-#[allow(dead_code)]
-const ISC_GET_PHYSICAL_DISPLAY_IDS: u32 = 3;
-
-/// The deprecated legacy tag for the same method; both are answered because the
-/// trace shows calls at 3 and 54 and the abort only clears when the right one
-/// returns a non-empty array.
-const ISC_GET_PHYSICAL_DISPLAY_IDS_LEGACY: u32 = 54;
-
-/// Third candidate: the trace shows a no-argument call at 5 immediately before
-/// the WCG abort. It turned out to be `getPhysicalDisplayToken` instead.
-#[allow(dead_code)]
-const ISC_GET_PHYSICAL_DISPLAY_IDS_ALT: u32 = 5;
-
-/// Legacy `android.ui.ISurfaceComposer.getCompositionPreference`.
-const ISC_GET_COMPOSITION_PREFERENCE: u32 = 27;
-
-/// Legacy `android.ui.ISurfaceComposer.getDynamicDisplayInfo`.
-const ISC_GET_DYNAMIC_DISPLAY_INFO: u32 = 55;
-
-/// Legacy `android.ui.ISurfaceComposer.getStaticDisplayInfo`.
-const ISC_LEGACY_GET_STATIC_DISPLAY_INFO: u32 = 8;
-
-/// `ISurfaceComposer.getPhysicalDisplayToken(long id)` (AIDL).
-const ISC_GET_PHYSICAL_DISPLAY_TOKEN: u32 = 5;
-
-/// `ISurfaceComposer` transaction code for `createDisplayEventConnection`.
-///
-/// `ISurfaceComposer` is a hand-written binder interface (`libs/gui/
-/// ISurfaceComposer.cpp`), not AIDL, so its reply carries **no status word**:
-/// the client's first read is `reply.readStrongBinder()` at offset 0.
-const ISC_CREATE_DISPLAY_EVENT_CONNECTION: u32 = 4;
 
 /// `IDisplayEventConnection` transaction code for `stealReceiveChannel`.
 ///
@@ -703,7 +686,7 @@ const IWM_OPEN_SESSION: u32 = 4;
 /// 4 to 3 and dropped `prepareToReplaceWindows`/`setInTouchMode` entirely. The
 /// shim therefore asks the loaded framework for its generated
 /// `IWindowSession$Stub.TRANSACTION_*` constants and dispatches on these ids,
-/// keeping the API-33 table only as a fallback.
+/// with no fallback table.
 const WS_ADD_TO_DISPLAY: u8 = 1;
 const WS_ADD_TO_DISPLAY_AS_USER: u8 = 2;
 const WS_REMOVE: u8 = 3;
@@ -803,20 +786,13 @@ const IDEC_SET_VSYNC_RATE: u32 = 2;
 /// `IDisplayEventConnection` transaction code for `requestNextVsync` (oneway).
 const IDEC_REQUEST_NEXT_VSYNC: u32 = 3;
 
-/// Size of one `DisplayEventReceiver::Event` on this ABI.
-///
-/// `Header` is `{u32 type; u64 displayId; i64 timestamp}` (24 bytes, both
-/// 64-bit fields 8-aligned), and the union's largest member is `VSync`:
-/// `{u32 count; VsyncEventData}` where `VsyncEventData` is
-/// `{i64 frameInterval; u32 preferredFrameTimelineIndex; FrameTimeline[7]}`
-/// with `FrameTimeline` = three `i64`s — 192 bytes. 24 + 192 = 216.
-const DISPLAY_EVENT_SIZE: usize = 216;
-/// `DisplayEventReceiver::DISPLAY_EVENT_VSYNC`.
-///
-/// Android 13 spells the event types as `fourcc(...)` tags, and `fourcc` packs
-/// them big-endian: `'v' << 24 | 's' << 16 | 'y' << 8 | 'n'`. The value was
-/// read out of `libgui`'s own comparison in `processPendingEvents`.
+/// Measured API-37 x86_64 DisplayEventReceiver::Event: a 24-byte header and
+/// 200-byte VSync union, including frameTimelinesLength/numberQueuedBuffers.
+const DISPLAY_EVENT_SIZE: usize = 224;
+/// DisplayEventReceiver::DISPLAY_EVENT_VSYNC, read from libgui's comparison in
+/// processPendingEvents (a big-endian fourcc, independent of host byte order).
 const DISPLAY_EVENT_VSYNC: u32 = 0x7673_796e;
+const VSYNC_FRAME_INTERVAL_NS: i64 = 16_666_666;
 
 /// `ILocaleManager` transaction codes.
 ///
@@ -851,50 +827,75 @@ static EMPTY_BUNDLE: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
 static SETTING_ENTRIES: std::sync::LazyLock<std::sync::Mutex<Vec<(String, Vec<u8>)>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
-/// `IThermalService` transaction codes, read out of the framework's own
-/// `android.os.IThermalService$Stub` static fields (`--dump-class`).
+/// API-37 IThermalService codes, unknown until installed from its Stub.
+static THERMAL_TRANSACTION_CODES: Mutex<Option<[u32; 11]>> = Mutex::new(None);
+
+/// Install IThermalService$Stub codes in this semantic order:
+/// registerThermalEventListener, registerThermalEventListenerWithType,
+/// unregisterThermalEventListener, getCurrentTemperatures,
+/// getCurrentTemperaturesWithType, registerThermalStatusListener,
+/// unregisterThermalStatusListener, getCurrentThermalStatus,
+/// getCurrentCoolingDevices, getCurrentCoolingDevicesWithType, getThermalHeadroom.
 ///
-/// `PowerManager.addThermalStatusListener` throws
-/// `RuntimeException("Listener failed to set")` when the boolean reply is
-/// false, and `ActivityNativeMain.onCreate` treats that as fatal: Roblox asks
-/// for a thermal listener unconditionally, so an empty reply (which reads back
-/// as false) kills the activity before it ever lays out.
-const ITHERMAL_REGISTER_THERMAL_EVENT_LISTENER: u32 = 1;
-const ITHERMAL_REGISTER_THERMAL_EVENT_LISTENER_WITH_TYPE: u32 = 2;
-const ITHERMAL_GET_CURRENT_TEMPERATURES: u32 = 4;
-const ITHERMAL_GET_CURRENT_TEMPERATURES_WITH_TYPE: u32 = 5;
-const ITHERMAL_REGISTER_THERMAL_STATUS_LISTENER: u32 = 6;
-const ITHERMAL_UNREGISTER_THERMAL_STATUS_LISTENER: u32 = 7;
-const ITHERMAL_GET_CURRENT_THERMAL_STATUS: u32 = 8;
-const ITHERMAL_GET_CURRENT_COOLING_DEVICES: u32 = 9;
-const ITHERMAL_GET_CURRENT_COOLING_DEVICES_WITH_TYPE: u32 = 10;
-const ITHERMAL_GET_THERMAL_HEADROOM: u32 = 11;
+/// `len` must be 11 u32 elements. All codes must be distinct and in
+/// 1..0x00ff_fffe. The table is copied and replaced as one unit. False preserves
+/// the previous table; no thermal method dispatches before installation.
+///
+/// # Safety
+/// For a non-null pointer and len == 11, `codes` must point to eleven aligned,
+/// readable u32s for this call. The pointer is not retained.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_thermal_transactions(
+    codes: *const u32,
+    len: usize,
+) -> bool {
+    if codes.is_null() || len != 11 { return false; }
+    let codes: [u32; 11] = std::slice::from_raw_parts(codes, len).try_into().unwrap();
+    if codes.iter().any(|&code| code == 0 || code >= 0x00ff_fffe)
+        || codes.iter().enumerate().any(|(i, code)| codes[..i].contains(code)) {
+        return false;
+    }
+    *THERMAL_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner()) = Some(codes);
+    true
+}
 
 /// `IDisplayManager` transaction code for `getDisplayInfo(int)`.
 const IDM_GET_DISPLAY_INFO: u32 = 1;
 
 /// Framework-marshalled virtual keyboard InputDevice, including its native map.
 static VIRTUAL_INPUT_DEVICE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+// Internal virtual_input::reply semantic IDs, never default wire codes.
 const INPUT_OPERATIONS: [u32; 8] = [1, 2, 3, 4, 5, 6, 7, 22];
-static INPUT_TRANSACTION_CODES: Mutex<[u32; 8]> = Mutex::new(INPUT_OPERATIONS);
+static INPUT_TRANSACTION_CODES: Mutex<Option<[u32; 8]>> = Mutex::new(None);
 
-/// `codes` points to the eight generated IInputManager constants in semantic order.
+/// Install IInputManager$Stub codes in getInputDevice, getInputDeviceIds,
+/// isInputDeviceEnabled, enableInputDevice, disableInputDevice, hasKeys,
+/// getKeyCodeForKeyLocation, registerInputDevicesChangedListener order.
+/// `len` must be 8 u32 elements. Only isInputDeviceEnabled may be zero (absent
+/// on API 37); zero never dispatches. Other codes must be distinct and in
+/// 1..0x00ff_fffe. False preserves the previous table; there is no default.
+///
+/// # Safety
+/// For a non-null pointer and len == 8, `codes` must point to eight aligned,
+/// readable u32s for this call. The contents are copied, not retained.
 #[no_mangle]
 pub unsafe extern "C" fn __pengudroid_binder_set_input_transactions(codes: *const u32, len: usize) -> bool {
     if codes.is_null() || len != 8 { return false; }
     let codes: [u32; 8] = std::slice::from_raw_parts(codes, len).try_into().unwrap();
     if codes.iter().enumerate().any(|(i, &c)| (c == 0 && i != 2) || c >= 0x00ff_fffe)
         || codes.iter().enumerate().any(|(i, c)| *c != 0 && codes[..i].contains(c)) { return false; }
-    *INPUT_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner()) = codes;
+    *INPUT_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner()) = Some(codes);
     true
 }
 
 
 static AUDIO_FOCUS: crate::audiofocus::AudioFocus = crate::audiofocus::AudioFocus::new();
-static AUDIO_FOCUS_TRANSACTIONS: Mutex<crate::audiofocus::Transactions> =
-    Mutex::new(crate::audiofocus::Transactions::LEGACY);
+static AUDIO_FOCUS_TRANSACTIONS: Mutex<Option<crate::audiofocus::Transactions>> =
+    Mutex::new(None);
 
-/// Install the loaded framework's generated Stub codes as one validated unit.
+/// Install request/abandon/unregister/current focus codes from the loaded Stub.
+/// All must be nonzero, distinct user codes; false preserves the previous table.
+/// Until installation, no focus operation dispatches.
 #[no_mangle]
 pub extern "C" fn __pengudroid_binder_set_audio_focus_transactions(
     request: u32, abandon: u32, unregister: u32, current: u32,
@@ -902,7 +903,7 @@ pub extern "C" fn __pengudroid_binder_set_audio_focus_transactions(
     let Some(table) = crate::audiofocus::Transactions::new([request, abandon, unregister, current]) else {
         return false;
     };
-    *AUDIO_FOCUS_TRANSACTIONS.lock().unwrap_or_else(|e| e.into_inner()) = table;
+    *AUDIO_FOCUS_TRANSACTIONS.lock().unwrap_or_else(|e| e.into_inner()) = Some(table);
     true
 }
 
@@ -1117,6 +1118,41 @@ fn push_transaction(out: &mut Vec<u8>, tr: &TransactionData) {
 struct Reply {
     parcel: Vec<u8>,
     objects: Vec<u64>,
+    flags: u32,
+}
+
+impl Reply {
+    fn unknown_transaction(tr: &TransactionData, reason: &str) -> Self {
+        unsafe {
+            diag(&format!(
+                "[binder] UNKNOWN_TRANSACTION target={} ({}) code={}: {reason}\n",
+                tr.target_handle,
+                name_for_handle(tr.target_handle).as_deref().unwrap_or("service_manager"),
+                tr.code,
+            ));
+        }
+        Self {
+            parcel: UNKNOWN_TRANSACTION.to_ne_bytes().to_vec(),
+            objects: Vec::new(),
+            flags: TF_STATUS_CODE,
+        }
+    }
+}
+
+/// Keep native replies byte-for-byte; a missing reply is not a software codec.
+fn codec2_dispatch_reply(tr: &TransactionData, reply: Option<(Vec<u8>, Vec<u64>)>) -> Reply {
+    let Some((parcel, objects)) = reply else {
+        return Reply::unknown_transaction(tr, "native Codec2 dispatch failed; no fabricated reply");
+    };
+    if trace_enabled() {
+        unsafe {
+            diag(&format!(
+                "[binder]   -> codec2 service code {} ({} bytes, {} objects)\n",
+                tr.code, parcel.len(), objects.len()
+            ));
+        }
+    }
+    Reply { parcel, objects, flags: 0 }
 }
 
 fn decode_utf16le(bytes: &[u8]) -> String {
@@ -1569,16 +1605,44 @@ fn input_channel_pair() -> Option<(RawFd, RawFd)> {
     Some((fds[0], fds[1]))
 }
 
+fn check_api37_sdk(sdk: Option<&str>) -> Result<(), String> {
+    if sdk != Some("37") {
+        return Err(format!(
+            "Android 17 / API 37 x86_64 required: ro.build.version.sdk must be 37, got {sdk:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn require_api37() -> Result<(), String> {
+    check_api37_sdk(crate::get_prop("ro.build.version.sdk").as_deref())
+}
+
+/// The measured API-37 event layout; only the preferred timeline is populated.
+fn vsync_event(vsync_time: i64, frame: u32) -> [u8; DISPLAY_EVENT_SIZE] {
+    let mut event = [0u8; DISPLAY_EVENT_SIZE];
+    event[0..4].copy_from_slice(&DISPLAY_EVENT_VSYNC.to_ne_bytes());
+    // displayId stays 0 (the hosted display).
+    event[16..24].copy_from_slice(&vsync_time.to_ne_bytes());
+    event[24..28].copy_from_slice(&frame.to_ne_bytes());
+    event[32..40].copy_from_slice(&VSYNC_FRAME_INTERVAL_NS.to_ne_bytes());
+    event[40..44].copy_from_slice(&0u32.to_ne_bytes()); // preferredFrameTimelineIndex
+    event[44..48].copy_from_slice(&1u32.to_ne_bytes()); // frameTimelinesLength
+    // numberQueuedBuffers and alignment precede FrameTimeline[7] at offset 56.
+    let expected = vsync_time + VSYNC_FRAME_INTERVAL_NS;
+    event[56..64].copy_from_slice(&(frame as i64).to_ne_bytes());
+    event[64..72].copy_from_slice(&expected.to_ne_bytes());
+    event[72..80].copy_from_slice(&expected.to_ne_bytes());
+    event
+}
+
 /// Deliver one vsync event on every open `BitTube`.
 ///
 /// The client's `DisplayEventReceiver::getEvents` does a `recv` on the socket
 /// and divides the byte count by `sizeof(Event)`, so each `send` has to be
 /// exactly one whole event.
-fn send_vsync() {
-    let modern = crate::get_prop("ro.build.version.sdk").as_deref() == Some("37");
-    let mut event = vec![0u8; if modern { 224 } else { DISPLAY_EVENT_SIZE }];
-    event[0..4].copy_from_slice(&DISPLAY_EVENT_VSYNC.to_ne_bytes());
-    // `displayId` stays 0 (the default display).
+fn send_vsync() -> Result<(), String> {
+    require_api37()?;
 
     // `Header.timestamp` is the *vsync* time: the moment the frame started. It
     // has to be on `CLOCK_MONOTONIC` — the clock `System.nanoTime()` reads — and
@@ -1591,7 +1655,6 @@ fn send_vsync() {
     //     generating vsync timestamps using the correct timebase.
     //
     // `CLOCK_MONOTONIC` is already monotonic, so reading it is all that is needed.
-    const FRAME_INTERVAL: i64 = 16_666_666;
     static FRAME: AtomicU32 = AtomicU32::new(0);
 
     let vsync_time = {
@@ -1610,38 +1673,16 @@ fn send_vsync() {
     {
         static LAST_SEND: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
         let previous = LAST_SEND.load(Ordering::Relaxed);
-        if previous != 0 && vsync_time - previous < FRAME_INTERVAL / 2 {
-            return;
+        if previous != 0 && vsync_time - previous < VSYNC_FRAME_INTERVAL_NS / 2 {
+            return Ok(());
         }
         LAST_SEND.store(vsync_time, Ordering::Relaxed);
     }
     let frame = FRAME.fetch_add(1, Ordering::Relaxed);
 
-    event[16..24].copy_from_slice(&vsync_time.to_ne_bytes());
-    // `vsync.count` is the frame number; a monotonically increasing counter is
-    // what `Choreographer` expects.
-    event[24..28].copy_from_slice(&frame.to_ne_bytes());
-
-    // `VsyncEventData`: `{frameInterval, preferredFrameTimelineIndex, timelines[7]}`
-    // where a timeline is `{vsyncId, expectedPresentationTime, deadline}`.
-    // Leaving the timelines zeroed is what makes `Choreographer` treat every
-    // frame as already late, so the first entry is filled in and marked
-    // preferred.
-    const TIMELINES_OFFSET: usize = 48;
-    const TIMELINE_SIZE: usize = 24;
-    event[32..40].copy_from_slice(&FRAME_INTERVAL.to_ne_bytes());
-    event[40..44].copy_from_slice(&0u32.to_ne_bytes()); // preferredFrameTimelineIndex
-    let vsync_id = frame as i64;
-    let expected = vsync_time + FRAME_INTERVAL;
-    let base = if modern {
-        event[44..48].copy_from_slice(&1u32.to_ne_bytes()); // frameTimelinesLength
-        56 // numberQueuedBuffers and alignment precede the timeline array
-    } else { TIMELINES_OFFSET };
-    event[base..base + 8].copy_from_slice(&vsync_id.to_ne_bytes());
-    event[base + 8..base + 16].copy_from_slice(&expected.to_ne_bytes());
-    event[base + 16..base + 24].copy_from_slice(&expected.to_ne_bytes());
-    // The remaining six entries stay zeroed; `preferredFrameTimelineIndex` is 0.
-    let _ = TIMELINE_SIZE;
+    // Real timestamps and a populated preferred timeline keep Choreographer
+    // from treating every frame as late or in the future.
+    let event = vsync_event(vsync_time, frame);
 
     let fds = VSYNC_SEND_FDS.lock().unwrap_or_else(|e| e.into_inner());
     let mut dropped = 0usize;
@@ -1670,6 +1711,7 @@ fn send_vsync() {
             ))
         };
     }
+    Ok(())
 }
 
 /// Start the 60 Hz frame clock, once per process.
@@ -1688,7 +1730,10 @@ fn start_frame_clock() {
                 .unwrap_or_else(|e| e.into_inner())
                 .is_empty()
             {
-                send_vsync();
+                if let Err(error) = send_vsync() {
+                    unsafe { diag(&format!("[binder] frame clock stopped: {error}\n")) };
+                    break;
+                }
             }
         });
     });
@@ -1749,17 +1794,7 @@ fn parcel_contains_string16(data: &[u8], value: &str) -> bool {
     })
 }
 
-/// Reverse lookup of a handle, for diagnostics.
-/// Whether `handle` is the media metrics service, under either of the two
-/// names it is known by (`media.metrics` is the servicemanager name,
-/// `media_metrics` the one clients request through `Context`).
-fn is_media_metrics_handle(handle: u32) -> bool {
-    matches!(
-        name_for_handle(handle).as_deref(),
-        Some("media.metrics") | Some("media_metrics")
-    )
-}
-
+/// Reverse lookup of a handle, for diagnostics and service aliases.
 fn name_for_handle(handle: u32) -> Option<String> {
     let map = SERVICE_HANDLES.lock().unwrap_or_else(|e| e.into_inner());
     map.iter().find(|(_, h)| **h == handle).map(|(n, _)| n.clone())
@@ -1812,9 +1847,9 @@ fn string16_candidates(data: &[u8]) -> Vec<(usize, String)> {
 /// Component name carried by a `startService`/`bindService` request.
 ///
 /// Uses the first plausible package-like string followed by a class-like string
-/// that lives under it. An `Intent` writes `package` right before its
-/// `ComponentName`, so this pair identifies the target service. The package's
-/// offset is returned too: the `Intent` is unmarshalled from that point.
+/// that lives under it. API-37 Intent writes its ComponentName after the seven
+/// prefix fields, with the component's package as a String16. Its offset is
+/// returned so intent_start can walk back to the Intent for unmarshalling.
 fn service_component(data: &[u8]) -> Option<(String, String, usize)> {
     let candidates = string16_candidates(data);
     for (i, (offset, package)) in candidates.iter().enumerate() {
@@ -1870,10 +1905,9 @@ fn string16_start_ending_at(data: &[u8], end: usize) -> Option<usize> {
 
 /// Find the `string8` that ends exactly at `end`, returning its start.
 ///
-/// Android 13's `Intent.writeToParcel` writes its strings with `writeString8`
-/// (`[u32 len including NUL][bytes][pad to 4]`), and a null is either `-1` or
-/// `0` depending on the field. All writes are 4-byte aligned, so stepping back
-/// in 4-byte steps finds the length word.
+/// Walk the API-37 Intent's String8 and nullable Uri fields backwards. Null
+/// strings use -1 and a null Uri uses 0. All field boundaries are 4-byte aligned,
+/// so stepping back in 4-byte steps locates the length word.
 fn string8_start_ending_at(data: &[u8], end: usize) -> Option<usize> {
     if end < 4 || end > data.len() {
         return None;
@@ -1908,16 +1942,15 @@ fn string8_start_ending_at(data: &[u8], end: usize) -> Option<usize> {
 /// Offset of the `Intent` that contains the component package at
 /// `package_offset`.
 ///
-/// `Intent.writeToParcel` writes, in order: `action` (string8), `data` (`Uri`,
-/// either a string8 or an int `0`), `type` (string8), `identifier` (string8),
-/// `flags` (int), `extendedFlags` (int, added after Android 13), `package`
-/// (string8), then the `ComponentName` as two `string16`s. The package this
+/// API-37 Intent.writeToParcel writes seven prefix fields: `action` (string8),
+/// `data` (nullable Uri), `type` (string8), `identifier` (string8), `flags` (int),
+/// `extendedFlags` (int), and `package` (string8), then the ComponentName as two
+/// String16s. The package this
 /// function is given is the second of those (the component's), so walking back
 /// over the seven fields before it lands on `action` — the first byte of the
 /// `Intent`, and therefore the offset `Parcel.unmarshall` wants.
 ///
-/// The service host also tries four bytes later for the legacy layout without
-/// `extendedFlags`, retaining the API-33 regression fixture.
+/// Only this API-37 layout is accepted; no older Intent layout is retried.
 fn intent_start(data: &[u8], package_offset: usize) -> Option<usize> {
     let package = string8_start_ending_at(data, package_offset)?;
     let extended_flags = package.checked_sub(4)?;
@@ -1936,137 +1969,18 @@ fn intent_start(data: &[u8], package_offset: usize) -> Option<usize> {
 /// libbinder prefixes the token with a 12-byte header (`[u32][i32 -1]["TSYS"]`)
 /// before the `String16`, so the string does not start at offset 0.
 fn first_string16(data: &[u8]) -> Option<String> {
-    for start in [12usize, 0] {
-        if data.len() < start + 8 {
-            continue;
-        }
-        let len = u32::from_ne_bytes([
-            data[start],
-            data[start + 1],
-            data[start + 2],
-            data[start + 3],
-        ]) as usize;
-        if len == 0 || len > 512 || start + 4 + len * 2 > data.len() {
-            continue;
-        }
-        let text = decode_utf16le(&data[start + 4..start + 4 + len * 2]);
-        if text.chars().all(|c| c.is_ascii_graphic() || c == '.' || c == '/') {
-            return Some(text);
-        }
-    }
-    None
+    if data.get(8..12)? != b"TSYS" { return None; }
+    let len = u32::from_ne_bytes(data.get(12..16)?.try_into().ok()?) as usize;
+    if len == 0 || len > 512 { return None; }
+    let end = 16 + len * 2;
+    if data.get(end..end + 2)? != [0, 0] { return None; }
+    Some(decode_utf16le(data.get(16..end)?))
 }
 
-/// Whether a request was addressed to the legacy `android.ui.ISurfaceComposer`.
-///
-/// The same handle and the same code number can belong to either interface: the
-/// AIDL proxy writes `android.gui.ISurfaceComposer` as its token and the legacy
-/// one writes `android.ui.ISurfaceComposer`. Only the token tells them apart,
-/// and only the AIDL replies start with a `Status` word.
-fn is_legacy_surface_composer(data: &[u8]) -> bool {
-    matches!(first_string16(data).as_deref(), Some(t) if t.contains("android.ui.ISurfaceComposer"))
-}
-
-/// Build a flattened `ui::DynamicDisplayInfo` by asking libui to serialise a
-/// zeroed instance.
-///
-/// Hand-writing the blob is error-prone (it is a chain of nested vectors and
-/// optionals), but the library exports both `getFlattenedSize` and `flatten`, so
-/// a zeroed instance round-trips into a blob that `unflatten` accepts.
-fn dynamic_display_info_blob() -> Option<Vec<u8>> {
-    let handle = unsafe { libc::dlopen(c"libui.so".as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
-    if handle.is_null() {
-        return None;
-    }
-    let size_fn = unsafe {
-        libc::dlsym(
-            handle,
-            c"_ZNK7android2ui18DynamicDisplayInfo16getFlattenedSizeEv".as_ptr(),
-        )
-    };
-    let flatten_fn = unsafe {
-        libc::dlsym(handle, c"_ZNK7android2ui18DynamicDisplayInfo7flattenEPvm".as_ptr())
-    };
-    if size_fn.is_null() || flatten_fn.is_null() {
-        return None;
-    }
-    // Generous, zeroed storage for the struct itself.
-    let mut instance = vec![0u8; 1024];
-    // `ADisplay_acquirePhysicalDisplays` rejects a display whose
-    // `supportedDisplayModes` vector is empty (-ENODEV), so give it one mode.
-    // `sizeof(ui::DisplayMode)` is 0x38 (from `vector::__push_back_slow_path`).
-    let mut mode = vec![0u8; 0x38];
-    mode[0..4].copy_from_slice(&1u32.to_ne_bytes()); // id
-    mode[4..12].copy_from_slice(&16_666_666u64.to_ne_bytes()); // vsync period (ns)
-    mode[0x0c..0x10].copy_from_slice(&1280u32.to_ne_bytes()); // width
-    mode[0x10..0x14].copy_from_slice(&720u32.to_ne_bytes()); // height
-    mode[0x14..0x18].copy_from_slice(&60.0f32.to_ne_bytes()); // refresh rate
-    let mode_addr = mode.as_ptr() as u64;
-    instance[0..8].copy_from_slice(&mode_addr.to_ne_bytes());
-    instance[8..16].copy_from_slice(&(mode_addr + 0x38).to_ne_bytes());
-    instance[16..24].copy_from_slice(&(mode_addr + 0x38).to_ne_bytes());
-    // `activeDisplayModeId` sits at offset 0x18 in the struct.
-    instance[0x18..0x1c].copy_from_slice(&1u32.to_ne_bytes());
-    // `supportedColorModes` is the vector at offset 0x20; an empty one leaves
-    // hwui with pixel format 0 ("Unreachable: unsupported pixel format: 0").
-    // `ui::ColorMode::SRGB` is 1.
-    let mut color_mode = vec![0u8; 4];
-    color_mode[0..4].copy_from_slice(&1i32.to_ne_bytes());
-    let cm_addr = color_mode.as_ptr() as u64;
-    instance[0x20..0x28].copy_from_slice(&cm_addr.to_ne_bytes());
-    instance[0x28..0x30].copy_from_slice(&(cm_addr + 4).to_ne_bytes());
-    instance[0x30..0x38].copy_from_slice(&(cm_addr + 4).to_ne_bytes());
-    type SizeFn = unsafe extern "C" fn(*const u8) -> usize;
-    type FlattenFn = unsafe extern "C" fn(*const u8, *mut u8, usize) -> i32;
-    let size_of: SizeFn = unsafe { std::mem::transmute(size_fn) };
-    let flatten: FlattenFn = unsafe { std::mem::transmute(flatten_fn) };
-    let size = unsafe { size_of(instance.as_ptr()) };
-    if size == 0 || size > 4096 {
-        return None;
-    }
-    let mut blob = vec![0u8; size];
-    let rc = unsafe { flatten(instance.as_ptr(), blob.as_mut_ptr(), size) };
-    if rc != 0 {
-        return None;
-    }
-    Some(blob)
-}
-
-/// Whether a reply starts with an AIDL `Status` word.
-///
-/// Almost every interface here is AIDL, whose generated proxy reads the status
-/// before anything else. `ISurfaceComposer` is the exception: it is a
-/// hand-written binder interface, and the methods that return a binder read it
-/// straight from offset 0. Writing a status word there shifts every object by
-/// four bytes, `Parcel::finishUnflattenBinder` cannot find the object in the
-/// offset table, and `readStrongBinder` returns null.
+/// Whether a reply starts with an AIDL `Status` word. SurfaceComposer and its
+/// client are API-37 generated AIDL; neither has a handwritten reply variant.
 fn reply_has_status(handle: u32, code: u32) -> bool {
-    if is_surface_flinger(handle) {
-        // Two different interfaces share the name: the legacy hand-written
-        // `android.ui.ISurfaceComposer` (asked for as "SurfaceFlinger") and the
-        // AIDL `android.gui.ISurfaceComposer` (asked for as
-        // "SurfaceFlingerAIDL"). Only the AIDL one starts its replies with a
-        // `Status` word; for the legacy one a status word shifts every field by
-        // four bytes, so `readInt64Vector` reads the status (0) as the element
-        // count and every reply looks empty.
-        let aidl = matches!(name_for_handle(handle).as_deref(), Some("SurfaceFlingerAIDL"));
-        if !aidl {
-            return false;
-        }
-        // `createConnection` and `createDisplayEventConnection` are legacy
-        // methods that also end in `reply.readStrongBinder()` with no status.
-        return !matches!(
-            code,
-            ISC_CREATE_CONNECTION | ISC_CREATE_DISPLAY_EVENT_CONNECTION
-        );
-    }
-    if handle == handle_for("surface_composer_client") {
-        // Android 17's `android.gui.ISurfaceComposerClient` is generated AIDL, so
-        // its replies start with a `binder::Status`, exactly like every other
-        // AIDL interface. (The pre-17 hand-written interface read its outs first
-        // and its status last, which is where the old exception came from.)
-        return true;
-    }
+
     if handle == handle_for("media.resource_manager") && code == INTERFACE_TRANSACTION {
         // `BpBinder::getInterfaceDescriptor` (`libbinder.so` `0x5ef60`) calls
         // `transact` and then `Parcel::readString16()` straight away, with no
@@ -2129,48 +2043,48 @@ fn push_dynamic_display_info(parcel: &mut Vec<u8>) {
 
 /// Build the reply parcel for a transaction.
 ///
-/// Every reply starts with the AIDL status word (`0` = no exception); a
-/// `getService`/`checkService` call on the service manager additionally gets a
-/// `flat_binder_object` describing the handle the broker assigned to the name.
-/// Other calls succeed with no result, which is enough for void methods.
+/// AIDL replies start with a status word; unavailable contracts in the
+/// SurfaceComposer, display-event, service-manager, Codec2, media, focus, user,
+/// thermal and input paths return a transport UNKNOWN_TRANSACTION instead of an
+/// empty success parcel.
 unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
+    if tr.code == 0 {
+        return Reply::unknown_transaction(tr, "zero is not a Binder transaction code");
+    }
     let mut parcel = Vec::new();
     let mut objects = Vec::new();
-    // API-37 android.gui.ISurfaceComposer is generated AIDL. Its method
-    // numbers and status prefix differ from the legacy android.ui interface,
-    // even when both are accessed through the same service alias.
-    if is_surface_flinger(tr.target_handle) && crate::get_prop("ro.build.version.sdk").as_deref() == Some("37")
-        && tr.data_size > 0 && tr.data_ptr != 0 {
-        let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
-        if parcel_contains_string16(data, "android.gui.ISurfaceComposer")
-            && matches!(tr.code, 2 | 3 | 6 | 7 | 12 | 13 | 34 | 69)
-        {
-            parcel.extend_from_slice(&0u32.to_ne_bytes()); // AIDL Status
-            match tr.code {
-                2 => push_flat_handle(&mut parcel, &mut objects, handle_for("display_event_connection")),
-                3 => push_flat_handle(&mut parcel, &mut objects, handle_for("surface_composer_client")),
-                6 => { // one hosted display
-                    parcel.extend_from_slice(&1i32.to_ne_bytes());
-                    parcel.extend_from_slice(&0i64.to_ne_bytes());
-                }
-                7 => push_flat_handle(&mut parcel, &mut objects, handle_for("display_token")),
-                12 => push_static_display_info(&mut parcel),
-                13 => push_dynamic_display_info(&mut parcel),
-                34 => push_sized_parcelable(&mut parcel, |parcel| {
-                    for value in [0i32, 1, 0, 1] {
-                        parcel.extend_from_slice(&value.to_ne_bytes());
-                    }
-                }),
-                // `int getMaxAcquiredBufferCount()` — transaction 0x45, measured from
-                // `BpSurfaceComposer::getMaxAcquiredBufferCount` in libgui.so.
-                // `BLASTBufferQueue::initialize()` uses it to size its consumer; a
-                // missing reply leaves the count at 0 and the queue logs
-                // "setMaxAcquiredBufferCount: invalid count 0".
-                69 => parcel.extend_from_slice(&2i32.to_ne_bytes()),
-                _ => unreachable!(),
-            }
-            return Reply { parcel, objects };
+    if is_surface_flinger(tr.target_handle) {
+        if let Err(error) = require_api37() {
+            return Reply::unknown_transaction(tr, &error);
         }
+        let data = if tr.data_size > 0 && tr.data_ptr != 0 {
+            std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize)
+        } else { &[] };
+        if first_string16(data).as_deref() != Some("android.gui.ISurfaceComposer") {
+            return Reply::unknown_transaction(tr, "API-37 android.gui.ISurfaceComposer token required");
+        }
+        parcel.extend_from_slice(&0u32.to_ne_bytes()); // AIDL Status
+        match tr.code {
+            ISC_CREATE_DISPLAY_EVENT_CONNECTION => push_flat_handle(&mut parcel, &mut objects, handle_for("display_event_connection")),
+            ISC_CREATE_CONNECTION => push_flat_handle(&mut parcel, &mut objects, handle_for("surface_composer_client")),
+            ISC_GET_PHYSICAL_DISPLAY_IDS => { // one hosted display
+                parcel.extend_from_slice(&1i32.to_ne_bytes());
+                parcel.extend_from_slice(&0i64.to_ne_bytes());
+            }
+            ISC_GET_PHYSICAL_DISPLAY_TOKEN => push_flat_handle(&mut parcel, &mut objects, handle_for("display_token")),
+            ISC_GET_STATIC_DISPLAY_INFO => push_static_display_info(&mut parcel),
+            ISC_GET_DYNAMIC_DISPLAY_INFO => push_dynamic_display_info(&mut parcel),
+            ISC_GET_COMPOSITION_PREFERENCE => push_sized_parcelable(&mut parcel, |parcel| {
+                for value in [0i32, 1, 0, 1] {
+                    parcel.extend_from_slice(&value.to_ne_bytes());
+                }
+            }),
+            // Measured BpSurfaceComposer::getMaxAcquiredBufferCount in libgui.
+            // BLASTBufferQueue::initialize requires a nonzero consumer count.
+            ISC_GET_MAX_ACQUIRED_BUFFER_COUNT => parcel.extend_from_slice(&2i32.to_ne_bytes()),
+            _ => return Reply::unknown_transaction(tr, "unimplemented API-37 ISurfaceComposer method"),
+        }
+        return Reply { parcel, objects, flags: 0 };
     }
     if trace_enabled() {
         let name = name_for_handle(tr.target_handle).unwrap_or_else(|| "?".to_string());
@@ -2202,132 +2116,26 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             }
         }
     }
-    if trace_enabled() && is_surface_flinger(tr.target_handle) && tr.data_size > 0 && tr.data_ptr != 0 {
-        let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
-        let token = first_string16(data).unwrap_or_else(|| "?".into());
-        let has_binder = data
-            .windows(4)
-            .any(|w| u32::from_ne_bytes([w[0], w[1], w[2], w[3]]) == BINDER_TYPE_HANDLE);
-        diag(&format!(
-            "[binder]   SF code={} token={token} binder={has_binder}\n",
-            tr.code
-        ));
-    }
-    if is_surface_flinger(tr.target_handle) && tr.code == ISC_GET_COMPOSITION_PREFERENCE {
-        // Legacy `getCompositionPreference`: `[status][dataspace][format][renderIntent]`.
-        // hwui's `DeviceInfo::updateDisplayInfo` asserts "Unreachable: unsupported
-        // pixel format" unless the format is 1 (RGBA_8888) or 0x16.
-        parcel.extend_from_slice(&0i32.to_ne_bytes()); // status
-        // The client reads five int32s. `ADisplay_acquirePhysicalDisplays` copies
-        // the third payload into `ADisplay+0x0c` (dataspace) and the fourth into
-        // `ADisplay+0x10` (the pixel format that
-        // `ADisplay_getPreferredWideColorFormat` reports), so the fourth carries
-        // RGBA_8888.
-        parcel.extend_from_slice(&0i32.to_ne_bytes()); // 1st payload
-        parcel.extend_from_slice(&1i32.to_ne_bytes()); // 2nd payload
-        parcel.extend_from_slice(&0i32.to_ne_bytes()); // 3rd payload -> dataspace
-        parcel.extend_from_slice(&1i32.to_ne_bytes()); // 4th payload -> format RGBA_8888
-        if trace_enabled() {
-            diag("[binder]   -> getCompositionPreference (RGBA_8888)\n");
-        }
-    }
-    if is_surface_flinger(tr.target_handle) && tr.code == ISC_GET_DYNAMIC_DISPLAY_INFO {
-        // Legacy `getDynamicDisplayInfo`: `[int32 status][int32 size][blob]`.
-        // `ADisplay_acquirePhysicalDisplays` returns -ENODATA when this fails,
-        // which leaves hwui with no display at all.
-        match dynamic_display_info_blob() {
-            Some(blob) => {
-                parcel.extend_from_slice(&0i32.to_ne_bytes());
-                parcel.extend_from_slice(&(blob.len() as i32).to_ne_bytes());
-                parcel.extend_from_slice(&blob);
-                if trace_enabled() {
-                    diag(&format!("[binder]   -> getDynamicDisplayInfo ({} bytes)\n", blob.len()));
-                }
-            }
-            None => {
-                diag("[binder]   getDynamicDisplayInfo: libui flatten unavailable\n");
-            }
-        }
-    }
-    if is_surface_flinger(tr.target_handle) && tr.code == ISC_GET_PHYSICAL_DISPLAY_IDS {
-        let legacy = tr.data_size > 0
-            && tr.data_ptr != 0
-            && is_legacy_surface_composer(std::slice::from_raw_parts(
-                tr.data_ptr as *const u8,
-                tr.data_size as usize,
-            ));
-        if legacy {
-            // Legacy `android.ui.ISurfaceComposer.getStaticDisplayInfo`:
-            // `[int32 status][flattened ui::StaticDisplayInfo]`. The flattened
-            // form, read out of `StaticDisplayInfo::unflatten` and
-            // `DeviceProductInfo::unflatten`, is
-            //   [4B connected][4B density][1B secure]
-            //   [u64 nameLen][name][u32 year][u64 modelLen][model][u64][u32]
-            //   [4B]
-            // `ADisplay_acquirePhysicalDisplays` drops a display whose static
-            // info cannot be read, and hwui then indexes `displays[0]` of an
-            // empty array.
-            parcel.extend_from_slice(&0i32.to_ne_bytes()); // status
-            // The client reads `status`, then the flattened *size*, then the blob
-            // (`readInt32`, `readInt32`, `readInplace(size)`, `unflatten`).
-            let mut blob: Vec<u8> = Vec::new();
-            blob.extend_from_slice(&1i32.to_ne_bytes()); // connected
-            blob.extend_from_slice(&420.0f32.to_ne_bytes()); // density
-            blob.push(0); // secure
-            blob.extend_from_slice(&0u64.to_ne_bytes()); // product name length
-            blob.extend_from_slice(&0u32.to_ne_bytes()); // manufacture year
-            blob.extend_from_slice(&0u64.to_ne_bytes()); // model length
-            blob.extend_from_slice(&0u64.to_ne_bytes());
-            blob.extend_from_slice(&0u32.to_ne_bytes());
-            blob.extend_from_slice(&0u32.to_ne_bytes()); // trailing field
-            parcel.extend_from_slice(&(blob.len() as i32).to_ne_bytes());
-            parcel.extend_from_slice(&blob);
-            if trace_enabled() {
-                diag("[binder]   -> legacy getStaticDisplayInfo (connected, 420 dpi)\n");
-            }
-        } else {
-            // AIDL `long[] getPhysicalDisplayIds()`: `[int32 count][int64 id...]`.
-            parcel.extend_from_slice(&1i32.to_ne_bytes());
-            parcel.extend_from_slice(&0i64.to_ne_bytes());
-            if trace_enabled() {
-                diag("[binder]   -> getPhysicalDisplayIds = [0]\n");
-            }
-        }
-    }
-    if is_surface_flinger(tr.target_handle) && tr.code == ISC_GET_PHYSICAL_DISPLAY_TOKEN {
-        // AIDL `IBinder getPhysicalDisplayToken(long id)`: `[status][strongBinder]`.
-        // `ADisplay_acquirePhysicalDisplays` skips a display whose token is null,
-        // and hwui's `DeviceInfo::updateDisplayInfo` then indexes `displays[0]`
-        // of an empty array and faults.
-        push_flat_handle(&mut parcel, &mut objects, handle_for("display_token"));
-        if trace_enabled() {
-            diag("[binder]   -> display_token handle\n");
-        }
-    }
+
     if tr.target_handle == 0 && !is_hidl_request(tr) {
         let codes = *SERVICE_MANAGER_CODES.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(metadata) = service_manager_shape(codes, tr.code) {
-            if tr.data_size > 0 && tr.data_ptr != 0 {
-                let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
-                if let Some(name) = last_string16(data) {
-                    let handle = (name != "autofill").then(|| handle_for(&name));
-                    push_service_reply(&mut parcel, &mut objects, handle, metadata);
-                }
-            }
-        }
+        let Some(metadata) = service_manager_shape(codes, tr.code) else {
+            return Reply::unknown_transaction(tr, "IServiceManager codes not installed or method unsupported");
+        };
+        let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
+        let Some(name) = last_string16(data) else {
+            return Reply::unknown_transaction(tr, "IServiceManager request has no service name");
+        };
+        let handle = (name != "autofill").then(|| handle_for(&name));
+        push_service_reply(&mut parcel, &mut objects, handle, metadata);
     }
     if tr.target_handle == handle_for("codec2") {
-        // The real codec2 service objects are hosted in this process (see
-        // `codec2.rs`), so the generated HIDL code does the marshalling for us.
-        // The stub replies below are only the fallback for when the service
-        // libraries cannot be loaded.
-        //
-        // `IBase` methods (codes above `0x0F000000`) are answered by the stub:
-        // `interfaceChain` writes its reply synchronously, so the `hidl_vec` it
-        // points at is a dead local by the time `onTransact` returns. The
-        // methods that matter (`createComponent`, `listComponents`) hand the
-        // reply to the callback instead, which is where `codec2.rs` captures it.
-        if tr.data_ptr != 0 && tr.code < 0x0F00_0000 {
+        if !crate::codec2::available() {
+            return Reply::unknown_transaction(tr, "native Codec2 component store unavailable; no placeholder service");
+        }
+        // Only the real backend may list codecs or create components. Its
+        // captured reply owns the native service's marshalling contract.
+        if tr.data_size > 0 && tr.data_ptr != 0 && tr.code < 0x0F00_0000 {
             let data = std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize);
             let offsets: Vec<u64> = if tr.offsets_ptr != 0 && tr.offsets_size > 0 {
                 std::slice::from_raw_parts(
@@ -2338,24 +2146,11 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             } else {
                 Vec::new()
             };
-            if let Some((bytes, offs)) = crate::codec2::dispatch(tr.code, data, &offsets) {
-                if trace_enabled() {
-                    diag(&format!(
-                        "[binder]   -> codec2 service code {} ({} bytes, {} objects)\n",
-                        tr.code,
-                        bytes.len(),
-                        offs.len()
-                    ));
-                }
-                return Reply {
-                    parcel: bytes,
-                    objects: offs,
-                };
-            }
+            return codec2_dispatch_reply(tr, crate::codec2::dispatch(tr.code, data, &offsets));
         }
-        // The first call on a HIDL proxy is `interfaceChain`; the client uses it
-        // to decide whether the proxy really implements the interface it asked
-        // for. Its code is a hash, not a small ordinal.
+        // Preserve the existing versioned base-interface chain only for a real
+        // store. Forwarding its synchronous native reply would leave borrowed
+        // hidl_vec storage dangling after onTransact returns.
         if tr.code == 0x0F43_484E {
             let chain = [
                 "android.hardware.media.c2@1.0::IComponentStore",
@@ -2363,90 +2158,19 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                 "android.hidl.base@1.0::IBase",
             ];
             push_hidl_string_vec(&mut parcel, &mut objects, &chain);
-        } else if tr.code == 3 {
-            // `IComponentStore::listComponents()` -> `vec<ComponentTraits>`.
-            // Measured from writeEmbeddedToParcel(ComponentTraits) (0x5de70):
-            // name @0x00, mediaType @0x10, domain/kind/rank @0x20, the aliases
-            // vector @0x30 and a third string @0x40 (80 bytes total).
-            let (name_ptr, name_len) = leak_cstr("c2.android.avc.decoder");
-            let (mt_ptr, mt_len) = leak_cstr("video/avc");
-            let mut info = Vec::with_capacity(64);
-            info.extend_from_slice(&name_ptr.to_ne_bytes());
-            info.extend_from_slice(&(name_len - 1).to_ne_bytes());
-            info.extend_from_slice(&1u32.to_ne_bytes()); // Domain::VIDEO
-            info.extend_from_slice(&0u32.to_ne_bytes()); // Kind::DECODER
-            info.extend_from_slice(&0u32.to_ne_bytes()); // rank
-            info.extend_from_slice(&0u32.to_ne_bytes()); // padding
-            info.extend_from_slice(&mt_ptr.to_ne_bytes());
-            info.extend_from_slice(&(mt_len - 1).to_ne_bytes());
-            let (al_ptr, al_len) = leak_cstr("OMX.google.h264.decoder");
-            let mut alias_arr = Vec::with_capacity(16);
-            alias_arr.extend_from_slice(&al_ptr.to_ne_bytes());
-            alias_arr.extend_from_slice(&(al_len - 1).to_ne_bytes());
-            let alias_arr: &'static [u8] = Box::leak(alias_arr.into_boxed_slice());
-            info.extend_from_slice(&(alias_arr.as_ptr() as u64).to_ne_bytes()); // aliases.mData
-            info.extend_from_slice(&1u64.to_ne_bytes()); // aliases.mSize
-            let info: &'static [u8] = Box::leak(info.into_boxed_slice());
-
-            let mut vec = Vec::with_capacity(16);
-            vec.extend_from_slice(&(info.as_ptr() as u64).to_ne_bytes());
-            vec.extend_from_slice(&1u32.to_ne_bytes());
-            vec.extend_from_slice(&0u32.to_ne_bytes());
-            let vec: &'static [u8] = Box::leak(vec.into_boxed_slice());
-
-            // `listComponents() generates (Status, vec<ComponentTraits>)`.
-            // The reply is `[hidl status][codec2 status][vec struct][elements]`:
-            // the client reads the HIDL `Status`, then a second int32 that is
-            // the codec2 `V1_0::Status` handed to the callback (measured: a
-            // non-zero value here makes `Codec2Client::_listComponents` log
-            // "call failed: BAD_STATE"), then the 16-byte vec struct and the
-            // element array. The element count comes from the vec struct, not
-            // from this word.
-            parcel.extend_from_slice(&0i32.to_ne_bytes()); // codec2 Status::OK
-            let vec_idx =
-                push_buffer_object(&mut parcel, &mut objects, 0, vec.as_ptr() as u64, 16, 0, 0);
-            let arr_idx =
-                push_buffer_object(&mut parcel, &mut objects, 1, info.as_ptr() as u64, 64, vec_idx, 0);
-            push_buffer_object(&mut parcel, &mut objects, 1, name_ptr, name_len, arr_idx, 0);
-            push_buffer_object(&mut parcel, &mut objects, 1, mt_ptr, mt_len, arr_idx, 32);
-            // The parent check compares `*(u64*)(parentBuffer + parentOffset)`
-            // with the child's buffer, so the aliases vector's buffer is its
-            // data pointer, not the address of the struct field.
-            // `readNullableEmbeddedBuffer(size*16, &handle, i*64, i*64+0x30)`
-            // reads the element array itself, so there is no separate object
-            // for the vector struct.
-            let alias_arr_idx = push_buffer_object(
-                &mut parcel,
-                &mut objects,
-                1,
-                alias_arr.as_ptr() as u64,
-                16,
-                arr_idx,
-                0x30,
-            );
-            push_buffer_object(&mut parcel, &mut objects, 1, al_ptr, al_len, alias_arr_idx, 0);
-        } else if tr.code == 1 {
-            // `createComponent(hidl_string name, sp<IComponentListener>,
-            // sp<IClientManager>) generates (Status, sp<IComponent>)`. The
-            // client reads the status and then the binder, so the object sits
-            // at offset 4 (measured: "read object ... at offset 4").
-            push_flat_handle(&mut parcel, &mut objects, handle_for("codec2_component"));
         } else {
-            // `getConfigurable`, `getPoolClientManager` and `createInterface`
-            // all return a binder; handing back the store's own handle keeps
-            // the client's `static_cast<sp<...>>` from dereferencing a null.
-            // `createInterface` is code 2 and the client's `mDataPos` is 8 when
-            // it reads the object, so that reply carries a padding word.
-            if tr.code == 2 {
-                parcel.extend_from_slice(&0u32.to_ne_bytes());
-            }
-            push_flat_handle(&mut parcel, &mut objects, handle_for("codec2"));
-        }
-        if trace_enabled() {
-            diag(&format!("[binder]   -> codec2 call code {}\n", tr.code));
+            return Reply::unknown_transaction(tr, "native Codec2 dispatch unavailable or method unsupported; no fabricated reply");
         }
     }
     if tr.target_handle == 0 && is_hidl_request(tr) {
+        if matches!(tr.code, 1 | 3 | 5 | 13) { // get/getTransport/listManifestByInterface
+            let Some(fq) = hidl_arg_string(tr, 0) else {
+                return Reply::unknown_transaction(tr, "HIDL service discovery requires an interface name");
+            };
+            if (fq.contains("media.c2") || fq.contains("ICodec2")) && !crate::codec2::available() {
+                return Reply::unknown_transaction(tr, "native Codec2 component store unavailable; no instance advertised");
+            }
+        }
         unsafe { hidl_service_manager_reply(tr.code, &mut parcel, &mut objects, tr) };
     }
     if tr.target_handle == handle_for("activity_task") && tr.code == APPLICATION_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner())[0] {
@@ -2568,9 +2292,9 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
     if tr.target_handle == handle_for("activity") && tr.code == APPLICATION_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner())[1] {
         let info = PROVIDER_INFO.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if !info.is_empty() {
-            // `ContentProviderHolder` layout, measured by marshalling one with
-            // null binders: [ProviderInfo][provider][connection][int][int].
-            // `readTypedObject` supplies the presence int, so it goes first.
+            // API-37 ContentProviderHolder.writeToParcel (frameworks/base 94b4c16):
+            // ProviderInfo, provider/connection binders, then three int flags.
+            // readTypedObject supplies the presence int before the holder.
             parcel.extend_from_slice(&1u32.to_ne_bytes());
             parcel.extend_from_slice(&info);
             let handle = handle_for("settings_provider");
@@ -2578,74 +2302,42 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             push_flat_handle(&mut parcel, &mut objects, handle);
             parcel.extend_from_slice(&0u32.to_ne_bytes()); // noReleaseNeeded
             parcel.extend_from_slice(&0u32.to_ne_bytes()); // mLocal
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // noReleaseNeededIfUnstable
             if trace_enabled() {
                 diag(&format!("[binder]   -> ContentProviderHolder ({} bytes)\n", info.len()));
             }
         }
     }
-    if is_media_metrics_handle(tr.target_handle) && tr.code == IMM_GET_PLAYBACK_SESSION_ID {
-        // `MediaMetricsManager.createPlaybackSession` wraps this reply in a
-        // `PlaybackSession`, whose constructor
-        // `AnnotationValidations.validate(NonNull.class, null, id)` rejects a null
-        // id with an NPE. ExoPlayer 2.18 registers such a listener unconditionally
-        // on API 31+, so without an id `Player.initPlayback` dies and no playback
-        // session is ever created.
-        //
-        // The handle has to be matched by *name* and not by
-        // `handle_for("media.metrics")`: ServiceManager registers the service as
-        // `media.metrics` but every Java client asks for it through
-        // `Context.MEDIA_METRICS_SERVICE`, which is `media_metrics` — the handle
-        // the app transacts with is the one the service manager minted for the
-        // underscore name. Keying the reply on the dotted name silently produced
-        // an empty reply, and `Parcel.readString16` then returned null.
-        parcel.extend_from_slice(&string16(&format!(
-            "pengudroid-playback-{}",
-            NEXT_HANDLE.fetch_add(1, Ordering::Relaxed)
-        )));
-        if trace_enabled() {
-            diag("[binder]   -> media.metrics playback session id\n");
-        }
-    }
-    if tr.target_handle == handle_for("media_session") && tr.code == ISM_CREATE_SESSION {
-        // `MediaSessionManager.createSession` mints the framework session that
-        // every `MediaSessionCompat` on API 29+ wraps; `MediaSession`'s
-        // constructor immediately dereferences it (`ISession.getController`),
-        // so returning nothing makes NewPipe's `PlayerService.onCreate` die
-        // with an NPE. A pair of empty binder handles is enough for the
-        // constructor and for every later `setFlags`/`setMetadata`/... call,
-        // which are void and succeed with no result.
-        push_flat_handle(&mut parcel, &mut objects, handle_for("media_session_session"));
-        if trace_enabled() {
-            diag("[binder]   -> createSession (fake ISession)\n");
-        }
-    }
-    if tr.target_handle == handle_for("media_session_session")
-        && tr.code == ISESSION_GET_CONTROLLER
+    let media_name = name_for_handle(tr.target_handle);
+    if matches!(media_name.as_deref(), Some("media_session" | "media_session_session"
+        | "media_session_controller" | "media_session_queue" | "media.metrics" | "media_metrics"))
     {
-        push_flat_handle(
-            &mut parcel,
-            &mut objects,
-            handle_for("media_session_controller"),
-        );
-        if trace_enabled() {
-            diag("[binder]   -> ISession.getController (fake ISessionController)\n");
-        }
-    }
-    if tr.target_handle == handle_for("media_session_session")
-        && tr.code == ISESSION_GET_BINDER_FOR_SET_QUEUE
-    {
-        // `MediaSession.setQueue` hands this binder to
-        // `ParcelableListBinder.send`, which calls `binder.transact(...)` with
-        // no null check, so a null result is an NPE in the middle of
-        // `MediaSessionConnector.onEvents`. The transaction it sends is
-        // fire-and-forget for our purposes: an empty reply satisfies libbinder.
-        push_flat_handle(
-            &mut parcel,
-            &mut objects,
-            handle_for("media_session_queue"),
-        );
-        if trace_enabled() {
-            diag("[binder]   -> ISession.getBinderForSetQueue (fake queue binder)\n");
+        let Some(codes) = *MEDIA_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner()) else {
+            return Reply::unknown_transaction(tr, "API-37 media Stub transactions not installed");
+        };
+        match (media_name.as_deref(), tr.code) {
+            (Some("media_session"), code) if code == codes[0] => {
+                // MediaSession's constructor requires non-null session/controller
+                // handles. These placeholders do not publish a real media session.
+                push_flat_handle(&mut parcel, &mut objects, handle_for("media_session_session"));
+            }
+            (Some("media_session_session"), code) if code == codes[1] => {
+                push_flat_handle(&mut parcel, &mut objects, handle_for("media_session_controller"));
+            }
+            (Some("media_session_session"), code) if code == codes[2] => {
+                // Preserve the non-null result required by ParcelableListBinder.send.
+                // Queue transfer itself is unsupported and must not report success.
+                push_flat_handle(&mut parcel, &mut objects, handle_for("media_session_queue"));
+            }
+            (Some("media.metrics" | "media_metrics"), code) if code == codes[3] => {
+                // PlaybackSession's @NonNull validation requires a nonempty ID.
+                // Both the servicemanager and Context service names reach here.
+                parcel.extend_from_slice(&string16(&format!(
+                    "pengudroid-playback-{}",
+                    NEXT_HANDLE.fetch_add(1, Ordering::Relaxed)
+                )));
+            }
+            _ => return Reply::unknown_transaction(tr, "unimplemented media method (including session setters, controller and queue transfer)"),
         }
     }
     if tr.target_handle == handle_for("media.resource_manager") {
@@ -2687,18 +2379,22 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             diag(&format!("[binder]   -> empty cursor code {}\n", tr.code));
         }
     }
-    if tr.target_handle == handle_for("user")
-        && (tr.code == IUM_IS_USER_UNLOCKED || tr.code == IUM_IS_USER_UNLOCKING_OR_UNLOCKED)
-    {
-        // Without this the framework logs "Failed to find provider info for
-        // settings (user not unlocked)" and refuses the provider lookup, and
-        // `getSharedPreferences` throws for credential-encrypted storage.
+    if tr.target_handle == handle_for("user") {
+        let Some(codes) = *USER_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner()) else {
+            return Reply::unknown_transaction(tr, "API-37 IUserManager Stub transactions not installed");
+        };
+        if !codes.contains(&tr.code) {
+            return Reply::unknown_transaction(tr, "unimplemented IUserManager method");
+        }
+        // The hosted user is unlocked, allowing credential-encrypted preferences
+        // and provider lookup. Only the two installed unlock queries answer true.
         parcel.extend_from_slice(&1u32.to_ne_bytes());
     }
     if tr.target_handle == handle_for("audio") {
-        let operation = AUDIO_FOCUS_TRANSACTIONS.lock()
-            .unwrap_or_else(|e| e.into_inner()).operation(tr.code);
-        match operation {
+        let Some(table) = *AUDIO_FOCUS_TRANSACTIONS.lock().unwrap_or_else(|e| e.into_inner()) else {
+            return Reply::unknown_transaction(tr, "API-37 audio-focus Stub transactions not installed");
+        };
+        match table.operation(tr.code) {
             Some(crate::audiofocus::Operation::Request) => {
                 let data = if tr.data_size > 0 && tr.data_ptr != 0 {
                     std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize)
@@ -2719,22 +2415,28 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             Some(crate::audiofocus::Operation::Abandon) => parcel.extend_from_slice(&AUDIO_FOCUS.abandon().to_ne_bytes()),
             Some(crate::audiofocus::Operation::Unregister) => { AUDIO_FOCUS.abandon(); }
             Some(crate::audiofocus::Operation::Current) => parcel.extend_from_slice(&AUDIO_FOCUS.current().to_ne_bytes()),
-            _ => {}
+            None => return Reply::unknown_transaction(tr, "unimplemented IAudioService method"),
         }
     }
     if tr.target_handle == handle_for("input") {
-        let codes = INPUT_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner());
-        let operation = codes.iter().position(|&code| code != 0 && code == tr.code).map(|i| INPUT_OPERATIONS[i]);
-        drop(codes);
+        let Some(codes) = *INPUT_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner()) else {
+            return Reply::unknown_transaction(tr, "API-37 IInputManager Stub transactions not installed");
+        };
+        let Some(operation) = codes.iter().position(|&code| code != 0 && code == tr.code)
+            .map(|i| INPUT_OPERATIONS[i]) else {
+            return Reply::unknown_transaction(tr, "unimplemented IInputManager method");
+        };
         let data = if tr.data_size > 0 && tr.data_ptr != 0 {
             std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize)
         } else { &[] };
-        if let Some(args) = crate::virtual_input::arguments(data) {
-            let device = VIRTUAL_INPUT_DEVICE.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(body) = operation.and_then(|code| crate::virtual_input::reply(code, args, &device)) {
-                parcel.extend_from_slice(&body);
-            }
-        }
+        let Some(args) = crate::virtual_input::arguments(data) else {
+            return Reply::unknown_transaction(tr, "invalid IInputManager interface token");
+        };
+        let device = VIRTUAL_INPUT_DEVICE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(body) = crate::virtual_input::reply(operation, args, &device) else {
+            return Reply::unknown_transaction(tr, "unsupported or malformed IInputManager arguments");
+        };
+        parcel.extend_from_slice(&body);
     }
     if tr.target_handle == handle_for("display") && tr.code == IDM_GET_DISPLAY_INFO {
         let info = DISPLAY_INFO.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -2761,19 +2463,13 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             }
         }
     }
-    if is_surface_flinger(tr.target_handle) && tr.code == ISC_CREATE_CONNECTION {
-        push_flat_handle(
-            &mut parcel,
-            &mut objects,
-            handle_for("surface_composer_client"),
-        );
-        if trace_enabled() {
-            diag("[binder]   -> surface_composer_client handle\n");
+    if tr.target_handle == handle_for("surface_composer_client") {
+        if let Err(error) = require_api37() {
+            return Reply::unknown_transaction(tr, &error);
         }
-    }
-    if tr.target_handle == handle_for("surface_composer_client")
-        && tr.code == ISCC_CREATE_SURFACE
-    {
+        if tr.code != ISCC_CREATE_SURFACE {
+            return Reply::unknown_transaction(tr, "unimplemented API-37 ISurfaceComposerClient method");
+        }
         // `CreateSurfaceResult createSurface(@utf8InCpp String name, int flags,
         //   @nullable IBinder parent, in LayerMetadata metadata)`
         //
@@ -2803,27 +2499,13 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             diag("[binder]   -> CreateSurfaceResult\n");
         }
     }
-    if is_surface_flinger(tr.target_handle) && tr.code == ISC_AUTHENTICATE_SURFACE {
-        // `TextureView` asks SurfaceFlinger to vouch for its `SurfaceTexture`
-        // before the first frame. An empty reply makes `Parcel::readBool` fail
-        // and the framework logs
-        // "authenticateSurfaceTexture: error retrieving result: No data available".
-        // There is no SurfaceFlinger to authenticate against, and the consumer
-        // is ours, so the answer is simply "yes".
-        parcel.extend_from_slice(&1i32.to_ne_bytes());
-        if trace_enabled() {
-            diag("[binder]   -> authenticateSurfaceTexture = true\n");
+
+    if tr.target_handle == handle_for("display_event_connection") {
+        if let Err(error) = require_api37() {
+            return Reply::unknown_transaction(tr, &error);
         }
-    }
-    if is_surface_flinger(tr.target_handle) && tr.code == ISC_CREATE_DISPLAY_EVENT_CONNECTION {
-        // No status word: the client's first read is `readStrongBinder()`.
-        push_flat_handle(
-            &mut parcel,
-            &mut objects,
-            handle_for("display_event_connection"),
-        );
-        if trace_enabled() {
-            diag("[binder]   -> display_event_connection handle\n");
+        if !matches!(tr.code, IDEC_STEAL_RECEIVE_CHANNEL | IDEC_SET_VSYNC_RATE | IDEC_REQUEST_NEXT_VSYNC) {
+            return Reply::unknown_transaction(tr, "unimplemented IDisplayEventConnection method (getLatestVsyncEventData is unsupported)");
         }
     }
     if tr.target_handle == handle_for("display_event_connection")
@@ -2855,20 +2537,16 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         }
     }
     if tr.target_handle == handle_for("display_event_connection") {
-        // `setVsyncRate` / `requestNextVsync` / `getLatestVsyncEventData` are
-        // either oneway or not needed for the first frame; answer with a bare
-        // status so a synchronous caller does not block.
+        // Only the measured setVsyncRate/requestNextVsync operations are known.
+        // Other methods must not receive a fabricated empty success reply.
         if tr.code != IDEC_STEAL_RECEIVE_CHANNEL {
             parcel.extend_from_slice(&0u32.to_ne_bytes());
         }
-        if tr.code == IDEC_REQUEST_NEXT_VSYNC {
-            // `ViewRootImpl` schedules its first traversal from a vsync, so
-            // without this the window is added but never laid out and
-            // `relayout` is never called.
-            send_vsync();
-        }
-        if tr.code == IDEC_SET_VSYNC_RATE {
-            send_vsync();
+        if matches!(tr.code, IDEC_REQUEST_NEXT_VSYNC | IDEC_SET_VSYNC_RATE) {
+            // ViewRootImpl schedules its first traversal from this pulse.
+            if let Err(error) = send_vsync() {
+                return Reply::unknown_transaction(tr, &error);
+            }
         }
     }
     if tr.target_handle == handle_for("window") && tr.code == IWM_OPEN_SESSION {
@@ -3061,33 +2739,28 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         }
     }
     if tr.target_handle == handle_for("thermalservice") {
-        // A handheld that is never throttled is the honest model here: there is
-        // no thermal zone to read on the host, and a "none" status is what a
-        // cool device reports. The listener registrations must answer `true` or
-        // the framework throws instead of returning.
-        match tr.code {
-            ITHERMAL_REGISTER_THERMAL_EVENT_LISTENER
-            | ITHERMAL_REGISTER_THERMAL_EVENT_LISTENER_WITH_TYPE
-            | ITHERMAL_REGISTER_THERMAL_STATUS_LISTENER
-            | ITHERMAL_UNREGISTER_THERMAL_STATUS_LISTENER => {
-                parcel.extend_from_slice(&1u32.to_ne_bytes());
+        let Some(codes) = *THERMAL_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner()) else {
+            return Reply::unknown_transaction(tr, "API-37 IThermalService Stub transactions not installed");
+        };
+        let Some(operation) = codes.iter().position(|&code| code == tr.code) else {
+            return Reply::unknown_transaction(tr, "unimplemented IThermalService method");
+        };
+        // Semantic table positions, not wire codes. The hosted model has no
+        // thermal zones or status changes; registrations remain inert. Return
+        // types are pinned by frameworks/base 94b4c16 IThermalService.aidl.
+        match operation {
+            0 | 1 | 2 | 5 | 6 => {
+                parcel.extend_from_slice(&1u32.to_ne_bytes()); // register/unregister: true
             }
-            ITHERMAL_GET_CURRENT_THERMAL_STATUS => {
-                parcel.extend_from_slice(&0u32.to_ne_bytes()); // THERMAL_STATUS_NONE
-            }
-            ITHERMAL_GET_CURRENT_TEMPERATURES
-            | ITHERMAL_GET_CURRENT_TEMPERATURES_WITH_TYPE
-            | ITHERMAL_GET_CURRENT_COOLING_DEVICES
-            | ITHERMAL_GET_CURRENT_COOLING_DEVICES_WITH_TYPE => {
+            3 | 4 | 8 | 9 => {
                 parcel.extend_from_slice(&0u32.to_ne_bytes()); // empty typed array
             }
-            ITHERMAL_GET_THERMAL_HEADROOM => {
-                parcel.extend_from_slice(&0.0f32.to_ne_bytes());
-            }
-            _ => {}
+            7 => parcel.extend_from_slice(&0u32.to_ne_bytes()), // THERMAL_STATUS_NONE
+            10 => parcel.extend_from_slice(&0.0f32.to_ne_bytes()),
+            _ => unreachable!(),
         }
         if trace_enabled() {
-            diag(&format!("[binder]   -> thermal code {}\n", tr.code));
+            diag(&format!("[binder]   -> thermal code {} operation={operation}\n", tr.code));
         }
     }
     if tr.target_handle == handle_for("package") && tr.code == IPM_GET_PROVIDER_INFO {
@@ -3143,7 +2816,7 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
     while parcel.len() % 8 != 0 {
         parcel.push(0);
     }
-    Reply { parcel, objects }
+    Reply { parcel, objects, flags: 0 }
 }
 
 /// Find a `flat_binder_object` describing a binder that lives in this process.
@@ -3185,6 +2858,7 @@ unsafe fn incoming_transaction(
     let reply = Reply {
         parcel: parcel.to_vec(),
         objects: Vec::new(),
+        flags: 0,
     };
     let (addr, offsets_addr) = place_reply(&reply)?;
     let tr = TransactionData {
@@ -3473,6 +3147,7 @@ unsafe fn handle_write_read(wr: *mut WriteRead) -> c_int {
         let Some(reply) = entry else { continue };
         push_u32(&mut out, BR_REPLY);
         let mut tr = TransactionData {
+            flags: reply.flags,
             sender_pid: pid,
             data_size: reply.parcel.len() as u64,
             offsets_size: (reply.objects.len() * 8) as u64,
@@ -4030,6 +3705,75 @@ pub unsafe extern "C" fn __pengudroid_binder_mmap_prot(fd: c_int, prot: c_int) -
 mod tests {
     use super::*;
 
+    static CONTRACT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct RestoreTable<'a, T> {
+        table: &'a Mutex<T>,
+        previous: Option<T>,
+    }
+
+    fn reset_table<T>(table: &Mutex<T>, value: T) -> RestoreTable<'_, T> {
+        let previous = std::mem::replace(&mut *table.lock().unwrap_or_else(|e| e.into_inner()), value);
+        RestoreTable { table, previous: Some(previous) }
+    }
+
+    impl<T> Drop for RestoreTable<'_, T> {
+        fn drop(&mut self) {
+            *self.table.lock().unwrap_or_else(|e| e.into_inner()) = self.previous.take().unwrap();
+        }
+    }
+
+    fn assert_required_transaction_table<const N: usize>(
+        table: &Mutex<Option<[u32; N]>>,
+        setter: unsafe extern "C" fn(*const u32, usize) -> bool,
+        codes: [u32; N],
+    ) {
+        assert!(!unsafe { setter(std::ptr::null(), N) });
+        for len in [0, N - 1, N + 1] {
+            assert!(!unsafe { setter(codes.as_ptr(), len) });
+        }
+        assert_eq!(*table.lock().unwrap(), None);
+        assert!(unsafe { setter(codes.as_ptr(), N) });
+        for i in 0..N {
+            for invalid in [0, 0x00ff_fffe, 0x00ff_ffff, 0x0100_0000] {
+                let mut bad = codes;
+                bad[i] = invalid;
+                assert!(!unsafe { setter(bad.as_ptr(), N) });
+                assert_eq!(*table.lock().unwrap(), Some(codes));
+            }
+            for j in 0..i {
+                let mut bad = codes;
+                bad[i] = bad[j];
+                assert!(!unsafe { setter(bad.as_ptr(), N) });
+                assert_eq!(*table.lock().unwrap(), Some(codes));
+            }
+        }
+    }
+
+    fn transaction(target_handle: u32, code: u32, data: &[u8]) -> TransactionData {
+        TransactionData {
+            target_handle,
+            code,
+            data_size: data.len() as u64,
+            data_ptr: data.as_ptr() as u64,
+            ..TransactionData::default()
+        }
+    }
+
+    fn assert_unknown_transaction(reply: Reply) {
+        assert_eq!(reply.flags, TF_STATUS_CODE);
+        assert_eq!(reply.parcel, UNKNOWN_TRANSACTION.to_ne_bytes());
+        assert!(reply.objects.is_empty());
+    }
+
+    fn assert_handle_reply(reply: Reply, name: &str) {
+        assert_eq!(reply.flags, 0);
+        assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes());
+        assert_eq!(reply.objects, [4]);
+        assert_eq!(&reply.parcel[4..8], &BINDER_TYPE_HANDLE.to_ne_bytes());
+        assert_eq!(&reply.parcel[12..16], &handle_for(name).to_ne_bytes());
+    }
+
     #[test]
     fn recognises_the_binder_devices() {
         for p in [
@@ -4123,6 +3867,7 @@ mod tests {
         c.push_str("printf(\"%u\\n\", (unsigned)BR_TRANSACTION_COMPLETE);\n");
         c.push_str("printf(\"%u\\n\", (unsigned)BR_REPLY);\n");
         c.push_str("printf(\"%u\\n\", (unsigned)BR_TRANSACTION);\n");
+        c.push_str("printf(\"%u\\n\", (unsigned)TF_STATUS_CODE);\n");
         c.push_str("printf(\"%zu\\n%zu\\n\", sizeof(struct binder_transaction_data), sizeof(struct binder_write_read));\nreturn 0;}\n");
         std::fs::write(&source, c).unwrap();
         assert!(Command::new("cc").arg(&source).arg("-o").arg(&executable).status().unwrap().success());
@@ -4153,6 +3898,7 @@ mod tests {
             BR_TRANSACTION_COMPLETE as u64,
             BR_REPLY as u64,
             BR_TRANSACTION as u64,
+            TF_STATUS_CODE as u64,
             std::mem::size_of::<TransactionData>() as u64,
             std::mem::size_of::<WriteRead>() as u64,
         ];
@@ -4178,6 +3924,141 @@ mod tests {
             (92, 1), (96, 60.0f32.to_bits()), (100, 1), (104, 0), (108, 0)] {
             assert_eq!(word(&parcel, offset), expected, "field at {offset}");
         }
+    }
+
+    #[test]
+    fn display_contract_requires_the_shared_api37_property() {
+        const CHILD: &str = "PENGUDROID_BINDER_TEST_PLATFORM_FAILURES";
+        if std::env::var_os(CHILD).is_some() {
+            // Isolate property mutations from the other host unit tests. This
+            // process never loads an Android framework or runtime.
+            for sdk in [None, Some(""), Some("33"), Some("36"), Some("38")] {
+                {
+                    let mut props = crate::props_lock();
+                    if let Some(sdk) = sdk {
+                        props.insert("ro.build.version.sdk".to_string(), sdk.to_string());
+                    } else {
+                        props.remove("ro.build.version.sdk");
+                    }
+                }
+                assert!(send_vsync().is_err());
+                for (name, code, descriptor) in [
+                    ("SurfaceFlinger", ISC_CREATE_CONNECTION, "android.gui.ISurfaceComposer"),
+                    ("SurfaceFlingerAIDL", ISC_GET_PHYSICAL_DISPLAY_IDS, "android.gui.ISurfaceComposer"),
+                    ("surface_composer_client", ISCC_CREATE_SURFACE, "android.gui.ISurfaceComposerClient"),
+                    ("display_event_connection", IDEC_STEAL_RECEIVE_CHANNEL, "android.gui.IDisplayEventConnection"),
+                    ("display_event_connection", IDEC_REQUEST_NEXT_VSYNC, "android.gui.IDisplayEventConnection"),
+                ] {
+                    let data = service_request(descriptor, "");
+                    assert_unknown_transaction(unsafe { make_reply(&transaction(handle_for(name), code, &data), 1) });
+                }
+                assert!(VSYNC_SEND_FDS.lock().unwrap().is_empty());
+            }
+            return;
+        }
+        assert!(check_api37_sdk(Some("37")).is_ok());
+        for sdk in [None, Some(""), Some("33"), Some("36"), Some("38")] {
+            let error = check_api37_sdk(sdk).unwrap_err();
+            assert!(error.contains("ro.build.version.sdk must be 37"));
+        }
+        // The emitter reads the shared property store, not an environment-only
+        // SDK selector or a default for a missing property.
+        require_api37().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "binder::tests::display_contract_requires_the_shared_api37_property", "--nocapture"])
+            .env(CHILD, "1")
+            .env_remove("PENGUDROID_ROOT")
+            .env_remove("BIONIC_APPCOMPAT_OVERRIDE")
+            .output().unwrap();
+        assert!(output.status.success(), "{}\n{}",
+            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn android17_vsync_is_always_the_measured_224_byte_layout() {
+        let time = 1_000_000_000i64;
+        let event = vsync_event(time, 42);
+        let word = |at| u32::from_ne_bytes(event[at..at + 4].try_into().unwrap());
+        let long = |at| i64::from_ne_bytes(event[at..at + 8].try_into().unwrap());
+        assert_eq!(event.len(), 224);
+        assert_eq!(word(0), DISPLAY_EVENT_VSYNC);
+        assert_eq!(long(8), 0); // display ID
+        assert_eq!(long(16), time);
+        assert_eq!(word(24), 42);
+        assert_eq!(long(32), 16_666_666);
+        assert_eq!(word(40), 0); // preferred timeline
+        assert_eq!(word(44), 1); // timeline count, not the old timeline offset
+        assert_eq!(word(48), 0); // numberQueuedBuffers
+        assert_eq!(word(52), 0); // alignment
+        assert_eq!(long(56), 42);
+        assert_eq!(long(64), time + 16_666_666);
+        assert_eq!(long(72), time + 16_666_666);
+        assert!(event[80..].iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn surface_composer_preserves_measured_api37_aidl_replies_for_both_aliases() {
+        let data = service_request("android.gui.ISurfaceComposer", "");
+        for alias in ["SurfaceFlinger", "SurfaceFlingerAIDL"] {
+            let target = handle_for(alias);
+            for (code, result) in [(2, "display_event_connection"),
+                (3, "surface_composer_client"), (7, "display_token")] {
+                assert!(reply_has_status(target, code));
+                assert_handle_reply(unsafe { make_reply(&transaction(target, code, &data), 1) }, result);
+            }
+            let reply = unsafe { make_reply(&transaction(target, 6, &data), 1) };
+            assert_eq!(reply.flags, 0);
+            assert_eq!(reply.parcel.len(), 16);
+            assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes());
+            assert_eq!(&reply.parcel[4..8], &1i32.to_ne_bytes());
+            assert_eq!(&reply.parcel[8..16], &0i64.to_ne_bytes());
+            for (code, size) in [(12, 40), (13, 116), (34, 28), (69, 8)] {
+                let reply = unsafe { make_reply(&transaction(target, code, &data), 1) };
+                assert_eq!(reply.flags, 0);
+                assert_eq!(reply.parcel.len(), size);
+                assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes());
+                assert!(reply.objects.is_empty());
+                if code == 69 {
+                    assert_eq!(&reply.parcel[4..8], &2i32.to_ne_bytes());
+                } else {
+                    assert_eq!(&reply.parcel[4..8], &1i32.to_ne_bytes()); // sized parcelable
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn surface_composer_rejects_legacy_tokens_and_unknown_contracts() {
+        let aidl = service_request("android.gui.ISurfaceComposer", "");
+        let legacy = service_request("android.ui.ISurfaceComposer", "android.gui.ISurfaceComposer");
+        let headerless = string16("android.gui.ISurfaceComposer");
+        for alias in ["SurfaceFlinger", "SurfaceFlingerAIDL"] {
+            let target = handle_for(alias);
+            for code in [0, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 27, 34, 54, 55, 69] {
+                assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &legacy), 1) });
+            }
+            for code in [0, 4, 5, 8, 9, 27, 54, 55, 9999] {
+                assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &aidl), 1) });
+            }
+            for data in [&[][..], headerless.as_slice()] {
+                assert_unknown_transaction(unsafe { make_reply(&transaction(target, 6, data), 1) });
+            }
+        }
+        for name in ["surface_composer_client", "display_event_connection"] {
+            assert_unknown_transaction(unsafe { make_reply(&transaction(handle_for(name), 9999, &[]), 1) });
+        }
+    }
+
+    #[test]
+    fn surface_composer_client_keeps_the_api37_create_surface_parcelable() {
+        let data = service_request("android.gui.ISurfaceComposerClient", "");
+        let reply = unsafe { make_reply(&transaction(handle_for("surface_composer_client"), 1, &data), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes());
+        assert_eq!(&reply.parcel[4..8], &1i32.to_ne_bytes());
+        assert_eq!(reply.objects, [12]); // Status, presence, self-size, then binder
+        assert_eq!(&reply.parcel[12..16], &BINDER_TYPE_HANDLE.to_ne_bytes());
+        assert_eq!(&reply.parcel[20..24], &handle_for("surface_handle").to_ne_bytes());
     }
 
     /// Build the parcel shape `writeInterfaceToken` + `writeString(name)`
@@ -4224,14 +4105,57 @@ mod tests {
     }
 
     #[test]
+    fn service_manager_requires_all_four_installed_stub_codes() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = reset_table(&SERVICE_MANAGER_CODES, [0; 4]);
+        let data = service_request("android.os.IServiceManager", "activity");
+        for code in [0, 1, 2, 101, 203, 307, 409] {
+            assert_eq!(service_manager_shape([0; 4], code), None);
+            assert_unknown_transaction(unsafe { make_reply(&transaction(0, code, &data), 1) });
+        }
+        assert_eq!(service_manager_shape([101, 203, 0, 0], 101), None);
+        assert_eq!(service_manager_shape([101, 203, 307, 409], 0), None);
+
+        // Synthetic, deliberately remapped codes, not API-37 wire-number claims.
+        let codes = [101, 203, 307, 409];
+        assert!(__pengudroid_binder_set_service_manager_codes(codes[0], codes[1], codes[2], codes[3]));
+        for i in 0..4 {
+            for invalid in [0, 0x00ff_fffe, 0x00ff_ffff, 0x0100_0000] {
+                let mut bad = codes;
+                bad[i] = invalid;
+                assert!(!__pengudroid_binder_set_service_manager_codes(bad[0], bad[1], bad[2], bad[3]));
+            }
+            for j in 0..i {
+                let mut bad = codes;
+                bad[i] = bad[j];
+                assert!(!__pengudroid_binder_set_service_manager_codes(bad[0], bad[1], bad[2], bad[3]));
+            }
+        }
+        assert!(!__pengudroid_binder_set_service_manager_codes(101, 203, 0, 0));
+        assert_eq!(*SERVICE_MANAGER_CODES.lock().unwrap(), codes);
+        for (i, code) in codes.into_iter().enumerate() {
+            let metadata = i >= 2;
+            assert_eq!(service_manager_shape(codes, code), Some(metadata));
+            let reply = unsafe { make_reply(&transaction(0, code, &data), 1) };
+            assert_eq!(reply.flags, 0);
+            assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes());
+            let object_at = if metadata { 20 } else { 4 };
+            assert_eq!(reply.objects, [object_at as u64]);
+            assert_eq!(&reply.parcel[object_at..object_at + 4], &BINDER_TYPE_HANDLE.to_ne_bytes());
+        }
+        for code in [0, 1, 2, 9999] {
+            assert_unknown_transaction(unsafe { make_reply(&transaction(0, code, &data), 1) });
+        }
+    }
+
+    #[test]
     fn absent_autofill_does_not_advertise_a_binder_that_never_calls_back() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = reset_table(&SERVICE_MANAGER_CODES, [0; 4]);
+        assert!(__pengudroid_binder_set_service_manager_codes(101, 203, 307, 409));
         let data = service_request("android.os.IServiceManager", "autofill");
-        let tr = TransactionData {
-            target_handle: 0, _pad0: 0, cookie: 0, code: ISM_GET_SERVICE, flags: 0,
-            sender_pid: 0, sender_euid: 0, data_size: data.len() as u64,
-            offsets_size: 0, data_ptr: data.as_ptr() as u64, offsets_ptr: 0,
-        };
-        let reply = unsafe { make_reply(&tr, 1) };
+        let reply = unsafe { make_reply(&transaction(0, 101, &data), 1) };
+        assert_eq!(reply.flags, 0);
         assert!(reply.objects.is_empty());
         assert_eq!(&reply.parcel[4..8], &BINDER_TYPE_BINDER.to_ne_bytes());
         assert_eq!(&reply.parcel[12..28], &[0u8; 16]);
@@ -4245,56 +4169,210 @@ mod tests {
         assert!(a >= 1);
     }
 
-    /// `PowerManager.addThermalStatusListener` throws
-    /// `RuntimeException("Listener failed to set")` unless
-    /// `IThermalService.registerThermalStatusListener` answers `true`, and
-    /// Roblox's `ActivityNativeMain.onCreate` treats that as fatal. An empty
-    /// reply reads back as `false`, so the boolean has to be written.
     #[test]
-    fn thermal_listeners_register_successfully() {
-        let tr = TransactionData {
-            target_handle: handle_for("thermalservice"),
-            code: ITHERMAL_REGISTER_THERMAL_STATUS_LISTENER,
-            ..TransactionData::default()
-        };
-        // SAFETY: `make_reply` only reads the transaction descriptor; this one
-        // carries no parcel payload.
-        let reply = unsafe { make_reply(&tr, 1) };
-        assert_eq!(reply.parcel.len(), 8, "status word plus the boolean");
-        assert_eq!(&reply.parcel[0..4], &0u32.to_ne_bytes());
-        assert_eq!(&reply.parcel[4..8], &1u32.to_ne_bytes());
+    fn user_unlock_queries_require_installed_codes_and_never_alias_code_71() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = reset_table(&USER_TRANSACTION_CODES, None);
+        let target = handle_for("user");
+        let codes = [403, 907]; // synthetic remapping, not framework wire numbers
+        for code in [0, 71, 79, codes[0], codes[1], 9999] {
+            assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &[]), 1) });
+        }
+        assert_required_transaction_table(&USER_TRANSACTION_CODES,
+            __pengudroid_binder_set_user_transactions, codes);
+        for code in codes {
+            let reply = unsafe { make_reply(&transaction(target, code, &[]), 1) };
+            assert_eq!(reply.flags, 0);
+            assert_eq!(reply.parcel, [0u32, 1].into_iter().flat_map(u32::to_ne_bytes).collect::<Vec<_>>());
+            assert!(reply.objects.is_empty());
+        }
+        // In the pinned API-37 Stub, 71 is clearSeedAccountData, not an unlock
+        // query. Neither it nor the other old default may return true.
+        for code in [0, 1, 2, 71, 79, 9999] {
+            assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &[]), 1) });
+        }
+    }
 
-        // The status query must answer "not throttled" rather than nothing.
-        let tr = TransactionData {
-            target_handle: handle_for("thermalservice"),
-            code: ITHERMAL_GET_CURRENT_THERMAL_STATUS,
-            ..TransactionData::default()
-        };
-        // SAFETY: as above.
-        let reply = unsafe { make_reply(&tr, 1) };
-        assert_eq!(reply.parcel.len(), 8);
-        assert_eq!(&reply.parcel[4..8], &0u32.to_ne_bytes());
+    #[test]
+    fn thermal_methods_require_installed_codes_and_preserve_semantic_reply_types() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = reset_table(&THERMAL_TRANSACTION_CODES, None);
+        let target = handle_for("thermalservice");
+        // Deliberately nonsequential and reordered; positions select methods.
+        let codes = [503, 101, 907, 307, 809, 203, 1103, 409, 1009, 607, 709];
+        for code in (0..=11).chain([codes[5], 9999]) {
+            assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &[]), 1) });
+        }
+        assert_required_transaction_table(&THERMAL_TRANSACTION_CODES,
+            __pengudroid_binder_set_thermal_transactions, codes);
+        // register/unregister booleans, empty arrays, THERMAL_STATUS_NONE, and
+        // zero headroom (float bits) from the hosted no-thermal-zone model.
+        let results = [1u32, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0.0f32.to_bits()];
+        for (code, result) in codes.into_iter().zip(results) {
+            let reply = unsafe { make_reply(&transaction(target, code, &[]), 1) };
+            assert_eq!(reply.flags, 0);
+            assert_eq!(reply.parcel, [0u32, result].into_iter().flat_map(u32::to_ne_bytes).collect::<Vec<_>>());
+            assert!(reply.objects.is_empty());
+        }
+        for code in (0..=11).chain([9999]) {
+            assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &[]), 1) });
+        }
+    }
+
+    #[test]
+    fn input_requires_installed_codes_and_rejects_unknown_or_malformed_requests() {
+        fn request(args: &[i32]) -> Vec<u8> {
+            let mut data = vec![0; 8];
+            data.extend_from_slice(b"TSYS");
+            data.extend_from_slice(&string16("android.hardware.input.IInputManager"));
+            data.extend(args.iter().flat_map(|word| word.to_ne_bytes()));
+            data
+        }
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = reset_table(&INPUT_TRANSACTION_CODES, None);
+        let _device_restore = reset_table(&VIRTUAL_INPUT_DEVICE, 0x1234_5678u32.to_ne_bytes().to_vec());
+        let target = handle_for("input");
+        let data = request(&[-1]);
+        for code in [0, 1, 2, 3, 4, 5, 6, 7, 22, 101, 203, 9999] {
+            assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &data), 1) });
+        }
+        // API 37 has no isInputDeviceEnabled method; its zero slot is not a code.
+        let codes = [101, 203, 0, 409, 503, 607, 709, 809];
+        assert!(!unsafe { __pengudroid_binder_set_input_transactions(std::ptr::null(), 8) });
+        for len in [0, 7, 9] {
+            assert!(!unsafe { __pengudroid_binder_set_input_transactions(codes.as_ptr(), len) });
+        }
+        assert_eq!(*INPUT_TRANSACTION_CODES.lock().unwrap(), None);
+        assert!(unsafe { __pengudroid_binder_set_input_transactions(codes.as_ptr(), codes.len()) });
+        for i in 0..8 {
+            for invalid in [0, 0x00ff_fffe, 0x00ff_ffff, 0x0100_0000] {
+                if i == 2 && invalid == 0 { continue; }
+                let mut bad = codes;
+                bad[i] = invalid;
+                assert!(!unsafe { __pengudroid_binder_set_input_transactions(bad.as_ptr(), bad.len()) });
+                assert_eq!(*INPUT_TRANSACTION_CODES.lock().unwrap(), Some(codes));
+            }
+            for j in 0..i {
+                let mut bad = codes;
+                bad[i] = bad[j];
+                assert!(!unsafe { __pengudroid_binder_set_input_transactions(bad.as_ptr(), bad.len()) });
+                assert_eq!(*INPUT_TRANSACTION_CODES.lock().unwrap(), Some(codes));
+            }
+        }
+        for (code, args, body) in [
+            (101, vec![-1], vec![1, 0x1234_5678]),
+            (101, vec![0], vec![0]),
+            (203, vec![], vec![1, -1]),
+            (409, vec![-1], vec![]),
+            (503, vec![-1], vec![]),
+            (607, vec![-1, 0x101, 3, 29, 67, 200, 3], vec![1, 3, 1, 1, 0]),
+            (709, vec![-1, 29], vec![29]),
+        ] {
+            let data = request(&args);
+            let reply = unsafe { make_reply(&transaction(target, code, &data), 1) };
+            let mut expected: Vec<u8> = [0i32].into_iter().chain(body).flat_map(i32::to_ne_bytes).collect();
+            expected.resize((expected.len() + 7) & !7, 0);
+            assert_eq!(reply.flags, 0);
+            assert_eq!(reply.parcel, expected);
+            assert!(reply.objects.is_empty());
+        }
+        for code in [0, 1, 2, 3, 4, 5, 6, 7, 22, 9999] {
+            assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &data), 1) });
+        }
+        for args in [vec![], vec![-1, 0, -1], vec![-1, 0, 769], vec![-1, 0, 1, 29]] {
+            let data = request(&args);
+            assert_unknown_transaction(unsafe { make_reply(&transaction(target, 607, &data), 1) });
+        }
+        for data in [vec![], service_request("not.IInputManager", "")] {
+            assert_unknown_transaction(unsafe { make_reply(&transaction(target, 203, &data), 1) });
+        }
+    }
+
+    #[test]
+    fn content_provider_holder_wrapper_has_three_explicit_flags_at_both_alignments() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _codes_restore = reset_table(&APPLICATION_TRANSACTION_CODES, [u32::MAX; 5]);
+        let _info_restore = reset_table(&PROVIDER_INFO, Vec::new());
+        assert!(__pengudroid_binder_set_application_transactions(101, 203, 307, 409, 503));
+        for info_words in [vec![0x1234_5678u32], vec![0x1234_5678, 0x8765_4321]] {
+            // ProviderInfo is an opaque, framework-marshalled body here. Vary
+            // its alignment so final padding cannot masquerade as a flag.
+            *PROVIDER_INFO.lock().unwrap() = info_words.iter().flat_map(|word| word.to_ne_bytes()).collect();
+            let reply = unsafe { make_reply(&transaction(handle_for("activity"), 203, &[]), 1) };
+            let handle = handle_for("settings_provider");
+            // Independent wrapper oracle: do not call any production writer.
+            // ContentProviderHolder.java at frameworks/base 94b4c16 writes
+            // info, provider, connection, noReleaseNeeded, mLocal, then
+            // noReleaseNeededIfUnstable (three int32s, not alignment padding).
+            let binder_words = [0x7368_2a85u32, 0x7f, handle, 0, 0, 0, 0x0c];
+            let mut expected = vec![0u32, 1]; // AIDL status, readTypedObject presence
+            expected.extend_from_slice(&info_words);
+            let provider_at = (expected.len() * 4) as u64;
+            expected.extend_from_slice(&binder_words);
+            let connection_at = (expected.len() * 4) as u64;
+            expected.extend_from_slice(&binder_words);
+            expected.extend_from_slice(&[0, 0, 0]); // the three explicit false flags
+            expected.resize((expected.len() + 1) & !1, 0); // transfer-area alignment
+            let expected: Vec<u8> = expected.into_iter().flat_map(u32::to_ne_bytes).collect();
+            assert_eq!(reply.flags, 0);
+            assert_eq!(reply.objects, [provider_at, connection_at]);
+            assert_eq!(reply.parcel, expected, "ProviderInfo words: {}", info_words.len());
+            assert_eq!(reply.parcel.len(), if info_words.len() == 1 { 80 } else { 88 });
+        }
     }
 
     /// `MediaSession.setQueue` passes `ISession.getBinderForSetQueue()`'s result
     /// straight to `ParcelableListBinder.send`, which calls `transact` on it with
     /// no null check: an empty reply is an NPE while the player is being built.
     #[test]
-    fn media_session_answers_a_queue_binder() {
-        let tr = TransactionData {
-            target_handle: handle_for("media_session_session"),
-            code: ISESSION_GET_BINDER_FOR_SET_QUEUE,
-            ..TransactionData::default()
-        };
-        // SAFETY: `make_reply` only reads the transaction descriptor; this one
-        // carries no parcel payload.
-        let reply = unsafe { make_reply(&tr, 1) };
-        assert_eq!(&reply.parcel[0..4], &0u32.to_ne_bytes(), "status word");
-        assert_eq!(
-            u32::from_ne_bytes(reply.parcel[4..8].try_into().unwrap()),
-            BINDER_TYPE_HANDLE
-        );
-        assert_eq!(reply.objects.len(), 1, "one flat_binder_object");
+    fn media_session_requires_installation_and_scopes_codes_to_each_stub() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = reset_table(&MEDIA_TRANSACTION_CODES, None);
+        let names = ["media_session", "media_session_session", "media_session_controller",
+            "media_session_queue", "media.metrics", "media_metrics"];
+        for name in names {
+            for code in [0, 1, 2, 12, 101, 307] {
+                assert_unknown_transaction(unsafe { make_reply(&transaction(handle_for(name), code, &[]), 1) });
+            }
+        }
+        // Reuse across ISessionManager/ISession/IMediaMetricsManager is legal.
+        // Only ISession's two operations must use different codes.
+        let codes = [101, 101, 307, 101];
+        assert!(!unsafe { __pengudroid_binder_set_media_transactions(std::ptr::null(), 4) });
+        for len in [0, 3, 5] {
+            assert!(!unsafe { __pengudroid_binder_set_media_transactions(codes.as_ptr(), len) });
+        }
+        assert_eq!(*MEDIA_TRANSACTION_CODES.lock().unwrap(), None);
+        assert!(unsafe { __pengudroid_binder_set_media_transactions(codes.as_ptr(), codes.len()) });
+        for i in 0..4 {
+            for invalid in [0, 0x00ff_fffe, 0x00ff_ffff, 0x0100_0000] {
+                let mut bad = codes;
+                bad[i] = invalid;
+                assert!(!unsafe { __pengudroid_binder_set_media_transactions(bad.as_ptr(), bad.len()) });
+                assert_eq!(*MEDIA_TRANSACTION_CODES.lock().unwrap(), Some(codes));
+            }
+        }
+        let collision = [101, 307, 307, 101];
+        assert!(!unsafe { __pengudroid_binder_set_media_transactions(collision.as_ptr(), collision.len()) });
+        assert_eq!(*MEDIA_TRANSACTION_CODES.lock().unwrap(), Some(codes));
+        for (name, code, result) in [
+            ("media_session", 101, "media_session_session"),
+            ("media_session_session", 101, "media_session_controller"),
+            ("media_session_session", 307, "media_session_queue"),
+        ] {
+            assert_handle_reply(unsafe { make_reply(&transaction(handle_for(name), code, &[]), 1) }, result);
+        }
+        for name in names {
+            for code in [0, 1, 2, 12, 9999] {
+                assert_unknown_transaction(unsafe { make_reply(&transaction(handle_for(name), code, &[]), 1) });
+            }
+        }
+        // A session code does not select a method on another Stub, and returned
+        // controller/queue handles do not claim to implement their protocols.
+        for (name, code) in [("media_session", 307), ("media.metrics", 307),
+            ("media_session_controller", 101), ("media_session_queue", 101)] {
+            assert_unknown_transaction(unsafe { make_reply(&transaction(handle_for(name), code, &[]), 1) });
+        }
     }
 
     /// `MediaMetricsManager.createPlaybackSession` turns the reply to
@@ -4307,15 +4385,20 @@ mod tests {
     /// manager knows it as `media.metrics`.
     #[test]
     fn media_metrics_answers_a_session_id_under_both_names() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = reset_table(&MEDIA_TRANSACTION_CODES, None);
+        let codes = [101, 101, 307, 101];
+        assert!(unsafe { __pengudroid_binder_set_media_transactions(codes.as_ptr(), codes.len()) });
         for name in ["media_metrics", "media.metrics"] {
             let tr = TransactionData {
                 target_handle: handle_for(name),
-                code: IMM_GET_PLAYBACK_SESSION_ID,
+                code: codes[3],
                 ..TransactionData::default()
             };
             // SAFETY: `make_reply` only reads the transaction descriptor; this
             // one carries no parcel payload.
             let reply = unsafe { make_reply(&tr, 1) };
+            assert_eq!(reply.flags, 0);
             assert_eq!(&reply.parcel[0..4], &0u32.to_ne_bytes(), "status word");
             let len =
                 u32::from_ne_bytes(reply.parcel[4..8].try_into().unwrap()) as usize;
@@ -4330,6 +4413,41 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name}: unexpected id {id:?}"));
             assert!(suffix.parse::<u32>().is_ok(), "{name}: {id:?}");
         }
+    }
+
+    #[test]
+    fn audio_focus_requires_installation_and_never_dispatches_old_defaults() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = reset_table(&AUDIO_FOCUS_TRANSACTIONS, None);
+        let target = handle_for("audio");
+        AUDIO_FOCUS.abandon();
+        for code in [0, 66, 67, 68, 69, 101, 203, 307, 409] {
+            assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &[]), 1) });
+        }
+        assert!(__pengudroid_binder_set_audio_focus_transactions(101, 203, 307, 409));
+        assert!(!__pengudroid_binder_set_audio_focus_transactions(0, 203, 307, 409));
+        assert!(!__pengudroid_binder_set_audio_focus_transactions(101, 101, 307, 409));
+        AUDIO_FOCUS.request(3);
+        for code in [0, 66, 67, 68, 69, 9999] {
+            assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &[]), 1) });
+            assert_eq!(AUDIO_FOCUS.current(), 3);
+        }
+        let reply = unsafe { make_reply(&transaction(target, 409, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes());
+        assert_eq!(&reply.parcel[4..8], &3i32.to_ne_bytes());
+        let reply = unsafe { make_reply(&transaction(target, 203, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(&reply.parcel[4..8], &1i32.to_ne_bytes());
+        assert_eq!(AUDIO_FOCUS.current(), 0);
+        AUDIO_FOCUS.request(1);
+        let reply = unsafe { make_reply(&transaction(target, 307, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(AUDIO_FOCUS.current(), 0);
+        // Missing request arguments deny focus; they do not invent a gain.
+        let reply = unsafe { make_reply(&transaction(target, 101, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(&reply.parcel[4..8], &0i32.to_ne_bytes());
     }
 
     /// `Settings.NameValueCache` reads `Bundle.getString("value")` from the
@@ -4376,6 +4494,108 @@ mod tests {
         let mut parcel = Vec::new();
         provider_reply(ICP_CALL, Some(&data), &mut parcel, &mut objects);
         assert_ne!(parcel, value);
+    }
+
+    #[test]
+    fn codec2_failed_dispatch_never_synthesizes_a_reply_and_preserves_native_bytes() {
+        for code in [1, 2, 3, 4, 5] {
+            let tr = transaction(handle_for("codec2"), code, &[]);
+            assert_unknown_transaction(codec2_dispatch_reply(&tr, None));
+        }
+        // An opaque captured native reply must not acquire a fabricated status,
+        // codec entry, binder handle or padding from this broker.
+        let parcel = vec![0x11, 0x22, 0x33, 0x44, 0x55];
+        let offsets = vec![4];
+        let tr = transaction(handle_for("codec2"), 3, &[]);
+        let reply = codec2_dispatch_reply(&tr, Some((parcel.clone(), offsets.clone())));
+        assert_eq!(reply.flags, 0);
+        assert_eq!(reply.parcel, parcel);
+        assert_eq!(reply.objects, offsets);
+    }
+
+    #[test]
+    fn codec2_unavailable_never_advertises_or_creates_placeholder_decoders() {
+        const CHILD: &str = "PENGUDROID_BINDER_TEST_CODEC2_ABSENT";
+        if std::env::var_os(CHILD).is_none() {
+            // Isolate the opt-out from parallel tests. It short-circuits the
+            // native loader: no Android service, framework or runtime executes.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "binder::tests::codec2_unavailable_never_advertises_or_creates_placeholder_decoders", "--nocapture"])
+                .env(CHILD, "1")
+                .env("PENGUDROID_NO_CODEC2_SERVICE", "1")
+                .env_remove("PENGUDROID_ROOT")
+                .output().unwrap();
+            assert!(output.status.success(), "{}\n{}",
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        assert!(!crate::codec2::available());
+        let target = handle_for("codec2");
+        let request = b"android.hardware.media.c2@1.0::IComponentStore\0";
+        for code in [1, 2, 3, 4, 5, 9999, 0x0f43_484e] {
+            for data in [&[][..], request.as_slice()] {
+                assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, data), 1) });
+            }
+        }
+        assert!(!SERVICE_HANDLES.lock().unwrap().contains_key("codec2_component"));
+
+        // Discovery must not advertise a default instance or HWBINDER transport
+        // and must not mint a service result for an absent component store.
+        let (fq_ptr, fq_len) = leak_cstr("android.hardware.media.c2@1.0::IComponentStore");
+        let mut data = b"android.hidl.manager@1.0::IServiceManager\0".to_vec();
+        while data.len() % 4 != 0 { data.push(0); }
+        let mut offsets = Vec::new();
+        push_buffer_object(&mut data, &mut offsets, 0, 0, 16, 0, 0);
+        push_buffer_object(&mut data, &mut offsets, 1, fq_ptr, fq_len, 0, 0);
+        for code in [1, 3, 5, 13] {
+            let mut tr = transaction(0, code, &data);
+            tr.offsets_size = (offsets.len() * 8) as u64;
+            tr.offsets_ptr = offsets.as_ptr() as u64;
+            assert_unknown_transaction(unsafe { make_reply(&tr, 1) });
+        }
+        // The manager's own base descriptors remain available independently of
+        // Codec2; keeping them does not claim any decoder implementation.
+        let reply = unsafe { make_reply(&transaction(0, INTERFACE_TRANSACTION, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        let base = b"android.hidl.base@1.0::IBase";
+        assert!(reply.parcel.windows(base.len()).any(|bytes| bytes == base));
+    }
+
+    #[test]
+    fn unknown_transaction_is_a_transport_status_not_an_aidl_exception() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let data = service_request("android.gui.ISurfaceComposer", "");
+        let tr = transaction(handle_for("SurfaceFlingerAIDL"), 9999, &data);
+        let mut write = Vec::new();
+        push_u32(&mut write, BC_TRANSACTION);
+        push_transaction(&mut write, &tr);
+        let mut read = vec![0u8; 256];
+        let mut mapping = vec![0u8; MAP_SIZE as usize];
+        let old_base = MAP_BASE.swap(mapping.as_mut_ptr() as usize, Ordering::Relaxed);
+        let old_len = MAP_LEN.swap(mapping.len(), Ordering::Relaxed);
+        let mut wr = WriteRead {
+            write_size: write.len() as u64,
+            write_buffer: write.as_ptr() as u64,
+            read_size: read.len() as u64,
+            read_buffer: read.as_mut_ptr() as u64,
+            ..WriteRead::default()
+        };
+        let rc = unsafe { handle_write_read(&mut wr) };
+        let response = unsafe { transaction_at(read.as_ptr() as u64, 8) };
+        let status = response.data_ptr.checked_sub(mapping.as_ptr() as u64)
+            .and_then(|at| mapping.get(at as usize..at as usize + 4))
+            .map(|bytes| i32::from_ne_bytes(bytes.try_into().unwrap()));
+        MAP_BASE.store(old_base, Ordering::Relaxed);
+        MAP_LEN.store(old_len, Ordering::Relaxed);
+        assert_eq!(rc, 0);
+        assert_eq!(wr.write_consumed, write.len() as u64);
+        assert_eq!(wr.read_consumed, 8 + std::mem::size_of::<TransactionData>() as u64);
+        assert_eq!(&read[..4], &BR_TRANSACTION_COMPLETE.to_ne_bytes());
+        assert_eq!(&read[4..8], &BR_REPLY.to_ne_bytes());
+        assert_eq!(response.flags, TF_STATUS_CODE);
+        assert_eq!(response.data_size, 4);
+        assert_eq!(response.offsets_size, 0);
+        assert_eq!(status, Some(UNKNOWN_TRANSACTION));
     }
 
     /// A one-way transaction must still be acknowledged.

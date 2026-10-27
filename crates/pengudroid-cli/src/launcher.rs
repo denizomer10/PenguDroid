@@ -412,14 +412,17 @@ pub fn launch(args: &[String]) -> i32 {
             // existing x86_64 app path (NewPipe and friends) is unchanged; the
             // translator is not yet able to finish guest execution for every
             // app, so enabling it by default would regress working launches.
-            // The 128 MiB heap is required once the bridge has reserved the
-            // guest address layout (see LIMITATIONS.md §2.1).
+            // The default name is the Android 17 / Digitalis ARM64 bridge
+            // (`frameworks/libs/binary_translation`, ARM64-to-x86_64 build); set
+            // PENGUDROID_NATIVE_BRIDGE_NAME for a different build. The 128 MiB
+            // heap is required once the bridge has reserved the guest address
+            // layout (see LIMITATIONS.md §2.1 and NATIVE_BRIDGE.md).
             if let Ok(bridge_lib) = std::env::var("PENGUDROID_NATIVE_BRIDGE_LIB") {
                 cmd.arg("--bridge-lib").arg(bridge_lib);
                 let name = std::env::var("PENGUDROID_NATIVE_BRIDGE_NAME")
-                    .unwrap_or_else(|_| "libndk_translation.so".to_string());
+                    .unwrap_or_else(|_| "libberberis_arm64.so".to_string());
                 cmd.arg("--native-bridge").arg(name);
-                cmd.arg("--init-bridge").arg("arm64");
+                cmd.arg("--init-bridge").arg(pengudroid_nativebridge::ARM64_ISA);
                 cmd.arg("--xmx").arg("128m");
             }
             // The JIT crashes in `nterp_op_invoke_virtual` on this framework

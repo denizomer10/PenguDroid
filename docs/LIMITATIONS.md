@@ -30,12 +30,13 @@ Wine works because the Win32 ABI is stable, documented, and — crucially —
 Wine reimplements the entire platform rather than hosting Microsoft's
 `ntdll`. PenguDroid's plan is the harder, opposite bet: host *Google's* ART.
 
-**Where it stands now.** `pengudroid art-test --sysroot <tree>` against an
-extracted LineageOS 20 (Android 13, x86_64) tree returns **`JNI_OK`**. A live
-`JavaVM` and `JNIEnv` come back, `GetVersion()` reports `JNI_VERSION_1_6`, and
-Java code executes: classes taken from a real APK's `classes.dex` are loaded and
-linked through the system class loader, and `android.app.ActivityThread.main`
-can be invoked.
+**Current runtime contract: Android 17 / API 37 x86_64 only.** Earlier Android-17
+bringup reached JNI_OK, core framework probes, UI rendering and service binding;
+that does not establish complete media/application compatibility. The verified
+runtime tree is absent from the current checkout, so new live validation is
+blocked, not redirected to another Android release. See [ANDROID17.md](ANDROID17.md)
+and [STATUS.md](STATUS.md). Older diagnostic observations below are historical
+lessons, not supported runtime configurations.
 
 The path there was ABI translation, not environment emulation:
 
@@ -162,45 +163,18 @@ code *starts* executing but does not yet run. Booting the guest ARM
 runtime" path, so even a fixed handler would need the same `system_server` work
 that blocks Activities above.
 
-### 2.2 Reproducing the translator run
+### 2.2 ARM64 execution is an independent migration gate
 
-The translator and its guest runtime come from Google's Android 11 (API 30)
-x86_64 Google-APIs image (`system-images;android-30;google_apis;x86_64`,
-`x86_64-30_r16.zip`, sha1 `6ae21030eaadc041078444d3798e4b399f3e787d`). Inside
-its `system.img` (raw ext4 at offset `0x300000`):
+The old mixed-runtime/container diagnostic recipe is retired. It is not a
+supported launch path and must not be used as a fallback for API 37.
+An ARM64 implementation must work within the Android-17 host boundary and keep
+its loader, libc/JNI, graphics and memory ownership contracts explicit.
 
-```
-/system/lib64/libndk_translation.so          # the translator
-/system/lib64/libndk_translation_proxy_*.so  # GLES/EGL/Vulkan proxies
-/system/lib64/arm64/                         # 59 ARM64 guest libs
-/system/lib/arm/                             # 32-bit guest libs
-/system/bin/arm64/{app_process64,linker64}   # guest runtime entry points
-```
-
-The run needs `/system` and `/apex` at their real paths, because the translator
-opens them by absolute path. `bwrap` gives that without root:
-
-```sh
-SYS=$PWD/.toolchain/sysroot/system                 # the Android 13 system tree
-ARM=$PWD/.toolchain/ndk-arm                        # the extracted ARM runtime
-bwrap --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
-      --ro-bind /bin /bin --ro-bind /sbin /sbin --ro-bind /etc /etc \
-      --bind /home /home --bind /tmp /tmp --bind /run /run \
-      --dev /dev --proc /proc --bind /sys /sys \
-      --ro-bind $SYS /system --ro-bind $SYS/apex /apex \
-      --ro-bind $ARM/lib64/arm64 /system/lib64 \
-      --ro-bind $ARM/lib/arm /system/lib/arm \
-      --ro-bind $ARM/bin/arm64 /system/bin/arm64 \
-      --dir /data --dir /dev/socket --chdir $PWD \
-      ./target/debug/pengudroid art-test --sysroot .toolchain/sysroot \
-        --bridge-lib .toolchain/ndk-arm/lib64 \
-        --native-bridge libndk_translation.so --init-bridge arm64 --xmx 128m
-```
-
-Note `/system/lib64` is bound to the **ARM64** directory: the guest linker
-otherwise picks the x86-64 `libc++.so` that lives in the host system tree.
-Nothing about this path is vendor specific — the translator's proxy libraries
-forward the guest's EGL/GLES/Vulkan calls to whatever host driver is installed.
+The currently supplied Beach Buggy Racing 2 XAPK contains 18 native libraries,
+all ELF AArch64, and no x86_64 native payload. This was checked offline across
+all its APK members; the application was not executed. Exact artifact identity
+and the migration gates are recorded in [ANDROID17.md](ANDROID17.md). The older
+APKM example in the next section is a different artifact, not current validation.
 
 ### 2.3 Worked example: Beach Buggy Racing 2 (APKM bundle)
 

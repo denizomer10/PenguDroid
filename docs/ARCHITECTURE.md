@@ -186,7 +186,7 @@ symbol names so they interpose over the real ones in a guest process:
 * `ashmem_create_region` and friends, mapped to memfd
 * `android_get_device_api_level`, reporting 36
 * the `__system_property_*` family, backed by an in-process store seeded with
-  Android 16 defaults
+  Android 17 / API 37 x86_64 defaults (platform identity is immutable)
 
 It carries a `.init_array` constructor so its load is visible.
 

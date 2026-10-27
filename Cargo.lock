@@ -2992,6 +2992,7 @@ dependencies = [
  "pengudroid-elf",
  "pengudroid-hostgpu",
  "pengudroid-input",
+ "pengudroid-nativebridge",
  "pengudroid-proto",
  "pengudroid-socket",
  "roxmltree",
@@ -3043,6 +3044,13 @@ dependencies = [
 
 [[package]]
 name = "pengudroid-input"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "pengudroid-nativebridge"
 version = "0.1.0"
 dependencies = [
  "libc",

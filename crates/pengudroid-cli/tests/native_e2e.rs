@@ -152,7 +152,10 @@ fn software_video_frames_keep_wayland_connection_alive() {
         std::thread::sleep(Duration::from_millis(20));
     }
     let conn = Connection::connect_endpoint(&socket).unwrap();
-    conn.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    // A full workspace run executes many test binaries in parallel, and this
+    // test waits on compositor round trips. Three seconds was enough alone but
+    // not under that load, where a healthy daemon was reported as `WouldBlock`.
+    conn.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
     conn.send_message(&Message::Hello {
         version: PROTO_VERSION, role: Role::Guest, pid: std::process::id() as i32,
     }, &[]).unwrap();

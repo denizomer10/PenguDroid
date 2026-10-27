@@ -1,6 +1,7 @@
 //! IInputManager's immutable virtual keyboard. The InputDevice body is written
 //! by the live framework, including its real native KeyCharacterMap parcel.
-//! Transaction numbers are from this Android 13 framework's IInputManager$Stub.
+//! `reply` accepts internal semantic operation IDs, not Binder transaction
+//! numbers. The broker maps the API-37 Stub's installed codes to these IDs.
 
 fn int(args: &[u8], index: usize) -> Option<i32> {
     Some(i32::from_le_bytes(args.get(index * 4..index * 4 + 4)?.try_into().ok()?))

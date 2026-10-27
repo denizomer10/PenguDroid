@@ -1,0 +1,11 @@
+[package]
+name = "pengudroid-nativebridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Client for Android's native-bridge interface, used to run ARM64 guest code on x86_64"
+
+[dependencies]
+libc.workspace = true

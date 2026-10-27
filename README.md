@@ -15,10 +15,15 @@ A small always-on daemon (`pengudroid-daemon`, analogous to Proton's
 `wineserver`) brokers shared resources and stays resident; apps come and go as
 normal processes that you can see in `ps aux`.
 
+**Runtime target: Android 17 / API 37, x86_64 only.** Older runtime images are
+rejected, not used as fallback. APK minSdk/targetSdk remain application metadata.
+See [the current migration boundaries](docs/ANDROID17.md) and
+[status](docs/STATUS.md) before interpreting historical app screenshots/results.
+
 ```
 $ pengudroid run app.apk
 package:      com.example.app
-targetSdk:    36
+targetSdk:    37
 main activity:com.example.app/.MainActivity
 started guest: pid 26829 (com.example.app)
 the window is live; press Ctrl-C to stop the guest
@@ -36,11 +41,13 @@ $ ps -eo pid,comm,args | grep pengudroid
 
 > **Where we are right now:** `docs/STATUS.md` is the up-to-date handoff note
 > (what runs, what does not, and the exact failure point of each attempt).
-> Last verified: **NewPipe 0.29.1 launches, draws and presents on screen** —
-> `pengudroid launch NewPipe_v0.29.1.apk --sysroot <dir>` opens a Wayland window
-> with the live feed, rendered by hwui on the host GPU, with a clean log (no EGL
-> or vsync warnings). x86_64 NativeActivity games run on the GPU too. Beach Buggy
-> Racing 2 still stops at the ARM translator.
+> **Current target: API 37 only.** Earlier API-37 runs reached NewPipe UI and
+> PlayerService binding, but stable playback and hardware decoding are not yet
+> established. The API-37 runtime is absent from this checkout, so the latest
+> changes have host/source tests, not a new live NewPipe result. The included
+> Beach Buggy Racing 2 package has only ARM64 native libraries and needs a working
+> ARM64 execution path. Screenshots below record earlier milestones, not proof
+> that the current API-37 end-to-end goals are complete.
 >
 > ![NewPipe running under PenguDroid](docs/screenshots/newpipe.png)
 >
@@ -52,7 +59,9 @@ $ ps -eo pid,comm,args | grep pengudroid
 
 This is an **MVP skeleton with a genuinely working spine**. The infrastructure
 is real and tested; the Android runtime integration is the next (very large)
-milestone. Nothing below is overstated.
+milestone. App/framework rows below include historical measurements and must be
+revalidated on the API-37 target; the current migration gaps are listed in
+[ANDROID17.md](docs/ANDROID17.md).
 
 | Area | Status | Notes |
 |---|---|---|
@@ -62,7 +71,7 @@ milestone. Nothing below is overstated.
 | Kernel binder probe (`BINDER_VERSION` ioctl) + fallback | **Working** | detects `/dev/binderfs/binder`; falls back to userspace broker on desktop kernels |
 | Userspace binder broker: named services, transactions | **Working** | `pengudroid services` lists the table; platform stubs answer transactions |
 | Guest↔guest service calls (forwarded over the control socket) | **Working** | a guest registers a service, another connection transacts on its handle; covered by an integration test with a real daemon |
-| Android property store (`getprop`/`setprop`, enumeration) | **Working** | Android 16 defaults; `getprop` with no name lists everything |
+| Android property store (`getprop`/`setprop`, enumeration) | **Working** | Android 17 / API 37 x86_64 identity; incompatible overrides and stale persisted identity are rejected |
 | APK + binary `AndroidManifest.xml` parsing | **Working** | ZIP (store/deflate) + AXML parser, unit-tested |
 | `pengudroid deps`: ELF import / Bionic-coverage analysis | **Working** | parses real arm64 / armv7 / x86-64 APK libraries; predicts `dlopen` outcome |
 | Loading **real Android APK libraries** on glibc (`de-bionic` + `libpath` + `nativelib`) | **Working** | real x86-64 APK libraries (`librtb.so`, `libgtb.so`, `libnativeutil.so`) `dlopen` successfully |
@@ -96,7 +105,7 @@ milestone. Nothing below is overstated.
 | **App services (`startService`/`bindService`)** | **Working** | the host answers both `IActivityManager` transactions and plays `ActiveServices`: it builds `CreateServiceData`, posts `ActivityThread$H.CREATE_SERVICE` on the main thread, calls `handleCreateService`/`onBind`, publishes the binder and delivers `IServiceConnection.connected`. NewPipe's `PlayerService` comes up and ExoPlayer starts |
 | Audio: PipeWire | **Working** | the daemon owns a shared ring and drains it into `pw-cat` (or `aplay`); `audio-test [--via-daemon]` streams PCM |
 | Telephony (`ITelephony`) | **Working (no-SIM model)** | real AIDL transaction codes and `Parcel`-marshalled replies for the methods apps reach through `TelephonyManager`; `pengudroid telephony` transacts and decodes them |
-| **Running real DEX bytecode (ART)** | **Working (VM + DEX)** | `JNI_CreateJavaVM` now returns `JNI_OK` against an extracted LineageOS 20 (Android 13) tree: ART's whole startup path completes and Java code executes. Classes from a real APK's `classes.dex` load and link through the system class loader |
+| **Running real DEX bytecode (ART)** | **API-37 migration** | Earlier Android 17 bringup returned `JNI_OK` and ran core/BLAST CheckJNI probes. Current sysroot selection accepts API-37 x86_64 only; the live fixture must be supplied to rerun those gates |
 | **Activity lifecycle driven from the host** | **Working** | with `--bind-app` the host plays `system_server`'s part: it builds `AppBindData` over JNI, calls `handleBindApplication`, then `handleLaunchActivity`/`handleResumeActivity` for the manifest's launcher activity. No `system_server`, no `AppBindData` parcel |
 | **hwui drawing** | **Working** | `ViewRootImpl.performTraversals` reaches `performDraw`, `ThreadedRenderer` renders the real view hierarchy into the shim's FBO, and `eglSwapBuffers` runs every frame |
 | **Presenting an app's frames on Wayland** | **Working** | the gleshim exports the FBO as a dma-buf, the daemon imports it through `zwp_linux_dmabuf_v1` and commits it; NewPipe's live feed is on screen (`docs/screenshots/newpipe.png`) |
@@ -112,7 +121,7 @@ milestone. Nothing below is overstated.
 | **`ActivityThread.main`** | **Working (framework loop)** | invoked on the live VM; `attach()` completes against the emulated binder broker and the process enters `Looper.loop()`, waiting for `system_server` to bind it |
 | **Bionic `sigaction`/`sigset_t` translation** | **Working** | Bionic's `sigset_t` is 8 bytes and `struct sigaction` 32; glibc's are 128/152. Interposing the whole signal API is what made ART stop corrupting its own globals |
 | **Virtual Android root (`PENGUDROID_ROOT`)** | **Working** | absolute paths under `/apex`, `/system`, `/vendor`, `/data`, ... are rewritten into an extracted tree at the libc boundary (`open`/`fopen`/`stat`/...), so libcore's `VMClassLoader` can open the boot jars — no chroot, no mount namespace |
-| **Full boot class path (boot image + APEX fragments)** | **Working** | the image's 12 components plus the `etc/classpaths/bootclasspath.pb` fragments of every APEX (31 jars on LineageOS 20); without them mainline classes (`android.net.ProxyInfo`, conscrypt, bluetooth) are invisible to the boot loader |
+| **Full boot class path (boot image + APEX fragments)** | **API-37 contract** | Required framework classpath metadata and APEX fragments determine jar order; malformed metadata and missing declared jars fail rather than selecting a hardcoded older jar list |
 | **`AndroidRuntime::setArgv0` without `app_process`** | **Working** | interposed because `getRuntime()` is null when ART is hosted directly; the call would otherwise null-deref during `ActivityThread.main` |
 | **In-process `/dev/binder` device** | **Working (service lookups)** | `memfd`-backed device answering `BINDER_VERSION` (8), `SET_MAX_THREADS`, `SET_CONTEXT_MGR`, `THREAD_EXIT`; `BINDER_WRITE_READ` parses transactions and replies with `flat_binder_object` handles (including the stability field libbinder requires). `ServiceManager.getService` returns a real proxy and `attachApplication` is accepted |
 | **ARM→x86_64 translation (Intel NDK translation)** | **Partial** | the emulator's `libndk_translation.so` loads and initialises (`Initialized NDK translation (aarch64)`), the guest linker resolves the ARM64 runtime and `ExecuteGuest` starts running the real ARM64 `app_process64`; it then dies in the translator's lazy code-translation fault handler. See `docs/LIMITATIONS.md` §2.1 |

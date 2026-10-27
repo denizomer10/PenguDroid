@@ -43,6 +43,7 @@ use std::ffi::CStr;
 use std::os::raw::{c_char, c_void};
 use std::sync::Mutex;
 
+use crate::ahardwarebuffer::{GetNativeBuffer, GRAPHIC_BUFFER_GET_NATIVE_BUFFER};
 use crate::audiotrack::{jni_find_class, jni_slot, NativeMethod};
 
 // ---------------------------------------------------------------------------
@@ -123,7 +124,7 @@ type AcquireBuffer =
 /// `BufferItemConsumer::releaseBuffer(const BufferItem&, const sp<Fence>&,
 /// std::optional<std::function<void(const sp<GraphicBuffer>&)>>)`.
 type ReleaseBuffer =
-    unsafe extern "C" fn(*mut c_void, *const c_void, *const [u64; 2], *mut UnusedOptional) -> i32;
+    unsafe extern "C" fn(*mut c_void, *const c_void, *const c_void, *mut UnusedOptional) -> i32;
 
 /// One disengaged libc++ `optional<std::function<void(const sp<GraphicBuffer>&)>>`.
 ///
@@ -177,6 +178,7 @@ struct Gui {
     item_consumer_ctor: ItemConsumerCtor,
     item_ctor: BufferItemCtor,
     item_dtor: BufferItemDtor,
+    get_native_buffer: GetNativeBuffer,
     acquire: AcquireBuffer,
     release: ReleaseBuffer,
     set_default_size: SetDefaultSize,
@@ -209,6 +211,11 @@ fn gui() -> Option<&'static Gui> {
         );
         let item_ctor = guest_sym(b"libgui.so\0", b"_ZN7android10BufferItemC1Ev\0");
         let item_dtor = guest_sym(b"libgui.so\0", b"_ZN7android10BufferItemD1Ev\0");
+        let get_native_buffer = guest_sym(b"libui.so\0", GRAPHIC_BUFFER_GET_NATIVE_BUFFER);
+        if get_native_buffer.is_null() {
+            eprintln!("[blast] libui.so is missing Android 17 GraphicBuffer::getNativeBuffer() const; private-layout fallback is unsupported");
+            return None;
+        }
         let acquire = guest_sym(
             b"libgui.so\0",
             b"_ZN7android18BufferItemConsumer13acquireBufferEPNS_10BufferItemElbNSt3__18optionalINS3_8functionIFvRKNS_2spINS_13GraphicBufferEEEEEEEE\0",
@@ -279,6 +286,7 @@ fn gui() -> Option<&'static Gui> {
             item_consumer_ctor: std::mem::transmute(item_consumer_ctor),
             item_ctor: std::mem::transmute(item_ctor),
             item_dtor: std::mem::transmute(item_dtor),
+            get_native_buffer: std::mem::transmute(get_native_buffer),
             acquire: std::mem::transmute(acquire),
             release: std::mem::transmute(release),
             set_default_size: std::mem::transmute(set_default_size),
@@ -303,15 +311,15 @@ fn gui() -> Option<&'static Gui> {
 
 /// Bytes reserved for a `libgui` object we construct ourselves.
 ///
-/// `Surface` and `BufferItemConsumer` have no exported `sizeof`, and their
-/// constructors write through `this`, so the block must be comfortably larger
-/// than either. 8 KiB is far above both (a `BLASTBufferQueue` is 5 KiB).
+/// `Surface`, `BufferItemConsumer` and `BLASTBufferQueue` have no exported
+/// `sizeof`. This existing reservation still needs target-build size/alignment
+/// validation; the native-buffer accessor fixture does not validate it.
 const OBJECT_SIZE: usize = 8192;
 
 /// One hosted `BLASTBufferQueue`.
 ///
-/// `producer`/`consumer` are `sp<>` pairs (object pointer + control block), the
-/// same layout `libgui` uses, so they can be handed straight back to it.
+/// android17-release StrongPointer.h stores one object pointer in `sp<T>`;
+/// `producer`/`consumer` reserve an extra, unused word, not a control block.
 struct Blast {
     producer: [u64; 2],
     consumer: [u64; 2],
@@ -656,11 +664,9 @@ static OWNER_ID: u8 = 0;
 
 /// The `RefBase` subobject of a `libgui` object.
 ///
-/// `ConsumerBase` inherits `virtual RefBase`, so its `RefBase` lives at the
-/// offset the vtable's virtual-base entry names — **not** at offset 0. Measured
-/// for `BufferItemConsumer`: `v[-3] = 1688 = 0x698`, which is exactly the
-/// `this + 0x698` its constructor passes to `RefBase::RefBase`. For a class
-/// whose `RefBase` is a non-virtual primary base (`Surface`) the entry is 0.
+/// android17-release declares ConsumerBase's RefBase virtual and Surface's
+/// RefBase non-virtual. The v[-3] lookup below is still private C++ ABI coupling,
+/// not an ANativeWindowBuffer offset, and needs target-build validation.
 unsafe fn refbase_of(obj: *mut c_void) -> *mut c_void {
     if obj.is_null() {
         return obj;
@@ -682,10 +688,10 @@ unsafe fn refbase_of(obj: *mut c_void) -> *mut c_void {
 /// the constructor did not run and calling `incStrong` would fault.
 unsafe fn keep_alive(gui: &Gui, what: &str, obj: *mut c_void, fixed_offset: Option<i32>) -> bool {
     let vptr = *(obj as *const *const u8);
-    // `Surface` has `RefBase` as its (non-virtual) primary base, so it lives at
-    // offset 0; its vtable header does not carry a usable vbase entry (measured:
-    // `v[-3]` decodes to -1312590112). `BufferItemConsumer` inherits
-    // `virtual RefBase`, so there the offset really is in the vtable.
+    // Remaining private C++ ABI dependencies: Surface's RefBase at +0, the
+    // virtual-base entry at v[-3], and RefBase::mRefs at +8 below. The Android 17
+    // inheritance declarations are source-confirmed, but the native-buffer
+    // fixture does not establish these target-build offsets.
     let off = match fixed_offset {
         Some(off) => off,
         None if vptr.is_null() => 0,
@@ -828,9 +834,8 @@ fn consumer_loop(addr: usize) {
         return;
     };
 
-    // A `BufferItem` is a plain aggregate; 1 KiB is comfortably more than its
-    // size on LP64. It is constructed once and reused: `acquireBuffer` assigns
-    // over it.
+    // Opaque BufferItem storage, constructed once and assigned by libgui.
+    // This existing 4 KiB capacity also needs target-build sizeof validation.
     let mut item = vec![0u64; 512];
     let item_ptr = item.as_mut_ptr() as *mut c_void;
     unsafe { (gui.item_ctor)(item_ptr) };
@@ -857,11 +862,13 @@ fn consumer_loop(addr: usize) {
             std::thread::sleep(std::time::Duration::from_millis(5));
             continue;
         }
-        // `BufferItem::mGraphicBuffer` is the first member.
+        // android17-release BufferItem.h: mGraphicBuffer is the first member,
+        // Flattenable<BufferItem> is empty, and StrongPointer.h's sp<T> holds a
+        // single T*. No private GraphicBuffer fields are read here.
         let gb = unsafe { *(item.as_ptr() as *const *mut c_void) };
 
         if !gb.is_null() {
-            let handle = unsafe { crate::ahardwarebuffer::graphicbuffer_handle(gb) };
+            let handle = unsafe { crate::ahardwarebuffer::graphicbuffer_handle(gb, gui.get_native_buffer) };
             if !handle.is_null() {
                 let h = unsafe { &*handle };
                 if h.num_fds >= 1 {
@@ -935,24 +942,22 @@ fn consumer_loop(addr: usize) {
                         }
                     }
                 }
+            } else if trace {
+                eprintln!("[blast] video: no supported shim-owned native handle for {gb:p}");
             }
         }
 
-        // `releaseBuffer` reads the item's `mSlot` (offset 0xa0) and the
-        // `sp<GraphicBuffer>` at offset 0. An *empty* `sp<Fence>` is not the
-        // same as `Fence::NO_FENCE`: libgui's `addReleaseFenceLocked` dereferences
-        // the fence, so an empty one faults (measured). Pass the real static.
-        let no_fence: &[u64; 2] = if gui.no_fence == 0 {
-            &EMPTY_SP
+        // Let libgui read mSlot from its own BufferItem; there is no Rust slot
+        // offset to maintain. The acquired item keeps the borrowed handle/fd
+        // alive through PresentShm's snapshot ACK above. An empty sp<Fence> is
+        // not Fence::NO_FENCE: pass the real static to addReleaseFenceLocked.
+        // sp<Fence> is one pointer in Android 17. Pass its address opaquely;
+        // do not form a two-word Rust reference over the guest's static.
+        let no_fence = if gui.no_fence == 0 {
+            EMPTY_SP.as_ptr() as *const c_void
         } else {
-            unsafe { &*(gui.no_fence as *const [u64; 2]) }
+            gui.no_fence as *const c_void
         };
-        if trace {
-            let slot = unsafe { *((item.as_ptr() as *const u8).add(0xa0) as *const i32) };
-            if presented < 3 {
-                eprintln!("[blast] video: releasing slot {slot}");
-            }
-        }
         unsafe {
             let mut unused = UnusedOptional::empty();
             (gui.release)(blast.item_consumer, item_ptr, no_fence, &mut unused)

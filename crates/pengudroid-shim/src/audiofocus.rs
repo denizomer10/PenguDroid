@@ -10,9 +10,8 @@ pub enum Operation { Request, Abandon, Unregister, Current }
 #[derive(Clone, Copy, Debug)]
 pub struct Transactions([u32; 4]);
 impl Transactions {
-    /// Fallback for the historically supported local framework. ART replaces
-    /// these with constants read from its own generated IAudioService Stub.
-    pub const LEGACY: Self = Self([66, 67, 68, 69]);
+    /// Validate codes read from the loaded API-37 IAudioService Stub, in
+    /// request/abandon/unregister/current order. There is no default table.
     pub fn new(codes: [u32; 4]) -> Option<Self> {
         if codes.iter().any(|&c| c == 0 || c >= 0x00ff_fffe)
             || codes.iter().enumerate().any(|(i, c)| codes[..i].contains(c)) {
@@ -52,8 +51,9 @@ mod tests {
             (307, Operation::Unregister), (409, Operation::Current)] {
             assert_eq!(table.operation(code), Some(op));
         }
-        assert_eq!(table.operation(66), None);
-        assert_eq!(Transactions::LEGACY.operation(66), Some(Operation::Request));
+        for code in [0, 66, 67, 68, 69] {
+            assert_eq!(table.operation(code), None);
+        }
         assert!(Transactions::new([1, 1, 2, 3]).is_none());
         assert!(Transactions::new([0, 1, 2, 3]).is_none());
         assert!(Transactions::new([0x00ff_fffe, 1, 2, 3]).is_none());

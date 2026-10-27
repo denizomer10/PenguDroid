@@ -25,7 +25,7 @@
 //! * `<android/api-level.h>` / `<android/set_abort_message.h>` version and
 //!   identity queries.
 //! * `<sys/system_properties.h>` — a small in-process property store seeded
-//!   with plausible Android 16 (API 36) defaults.
+//!   with Android 17 (API 37) x86_64 defaults and validated image identity.
 //!
 //! Besides the `extern "C"` surface, a small **safe** Rust API
 //! ([`format_log_line`], [`log_to_stderr`], [`create_ashmem`], [`get_prop`],
@@ -37,8 +37,9 @@
 //! * `%p`, `%ls` and friends are handed to the host `vsnprintf`, which is
 //!   POSIX-compatible; Android-specific format corner cases are not emulated.
 //! * ashmem pin seals are irreversible (see [`ashmem_unpin_region`]).
-//! * The property store is process-local and accepts `ro.*` writes (Android
-//!   itself normally freezes them after boot).
+//! * The property store is process-local and accepts non-platform `ro.*` writes
+//!   (Android itself normally freezes all of them after boot). Platform version
+//!   and CPU ABI properties cannot be changed through generic overrides.
 
 #![allow(clippy::missing_safety_doc)]
 
@@ -49,6 +50,7 @@ use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 
 use libc::{c_char, c_int, c_void};
+use pengudroid_proto::abi::{validate_platform_property_override, ANDROID_API_LEVEL, ANDROID_RELEASE};
 
 mod ahardwarebuffer;
 mod android_native;
@@ -676,7 +678,7 @@ pub unsafe extern "C" fn ashmem_set_size(fd: c_int, size: usize) -> c_int {
 /// `android_get_device_api_level()` — the API level we advertise to guests.
 #[no_mangle]
 pub unsafe extern "C" fn android_get_device_api_level() -> c_int {
-    pengudroid_proto::abi::ANDROID_API_LEVEL
+    ANDROID_API_LEVEL
 }
 
 /// `android_get_application_target_sdk_version()` — the target SDK a guest
@@ -684,7 +686,7 @@ pub unsafe extern "C" fn android_get_device_api_level() -> c_int {
 #[no_mangle]
 pub unsafe extern "C" fn android_get_application_target_sdk_version() -> c_int {
     match TARGET_SDK.load(Ordering::Relaxed) {
-        0 => pengudroid_proto::abi::ANDROID_API_LEVEL,
+        0 => ANDROID_API_LEVEL,
         v => v as c_int,
     }
 }
@@ -1220,39 +1222,67 @@ pub unsafe extern "C" fn __loader_dl_iterate_phdr(
 /// [`seeded_props`].
 static PROPS: LazyLock<Mutex<BTreeMap<String, String>>> = LazyLock::new(|| Mutex::new(seeded_props()));
 
-/// The property store's initial contents: [`default_props`] overlaid with what
-/// the sysroot's own `build.prop` says.
+/// The property store's initial contents: [`default_props`] overlaid with the
+/// supported sysroot's own `build.prop` version metadata.
 ///
-/// The API level has to describe the **framework that is actually loaded**, not
-/// the one we would like to have. Advertising API 36 while running an Android 13
-/// `framework.jar` makes apps take their API-34+ code paths and die on
-/// `NoSuchMethodError` (Roblox calls `JobScheduler.forNamespace`, added in 34).
-/// Reading `ro.build.version.*` out of the sysroot keeps the two in step, so
-/// upgrading the sysroot upgrades the reported level with no code change.
+/// A configured sysroot must prove it is Android 17 / API 37. Neither adopting
+/// an older image's SDK nor hiding an unreadable image behind the defaults is
+/// safe: the framework and the shim must use the same ABI.
 fn seeded_props() -> BTreeMap<String, String> {
     let mut props = default_props();
     let Some(root) = std::env::var_os("PENGUDROID_ROOT") else {
         return props;
     };
     let path = std::path::Path::new(&root).join("system/build.prop");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return props;
-    };
-    overlay_version_properties(&mut props, &text);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!("cannot verify Android {ANDROID_RELEASE} / API {ANDROID_API_LEVEL} sysroot identity at {}: {error}", path.display())
+    });
+    overlay_version_properties(&mut props, &text).unwrap_or_else(|error| {
+        panic!("invalid sysroot identity at {}: {error}", path.display())
+    });
     props
 }
 
-/// Version identity is one set, including API 36+ major.minor SDK fields.
-/// Host hardware/device identity must not be overwritten by image properties.
-fn overlay_version_properties(props: &mut BTreeMap<String, String>, text: &str) {
+/// Validate the image before changing any properties; defaults must not mask
+/// missing or incompatible SDK/release declarations. Preserve image version
+/// metadata, including the full SDK, but never its hardware/device identity.
+fn overlay_version_properties(props: &mut BTreeMap<String, String>, text: &str) -> Result<(), String> {
+    let mut image = BTreeMap::new();
     for line in text.lines().map(str::trim) {
         if line.starts_with('#') { continue; }
         if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim();
             if key.starts_with("ro.build.version.") {
-                props.insert(key.to_string(), value.trim().to_string());
+                image.insert(key, value.trim());
             }
         }
     }
+
+    let sdk = ANDROID_API_LEVEL.to_string();
+    for (key, expected) in [
+        ("ro.build.version.sdk", sdk.as_str()),
+        ("ro.build.version.release", ANDROID_RELEASE),
+    ] {
+        let actual = image.get(key).copied();
+        if actual != Some(expected) {
+            return Err(format!(
+                "Android {ANDROID_RELEASE} / API {ANDROID_API_LEVEL} x86_64 only: {key} must be {expected:?}, got {actual:?}"
+            ));
+        }
+    }
+    if let Some(value) = image.get("ro.build.version.sdk_full") {
+        let valid = value.split_once('.').is_some_and(|(major, minor)| {
+            major == sdk && !minor.is_empty() && minor.bytes().all(|b| b.is_ascii_digit())
+        });
+        if !valid {
+            return Err(format!(
+                "ro.build.version.sdk_full must be {sdk}.<minor>, got {value:?}"
+            ));
+        }
+    }
+
+    props.extend(image.into_iter().map(|(key, value)| (key.to_string(), value.to_string())));
+    Ok(())
 }
 
 /// Mutation counter for the property store, mirroring Bionic's per-area serial.
@@ -1262,19 +1292,27 @@ fn overlay_version_properties(props: &mut BTreeMap<String, String>, text: &str) 
 /// counter starts at `1` (as Android's does) and wraps naturally on overflow.
 static SERIAL: AtomicU32 = AtomicU32::new(1);
 
-/// The built-in property defaults plus any `PENGUDROID_PROP_*` overrides.
+/// The built-in property defaults plus validated `PENGUDROID_PROP_*` overrides.
 ///
 /// Environment variables named `PENGUDROID_PROP_<name>` seed a property named
-/// `<name>` (verbatim). Because POSIX environment names may not contain dots,
-/// this is mainly useful for simple, dotted-free property names; the dotted
-/// Android defaults below must be overridden through [`set_prop`].
+/// `<name>` (verbatim). Dotted names work through `env` or process APIs, though
+/// not ordinary shell assignment syntax. Platform version/ABI changes panic
+/// rather than silently accepting or ignoring an incompatible configuration.
 pub fn default_props() -> BTreeMap<String, String> {
+    default_props_with_overrides(std::env::vars())
+}
+
+fn default_props_with_overrides(overrides: impl IntoIterator<Item = (String, String)>) -> BTreeMap<String, String> {
     let mut props = BTreeMap::new();
+    let sdk = ANDROID_API_LEVEL.to_string();
+    let sdk_full = format!("{ANDROID_API_LEVEL}.0");
+    let fingerprint = format!("PenguDroid/pengudroid/pengudroid:{ANDROID_RELEASE}/PENGUDROID/userdebug:user/release-keys");
     let seed: &[(&str, &str)] = &[
-        ("ro.build.version.sdk", "36"),
-        ("ro.build.version.release", "16"),
-        ("ro.build.version.release_or_codename", "16"),
-        ("ro.build.version.release_or_preview_display", "16"),
+        ("ro.build.version.sdk", &sdk),
+        ("ro.build.version.sdk_full", &sdk_full),
+        ("ro.build.version.release", ANDROID_RELEASE),
+        ("ro.build.version.release_or_codename", ANDROID_RELEASE),
+        ("ro.build.version.release_or_preview_display", ANDROID_RELEASE),
         ("ro.build.version.codename", "REL"),
         // `Build.VERSION.ACTIVE_CODENAMES` indexes `ALL_CODENAMES[0]` and
         // `getStringList` returns a *zero-length* array when the property is
@@ -1303,7 +1341,7 @@ pub fn default_props() -> BTreeMap<String, String> {
         // can actually run here without the ARM translator.
         ("ro.product.cpu.abilist", "x86_64"),
         ("ro.product.cpu.abilist64", "x86_64"),
-        ("ro.product.cpu.abilist32", "x86"),
+        ("ro.product.cpu.abilist32", ""),
         ("ro.product.cpu.abi", "x86_64"),
         ("ro.product.cpu.abi2", ""),
         ("ro.product.name", "pengudroid"),
@@ -1318,8 +1356,8 @@ pub fn default_props() -> BTreeMap<String, String> {
         ("ro.build.user", "pengudroid"),
         ("ro.build.host", "pengudroid"),
         ("ro.build.date.utc", "0"),
-        ("ro.build.fingerprint", "PenguDroid/pengudroid/pengudroid:16/PENGUDROID/userdebug:user/release-keys"),
-        ("ro.system.build.fingerprint", "PenguDroid/pengudroid/pengudroid:16/PENGUDROID/userdebug:user/release-keys"),
+        ("ro.build.fingerprint", &fingerprint),
+        ("ro.system.build.fingerprint", &fingerprint),
         ("ro.bootloader", "unknown"),
         ("ro.boot.hardware.sku", "unknown"),
         ("ro.boot.product.hardware.sku", "unknown"),
@@ -1341,14 +1379,22 @@ pub fn default_props() -> BTreeMap<String, String> {
     for (k, v) in seed {
         props.insert(k.to_string(), v.to_string());
     }
-    for (key, value) in std::env::vars() {
+    for (key, value) in overrides {
         if let Some(rest) = key.strip_prefix("PENGUDROID_PROP_") {
             if !rest.is_empty() {
-                props.insert(rest.to_string(), value);
+                apply_property_override(&mut props, rest, &value).unwrap_or_else(|error| {
+                    panic!("invalid environment override {key}: {error}")
+                });
             }
         }
     }
     props
+}
+
+fn apply_property_override(props: &mut BTreeMap<String, String>, name: &str, value: &str) -> Result<(), String> {
+    validate_platform_property_override(name, value, props.get(name).map(String::as_str))?;
+    props.insert(name.to_string(), value.to_string());
+    Ok(())
 }
 
 /// Lock the property store, recovering from a poisoned mutex (a panic in
@@ -1376,14 +1422,30 @@ pub fn get_prop(name: &str) -> Option<String> {
     props.get(name).cloned()
 }
 
-/// Safe mutator: insert or update a property.
+/// Safe mutator: insert or update a non-platform property, or reassert an
+/// identical platform value. Other platform writes panic without mutation.
 ///
-/// Android would normally refuse to change `ro.*` after boot; we accept the
-/// write anyway and document the divergence. Each write bumps the store's
-/// serial (see [`prop_serial`]) so that property waiters observe a change.
+/// Unlike Android, non-platform `ro.*` writes are allowed after boot. Each
+/// accepted write bumps [`prop_serial`]; rejected writes leave it unchanged.
 pub fn set_prop(name: &str, value: &str) {
-    props_lock().insert(name.to_string(), value.to_string());
+    try_set_prop(name, value).unwrap_or_else(|error| panic!("{error}"));
+}
+
+fn try_set_prop(name: &str, value: &str) -> Result<(), String> {
+    apply_property_override(&mut props_lock(), name, value)?;
     SERIAL.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
+fn set_prop_from_c(name: &str, value: &str) -> c_int {
+    match try_set_prop(name, value) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("[pengudroid:props] {error}");
+            unsafe { *libc::__errno_location() = libc::EPERM; }
+            -1
+        }
+    }
 }
 
 /// The property store's current mutation serial (see [`SERIAL`]).
@@ -1423,8 +1485,8 @@ pub unsafe extern "C" fn __system_property_get(name: *const c_char, value: *mut 
 
 /// `__system_property_set(name, value)`.
 ///
-/// Accepts the write unconditionally (including `ro.*`, which Android would
-/// reject post-boot) and returns `0` on success or `-1` for a null `name`.
+/// Returns `0` on an accepted write or `-1` for a null `name`. Attempts to
+/// change platform identity return `-1` with `errno = EPERM` and a diagnostic.
 #[no_mangle]
 pub unsafe extern "C" fn __system_property_set(
     name: *const c_char,
@@ -1435,8 +1497,7 @@ pub unsafe extern "C" fn __system_property_set(
     }
     let name = cstr_lossy(name);
     let value = cstr_lossy(value);
-    set_prop(&name, &value);
-    0
+    set_prop_from_c(&name, &value)
 }
 
 /// A fake `prop_info` for the modern property API.
@@ -1575,8 +1636,8 @@ pub unsafe extern "C" fn property_get(
 
 /// `property_set(name, value)` (libcutils).
 ///
-/// Writes `name` into the store and returns `0`; a null `name` or `value`
-/// returns `-1`.
+/// Returns `0` on an accepted write or `-1` for a null `name` or `value`.
+/// Platform identity changes return `-1` with `errno = EPERM` and a diagnostic.
 #[no_mangle]
 pub unsafe extern "C" fn property_set(name: *const c_char, value: *const c_char) -> c_int {
     if name.is_null() || value.is_null() {
@@ -1584,8 +1645,7 @@ pub unsafe extern "C" fn property_set(name: *const c_char, value: *const c_char)
     }
     let name = cstr_lossy(name);
     let value = cstr_lossy(value);
-    set_prop(&name, &value);
-    0
+    set_prop_from_c(&name, &value)
 }
 
 /// `__system_property_serial(pi)` — the store's mutation serial.
@@ -5241,13 +5301,194 @@ mod tests {
     use super::*;
     use std::os::unix::io::FromRawFd;
 
+    const PLATFORM_OVERRIDE_REJECTIONS: &[(&str, &str)] = &[
+        ("ro.build.version.sdk", "33"),
+        ("ro.build.version.release", "16"),
+        ("ro.build.version.sdk_full", "36.0"),
+        ("ro.build.version.release_or_codename", "16"),
+        ("ro.build.version.release_or_preview_display", "16"),
+        ("ro.build.version.codename", "OldCodename"),
+        ("ro.build.fingerprint", "old-image"),
+        ("ro.system.build.fingerprint", "old-image"),
+        ("ro.product.cpu.abi", "x86"),
+        ("ro.product.cpu.abi2", "x86"),
+        ("ro.product.cpu.abilist", "x86_64,x86"),
+        ("ro.product.cpu.abilist64", "arm64-v8a"),
+        ("ro.product.cpu.abilist32", "x86"),
+        ("ro.appcompat_override.ro.build.version.sdk", "33"),
+        ("ro.appcompat_override.ro.build.version.release", "16"),
+        ("ro.appcompat_override.ro.product.cpu.abilist32", "x86"),
+        ("ro.appcompat_override.ro.appcompat_override.ro.product.cpu.abi", "x86"),
+    ];
+
+    #[test]
+    fn platform_contract_rejects_environment_overrides_without_mutation() {
+        let original = default_props_with_overrides([]);
+        for &(name, value) in PLATFORM_OVERRIDE_REJECTIONS {
+            let key = format!("PENGUDROID_PROP_{name}");
+            let failure = std::panic::catch_unwind(|| {
+                default_props_with_overrides([(key.clone(), value.to_string())])
+            }).expect_err("incompatible environment overrides must fail loudly");
+            let message = failure.downcast_ref::<String>().map(String::as_str)
+                .or_else(|| failure.downcast_ref::<&str>().copied()).unwrap_or("");
+            assert!(message.contains(&key), "{message}");
+
+            let mut props = original.clone();
+            assert!(apply_property_override(&mut props, name, value).is_err());
+            assert_eq!(props, original, "rejection must precede mutation: {name}");
+        }
+    }
+
+    #[test]
+    fn platform_contract_allows_identical_environment_values_and_unrelated_overrides() {
+        let original = default_props_with_overrides([]);
+        let mut overrides: Vec<_> = original.iter().map(|(key, value)| {
+            (format!("PENGUDROID_PROP_{key}"), value.clone())
+        }).collect();
+        overrides.extend([
+            ("PENGUDROID_PROP_pengudroid.app.target_sdk".into(), "33".into()),
+            ("PENGUDROID_PROP_ro.appcompat_override.persist.pengu.compat_probe".into(), "override".into()),
+        ]);
+        let props = default_props_with_overrides(overrides);
+        for (key, value) in original {
+            assert_eq!(props.get(&key), Some(&value), "{key}");
+        }
+        assert_eq!(props.get("pengudroid.app.target_sdk").map(String::as_str), Some("33"));
+        assert_eq!(props.get("ro.appcompat_override.persist.pengu.compat_probe").map(String::as_str), Some("override"));
+    }
+
+    #[test]
+    fn platform_contract_guards_writes_without_restricting_app_target_sdk() {
+        // Isolate the process-global target SDK, property serial and appcompat
+        // view from the rest of the parallel test harness.
+        const CHILD: &str = "PENGUDROID_TEST_PLATFORM_CONTRACT_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::platform_contract_guards_writes_without_restricting_app_target_sdk", "--nocapture"])
+                .env(CHILD, "1")
+                .env("BIONIC_APPCOMPAT_OVERRIDE", "1")
+                .env_remove("PENGUDROID_ROOT")
+                .output().unwrap();
+            assert!(output.status.success(), "{}{}",
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+
+        let setters: [unsafe extern "C" fn(*const c_char, *const c_char) -> c_int; 2] = [
+            __system_property_set, property_set,
+        ];
+        for &(name, value) in PLATFORM_OVERRIDE_REJECTIONS {
+            let before = get_prop(name);
+            let serial = prop_serial();
+            assert!(std::panic::catch_unwind(|| set_prop(name, value)).is_err(), "{name}");
+            assert_eq!(get_prop(name), before, "{name}");
+            assert_eq!(prop_serial(), serial, "rejected Rust write changed serial: {name}");
+            let cname = CString::new(name).unwrap();
+            let cvalue = CString::new(value).unwrap();
+            for setter in setters {
+                unsafe {
+                    *libc::__errno_location() = 0;
+                    assert_eq!(setter(cname.as_ptr(), cvalue.as_ptr()), -1, "{name}");
+                    assert_eq!(*libc::__errno_location(), libc::EPERM, "{name}");
+                }
+                assert_eq!(get_prop(name), before, "{name}");
+                assert_eq!(prop_serial(), serial, "rejected C write changed serial: {name}");
+            }
+        }
+
+        for name in ["ro.build.version.sdk", "ro.build.version.release", "ro.product.cpu.abilist32"] {
+            let value = get_prop(name).unwrap();
+            set_prop(name, &value);
+            let cname = CString::new(name).unwrap();
+            let cvalue = CString::new(value).unwrap();
+            for setter in setters {
+                assert_eq!(unsafe { setter(cname.as_ptr(), cvalue.as_ptr()) }, 0, "{name}");
+            }
+        }
+        for target in [23, 33, 36, 37, 38, 10_000] {
+            assert!(unsafe { android_set_application_target_sdk_version(target) });
+            assert_eq!(unsafe { android_get_application_target_sdk_version() }, target as c_int);
+            assert_eq!(unsafe { __loader_android_get_application_target_sdk_version() }, target as c_int);
+            assert_eq!(unsafe { android_get_device_api_level() }, ANDROID_API_LEVEL);
+            assert_eq!(get_prop("ro.build.version.sdk"), Some(ANDROID_API_LEVEL.to_string()));
+        }
+        assert!(unsafe { __loader_android_set_application_target_sdk_version(0) });
+        assert_eq!(unsafe { android_get_application_target_sdk_version() }, ANDROID_API_LEVEL);
+
+        for (name, expected) in [
+            ("ro.build.version.sdk", ANDROID_API_LEVEL.to_string()),
+            ("ro.product.cpu.abilist", "x86_64".into()),
+            ("ro.product.cpu.abilist32", "".into()),
+        ] {
+            let cname = CString::new(name).unwrap();
+            let mut value = [0 as c_char; PROP_VALUE_MAX];
+            let pi = unsafe { __system_property_find(cname.as_ptr()) };
+            assert!(!pi.is_null(), "{name}");
+            unsafe { __system_property_read(pi, std::ptr::null_mut(), value.as_mut_ptr()); }
+            assert_eq!(unsafe { CStr::from_ptr(value.as_ptr()) }.to_str().unwrap(), expected);
+        }
+        set_prop("persist.pengu.compat_probe", "base");
+        set_prop("ro.appcompat_override.persist.pengu.compat_probe", "override");
+        assert_eq!(get_prop("persist.pengu.compat_probe").as_deref(), Some("override"));
+    }
+
     #[test]
     fn image_version_identity_includes_full_sdk_and_preserves_host_device() {
-        let mut props = BTreeMap::from([("ro.product.model".into(), "PenguDroid".into())]);
-        overlay_version_properties(&mut props, "# image identity\nro.build.version.sdk=37\nro.build.version.sdk_full=37.0\nro.build.version.release=17\nro.build.version.all_codenames=REL\nro.product.model=Image Device\n");
-        assert_eq!(props.get("ro.build.version.sdk_full").map(String::as_str), Some("37.0"));
-        assert_eq!(props.get("ro.build.version.sdk").map(String::as_str), Some("37"));
+        let mut props = default_props();
+        let text = format!(
+            "# image identity\n ro.build.version.sdk = {ANDROID_API_LEVEL}\nro.build.version.sdk_full={ANDROID_API_LEVEL}.0\nro.build.version.release={ANDROID_RELEASE}\nro.build.version.all_codenames=REL\nro.build.version.incremental=image-build\nro.product.model=Image Device\nro.product.cpu.abilist=arm64-v8a\nro.product.cpu.abilist32=armeabi-v7a\n"
+        );
+        overlay_version_properties(&mut props, &text).expect("supported image identity");
+        assert_eq!(props.get("ro.build.version.sdk_full"), Some(&format!("{ANDROID_API_LEVEL}.0")));
+        assert_eq!(props.get("ro.build.version.sdk"), Some(&ANDROID_API_LEVEL.to_string()));
+        assert_eq!(props.get("ro.build.version.release").map(String::as_str), Some(ANDROID_RELEASE));
+        assert_eq!(props.get("ro.build.version.incremental").map(String::as_str), Some("image-build"));
         assert_eq!(props.get("ro.product.model").map(String::as_str), Some("PenguDroid"));
+        assert_eq!(props.get("ro.product.cpu.abilist").map(String::as_str), Some("x86_64"));
+        assert_eq!(props.get("ro.product.cpu.abilist32").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn image_version_identity_rejects_other_platforms_before_mutation() {
+        let original = default_props();
+        for (sdk, release) in [(33, "13"), (36, "16"), (38, "18"), (ANDROID_API_LEVEL, "16")] {
+            let mut props = original.clone();
+            let text = format!("ro.build.version.sdk={sdk}\nro.build.version.release={release}\n");
+            let error = overlay_version_properties(&mut props, &text).unwrap_err();
+            assert!(error.contains("x86_64 only"), "{error}");
+            assert!(error.contains("ro.build.version."), "{error}");
+            assert_eq!(props, original, "a rejected image must not partially change properties");
+        }
+    }
+
+    #[test]
+    fn image_version_identity_requires_explicit_sdk_and_release() {
+        let original = default_props();
+        for text in [
+            String::new(),
+            format!("# ro.build.version.sdk={ANDROID_API_LEVEL}\nro.build.version.release={ANDROID_RELEASE}\n"),
+            format!("ro.build.version.sdk={ANDROID_API_LEVEL}\n"),
+            format!("ro.build.version.sdk=\nro.build.version.release={ANDROID_RELEASE}\n"),
+        ] {
+            let mut props = original.clone();
+            let error = overlay_version_properties(&mut props, &text).unwrap_err();
+            assert!(error.contains("ro.build.version."), "{error}");
+            assert_eq!(props, original, "defaults must not conceal missing image identity");
+        }
+    }
+
+    #[test]
+    fn image_version_identity_rejects_inconsistent_full_sdk() {
+        let original = default_props();
+        for value in ["33.0", "36.0", "", "37", "37.x", "37.0.1"] {
+            let mut props = original.clone();
+            let text = format!(
+                "ro.build.version.sdk={ANDROID_API_LEVEL}\nro.build.version.release={ANDROID_RELEASE}\nro.build.version.sdk_full={value}\n"
+            );
+            let error = overlay_version_properties(&mut props, &text).unwrap_err();
+            assert!(error.contains("ro.build.version.sdk_full"), "{error}");
+            assert_eq!(props, original);
+        }
     }
 
     #[test]
@@ -5313,15 +5554,31 @@ mod tests {
     #[test]
     fn defaults_contain_sdk() {
         let props = default_props();
-        assert_eq!(props.get("ro.build.version.sdk").map(String::as_str), Some("36"));
-        assert_eq!(props.get("ro.build.version.release").map(String::as_str), Some("16"));
+        let sdk = ANDROID_API_LEVEL.to_string();
+        assert_eq!(props.get("ro.build.version.sdk").map(String::as_str), Some(sdk.as_str()));
+        assert_eq!(props.get("ro.build.version.sdk_full"), Some(&format!("{ANDROID_API_LEVEL}.0")));
+        for key in [
+            "ro.build.version.release",
+            "ro.build.version.release_or_codename",
+            "ro.build.version.release_or_preview_display",
+        ] {
+            assert_eq!(props.get(key).map(String::as_str), Some(ANDROID_RELEASE), "{key}");
+        }
+        let fingerprint = format!("PenguDroid/pengudroid/pengudroid:{ANDROID_RELEASE}/PENGUDROID/userdebug:user/release-keys");
+        for key in ["ro.build.fingerprint", "ro.system.build.fingerprint"] {
+            assert_eq!(props.get(key), Some(&fingerprint), "{key}");
+        }
+        for key in ["ro.product.cpu.abilist", "ro.product.cpu.abilist64", "ro.product.cpu.abi"] {
+            assert_eq!(props.get(key).map(String::as_str), Some("x86_64"), "{key}");
+        }
+        assert_eq!(props.get("ro.product.cpu.abilist32").map(String::as_str), Some(""));
         assert_eq!(props.get("ro.hardware").map(String::as_str), Some("pengudroid"));
     }
 
     #[test]
     fn prop_get_set_roundtrip() {
         // An existing default is readable.
-        assert_eq!(get_prop("ro.build.version.sdk").as_deref(), Some("36"));
+        assert_eq!(get_prop("ro.build.version.sdk"), Some(ANDROID_API_LEVEL.to_string()));
 
         // A brand-new key round-trips.
         set_prop("pengudroid.test.key", "value-42");
@@ -5371,10 +5628,10 @@ mod tests {
         let mut buf = [0 as c_char; PROP_VALUE_MAX];
 
         let n = unsafe { __system_property_get(name.as_ptr(), buf.as_mut_ptr()) };
-        assert_eq!(n, 2, "sdk value is 2 bytes long");
+        assert_eq!(n as usize, ANDROID_API_LEVEL.to_string().len());
 
         let got = unsafe { CStr::from_ptr(buf.as_ptr()) };
-        assert_eq!(got.to_str().unwrap(), "36");
+        assert_eq!(got.to_str().unwrap(), ANDROID_API_LEVEL.to_string());
     }
 
     #[test]
@@ -5415,15 +5672,11 @@ mod tests {
     }
 
     #[test]
-    fn identity_reports_api_36() {
-        assert_eq!(
-            unsafe { android_get_device_api_level() },
-            pengudroid_proto::abi::ANDROID_API_LEVEL
-        );
-        assert_eq!(
-            unsafe { android_get_application_target_sdk_version() },
-            pengudroid_proto::abi::ANDROID_API_LEVEL
-        );
+    fn identity_reports_api_37() {
+        assert_eq!(unsafe { android_get_device_api_level() }, ANDROID_API_LEVEL);
+        assert_eq!(unsafe { android_get_application_target_sdk_version() }, ANDROID_API_LEVEL);
+        assert_eq!(get_prop("ro.build.version.sdk"), Some(ANDROID_API_LEVEL.to_string()));
+        assert_eq!(get_prop("ro.build.version.release").as_deref(), Some(ANDROID_RELEASE));
     }
 
     #[test]
@@ -5495,8 +5748,8 @@ mod tests {
         let mut buf = [0 as c_char; PROP_VALUE_MAX];
 
         let n = unsafe { property_get(name.as_ptr(), buf.as_mut_ptr(), default.as_ptr()) };
-        assert_eq!(n, 2);
-        assert_eq!(unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap(), "36");
+        assert_eq!(n as usize, ANDROID_API_LEVEL.to_string().len());
+        assert_eq!(unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap(), ANDROID_API_LEVEL.to_string());
     }
 
     #[test]

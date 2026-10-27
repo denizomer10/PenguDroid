@@ -10,30 +10,62 @@
 //!   Bionic shim, loads `libart.so`, and calls `JNI_CreateJavaVM`. It prints
 //!   ART's own diagnostic when the runtime cannot start.
 //!
-//! Two layouts are understood:
-//!
-//! * **flat** — `lib64/libart.so`, `framework/framework.jar`, ... (what
-//!   `pengudroid sysroot` used to require);
-//! * **android** — an extracted Android root: `system/lib64`,
-//!   `system/apex/com.android.art/lib64`, `system/framework/x86_64/boot.art`,
-//!   ... (what a Waydroid/emulator `system.img` contains).
+//! Only an extracted Android 17 / API 37 x86_64 root is supported:
+//! `system/lib64`, `system/apex/com.android.art/lib64`, and
+//! `system/framework/x86_64/boot.art`. The runtime's own `system/build.prop`
+//! and ART ELF header must identify this target; legacy flat layouts are not
+//! accepted. Framework boot jars come from `system/etc/classpaths/bootclasspath.pb`.
 
 use std::ffi::{c_char, c_int, c_void, CString};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::deps::find_shim;
 use crate::nativelib::ensure_compat_dir;
+use pengudroid_nativebridge::{RuntimeCallbacks, Shorty, Translator};
 
-/// The host's Android ABI directory name (`x86_64`, `arm64-v8a`, ...).
-fn arch_dir() -> &'static str {
-    match std::env::consts::ARCH {
-        "x86_64" => "x86_64",
-        "aarch64" => "arm64",
-        "x86" => "x86",
-        "arm" => "arm",
-        other => other,
+/// Validate the runtime itself, independently of APK minSdk/targetSdk metadata.
+fn validate_runtime(system: &Path) -> Result<(), String> {
+    let props_path = system.join("build.prop");
+    let props = std::fs::read_to_string(&props_path).map_err(|e| format!(
+        "Android 17 / API 37 x86_64 requires {}: {e}", props_path.display()
+    ))?;
+    let sdk: Vec<&str> = props.lines().filter_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key.trim() == "ro.build.version.sdk").then_some(value.trim())
+    }).collect();
+    if sdk.len() != 1 || sdk[0] != "37" {
+        return Err(format!(
+            "unsupported runtime in {}: expected Android 17 / API 37 x86_64 \
+             (ro.build.version.sdk=37), found {}",
+            props_path.display(),
+            if sdk.is_empty() { "no SDK property".into() } else { sdk.join(", ") }
+        ));
     }
+
+    // Only identity is needed here, not section headers or dynamic symbols.
+    // A lib64 directory (or a CPU property) does not prove the ELF is x86_64.
+    let art = system.join("apex/com.android.art/lib64/libart.so");
+    let mut header = [0u8; 20];
+    std::fs::File::open(&art).and_then(|mut file| file.read_exact(&mut header))
+        .map_err(|e| format!(
+            "Android 17 / API 37 x86_64 requires an ART ELF header at {}: {e}",
+            art.display()
+        ))?;
+    if &header[..4] != b"\x7fELF" {
+        return Err(format!("{} is not an ELF file; Android 17 / API 37 x86_64 is required", art.display()));
+    }
+    let machine = u16::from_le_bytes([header[18], header[19]]);
+    if header[4] != 2 || header[5] != 1 || machine != 0x3e {
+        return Err(format!(
+            "unsupported ART runtime {}: Android 17 / API 37 requires a 64-bit \
+             little-endian x86_64 ELF (class=2, data=1, machine=62); \
+             found class={}, data={}, machine={} ({})",
+            art.display(), header[4], header[5], machine, pengudroid_elf::machine_name(machine)
+        ));
+    }
+    Ok(())
 }
 
 /// Where the pieces of an Android system tree live.
@@ -54,85 +86,127 @@ pub struct Layout {
     pub android_root: PathBuf,
 }
 
-/// Collect the boot classpath fragments published by APEXes.
-///
-/// Every mainline APEX ships `etc/classpaths/bootclasspath.pb`; init
-/// concatenates them into `BOOTCLASSPATH` on a device. Sorted by APEX name so
-/// the order is stable across runs.
-fn apex_bootclasspath_fragments(system: &Path) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let Ok(entries) = std::fs::read_dir(system.join("apex")) else {
-        return out;
-    };
-    let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+/// Collect fragments from APEX modules that extend the boot classpath.
+/// Sorted by APEX name so the order is stable across runs. An APEX need not
+/// publish a fragment, but a published fragment must be readable and valid.
+fn apex_bootclasspath_fragments(system: &Path) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let apex = system.join("apex");
+    let entries = std::fs::read_dir(&apex)
+        .map_err(|e| format!("cannot read {}: {e}", apex.display()))?;
+    let mut dirs = entries.map(|entry| entry.map(|e| e.path()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("cannot enumerate {}: {e}", apex.display()))?;
+    // Extracted trees may retain the packed .apex files alongside directories.
+    dirs.retain(|dir| dir.is_dir());
     dirs.sort();
     for dir in dirs {
         let pb = dir.join("etc/classpaths/bootclasspath.pb");
-        let Ok(data) = std::fs::read(&pb) else { continue };
-        for path in jar_paths_in_bootclasspath_pb(&data) {
+        let data = match std::fs::read(&pb) {
+            Ok(data) => data,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("cannot read {}: {e}", pb.display())),
+        };
+        let paths = jar_paths_in_bootclasspath_pb(&data)
+            .map_err(|e| format!("invalid boot classpath fragment {}: {e}", pb.display()))?;
+        for path in paths {
             if !out.contains(&path) {
                 out.push(path);
             }
         }
     }
-    out
+    Ok(out)
 }
 
-/// Read a protobuf varint, returning the value and the bytes consumed.
-fn read_varint(data: &[u8], mut pos: usize) -> Option<(usize, usize)> {
-    let start = pos;
-    let mut value = 0usize;
-    let mut shift = 0;
-    loop {
-        let byte = *data.get(pos)?;
-        pos += 1;
-        value |= ((byte & 0x7f) as usize) << shift;
-        if byte < 0x80 {
-            return Some((value, pos - start));
+fn read_varint(data: &mut &[u8]) -> Result<u64, String> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let (&byte, rest) = data.split_first().ok_or("truncated protobuf varint")?;
+        *data = rest;
+        if shift == 63 && byte > 1 {
+            return Err("overflowing protobuf varint".into());
         }
-        shift += 7;
-        if shift > 28 {
-            return None;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte < 0x80 {
+            return Ok(value);
         }
     }
+    Err("overflowing protobuf varint".into())
 }
 
-/// Extract the jar paths from a serialized `BootClasspath` message.
+/// Skip unneeded fields without guessing their meaning. Length-delimited
+/// values are bounded by the enclosing message, never the whole fragment.
+fn read_protobuf_field<'a>(data: &mut &'a [u8]) -> Result<(u64, Option<&'a [u8]>), String> {
+    let tag = read_varint(data)?;
+    let field = tag >> 3;
+    if field == 0 || field > 0x1fff_ffff {
+        return Err("invalid protobuf field number".into());
+    }
+    let wire = tag & 7;
+    let len = match wire {
+        0 => { read_varint(data)?; return Ok((field, None)); }
+        1 => 8,
+        2 => usize::try_from(read_varint(data)?).map_err(|_| "protobuf length overflow")?,
+        5 => 4,
+        _ => return Err(format!("unsupported protobuf wire type {wire}")),
+    };
+    let value = data.get(..len).ok_or("truncated protobuf field")?;
+    *data = &data[len..];
+    Ok((field, (wire == 2).then_some(value)))
+}
+
+/// Extract the jar paths from the image's boot classpath fragment.
 ///
-/// Layout, verified against the image's fragments:
+/// The fields used here, verified against the image's fragments, are:
 ///
 /// ```text
 /// BootClasspath { repeated Jar paths = 1; }
 /// Jar           { string path = 1; }
 /// ```
 ///
-/// A tiny hand-written parser keeps the CLI free of a protobuf dependency.
-fn jar_paths_in_bootclasspath_pb(data: &[u8]) -> Vec<String> {
+/// Other fields are skipped, not interpreted. Malformed data must not yield a
+/// partial classpath. A small parser avoids adding a protobuf dependency.
+fn jar_paths_in_bootclasspath_pb(mut data: &[u8]) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
-    let mut pos = 0usize;
-    while pos < data.len() {
-        // Outer field 1, wire type 2 (length-delimited).
-        if data[pos] != 0x0a {
-            break;
+    while !data.is_empty() {
+        let (field, value) = read_protobuf_field(&mut data)?;
+        if field != 1 {
+            continue;
         }
-        pos += 1;
-        let Some((len, used)) = read_varint(data, pos) else { break };
-        pos += used;
-        let end = pos.saturating_add(len).min(data.len());
-        if pos < end && data[pos] == 0x0a {
-            let mut inner = pos + 1;
-            if let Some((slen, u2)) = read_varint(data, inner) {
-                inner += u2;
-                if inner + slen <= data.len() {
-                    if let Ok(s) = std::str::from_utf8(&data[inner..inner + slen]) {
-                        out.push(s.to_string());
-                    }
+        let mut jar = value.ok_or("jar must be length-delimited")?;
+        let mut path = None;
+        while !jar.is_empty() {
+            let (field, value) = read_protobuf_field(&mut jar)?;
+            if field == 1 {
+                if path.is_some() {
+                    return Err("jar has duplicate paths".into());
                 }
+                let value = value.ok_or("jar path must be length-delimited")?;
+                let value = std::str::from_utf8(value).map_err(|_| "jar path is not UTF-8")?;
+                if value.is_empty() {
+                    return Err("jar path is empty".into());
+                }
+                path = Some(value.to_string());
             }
         }
-        pos = end;
+        out.push(path.ok_or("jar is missing its path")?);
     }
-    out
+    Ok(out)
+}
+
+fn boot_jar_path(system: &Path, location: &str) -> Result<PathBuf, String> {
+    let relative = location.strip_prefix("/system/")
+        .or_else(|| location.strip_prefix('/').filter(|p| p.starts_with("apex/")))
+        .ok_or_else(|| format!("unsupported boot classpath location: {location:?}"))?;
+    if location.contains(':') || location.contains('\0') || Path::new(relative).components()
+        .any(|part| !matches!(part, std::path::Component::Normal(_))) {
+        return Err(format!("invalid boot classpath location: {location:?}"));
+    }
+    let path = system.join(relative);
+    if !path.is_file() {
+        return Err(format!("required boot classpath jar {location} is missing: {}", path.display()));
+    }
+    Ok(path)
 }
 
 impl Layout {
@@ -141,67 +215,22 @@ impl Layout {
         // Everything downstream builds absolute guest paths from `root`
         // (`ANDROID_ROOT + "/etc/fonts.xml"`, boot class path locations, ...),
         // so a relative `--sysroot` would make them cwd-dependent or plain wrong.
-        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        let root = root.as_path();
-        let flat_art = root.join("lib64/libart.so");
-        let android_art = root.join("system/apex/com.android.art/lib64/libart.so");
-        if flat_art.exists() {
-            Ok(Self::flat(root))
-        } else if android_art.exists() {
-            Ok(Self::android(root))
-        } else {
-            Err(format!(
-                "{} contains neither lib64/libart.so nor \
-                 system/apex/com.android.art/lib64/libart.so",
+        let root = std::fs::canonicalize(root)
+            .map_err(|e| format!("cannot resolve sysroot {}: {e}", root.display()))?;
+        if !root.join("system").is_dir() {
+            return Err(format!(
+                "unsupported sysroot {}: expected an extracted Android 17 / API 37 x86_64 \
+                 root with system/build.prop and system/apex/com.android.art/lib64/libart.so; \
+                 legacy flat sysroots are not supported",
                 root.display()
-            ))
+            ));
         }
+        Self::android(&root)
     }
 
-    fn flat(root: &Path) -> Layout {
-        let art_root = root.join("apex/com.android.art");
-        let framework = root.join("framework");
-        let mut boot_jars = Vec::new();
-        for name in [
-            "core-oj.jar",
-            "core-libart.jar",
-            "okhttp.jar",
-            "bouncycastle.jar",
-            "apache-xml.jar",
-        ] {
-            let p = art_root.join("javalib").join(name);
-            if p.exists() {
-                boot_jars.push(p);
-            }
-        }
-        for name in [
-            "framework.jar",
-            "framework-graphics.jar",
-            "ext.jar",
-            "telephony-common.jar",
-            "voip-common.jar",
-            "ims-common.jar",
-        ] {
-            let p = framework.join(name);
-            if p.exists() {
-                boot_jars.push(p);
-            }
-        }
-        Layout {
-            root: root.to_path_buf(),
-            lib_dirs: vec![root.join("lib64")],
-            art_root,
-            framework: framework.clone(),
-            boot_images: framework.join(arch_dir()),
-            boot_locations: boot_jars.iter().map(|p| p.display().to_string()).collect(),
-            boot_jars,
-            apex_manifest: root.join("apex/com.android.art/apex_manifest.pb"),
-            android_root: root.to_path_buf(),
-        }
-    }
-
-    fn android(root: &Path) -> Layout {
+    fn android(root: &Path) -> Result<Layout, String> {
         let system = root.join("system");
+        validate_runtime(&system)?;
         let art_root = system.join("apex/com.android.art");
         let framework = system.join("framework");
         // Every APEX ships its own lib64; ART's dependency closure reaches
@@ -221,82 +250,63 @@ impl Layout {
             }
         }
 
-        // The ART APEX's boot classpath, then the framework jars. The locations
-        // are the paths the boot image was built with.
-        let mut boot_jars = Vec::new();
-        let mut boot_locations = Vec::new();
-        for name in ["core-oj.jar", "core-libart.jar", "okhttp.jar", "bouncycastle.jar", "apache-xml.jar"] {
-            let p = art_root.join("javalib").join(name);
-            if p.exists() {
-                boot_jars.push(p);
-                boot_locations.push(format!("/apex/com.android.art/javalib/{name}"));
-            }
-        }
-        // ICU4J lives in the i18n APEX and is part of the boot classpath.
-        let icu = system.join("apex/com.android.i18n/javalib/core-icu4j.jar");
-        if icu.exists() {
-            boot_jars.push(icu);
-            boot_locations.push("/apex/com.android.i18n/javalib/core-icu4j.jar".into());
-        }
-        // Android 17 split additional framework classes into jars such as
-        // framework-location and framework-ondeviceintelligence-platform.
-        // The image's classpath fragment, not a release-specific list, is the
-        // source of truth. Retain the old list for images without a fragment.
-        let configured = std::fs::read(system.join("etc/classpaths/bootclasspath.pb"))
-            .map(|bytes| jar_paths_in_bootclasspath_pb(&bytes)).unwrap_or_default();
-        let mut framework_locations: Vec<String> = configured.into_iter()
+        // Preserve the ART/ICU prefix used to build the boot image. Framework
+        // jars, including Android 17's split jars, must come from its fragment.
+        let mut boot_locations: Vec<String> = [
+            "/apex/com.android.art/javalib/core-oj.jar",
+            "/apex/com.android.art/javalib/core-libart.jar",
+            "/apex/com.android.art/javalib/okhttp.jar",
+            "/apex/com.android.art/javalib/bouncycastle.jar",
+            "/apex/com.android.art/javalib/apache-xml.jar",
+            "/apex/com.android.i18n/javalib/core-icu4j.jar",
+        ].into_iter().map(String::from).collect();
+        let fragment = system.join("etc/classpaths/bootclasspath.pb");
+        let data = std::fs::read(&fragment)
+            .map_err(|e| format!("cannot read required boot classpath fragment {}: {e}", fragment.display()))?;
+        let configured = jar_paths_in_bootclasspath_pb(&data)
+            .map_err(|e| format!("invalid boot classpath fragment {}: {e}", fragment.display()))?;
+        let framework_locations: Vec<String> = configured.into_iter()
             .filter(|p| p.starts_with("/system/framework/")).collect();
         if framework_locations.is_empty() {
-            framework_locations = ["framework.jar", "framework-graphics.jar", "ext.jar",
-                "telephony-common.jar", "voip-common.jar", "ims-common.jar"]
-                .into_iter().map(|name| format!("/system/framework/{name}")).collect();
+            return Err(format!(
+                "required boot classpath fragment {} contains no /system/framework/ jars",
+                fragment.display()
+            ));
         }
         for location in framework_locations {
-            if boot_locations.contains(&location) { continue; }
-            let file = root.join(location.trim_start_matches('/'));
-            if file.is_file() {
-                boot_jars.push(file);
+            if !boot_locations.contains(&location) {
                 boot_locations.push(location);
             }
         }
 
-        // Extra boot classpath entries that are *not* covered by the boot image:
-        // Android 13 moved connectivity, bluetooth, conscrypt, permission and
-        // friends into mainline APEX modules, each publishing its own
-        // `etc/classpaths/bootclasspath.pb` fragment. On a device init
-        // concatenates those fragments into BOOTCLASSPATH, so the boot loader
-        // can resolve the classes; without them a native FindClass for (say)
-        // `android.net.ProxyInfo` fails with "Class not found using the boot
-        // class loader". The image covers the first 12 entries, so these are
-        // appended after them.
-        for loc in apex_bootclasspath_fragments(&system) {
-            if boot_locations.contains(&loc) {
-                continue;
+        // Module fragments extend the boot classpath beyond the image's jars.
+        for location in apex_bootclasspath_fragments(&system)? {
+            if !location.starts_with("/apex/") {
+                return Err(format!("unsupported APEX boot classpath location: {location:?}"));
             }
-            let Some(rest) = loc.strip_prefix("/apex/") else { continue };
-            let file = system.join("apex").join(rest);
-            if file.exists() {
-                boot_jars.push(file);
-                boot_locations.push(loc);
+            if !boot_locations.contains(&location) {
+                boot_locations.push(location);
             }
         }
+        let boot_jars = boot_locations.iter().map(|location| boot_jar_path(&system, location))
+            .collect::<Result<Vec<_>, _>>()?;
 
-        Layout {
+        Ok(Layout {
             root: root.to_path_buf(),
             lib_dirs,
             art_root,
             framework: framework.clone(),
-            boot_images: framework.join(arch_dir()),
+            boot_images: framework.join("x86_64"),
             boot_jars,
             boot_locations,
             apex_manifest: system.join("apex/com.android.art/apex_manifest.pb"),
             android_root: system,
-        }
+        })
     }
 
     /// Files ART needs, with a description.
     pub fn required(&self) -> Vec<(String, PathBuf)> {
-        let mut out = vec![
+        vec![
             ("ART runtime".into(), self.art_root.join("lib64/libart.so")),
             ("ART base".into(), self.art_root.join("lib64/libartbase.so")),
             ("DEX support".into(), self.art_root.join("lib64/libdexfile.so")),
@@ -306,11 +316,8 @@ impl Layout {
             ("boot image (oat)".into(), self.boot_images.join("boot.oat")),
             ("framework classes".into(), self.framework.join("framework.jar")),
             ("ART APEX manifest".into(), self.apex_manifest.clone()),
-        ];
-        if self.boot_jars.is_empty() {
-            out.push(("boot classpath jars".into(), self.art_root.join("javalib/core-oj.jar")));
-        }
-        out
+            ("boot classpath fragment".into(), self.android_root.join("etc/classpaths/bootclasspath.pb")),
+        ]
     }
 
     /// `LD_LIBRARY_PATH` value.
@@ -363,7 +370,7 @@ pub fn sysroot(args: &[String]) -> i32 {
     };
 
     println!("sysroot:  {}", layout.root.display());
-    println!("layout:   {}", if layout.root.join("system").is_dir() { "android" } else { "flat" });
+    println!("layout:   android (Android 17 / API 37 x86_64)");
     println!("art root: {}", layout.art_root.display());
     println!("boot:     {}", layout.boot_images.display());
     println!();
@@ -1118,23 +1125,15 @@ fn dlerror() -> String {
     }
 }
 
-/// `NativeBridgeRuntimeCallbacks` — the three hooks ART gives the bridge so it
-/// can walk a class's native methods (`libnativebridge` only uses them when the
-/// translated code calls `RegisterNatives`).
-#[repr(C)]
-struct BridgeCallbacks {
-    get_method_shorty: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *const c_char,
-    get_native_method_count: unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32,
-    get_native_methods:
-        unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, u32) -> u32,
-}
-
+/// The JNI hooks the bridge calls to walk a class's native methods. The type
+/// and its layout belong to `pengudroid-nativebridge`; the CLI only fills it in.
+///
 /// `LoadNativeBridge` does **not** copy the table; it stores the pointer and
 /// hands it back to the translator on every later JNI call. A stack-local table
 /// would leave the translator dereferencing overwritten stack bytes (measured:
-/// `GetJMethodShorty` retains and jumps through it). It therefore has to outlive
-/// the whole process, so it is a `static`.
-static BRIDGE_CALLBACKS: BridgeCallbacks = BridgeCallbacks {
+/// `GetJMethodShorty` retains and jumps through it). It therefore has to
+/// outlive the whole process, so it is a `static`.
+static BRIDGE_CALLBACKS: RuntimeCallbacks = RuntimeCallbacks {
     get_method_shorty: bridge_get_method_shorty,
     get_native_method_count: bridge_get_native_method_count,
     get_native_methods: bridge_get_native_methods,
@@ -1160,9 +1159,9 @@ unsafe extern "C" fn bridge_get_native_methods(
 /// The native bridge, loaded but not yet handed the VM.
 struct BridgeSetup {
     handle: *mut c_void,
-    /// Handle of the translator itself (`libndk_translation.so`), so its
-    /// `NativeBridgeItf` vtable can be called directly.
-    translator: *mut c_void,
+    /// Where the translator itself was loaded from, for the direct self-test.
+    /// The `NativeBridgeItf` table is parsed by `pengudroid-nativebridge`.
+    translator_path: PathBuf,
     initialize: unsafe extern "C" fn(*mut c_void, *const c_char) -> bool,
     isa: String,
 }
@@ -1194,9 +1193,9 @@ fn setup_native_bridge(libs: Option<&Path>, data_dir: &Path, isa: &str) -> Optio
     }
 
     let name = std::env::var("PENGUDROID_PROP_ro.dalvik.vm.native.bridge")
-        .unwrap_or_else(|_| "libndk_translation.so".to_string());
+        .unwrap_or_else(|_| "libberberis_arm64.so".to_string());
     let cname = CString::new(name.as_str()).ok()?;
-    type Load = unsafe extern "C" fn(*const c_char, *const BridgeCallbacks) -> bool;
+    type Load = unsafe extern "C" fn(*const c_char, *const RuntimeCallbacks) -> bool;
     let f: Load = unsafe { std::mem::transmute(load) };
     let loaded = unsafe { f(cname.as_ptr(), &BRIDGE_CALLBACKS) };
     diag(&format!("art: LoadNativeBridge({name}) = {loaded}"));
@@ -1246,10 +1245,16 @@ fn setup_native_bridge(libs: Option<&Path>, data_dir: &Path, isa: &str) -> Optio
         diag(&format!("art: {probe_len} byte probe mmap ok at {probe:p}"));
         unsafe { libc::munmap(probe, probe_len) };
     }
-    // Load the translator a second time through our own handle: the Itf is a
-    // table of function pointers we can drive without libnativebridge's state
-    // machine (which would start a guest app_process).
-    let translator = unsafe { libc::dlopen(cname.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+    // Load the translator a second time through our own handle: the self-test
+    // drives its table directly, without libnativebridge's state machine
+    // (which would start a guest app_process).
+    let translator_path = match libs {
+        Some(dir) => dir.join(&name),
+        None => PathBuf::from(&name),
+    };
+    let ctranslator = CString::new(translator_path.as_os_str().as_encoded_bytes())
+        .unwrap_or_else(|_| cname.clone());
+    let translator = unsafe { libc::dlopen(ctranslator.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
     if translator.is_null() {
         diag(&format!("art: dlopen({name}) failed: {}", dlerror()));
         return None;
@@ -1257,22 +1262,13 @@ fn setup_native_bridge(libs: Option<&Path>, data_dir: &Path, isa: &str) -> Optio
 
     Some(BridgeSetup {
         handle,
-        translator,
+        translator_path,
         initialize: unsafe { std::mem::transmute(init) },
         isa: isa.to_string(),
     })
 }
 
 /// Alternative call shapes for the translator's initialiser.
-///
-/// This ndk_translation build declares `native_bridge_initialize(callbacks,
-/// const char*, const char*)`. Which strings it wants, and whether one of them
-/// selects "do not start a guest app_process", is not documented, so the
-/// selftest can try the shapes out with `PENGUDROID_BRIDGE_MODE`.
-fn bridge_init_mode() -> String {
-    std::env::var("PENGUDROID_BRIDGE_MODE").unwrap_or_else(|_| "dir+isa".into())
-}
-
 /// Drive the translator's `NativeBridgeItf` table directly.
 ///
 /// libnativebridge's state machine calls `Itf.initialize` *and* something that
@@ -1280,18 +1276,15 @@ fn bridge_init_mode() -> String {
 /// library inside our own (x86_64) ART we only need the first half:
 ///
 /// ```text
-///   Itf.initialize(callbacks)                 set up the JIT + signal handlers
-///   Itf.loadLibrary(path, RTLD_NOW)           map/parse the guest ELF
-///   Itf.getTrampoline(handle, name, shorty)   host-callable entry point
+/// NativeBridgeItf.initialize(runtime_cbs, private_dir, "arm64")
+/// NativeBridgeItf.loadLibrary("<lib>/lib/arm64/libfixture.so", RTLD_NOW)
+/// NativeBridgeItf.getTrampoline(handle, sym, shorty, len)
 /// ```
 ///
-/// `spec` is `<lib path>#<symbol>`; the symbol is called with a JNI-static
-/// shape `(JNIEnv*, jclass) -> jint` and its return value printed, so a guest
-/// function that returns a known constant proves translation end to end.
-///
-/// Returns false on any step that did not produce a callable entry point and a
-/// completed call: a self-test that logs a failure and returns success is worse
-/// than no test at all.
+/// The table layout, the argument order and the path rule live in
+/// `pengudroid-nativebridge`; this function only orchestrates. A self-test that
+/// logs a failure and returns success would be worse than no test at all, so
+/// every step must produce a callable entry point and a completed call.
 fn run_bridge_selftest(setup: &BridgeSetup, env: &crate::jni::JniEnv, spec: &str) -> bool {
     let (lib, symbol) = match spec.split_once('#') {
         Some(v) => v,
@@ -1300,100 +1293,65 @@ fn run_bridge_selftest(setup: &BridgeSetup, env: &crate::jni::JniEnv, spec: &str
             return false;
         }
     };
-    let itf = unsafe { libc::dlsym(setup.translator, c"NativeBridgeItf".as_ptr()) };
-    if itf.is_null() {
-        eprintln!("art: the translator does not export NativeBridgeItf");
-        return false;
-    }
-    // struct NativeBridgeCallbacks { uint32_t version; <function pointers...> }
-    let version = unsafe { *(itf as *const u32) };
-    let slot = |i: usize| -> *const c_void {
-        // Slot 0 is the 32-bit version; the pointers start at offset 8.
-        unsafe { *(itf as *const *const c_void).add(i) }
-    };
-    diag(&format!("art: NativeBridgeItf.version = {version}"));
-
-    let init_ptr = {
-        // Offset 8 = slot 1. This ndk_translation build takes three arguments:
-        // (callbacks, app_data_dir, instruction_set) — passing only the
-        // callbacks leaves the other two as garbage, and it strcmp()s them.
-        unsafe { *(itf as *const u8).add(8).cast::<*const c_void>() }
-    };
-    if init_ptr.is_null() {
-        eprintln!("art: Itf.initialize is null");
-        return false;
-    }
-    {
-        type Init = unsafe extern "C" fn(*const BridgeCallbacks, *const c_char, *const c_char) -> bool;
-        let f: Init = unsafe { std::mem::transmute(init_ptr) };
-        let data_dir = std::env::var_os("PENGUDROID_BRIDGE_DATA")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::env::temp_dir().join("pengudroid-bridge"));
-        let _ = std::fs::create_dir_all(&data_dir);
-        let (Ok(cdata), Ok(cisa)) = (
-            CString::new(data_dir.display().to_string()),
-            CString::new("arm64"),
-        ) else {
-            return false;
-        };
-        let mode = bridge_init_mode();
-        let (p2, p3) = match mode.as_str() {
-            "nulls" => (std::ptr::null(), std::ptr::null()),
-            "dir" => (cdata.as_ptr(), std::ptr::null()),
-            "isa+dir" => (cisa.as_ptr(), cdata.as_ptr()),
-            _ => (cdata.as_ptr(), cisa.as_ptr()),
-        };
-        // The translator retains this table pointer for the process lifetime,
-        // so the static must be passed here too — never a stack-local copy.
-        let ok = unsafe { f(&BRIDGE_CALLBACKS, p2, p3) };
-        diag(&format!("art: Itf.initialize(mode={mode}) = {ok}"));
-        if !ok {
+    let mut translator = match Translator::open(&setup.translator_path) {
+        Ok(translator) => translator,
+        Err(error) => {
+            diag(&format!("art: {error}"));
             return false;
         }
-    }
+    };
+    diag(&format!(
+        "art: NativeBridgeItf.version = {} ({})",
+        translator.version(),
+        translator.path().display()
+    ));
 
-    let load = slot(2);
-    if load.is_null() {
-        eprintln!("art: Itf.loadLibrary is null");
+    let data_dir = std::env::var_os("PENGUDROID_BRIDGE_DATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("pengudroid-bridge"));
+    let _ = std::fs::create_dir_all(&data_dir);
+    if let Err(error) = translator.initialize(&BRIDGE_CALLBACKS, &data_dir, &setup.isa) {
+        diag(&format!("art: {error}"));
         return false;
     }
-    type LoadLib = unsafe extern "C" fn(*const c_char, c_int) -> *mut c_void;
-    let f: LoadLib = unsafe { std::mem::transmute(load) };
-    let Ok(clib) = CString::new(lib) else { return false };
-    let handle = unsafe { f(clib.as_ptr(), 2) }; // RTLD_NOW
-    diag(&format!("art: Itf.loadLibrary({lib}) = {handle:p}"));
-    if handle.is_null() {
-        return false;
-    }
+    diag(&format!(
+        "art: Itf.initialize({}, {}) = true",
+        data_dir.display(),
+        setup.isa
+    ));
 
-    let tramp = slot(3);
-    if tramp.is_null() {
-        eprintln!("art: Itf.getTrampoline is null");
-        return false;
-    }
-    // `getTrampoline(handle, name, shorty, shorty_len)`: the shorty is the JNI
-    // shorty ("I" for a static ()I), not the method descriptor "()I". Passing
-    // a descriptor or the wrong length makes the translator build a trampoline
-    // with the wrong marshalling.
-    type GetTramp = unsafe extern "C" fn(
-        *mut c_void,
-        *const c_char,
-        *const c_char,
-        u32,
-    ) -> *mut c_void;
-    let f: GetTramp = unsafe { std::mem::transmute(tramp) };
-    let shorty = b"I";
-    let Ok(csym) = CString::new(symbol) else { return false };
-    let entry = unsafe { f(handle, csym.as_ptr(), shorty.as_ptr() as *const c_char, shorty.len() as u32) };
-    diag(&format!("art: Itf.getTrampoline({symbol}, shorty=I) = {entry:p}"));
-    if entry.is_null() {
-        return false;
-    }
+    let library = match translator.load_library(Path::new(lib)) {
+        Ok(library) => library,
+        Err(error) => {
+            diag(&format!("art: {error}"));
+            return false;
+        }
+    };
+    diag(&format!("art: Itf.loadLibrary({lib}) = {:p}", library.handle()));
 
-    type StaticIntFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
-    let call: StaticIntFn = unsafe { std::mem::transmute(entry) };
+    // The shorty is the JNI shorty (`I` for a static `()I`), not the method
+    // descriptor `()I`; the type rejects the descriptor before the bridge sees
+    // it, because a descriptor produces a wrongly marshalled trampoline.
+    let shorty = match Shorty::parse("I") {
+        Ok(shorty) => shorty,
+        Err(error) => {
+            diag(&format!("art: {error}"));
+            return false;
+        }
+    };
+    let function = match translator.guest_function(&library, symbol, &shorty) {
+        Ok(function) => function,
+        Err(error) => {
+            diag(&format!("art: {error}"));
+            return false;
+        }
+    };
+    diag(&format!(
+        "art: Itf.getTrampoline({symbol}, shorty=I) = {:p}",
+        function.address()
+    ));
     diag("art: calling the translated guest function");
-    let value = unsafe { call(env.0, std::ptr::null_mut()) };
+    let value = unsafe { function.call_int(env.0, &[]) };
     diag(&format!("art: guest {symbol}() returned {value}"));
     true
 }
@@ -1761,6 +1719,11 @@ unsafe fn install_findclass_tracer(env: *mut c_void) {
     println!("art: tracing JNI FindClass (PENGUDROID_TRACE_FINDCLASS)");
 }
 
+/// Default missing metadata, not a declared per-app compatibility level.
+fn app_target_sdk(target_sdk: Option<u32>) -> i32 {
+    target_sdk.map(|sdk| sdk as i32).unwrap_or(37)
+}
+
 /// Bind an APK into the `ActivityThread` that `main` creates.
 ///
 /// Runs on the calling thread (the one that created the VM). `ActivityThread`
@@ -1900,7 +1863,7 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) {
         splits: &splits,
         data_dir: &data_dir,
         native_lib_dir: &lib_dir,
-        target_sdk: info.target_sdk.map(|v| v as i32).unwrap_or(35),
+        target_sdk: app_target_sdk(info.target_sdk),
         min_sdk: info.min_sdk.map(|v| v as i32).unwrap_or(23),
         app_class: info.application_class.as_deref(),
         providers: &usable_providers,
@@ -2058,49 +2021,228 @@ fn run_main(env: &crate::jni::JniEnv, class: &str, args: &[String]) -> i32 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn detects_flat_and_android_layouts() {
-        let dir = std::env::temp_dir().join(format!("pd-layout-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("lib64")).unwrap();
-        std::fs::write(dir.join("lib64/libart.so"), b"x").unwrap();
-        let flat = Layout::detect(&dir).unwrap();
-        assert_eq!(flat.lib_dirs.len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
+    // Synthetic metadata and ELF headers only. No test loads an Android runtime
+    // or uses either of the user's .toolchain sysroot directories as a fixture.
+    struct Fixture(PathBuf);
 
-        let art = dir.join("system/apex/com.android.art/lib64");
-        std::fs::create_dir_all(&art).unwrap();
-        std::fs::write(art.join("libart.so"), b"x").unwrap();
-        let android = Layout::detect(&dir).unwrap();
-        // system/lib64 and the ART APEX are always on the path; every other
-        // APEX that ships a lib64 is appended as it appears.
-        assert_eq!(android.lib_dirs.len(), 2);
-        for apex in ["com.android.runtime", "com.android.i18n"] {
-            std::fs::create_dir_all(dir.join("system/apex").join(apex).join("lib64")).unwrap();
+    impl Fixture {
+        fn empty() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let dir = std::env::temp_dir().join(format!("pd-layout-{}-{stamp}-{id}", std::process::id()));
+            std::fs::create_dir(&dir).unwrap();
+            Self(dir)
         }
-        let android = Layout::detect(&dir).unwrap();
+
+        fn android17() -> Self {
+            let fixture = Self::empty();
+            fixture.write("system/build.prop", b"ro.build.version.sdk=37\nro.build.version.release=17\n");
+            fixture.write("system/apex/com.android.art/lib64/libart.so", &elf_header(2, 1, 0x3e));
+            for name in ["core-oj", "core-libart", "okhttp", "bouncycastle", "apache-xml"] {
+                fixture.write(&format!("system/apex/com.android.art/javalib/{name}.jar"), b"jar");
+            }
+            fixture.write("system/apex/com.android.i18n/javalib/core-icu4j.jar", b"jar");
+            fixture.write("system/framework/framework.jar", b"jar");
+            fixture.fragment("system/etc/classpaths/bootclasspath.pb", &["/system/framework/framework.jar"]);
+            fixture
+        }
+
+        fn write(&self, path: &str, data: &[u8]) {
+            let path = self.0.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, data).unwrap();
+        }
+
+        fn fragment(&self, path: &str, jars: &[&str]) {
+            let bytes: Vec<u8> = jars.iter().flat_map(|jar| pb_entry(jar)).collect();
+            self.write(path, &bytes);
+        }
+
+        fn error(&self) -> String {
+            Layout::detect(&self.0).unwrap_err()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn elf_header(class: u8, data: u8, machine: u16) -> Vec<u8> {
+        let mut header = vec![0u8; 64];
+        header[..4].copy_from_slice(b"\x7fELF");
+        header[4] = class;
+        header[5] = data;
+        header[6] = 1;
+        header[18..20].copy_from_slice(&machine.to_le_bytes());
+        header
+    }
+
+    fn pb_varint(mut value: u64, out: &mut Vec<u8>) {
+        while value >= 0x80 {
+            out.push((value as u8 & 0x7f) | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+    }
+
+    fn pb_bytes(field: u64, value: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        pb_varint((field << 3) | 2, &mut out);
+        pb_varint(value.len() as u64, &mut out);
+        out.extend_from_slice(value);
+        out
+    }
+
+    /// Serialize the fragment's field-1 Jar and its field-1 path.
+    fn pb_entry(path: &str) -> Vec<u8> {
+        pb_bytes(1, &pb_bytes(1, path.as_bytes()))
+    }
+
+    #[test]
+    fn detects_android17_x86_64_layout() {
+        let fixture = Fixture::android17();
+        // A legacy flat library must not override the supported layout.
+        fixture.write("lib64/libart.so", b"not an Android runtime");
+        let android = Layout::detect(&fixture.0).unwrap();
+        assert_eq!(android.root, std::fs::canonicalize(&fixture.0).unwrap());
+        assert_eq!(android.lib_dirs.len(), 2);
+        assert_eq!(android.boot_images, android.android_root.join("framework/x86_64"));
+        assert!(android.required().iter().any(|(_, path)|
+            path == &android.android_root.join("etc/classpaths/bootclasspath.pb")));
+        for apex in ["com.android.runtime", "com.android.i18n"] {
+            std::fs::create_dir_all(fixture.0.join("system/apex").join(apex).join("lib64")).unwrap();
+        }
+        let android = Layout::detect(&fixture.0).unwrap();
         assert_eq!(android.lib_dirs.len(), 4);
         assert!(android.android_root.ends_with("system"));
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(android.boot_jars.len(), android.boot_locations.len());
+        for (jar, location) in android.boot_jars.iter().zip(&android.boot_locations) {
+            assert_eq!(jar, &boot_jar_path(&android.android_root, location).unwrap());
+        }
     }
 
     #[test]
-    fn rejects_a_directory_without_art() {
-        let dir = std::env::temp_dir().join(format!("pd-layout-empty-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        assert!(Layout::detect(&dir).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+    fn rejects_empty_and_legacy_flat_layouts() {
+        let fixture = Fixture::empty();
+        let error = fixture.error();
+        assert!(error.contains("Android 17 / API 37 x86_64"), "{error}");
+        fixture.write("lib64/libart.so", &elf_header(2, 1, 0x3e));
+        let error = fixture.error();
+        assert!(error.contains("legacy flat sysroots are not supported"), "{error}");
     }
 
-    /// Serialize one `BootClasspath { repeated Jar paths = 1 }` entry.
-    fn pb_entry(path: &str) -> Vec<u8> {
-        let mut inner = vec![0x0a];
-        inner.push(path.len() as u8);
-        inner.extend_from_slice(path.as_bytes());
-        let mut out = vec![0x0a];
-        out.push(inner.len() as u8);
-        out.extend_from_slice(&inner);
-        out
+    #[test]
+    fn rejects_non37_missing_and_ambiguous_sdk_metadata() {
+        let fixture = Fixture::android17();
+        for props in [
+            "ro.build.version.sdk=33\n", "ro.build.version.sdk=36\n",
+            "ro.build.version.sdk=38\n", "ro.build.version.sdk=invalid\n",
+            "ro.build.version.sdk=\n", "ro.build.version.release=17\n",
+            "ro.build.version.sdk=37\nro.build.version.sdk=33\n",
+        ] {
+            fixture.write("system/build.prop", props.as_bytes());
+            let error = fixture.error();
+            assert!(error.contains("ro.build.version.sdk=37"), "{props:?}: {error}");
+            assert!(error.contains("system/build.prop"), "{error}");
+        }
+        std::fs::remove_file(fixture.0.join("system/build.prop")).unwrap();
+        let error = fixture.error();
+        assert!(error.contains("requires") && error.contains("system/build.prop"), "{error}");
+    }
+
+    #[test]
+    fn rejects_non_x86_64_or_invalid_art_without_layout_retry() {
+        let fixture = Fixture::android17();
+        for (class, data, machine) in [(2, 1, 0xb7), (1, 1, 3), (2, 2, 0x3e), (1, 1, 0x3e)] {
+            fixture.write("system/apex/com.android.art/lib64/libart.so", &elf_header(class, data, machine));
+            let error = fixture.error();
+            assert!(error.contains("x86_64 ELF"), "{error}");
+            assert!(error.contains(&format!("machine={machine}")), "{error}");
+        }
+        for bytes in [b"not an ELF".as_slice(), &[0u8; 64]] {
+            fixture.write("system/apex/com.android.art/lib64/libart.so", bytes);
+            let error = fixture.error();
+            assert!(error.contains("x86_64"), "{error}");
+        }
+        fixture.write("lib64/libart.so", &elf_header(2, 1, 0x3e));
+        std::fs::remove_file(fixture.0.join("system/apex/com.android.art/lib64/libart.so")).unwrap();
+        let error = fixture.error();
+        assert!(error.contains("requires an ART ELF header"), "{error}");
+    }
+
+    #[test]
+    fn requires_framework_fragment_without_hardcoded_fallback() {
+        let fixture = Fixture::android17();
+        for bytes in [Vec::new(), pb_entry("/apex/com.android.art/javalib/core-oj.jar"), vec![0x0a, 0x80]] {
+            fixture.write("system/etc/classpaths/bootclasspath.pb", &bytes);
+            let error = fixture.error();
+            assert!(error.contains("bootclasspath.pb"), "{error}");
+        }
+        std::fs::remove_file(fixture.0.join("system/etc/classpaths/bootclasspath.pb")).unwrap();
+        let error = fixture.error();
+        assert!(error.contains("cannot read required boot classpath fragment"), "{error}");
+        assert!(error.contains("system/etc/classpaths/bootclasspath.pb"), "{error}");
+    }
+
+    #[test]
+    fn uses_fragment_framework_order_and_deduplicates_without_extra_jars() {
+        let fixture = Fixture::android17();
+        fixture.write("system/framework/framework-location.jar", b"jar");
+        fixture.write("system/framework/ext.jar", b"unlisted jar");
+        fixture.fragment("system/etc/classpaths/bootclasspath.pb", &[
+            "/system/framework/framework-location.jar",
+            "/system/framework/framework.jar",
+            "/system/framework/framework-location.jar",
+        ]);
+        let layout = Layout::detect(&fixture.0).unwrap();
+        assert_eq!(&layout.boot_locations[6..], &[
+            "/system/framework/framework-location.jar", "/system/framework/framework.jar",
+        ]);
+        assert_eq!(layout.boot_jars[6], layout.framework.join("framework-location.jar"));
+    }
+
+    #[test]
+    fn rejects_missing_declared_framework_art_and_apex_jars() {
+        let fixture = Fixture::android17();
+        fixture.fragment("system/etc/classpaths/bootclasspath.pb", &["/system/framework/missing.jar"]);
+        let error = fixture.error();
+        assert!(error.contains("required boot classpath jar /system/framework/missing.jar"), "{error}");
+        fixture.fragment("system/etc/classpaths/bootclasspath.pb", &["/system/framework/framework.jar"]);
+        let core = fixture.0.join("system/apex/com.android.art/javalib/core-oj.jar");
+        std::fs::remove_file(&core).unwrap();
+        let error = fixture.error();
+        assert!(error.contains("core-oj.jar is missing"), "{error}");
+        std::fs::write(core, b"jar").unwrap();
+        fixture.fragment("system/apex/com.android.test/etc/classpaths/bootclasspath.pb", &[
+            "/apex/com.android.test/javalib/missing.jar",
+        ]);
+        let error = fixture.error();
+        assert!(error.contains("/apex/com.android.test/javalib/missing.jar is missing"), "{error}");
+    }
+
+    #[test]
+    fn rejects_malformed_published_apex_fragment() {
+        let fixture = Fixture::android17();
+        fixture.write("system/apex/com.android.test/etc/classpaths/bootclasspath.pb", &[0x0a, 0x80]);
+        let error = fixture.error();
+        assert!(error.contains("invalid boot classpath fragment"), "{error}");
+        assert!(error.contains("com.android.test/etc/classpaths/bootclasspath.pb"), "{error}");
+    }
+
+    #[test]
+    fn rejects_unsupported_or_escaping_boot_jar_locations() {
+        let fixture = Fixture::android17();
+        for location in [
+            "system/framework/framework.jar", "/vendor/framework/framework.jar",
+            "/system/framework/../framework/framework.jar", "/apex/../../outside.jar",
+            "/system/framework/a:b.jar", "/system/framework/a\0b.jar",
+        ] {
+            assert!(boot_jar_path(&fixture.0.join("system"), location).is_err(), "{location:?}");
+        }
     }
 
     #[test]
@@ -2109,7 +2251,7 @@ mod tests {
         data.extend_from_slice(&pb_entry("/apex/com.android.tethering/javalib/framework-connectivity.jar"));
         data.extend_from_slice(&pb_entry("/apex/com.android.tethering/javalib/framework-tethering.jar"));
         assert_eq!(
-            jar_paths_in_bootclasspath_pb(&data),
+            jar_paths_in_bootclasspath_pb(&data).unwrap(),
             vec![
                 "/apex/com.android.tethering/javalib/framework-connectivity.jar",
                 "/apex/com.android.tethering/javalib/framework-tethering.jar",
@@ -2118,26 +2260,66 @@ mod tests {
     }
 
     #[test]
-    fn collects_fragments_from_every_apex() {
-        let dir = std::env::temp_dir().join(format!("pd-apex-pb-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn parses_multibyte_lengths_and_skips_unknown_protobuf_fields() {
+        let path = format!("/system/framework/{}.jar", "a".repeat(160));
+        let mut jar = vec![0x10, 0x01]; // Uninterpreted varint field.
+        jar.extend(pb_bytes(1, path.as_bytes()));
+        jar.extend([0x1d, 0, 0, 0, 0]); // Uninterpreted fixed32 field.
+        jar.extend([0x21, 0, 0, 0, 0, 0, 0, 0, 0]); // Uninterpreted fixed64 field.
+        let mut data = pb_bytes(7, b"unknown outer field");
+        data.extend(pb_bytes(1, &jar));
+        data.push(0x40);
+        pb_varint(u64::MAX, &mut data);
+        assert_eq!(jar_paths_in_bootclasspath_pb(&data).unwrap(), vec![path]);
+    }
+
+    #[test]
+    fn rejects_malformed_protobuf_without_returning_a_partial_classpath() {
+        let mut duplicate = pb_bytes(1, b"/system/framework/a.jar");
+        duplicate.extend(pb_bytes(1, b"/system/framework/b.jar"));
+        let mut overflowing = vec![0x0a];
+        overflowing.extend([0xff; 10]);
+        for bad in [
+            vec![0x0a, 0x80], vec![0x0a, 0x05, 0x0a, 0x01, b'x'],
+            // The path must not consume bytes outside its enclosing Jar.
+            vec![0x0a, 0x02, 0x0a, 0x04, b'a', b'b', b'c', b'd'],
+            vec![0x00], vec![0x0f], vec![0x15, 0x01], vec![0x08, 0x01],
+            pb_bytes(1, &[0x08, 0x01]), pb_bytes(1, &[0x0a, 0x01, 0xff]),
+            pb_bytes(1, &pb_bytes(2, b"no path")), pb_bytes(1, &pb_bytes(1, b"")),
+            pb_bytes(1, &duplicate), overflowing,
+        ] {
+            let mut data = pb_entry("/system/framework/framework.jar");
+            data.extend(&bad);
+            assert!(jar_paths_in_bootclasspath_pb(&data).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn collects_fragments_from_every_apex_in_stable_order() {
+        let fixture = Fixture::android17();
+        fixture.write("system/apex/packed.apex", b"not an expanded APEX directory");
         for (apex, jar) in [
             ("com.android.tethering", "framework-connectivity.jar"),
             ("com.android.conscrypt", "conscrypt.jar"),
         ] {
-            let etc = dir.join("apex").join(apex).join("etc/classpaths");
-            std::fs::create_dir_all(&etc).unwrap();
             let path = format!("/apex/{apex}/javalib/{jar}");
-            std::fs::write(etc.join("bootclasspath.pb"), pb_entry(&path)).unwrap();
+            fixture.write(&format!("system/apex/{apex}/javalib/{jar}"), b"jar");
+            fixture.fragment(&format!("system/apex/{apex}/etc/classpaths/bootclasspath.pb"), &[&path, &path]);
         }
-        let found = apex_bootclasspath_fragments(&dir);
-        assert_eq!(
-            found,
-            vec![
-                "/apex/com.android.conscrypt/javalib/conscrypt.jar",
-                "/apex/com.android.tethering/javalib/framework-connectivity.jar",
-            ]
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+        let found = apex_bootclasspath_fragments(&fixture.0.join("system")).unwrap();
+        assert_eq!(found, vec![
+            "/apex/com.android.conscrypt/javalib/conscrypt.jar",
+            "/apex/com.android.tethering/javalib/framework-connectivity.jar",
+        ]);
+        let layout = Layout::detect(&fixture.0).unwrap();
+        assert_eq!(&layout.boot_locations[7..], found);
+    }
+
+    #[test]
+    fn defaults_only_missing_app_target_sdk_to_37() {
+        assert_eq!(app_target_sdk(None), 37);
+        for target in [1, 23, 33, 35, 36, 37, 38, 10_000] {
+            assert_eq!(app_target_sdk(Some(target)), target as i32);
+        }
     }
 }

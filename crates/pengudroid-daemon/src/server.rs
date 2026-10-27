@@ -561,9 +561,14 @@ fn handle(
         }
 
         Message::SetProp { name, value } => {
-            daemon.props.lock().unwrap().set(&name, &value);
-            crate::debug!("setprop {name}={value}");
-            (Some(Message::Ack), vec![], false)
+            let result = daemon.props.lock().unwrap().set(&name, &value);
+            match result {
+                Ok(()) => {
+                    crate::debug!("setprop {name}={value}");
+                    (Some(Message::Ack), vec![], false)
+                }
+                Err(message) => (Some(Message::Error { code: -libc::EPERM, message }), vec![], false),
+            }
         }
 
         Message::ListProps => {
@@ -1150,9 +1155,20 @@ mod tests {
             reply,
             Some(Message::PropValue {
                 name: "ro.build.version.sdk".into(),
-                value: Some("36".into())
+                value: Some(pengudroid_proto::abi::ANDROID_API_LEVEL.to_string())
             })
         );
+    }
+
+    #[test]
+    fn setprop_rejects_platform_identity_changes_over_the_protocol() {
+        let d = test_daemon();
+        let (p, _tx) = peer(pengudroid_proto::Role::Cli);
+        let (reply, _, _) = call(&d, &p, Message::SetProp {
+            name: "ro.build.version.sdk".into(), value: "33".into(),
+        });
+        assert!(matches!(reply, Some(Message::Error { code, .. }) if code == -libc::EPERM));
+        assert_eq!(d.props.lock().unwrap().get("ro.build.version.sdk"), Some("37"));
     }
 
     #[test]
@@ -1162,7 +1178,8 @@ mod tests {
         match call(&d, &p, Message::ListProps).0 {
             Some(Message::PropList { pairs, more }) => {
                 assert!(!more);
-                assert!(pairs.iter().any(|(k, v)| k == "ro.build.version.sdk" && v == "36"));
+                assert!(pairs.iter().any(|(k, v)| k == "ro.build.version.sdk"
+                    && v == &pengudroid_proto::abi::ANDROID_API_LEVEL.to_string()));
                 assert!(pairs.windows(2).all(|w| w[0].0 < w[1].0), "ordered by name");
             }
             other => panic!("unexpected {other:?}"),

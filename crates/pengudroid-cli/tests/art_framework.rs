@@ -53,21 +53,22 @@ fn run_framework_probe(sysroot: &Path, label: &str, blast: bool, native_display:
     text
 }
 
-// The API-33 full-framework gate (`real_art_keyboard_and_local_window_layout`)
-// was removed with the Android 17 hard lock. Runtime is Android 17 / API 37
-// only; every assertion it carried is covered against the API-37 runtime by
-// `android17_core_services_under_checkjni` and
-// `android17_blast_lifecycle_under_checkjni`.
+fn optional_android17_sysroot() -> Option<PathBuf> {
+    let explicit = std::env::var_os("PENGUDROID_TEST_ANDROID17_SYSROOT");
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+    let root = explicit.as_ref().map(PathBuf::from)
+        .unwrap_or_else(|| workspace.join(".toolchain/sysroot-android17"));
+    if !root.join("system/framework/framework.jar").exists() {
+        assert!(explicit.is_none(), "explicit API-37 sysroot is incomplete or missing: {}", root.display());
+        eprintln!("skipping: no API-37 runtime (set PENGUDROID_TEST_ANDROID17_SYSROOT)");
+        return None;
+    }
+    Some(root)
+}
 
 #[test]
 fn android17_blast_lifecycle_under_checkjni() {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
-    let sysroot = std::env::var_os("PENGUDROID_TEST_ANDROID17_SYSROOT").map(PathBuf::from)
-        .unwrap_or_else(|| workspace.join(".toolchain/sysroot-android17"));
-    if !sysroot.join("system/framework/framework.jar").exists() {
-        eprintln!("skipping: no API-37 runtime (set PENGUDROID_TEST_ANDROID17_SYSROOT)");
-        return;
-    }
+    let Some(sysroot) = optional_android17_sysroot() else { return; };
     let text = run_framework_probe(&sysroot, "api37-blast", true, true);
     assert!(text.contains("display: native internal 720x1280 @ 60 Hz, SDR RGBA_8888 passed"), "{text}");
     assert!(text.contains("binder: framework ServiceManager codes = [1, 3, 2, 4]"), "{text}");
@@ -79,22 +80,20 @@ fn android17_blast_lifecycle_under_checkjni() {
 /// establishes Android-17 app rendering or media compatibility.
 #[test]
 fn android17_core_services_under_checkjni() {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
-    let sysroot = std::env::var_os("PENGUDROID_TEST_ANDROID17_SYSROOT").map(PathBuf::from)
-        .unwrap_or_else(|| workspace.join(".toolchain/sysroot-android17"));
-    if !sysroot.join("system/framework/framework.jar").exists() {
-        eprintln!("skipping: no API-37 runtime (set PENGUDROID_TEST_ANDROID17_SYSROOT)");
-        return;
-    }
+    let Some(sysroot) = optional_android17_sysroot() else { return; };
     let text = run_framework_probe(&sysroot, "api37-core", false, true);
     for expected in [
         "display: native internal 720x1280 @ 60 Hz, SDR RGBA_8888 passed",
         "platform: feature cache native shared-memory roundtrip passed",
+        "media: framework session/metrics transaction codes = [",
+        "binder: framework android/os/IUserManager$Stub transaction codes = [",
+        "binder: framework android/os/IThermalService$Stub transaction codes = [",
         "audio: probe framework SDK_INT=37, focusEnvironmentToken=true",
         "binder: framework ServiceManager codes = [1, 3, 2, 4]",
         "settings: Binder/Parcel scalar value, missing key and unsupported list passed",
         "audio: AIDL focus granted, current gain verified, abandon cleared",
         "window: local WindowLayout.computeFrames = 720x1280",
+        "window: API-37 resized parcel typed result and flags passed",
         "native KeyCharacterMap: 6 Unicode cases passed",
     ] { assert!(text.contains(expected), "missing {expected}:\n{text}"); }
 }

@@ -2,10 +2,105 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
-## HANDOFF — the next agent continues here (2026-10-27)
+## Current handoff — API-37-only selection enforced, native bridge modularised (2026-10-27)
 
-**This session ends at this note. Work resumes in a NEW agent session; the next
-agent starts by reading this section and the hard-lock checklist below.**
+**Only Android 17 / API 37 x86_64 is a runtime target.** This pass removed
+remaining selectable old runtime contracts and isolated ARM64 translation behind
+one crate. It did not establish stable NewPipe playback, leak freedom, hardware
+decoding on every GPU, or a working BBR2 run.
+
+### Native bridge module
+
+All ARM64-to-x86_64 bridge knowledge now lives in `crates/pengudroid-nativebridge`:
+the `NativeBridgeItf` layout (21 members, version 8), `NativeBridgeRuntimeCallbacks`,
+the `arm64` / `/lib/arm64` parameters, library loading, trampoline lookup and the
+canonical staging layout. `sysroot.rs` only orchestrates the self-test and
+`launcher.rs` only forwards the opt-in environment. See [NATIVE_BRIDGE.md](NATIVE_BRIDGE.md).
+
+Verified without an Android runtime: the Rust table matches the real AOSP
+`native_bridge.h` **offset by offset and in total size**; a stub translator is
+driven through `initialize` → `loadLibrary` → `getTrampoline` → call and returns
+42; wrong argument order, an x86_64 path, a descriptor shorty, interface version
+99 and a non-bridge library are all rejected. An API-37 AArch64 guest fixture
+(`tools/build-arm64-bridge-fixture.sh`) cross-builds and links with Bionic
+`@LIBC` versions; it is not executed on the host.
+
+Correction recorded from the source: the ARM64 path rule is a `strstr` test, so
+`lib/arm64-v8a` **is** accepted. The module stages into `lib/arm64` as the
+canonical layout but does not reject the APK's own directory.
+
+**Not verified:** no real bridge binary exists here, so no guest instruction has
+been translated. Building one needs an AOSP checkout and `m berberis_all` with
+`BUILD_BERBERIS_ARM64_TO_X86_64`; the sources are supplied, the Android build
+system is not.
+
+### Implemented in the previous pass
+
+- Shared SDK/release/CPU identity is 37/17/x86_64. Shim/daemon property writes,
+  environment overrides and stale persistence cannot downgrade it or enable
+  32-bit ABI aliases. APK targetSdk remains application metadata, not platform
+  identity or Binder ABI selection.
+- Runtime selection requires SDK-37 metadata and an actual x86_64 ART ELF.
+  Required framework bootclasspath metadata replaces the hardcoded jar fallback.
+- Removed old keyboard parcel/InputDevice, activity-launch, WindowLayout and
+  audio-focus signature retries and window-frame field fallback. Runtime Stub
+  tables now cover service manager, application, input, audio focus, media
+  session/metrics, user and thermal operations; absent tables do not guess.
+- SurfaceComposer has only the covered API-37 AIDL path and 224-byte VSYNC.
+  Corrected the third ContentProviderHolder flag and the WindowRelayoutResult
+  resized-callback shape. Added framework-CREATOR decoding to the window gate.
+- Removed the GraphicBuffer private handle offset. The BLAST consumer uses the
+  source-confirmed native accessor and the pinned Android-17 C buffer layout.
+  A C++ fixture tests independent object layout, handle provenance, reference
+  counts, imports and CPU mapping cleanup.
+
+### Validation on this checkout
+
+- `cargo build --workspace --offline`: passed.
+- `cargo test --workspace --offline`: passed, zero failures. This includes the
+  native C++ buffer fixture, the bridge header/stub ABI tests and mapping/lifetime
+  regressions, not a live app soak.
+- No-Wayland daemon check: passed. Explicit Binder UAPI compilation/test against
+  the provided `common-30c0eaeef78d5c19f687ad8418c27b76353ab261` kernel tree: passed.
+- Negative runtime-selection check: `.toolchain/sysroot` reports SDK 33 and is
+  rejected before ART loads. It was not run as an Android runtime.
+- Both real API-37 CheckJNI gates **skipped**: `.toolchain/sysroot-android17` is
+  absent here. Configuring a missing fixture explicitly now fails instead of
+  skipping. These tests were not newly passed on a real Android-17 runtime.
+- Host capability query: Intel UHD 630, Mesa GLES 3.2, Intel iHD VA-API 1.22 and
+  reported VLD profiles. This is discovery, not NewPipe hardware decode evidence.
+
+Logs: `target/android17-hardlock-{build,tests,framework,cli,kernel-uapi,no-wayland,host-gpu,explicit-runtime}.log`.
+The bridge ABI tests are `cargo test -p pengudroid-nativebridge`; the guest
+fixture is built into `target/arm64-fixture/` by
+`tools/build-arm64-bridge-fixture.sh`.
+
+### Next concrete work / blockers
+
+1. Supply the verified API-37 x86_64 runtime and rerun CheckJNI plus a bounded
+   NewPipe launch/search/VOD/pause/seek/resize/exit/reopen flow. No fallback to
+   the old tree. `.toolchain/references/binary_translation-android17` is now
+   populated (AOSP `android17-release`, revision `1290e88c`); the other source
+   trees indexed in [ANDROID17.md](ANDROID17.md) are what this checkout has.
+2. Audit/replace Codec2's fabricated native C++ callback/Parcel/object layouts.
+   Its fabricated decoder-list/handle fallback is removed; unavailable native
+   service discovery and dispatch now fail explicitly. BLAST still has RefBase/refcount and opaque
+   storage/libc++ assumptions to validate. **The entire native ABI migration is
+   not complete.** Do not hide these gaps behind an API-37 version property.
+3. Integrate the actual hardware media adapter and measure bounded lifetimes
+   with RSS/PSS/fd/maps/JNI ownership. Intel host decode fixtures do not establish
+   NewPipe decoding; AMD/NVIDIA and Vulkan WSI require independent implementation
+   and hardware validation.
+4. The present BBR2 XAPK has **18 AArch64 native libraries and no x86_64 payload**
+   (offline ZIP/ELF inventory, no app execution). Its ARM64 execution requirement
+   is independent of the API-37 platform target and is now isolated in
+   `pengudroid-nativebridge`; see [NATIVE_BRIDGE.md](NATIVE_BRIDGE.md) for the
+   bridge build blocker and the ordered list of what BBR2 still needs.
+
+## Previous recorded checkpoint (2026-10-27)
+
+The checkpoint below describes the prior machine/session, not new runtime
+validation in this checkout.
 
 ### Non-negotiable hard lock: Android 17 / API 37 x86_64 only
 
@@ -39,46 +134,13 @@ resumes:
   gate deleted, `pengudroid-gui/src/runner.rs` default sysroot →
   `sysroot-android17`.
 
-### Remaining hard-lock checklist (the next agent's FIRST task)
+### Superseded checklist
 
-1. `pengudroid-shim/src/binder.rs`: `send_vsync` (~L1583) and the AIDL
-   SurfaceFlinger reply path (~L2146) still branch on
-   `ro.build.version.sdk == 37` choosing a 224-byte vs legacy
-   `DISPLAY_EVENT_SIZE` — always 224 and assert the property. Delete the legacy
-   `android.ui.ISurfaceComposer` dual-interface handling (~L1966, ~L2051) and
-   the `ISC_*_LEGACY` dual codes (~L653, both 3 and 54 answered) unless a live
-   API-37 trace proves they are still needed. `SERVICE_MANAGER_CODES` default
-   `[1, 2, 0, 0]` and `apphost.rs` `get2.unwrap_or(0)` → require `getService2`/
-   `checkService2`, empty default. `ISM_CREATE_SESSION`, `ISESSION_*`,
-   `IMM_GET_PLAYBACK_SESSION_ID` are derived from android-13 AIDL order → load
-   them from the framework's `Stub` constants instead.
-2. `pengudroid-cli/src/keyboard.rs`: `virtual_character_map_parcel(modern:
-   bool)` — drop the parameter, always write the API-37 `String8` form (the
-   `if modern { words.push(0); }` C-string variant is API 33). Related
-   `match sdk { 33 => …, 37 => …, _ => … }` in `apphost.rs` (~L5753) and
-   `if modern && name == "isInputDeviceEnabled"` (~L5765) go the same way.
-3. `pengudroid-cli/src/apphost.rs` `force_window_frame` (~L4635): "Try both"
-   `mClientWindowFrames.frame` and `mWinFrame` → `mClientWindowFrames.frame`
-   only.
-4. `pengudroid-cli/src/sysroot.rs` (~L245): drop the hardcoded boot-jar
-   fallback list, require the `bootclasspath.pb` fragment;
-   `target_sdk: …unwrap_or(35)` (~L1903) → 37.
-5. Reported platform identity: `pengudroid-shim/src/lib.rs` `default_props`
-   (~L1274) advertises `ro.build.version.sdk=36`/release 16 and
-   `pengudroid-proto/src/lib.rs` (~L960) `ANDROID_API_LEVEL=36` /
-   `ANDROID_RELEASE="16"` → **37 / 17** (also the `identity_reports_api_36`
-   test and `lib.rs:5418`).
-6. `pengudroid-shim/src/audiofocus.rs` (~L15): delete
-   `Transactions::LEGACY = [66, 67, 68, 69]` (API-33 codes).
-7. `apphost.rs` (~L734) `install_system_features_cache` silently returns when
-   `SDK_INT < 37` → fail loudly; `disabled_changes(root, target_sdk)`
-   (`apphost.rs` ~L898, `compat.rs` ~L46) must not select policy from the APK's
-   `targetSdk`.
-8. Stale "API-33 … fallback" comments: `binder.rs:712`, `apphost.rs:6185`.
-
-Re-verify after the checklist: `cargo build --workspace --offline`, then
-`cargo test --workspace --offline` (expect 255 passing; a clean
-`git diff --check`).
+The old selection/signature/default checklist was addressed in the current pass
+above; the remaining native/media contracts are explicitly still open. The
+loaded platform alone chooses wire ABI. Image-defined application compat policy
+continues to use the APK's targetSdk, as Android 17 does; that does not retain
+an older Android runtime.
 
 ### Product targets (after the hard lock is complete), in order
 
@@ -93,21 +155,21 @@ Re-verify after the checklist: `cargo build --workspace --offline`, then
    over sustained playback, seek/reconfigure, minimize/restore, reopen.
 2. **HW acceleration (decode + 3D) on Intel, AMD and NVIDIA** (Intel VA-API
    works; AMD needs validation, NVIDIA needs NVDEC; Vulkan WSI stays separate).
-3. **Beach Buggy Racing 2** eventually. It is arm64-only and needs
-   `system_server`; nothing is implemented and no compatibility is claimed.
+3. **Beach Buggy Racing 2** eventually. The available package is arm64-only;
+   compatibility is not established. Required service coverage must be measured,
+   not treated as proof that a booted `system_server` is necessary.
    See [LIMITATIONS.md](LIMITATIONS.md) §2.1 for the ARM64 execution gap
    (`libndk_translation` dies in `ndk_translation_HandleNoExec`; the
-   `gbos-x86/isa-emu` trap-and-emulate pattern in `.toolchain/references/` is
-   x86-on-x86 SIMD, not ARM64).
+   `.toolchain/gbos-x86-main/isa-emu` trap-and-emulate pattern is x86-on-x86
+   SIMD, not ARM64).
 
 ### Verification commands
 
 ```sh
-cd /home/asus/PenguDroid
-/home/asus/.cargo/bin/cargo build --workspace --offline   # run first: refreshes libpengudroid_shim.so
-/home/asus/.cargo/bin/cargo test --workspace --offline
-/home/asus/.cargo/bin/cargo test -p pengudroid-cli --test art_framework --offline -- --nocapture
-git --no-optional-locks diff --check
+cargo build --workspace --offline   # refresh runtime shared libraries first
+cargo test --workspace --offline
+cargo test -p pengudroid-cli --test art_framework --offline -- --nocapture
+git --no-pager diff --check
 ```
 
 Live runs are always bounded: private socket via

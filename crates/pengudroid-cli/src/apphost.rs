@@ -730,11 +730,21 @@ static APP_PACKAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// API 37's ApplicationThread.bindApplication initializes this before posting
 /// AppBindData. We call handleBindApplication directly, so reproduce that step.
+/// Validate the loaded framework, not the APK's declared target SDK.
+fn require_android17(env: &JniEnv) -> Option<()> {
+    let version = env.find_class("android/os/Build$VERSION")?;
+    let field = env.static_field_id(version, "SDK_INT", "I")?;
+    let sdk = env.static_int_field(version, field);
+    if sdk != pengudroid_proto::abi::ANDROID_API_LEVEL {
+        eprintln!("apphost: Android 17 / API 37 is required; loaded framework SDK_INT={sdk}");
+        return None;
+    }
+    Some(())
+}
+
 fn install_system_features_cache(env: &JniEnv) -> Option<()> {
     let _frame = env.local_frame(32)?;
-    let version = env.find_class("android/os/Build$VERSION")?;
-    let sdk = env.static_field_id(version, "SDK_INT", "I")?;
-    if env.static_int_field(version, sdk) < 37 { return Some(()); }
+    require_android17(env)?;
     let class = env.find_class("android/content/pm/SystemFeaturesCache")?;
     let has = env.static_method_id(class, "hasInstance", "()Z")?;
     if env.call_static_boolean(class, has, &[])? { return Some(()); }
@@ -773,6 +783,8 @@ pub fn probe_platform_state(env: &JniEnv) -> bool {
     let run = || -> Option<()> {
         let _frame = env.local_frame(32)?;
         install_system_features_cache(env)?;
+        install_media_transactions(env)?;
+        install_user_thermal_transactions(env)?;
         let class = env.find_class("android/content/pm/SystemFeaturesCache")?;
         let get = env.static_method_id(class, "getInstance", "()Landroid/content/pm/SystemFeaturesCache;")?;
         let cache = env.call_static_object(class, get, &[])?;
@@ -804,8 +816,16 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         eprintln!("apphost: cannot resolve application service transactions");
         return false;
     }
+    if install_user_thermal_transactions(env).is_none() {
+        eprintln!("apphost: cannot resolve Android 17 user/thermal service transactions");
+        return false;
+    }
     if install_audio_focus_transactions(env).is_none() {
         eprintln!("apphost: cannot resolve framework audio focus transactions");
+        return false;
+    }
+    if install_media_transactions(env).is_none() {
+        eprintln!("apphost: cannot resolve Android 17 media session/metrics transactions");
         return false;
     }
     if install_virtual_keyboard(env).is_none() {
@@ -1515,12 +1535,9 @@ fn report_surface_views(env: &JniEnv, verbose: bool) {
                             if let Some(f) = env.field_id(vri_class, "mHeight", "I") {
                                 env.set_int_field(vri, f, 1280);
                             }
-                            // NOTE: writing `mWinFrame` here as well was tried
-                            // and SIGSEGVs — the main thread reads that `Rect`
-                            // in `relayoutWindow` at the same time. `mWidth`
-                            // alone does not stick either, because
-                            // `performTraversals` derives `desiredWindowWidth`
-                            // from `mWinFrame`. See `docs/STATUS.md`.
+                            // Do not write the root's Rect from this worker:
+                            // the main thread owns layout and may be reading it.
+                            // Frame changes belong in the window-manager reply.
                             println!("views:   ViewRootImpl.mWidth {ww} -> 720");
                         }
                         // `layoutRequested` is `mLayoutRequested && (!mStopped ||
@@ -1690,11 +1707,9 @@ fn dump_root_state(env: &JniEnv, root: JObject, index: i32) {
         };
         parts.push(format!("{field}={value}"));
     }
-    // `mWidth`/`mHeight` are copied from `mWinFrame`, so when they are 0 the
-    // question is whether the relayout reply reached the window at all.
-    if let Some(id) = env.field_id(vri_class, "mWinFrame", "Landroid/graphics/Rect;") {
-        let rect = env.object_field(vri, id);
-        if !rect.is_null() {
+    // Read the API-37 frame used by relayout, not a field from another release.
+    if let Some(rect) = client_window_frame(env, vri_class, vri) {
+        {
             if let Some(rect_class) = env.find_class("android/graphics/Rect") {
                 let read = |name: &str| {
                     env.field_id(rect_class, name, "I")
@@ -1702,7 +1717,7 @@ fn dump_root_state(env: &JniEnv, root: JObject, index: i32) {
                         .unwrap_or(-9999)
                 };
                 parts.push(format!(
-                    "mWinFrame=({},{})-({},{})",
+                    "mClientWindowFrames.frame=({},{})-({},{})",
                     read("left"),
                     read("top"),
                     read("right"),
@@ -1920,19 +1935,14 @@ fn spawn_resized_pump(env: &JniEnv) {
 
 /// `PENGUDROID_PUMP_RESIZED=1`: play the window manager's `IWindow.resized`.
 ///
-/// An Android 13 window takes the `relayoutAsync` path whenever the frames it
-/// computed locally did not change. The window manager is then supposed to call
-/// `IWindow.resized` with the final frames; without it the client's
-/// `mRelayoutSeq` moves on and the window keeps whatever `mWinFrame` it computed
-/// from its *last measured size*. When that size is 0 the window is stuck: 0
-/// measures to 0, which relayouts to a 0 frame, which measures to 0.
+/// Nudge a collapsed root into synchronous relayout. Frame data comes from the
+/// hosted API-37 WindowRelayoutResult, not by writing a Rect on a worker thread.
 ///
 /// Replaying the callback through the emulated binder does not work in this
 /// tree (the app's `IWindow.Stub.onTransact` answers `UNKNOWN_TRANSACTION`), so
-/// the host plays the window manager directly: whenever `mRelayoutSeq` moves, it
-/// calls `ViewRootImpl.dispatchResized` with the real surface frames. That is the
-/// same nudge `force_window_frame` makes, through the framework's own entry point
-/// and therefore on the main thread's message queue.
+/// the host requests a traversal whenever `mRelayoutSeq` moves, allowing the
+/// main thread to consume the synchronous reply. It does not call a private
+/// `dispatchResized` overload or substitute a callback layout.
 fn pump_resized(env: &JniEnv, seen: &mut std::collections::HashMap<usize, (i32, u32)>) {
     let Some(wmg_class) = env.find_class("android/view/WindowManagerGlobal") else {
         return;
@@ -1972,21 +1982,7 @@ fn pump_resized(env: &JniEnv, seen: &mut std::collections::HashMap<usize, (i32, 
     let Some(seq_field) = env.field_id(vri_class, "mRelayoutSeq", "I") else {
         return;
     };
-    let Some(merged_field) = env.field_id(
-        vri_class,
-        "mLastReportedMergedConfiguration",
-        "Landroid/util/MergedConfiguration;",
-    ) else {
-        return;
-    };
-    let Some(dispatch) = env.method_id(
-        vri_class,
-        "dispatchResized",
-        "(Landroid/window/ClientWindowFrames;ZLandroid/util/MergedConfiguration;Landroid/view/InsetsState;ZZIII)V",
-    ) else {
-        eprintln!("apphost: resized pump: ViewRootImpl.dispatchResized not found");
-        return;
-    };
+
     let count = env.call_int(views, size_m, &[]).unwrap_or(0);
     for index in 0..count {
         env.describe_exception();
@@ -2046,7 +2042,7 @@ fn pump_resized(env: &JniEnv, seen: &mut std::collections::HashMap<usize, (i32, 
             .method_id(vri_class, "scheduleTraversals", "()V")
             .map(|m| env.call_void(root, m, &[]))
             .unwrap_or(false);
-        let _ = (&dispatch, &merged_field, &seq_field);
+
         println!(
             "apphost: nudge relayout root {index} seq={seq} ok={ok} at +{} ms",
             monotonic_ms()
@@ -3339,7 +3335,7 @@ impl ServiceHost {
     /// thread fails with "Can't create handler inside thread that has not called
     /// Looper.prepare()". `H` is the message the app's own binder thread posts.
     fn post_create_service(&self, data: JObject) -> bool {
-        self.post_to_h("CREATE_SERVICE", 114, data)
+        self.post_to_h("CREATE_SERVICE", data)
     }
 
     /// `ActivityThread$H.SERVICE_ARGS`: run `Service.onStartCommand` on the main
@@ -3359,11 +3355,11 @@ impl ServiceHost {
         if let Some(id) = self.env.field_id(data_class, "flags", "I") {
             self.env.set_int_field(data, id, 0);
         }
-        self.post_to_h("SERVICE_ARGS", 115, data)
+        self.post_to_h("SERVICE_ARGS", data)
     }
 
     /// Post a `Message` to `ActivityThread.mH`, the app's main-thread handler.
-    fn post_to_h(&self, what_field: &str, fallback: i32, data: JObject) -> bool {
+    fn post_to_h(&self, what_field: &str, data: JObject) -> bool {
         let Some(handler_class) = self.env.find_class("android/app/ActivityThread$H") else {
             eprintln!("service: ActivityThread$H not found");
             return false;
@@ -3384,11 +3380,11 @@ impl ServiceHost {
         // Read the message code out of the framework instead of hardcoding it:
         // it is a `static final int` on `H` and stable, but the value is not part
         // of any public API.
-        let what = self
-            .env
-            .static_field_id(handler_class, what_field, "I")
-            .map(|id| self.env.static_int_field(handler_class, id))
-            .unwrap_or(fallback);
+        let Some(field) = self.env.static_field_id(handler_class, what_field, "I") else {
+            eprintln!("service: required ActivityThread$H.{what_field} contract missing");
+            return false;
+        };
+        let what = self.env.static_int_field(handler_class, field);
         let Some(message_class) = self.env.find_class("android/os/Message") else {
             return false;
         };
@@ -4563,20 +4559,15 @@ fn launch_activity(
         let _ = config;
     }
 
-    let modern = env.method_id(thread_class, "handleLaunchActivity",
-        "(Landroid/app/ActivityThread$ActivityClientRecord;Landroid/app/servertransaction/PendingTransactionActions;ILandroid/content/Intent;)Landroid/app/Activity;");
-    let (handle, modern) = if let Some(handle) = modern { (handle, true) } else {
-        let Some(handle) = env.method_id(thread_class, "handleLaunchActivity",
-            "(Landroid/app/ActivityThread$ActivityClientRecord;Landroid/app/servertransaction/PendingTransactionActions;Landroid/content/Intent;)Landroid/app/Activity;") else {
-            eprintln!("apphost: ActivityThread.handleLaunchActivity not found");
-            return false;
-        };
-        (handle, false)
+    let Some(handle) = env.method_id(thread_class, "handleLaunchActivity",
+        "(Landroid/app/ActivityThread$ActivityClientRecord;Landroid/app/servertransaction/PendingTransactionActions;ILandroid/content/Intent;)Landroid/app/Activity;") else {
+        eprintln!("apphost: Android 17 ActivityThread.handleLaunchActivity contract missing");
+        return false;
     };
     let Some((_, pending)) = new_instance(env, "android/app/servertransaction/PendingTransactionActions") else { return false; };
-    let mut args = vec![JValue { l: record }, JValue { l: pending }];
-    if modern { args.push(JValue { i: 0 }); } // Context.DEVICE_ID_DEFAULT
-    args.push(JValue { l: std::ptr::null_mut() });
+    let args = [JValue { l: record }, JValue { l: pending },
+        JValue { i: 0 }, // Context.DEVICE_ID_DEFAULT
+        JValue { l: std::ptr::null_mut() }];
     println!("apphost: calling handleLaunchActivity for {activity_name}");
     match env.call_object(thread, handle, &args) {
         Some(activity) if activity.is_null() => {
@@ -4610,6 +4601,16 @@ fn launch_activity(
 /// Setting it here is the same kind of nudge the rest of this file makes: the
 /// framework object is mutated in place through JNI, so the very next traversal
 /// measures against the real surface.
+fn client_window_frame(env: &JniEnv, root_class: JClass, root: JObject) -> Option<JObject> {
+    let field = env.field_id(root_class, "mClientWindowFrames", "Landroid/window/ClientWindowFrames;")?;
+    let frames = env.object_field(root, field);
+    if frames.is_null() { return None; }
+    let class = env.find_class("android/window/ClientWindowFrames")?;
+    let frame = env.field_id(class, "frame", "Landroid/graphics/Rect;")?;
+    let rect = env.object_field(frames, frame);
+    (!rect.is_null()).then_some(rect)
+}
+
 fn force_window_frame(env: &JniEnv, root: JObject, width: i32, height: i32) {
     let Some(root_class) = env.find_class("android/view/ViewRootImpl") else {
         return;
@@ -4619,28 +4620,9 @@ fn force_window_frame(env: &JniEnv, root: JObject, width: i32, height: i32) {
     };
     let set = env.method_id(rect_class, "set", "(IIII)V");
 
-    // Android 13 moved the frame into `mClientWindowFrames.frame`; older trees
-    // still have a plain `mWinFrame`. Try both.
-    let mut target = env
-        .field_id(root_class, "mWinFrame", "Landroid/graphics/Rect;")
-        .map(|f| env.object_field(root, f));
-    if target.map_or(true, |r| r.is_null()) {
-        target = env
-            .field_id(
-                root_class,
-                "mClientWindowFrames",
-                "Landroid/window/ClientWindowFrames;",
-            )
-            .map(|f| env.object_field(root, f))
-            .filter(|frames| !frames.is_null())
-            .and_then(|frames| {
-                let frames_class = env.find_class("android/window/ClientWindowFrames")?;
-                let field = env.field_id(frames_class, "frame", "Landroid/graphics/Rect;")?;
-                Some(env.object_field(frames, field))
-            });
-    }
+    let target = client_window_frame(env, root_class, root);
     let Some(rect) = target.filter(|r| !r.is_null()) else {
-        eprintln!("apphost: no window frame field on ViewRootImpl");
+        eprintln!("apphost: Android 17 ViewRootImpl.mClientWindowFrames.frame is unavailable");
         return;
     };
     let Some(set) = set else {
@@ -4714,10 +4696,7 @@ fn schedule_roots_dump(env: &JniEnv) {
                 continue;
             }
             let mut frame = String::from("none");
-            let rect_source = env
-                .field_id(root_class, "mWinFrame", "Landroid/graphics/Rect;")
-                .map(|f| env.object_field(root, f))
-                .filter(|r| !r.is_null());
+            let rect_source = client_window_frame(&env, root_class, root);
             if let (Some(rect), Some(rect_class)) = (rect_source, env.find_class("android/graphics/Rect")) {
                 if let Some(desc) = env.method_id(rect_class, "toString", "()Ljava/lang/String;") {
                     frame = env
@@ -4727,7 +4706,7 @@ fn schedule_roots_dump(env: &JniEnv) {
                 }
             }
             println!(
-                "apphost: root {i} settled w={:?} h={:?} mWinFrame={frame}",
+                "apphost: root {i} settled w={:?} h={:?} mClientWindowFrames.frame={frame}",
                 int("mWidth", root),
                 int("mHeight", root),
             );
@@ -5431,10 +5410,11 @@ fn install_application_transactions(env: &JniEnv) -> Option<()> {
     Some(())
 }
 
-/// ServiceManager gained Service/ServiceWithMetadata union replies. Preserve
-/// legacy strong-binder replies while discovering both sets of Stub methods.
+/// API 37 exposes both binder and Service-union methods. All four contracts
+/// must exist on the loaded Stub; absence never selects another platform ABI.
 fn install_service_manager_abi(env: &JniEnv) -> Option<()> {
     let _frame = env.local_frame(16)?;
+    require_android17(env)?;
     let class = env.find_class("android/os/IServiceManager$Stub")?;
     let code = |name: &str| -> Option<u32> {
         let field = env.static_field_id(class, name, "I")?;
@@ -5442,15 +5422,64 @@ fn install_service_manager_abi(env: &JniEnv) -> Option<()> {
     };
     let get = code("TRANSACTION_getService")?;
     let check = code("TRANSACTION_checkService")?;
-    let get2 = code("TRANSACTION_getService2");
-    let check2 = code("TRANSACTION_checkService2");
-    if get2.is_some() != check2.is_some() { return None; }
+    let get2 = code("TRANSACTION_getService2")?;
+    let check2 = code("TRANSACTION_checkService2")?;
     let setter = shim_symbol("__pengudroid_binder_set_service_manager_codes")?;
     let setter: unsafe extern "C" fn(u32, u32, u32, u32) -> bool =
         unsafe { std::mem::transmute(setter) };
-    let codes = [get, check, get2.unwrap_or(0), check2.unwrap_or(0)];
+    let codes = [get, check, get2, check2];
     if !unsafe { setter(codes[0], codes[1], codes[2], codes[3]) } { return None; }
     println!("binder: framework ServiceManager codes = {codes:?}");
+    Some(())
+}
+
+fn install_service_transactions(env: &JniEnv, class: &str, setter: &str, methods: &[&str]) -> Option<()> {
+    let _frame = env.local_frame(16)?;
+    let stub = env.find_class(class)?;
+    let mut codes = Vec::with_capacity(methods.len());
+    for method in methods {
+        let field = env.static_field_id(stub, &format!("TRANSACTION_{method}"), "I")?;
+        codes.push(u32::try_from(env.static_int_field(stub, field)).ok()?);
+    }
+    let setter = shim_symbol(setter)?;
+    let setter: unsafe extern "C" fn(*const u32, usize) -> bool = unsafe { std::mem::transmute(setter) };
+    if !unsafe { setter(codes.as_ptr(), codes.len()) } { return None; }
+    println!("binder: framework {class} transaction codes = {codes:?}");
+    Some(())
+}
+
+fn install_user_thermal_transactions(env: &JniEnv) -> Option<()> {
+    install_service_transactions(env, "android/os/IUserManager$Stub",
+        "__pengudroid_binder_set_user_transactions", &[
+            "isUserUnlocked", "isUserUnlockingOrUnlocked",
+        ])?;
+    install_service_transactions(env, "android/os/IThermalService$Stub",
+        "__pengudroid_binder_set_thermal_transactions", &[
+            "registerThermalEventListener", "registerThermalEventListenerWithType",
+            "unregisterThermalEventListener", "getCurrentTemperatures", "getCurrentTemperaturesWithType",
+            "registerThermalStatusListener", "unregisterThermalStatusListener", "getCurrentThermalStatus",
+            "getCurrentCoolingDevices", "getCurrentCoolingDevicesWithType", "getThermalHeadroom",
+        ])
+}
+
+fn install_media_transactions(env: &JniEnv) -> Option<()> {
+    let _frame = env.local_frame(16)?;
+    let mut codes = [0u32; 4];
+    for (out, (class, name)) in codes.iter_mut().zip([
+        ("android/media/session/ISessionManager$Stub", "TRANSACTION_createSession"),
+        ("android/media/session/ISession$Stub", "TRANSACTION_getController"),
+        ("android/media/session/ISession$Stub", "TRANSACTION_getBinderForSetQueue"),
+        ("android/media/metrics/IMediaMetricsManager$Stub", "TRANSACTION_getPlaybackSessionId"),
+    ]) {
+        let stub = env.find_class(class)?;
+        let field = env.static_field_id(stub, name, "I")?;
+        *out = u32::try_from(env.static_int_field(stub, field)).ok()?;
+    }
+    let setter = shim_symbol("__pengudroid_binder_set_media_transactions")?;
+    let setter: unsafe extern "C" fn(*const u32, usize) -> bool =
+        unsafe { std::mem::transmute(setter) };
+    if !unsafe { setter(codes.as_ptr(), codes.len()) } { return None; }
+    println!("media: framework session/metrics transaction codes = {codes:?}");
     Some(())
 }
 
@@ -5499,40 +5528,29 @@ pub fn probe_audio_focus(env: &JniEnv) -> bool {
         let package = env.new_string("org.pengudroid.probe");
         let class = env.find_class("android/media/IAudioService")?;
         let null = std::ptr::null_mut();
-        let (current, tokenized) = if let Some(method) = env.method_id(class, "getCurrentAudioFocus", "()I") {
-            (method, false)
-        } else {
-            (env.method_id(class, "getCurrentAudioFocus", "(Landroid/os/IBinder;)I")?, true)
-        };
-        let request_signature = if tokenized {
-            "(Landroid/media/AudioAttributes;ILandroid/os/IBinder;Landroid/media/IAudioFocusDispatcher;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ILandroid/media/audiopolicy/IAudioPolicyCallback;ILandroid/os/IBinder;)I"
-        } else {
-            "(Landroid/media/AudioAttributes;ILandroid/os/IBinder;Landroid/media/IAudioFocusDispatcher;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ILandroid/media/audiopolicy/IAudioPolicyCallback;I)I"
-        };
+        let current = env.method_id(class, "getCurrentAudioFocus", "(Landroid/os/IBinder;)I")?;
+        let request_signature =
+            "(Landroid/media/AudioAttributes;ILandroid/os/IBinder;Landroid/media/IAudioFocusDispatcher;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ILandroid/media/audiopolicy/IAudioPolicyCallback;ILandroid/os/IBinder;)I";
         let request = env.method_id(class, "requestAudioFocus", request_signature)?;
         let version = env.find_class("android/os/Build$VERSION")?;
         let sdk_field = env.static_field_id(version, "SDK_INT", "I")?;
         let sdk = env.static_int_field(version, sdk_field);
-        println!("audio: probe framework SDK_INT={sdk}, focusEnvironmentToken={tokenized}");
-        let mut request_args = vec![
+        println!("audio: probe framework SDK_INT={sdk}, focusEnvironmentToken=true");
+        let request_args = [
             JValue { l: attrs }, JValue { i: 1 }, JValue { l: client }, JValue { l: null },
             JValue { l: client_id }, JValue { l: package }, JValue { l: null },
-            JValue { i: 0 }, JValue { l: null }, JValue { i: sdk },
+            JValue { i: 0 }, JValue { l: null }, JValue { i: sdk }, JValue { l: null },
         ];
-        let current_args = if tokenized { vec![JValue { l: null }] } else { vec![] };
-        if tokenized { request_args.push(JValue { l: null }); }
+        let current_args = [JValue { l: null }];
         let result = env.call_int(service, request, &request_args)?;
         if result != 1 || env.call_int(service, current, &current_args)? != 1 { return None; }
-        let abandon_signature = if tokenized {
-            "(Landroid/media/IAudioFocusDispatcher;Ljava/lang/String;Landroid/media/AudioAttributes;Ljava/lang/String;Landroid/os/IBinder;)I"
-        } else {
-            "(Landroid/media/IAudioFocusDispatcher;Ljava/lang/String;Landroid/media/AudioAttributes;Ljava/lang/String;)I"
-        };
+        let abandon_signature =
+            "(Landroid/media/IAudioFocusDispatcher;Ljava/lang/String;Landroid/media/AudioAttributes;Ljava/lang/String;Landroid/os/IBinder;)I";
         let abandon = env.method_id(class, "abandonAudioFocus", abandon_signature)?;
-        let mut abandon_args = vec![
+        let abandon_args = [
             JValue { l: null }, JValue { l: client_id }, JValue { l: attrs }, JValue { l: package },
+            JValue { l: null },
         ];
-        if tokenized { abandon_args.push(JValue { l: null }); }
         let result = env.call_int(service, abandon, &abandon_args)?;
         if result != 1 || env.call_int(service, current, &current_args)? != 0 { return None; }
         println!("audio: AIDL focus granted, current gain verified, abandon cleared");
@@ -5666,18 +5684,11 @@ pub fn probe_window_configuration(env: &JniEnv) -> bool {
         env.call_void(insets, safe_method, &[JValue { l: safe }]);
         let (frames_class, frames) = new_instance(env, "android/window/ClientWindowFrames")?;
         let (layout_class, layout) = new_instance(env, "android/view/WindowLayout")?;
-        let modern = env.method_id(layout_class, "computeFrames",
-            "(Landroid/view/WindowManager$LayoutParams;Landroid/view/InsetsState;Landroid/graphics/Rect;Landroid/graphics/Rect;IIIIFLandroid/window/ClientWindowFrames;)V");
-        let (compute, visible) = if let Some(compute) = modern {
-            let types = env.find_class("android/view/WindowInsets$Type")?;
-            let default_visible = env.static_method_id(types, "defaultVisible", "()I")?;
-            (compute, JValue { i: env.call_static_int(types, default_visible, &[])? })
-        } else {
-            let (_, visible) = new_instance(env, "android/view/InsetsVisibilities")?;
-            let compute = env.method_id(layout_class, "computeFrames",
-                "(Landroid/view/WindowManager$LayoutParams;Landroid/view/InsetsState;Landroid/graphics/Rect;Landroid/graphics/Rect;IIILandroid/view/InsetsVisibilities;FLandroid/window/ClientWindowFrames;)V")?;
-            (compute, JValue { l: visible })
-        };
+        let compute = env.method_id(layout_class, "computeFrames",
+            "(Landroid/view/WindowManager$LayoutParams;Landroid/view/InsetsState;Landroid/graphics/Rect;Landroid/graphics/Rect;IIIIFLandroid/window/ClientWindowFrames;)V")?;
+        let types = env.find_class("android/view/WindowInsets$Type")?;
+        let default_visible = env.static_method_id(types, "defaultVisible", "()I")?;
+        let visible = JValue { i: env.call_static_int(types, default_visible, &[])? };
         if !env.call_void(layout, compute, &[
             JValue { l: params }, JValue { l: insets }, JValue { l: safe }, JValue { l: bounds },
             JValue { i: 1 }, JValue { i: SURFACE_W }, JValue { i: SURFACE_H },
@@ -5690,7 +5701,9 @@ pub fn probe_window_configuration(env: &JniEnv) -> bool {
         let height = env.method_id(rect_class, "height", "()I")?;
         let (w, h) = (env.call_int(frame, width, &[])?, env.call_int(frame, height, &[])?);
         println!("window: local WindowLayout.computeFrames = {w}x{h}");
-        (w == SURFACE_W && h == SURFACE_H).then_some(())
+        if w != SURFACE_W || h != SURFACE_H { return None; }
+        probe_window_resized_payload(env)?;
+        Some(())
     };
     run().is_some()
 }
@@ -5733,19 +5746,13 @@ pub fn probe_keyboard(env: &JniEnv) -> bool {
 fn install_virtual_keyboard(env: &JniEnv) -> Option<()> {
     install_service_manager_abi(env)?;
     let _frame = env.local_frame(64)?;
-    let version = env.find_class("android/os/Build$VERSION")?;
-    let sdk_field = env.static_field_id(version, "SDK_INT", "I")?;
-    let sdk = env.static_int_field(version, sdk_field);
-    let modern = match sdk {
-        33 => false, 37 => true,
-        _ => { eprintln!("apphost: unvalidated native keyboard parcel ABI for SDK {sdk}"); return None; }
-    };
+    require_android17(env)?;
     let input_stub = env.find_class("android/hardware/input/IInputManager$Stub")?;
     let mut input_codes = Vec::new();
     for name in ["getInputDevice", "getInputDeviceIds", "isInputDeviceEnabled", "enableInputDevice",
         "disableInputDevice", "hasKeys", "getKeyCodeForKeyLocation", "registerInputDevicesChangedListener"] {
         // API 37 moved enabled state into InputDevice itself.
-        if modern && name == "isInputDeviceEnabled" { input_codes.push(0); continue; }
+        if name == "isInputDeviceEnabled" { input_codes.push(0); continue; }
         let field = env.static_field_id(input_stub, &format!("TRANSACTION_{name}"), "I")?;
         input_codes.push(u32::try_from(env.static_int_field(input_stub, field)).ok()?);
     }
@@ -5756,7 +5763,7 @@ fn install_virtual_keyboard(env: &JniEnv) -> Option<()> {
     let parcel_class = env.find_class("android/os/Parcel")?;
     let obtain = env.static_method_id(parcel_class, "obtain", "()Landroid/os/Parcel;")?;
     let parcel = env.call_static_object(parcel_class, obtain, &[])?;
-    let raw = crate::keyboard::virtual_character_map_parcel(modern);
+    let raw = crate::keyboard::virtual_character_map_parcel();
     let bytes = env.new_byte_array(raw.len() as i32)?;
     env.set_byte_array_region(bytes, 0, &raw);
     let unmarshall = env.method_id(parcel_class, "unmarshall", "([BII)V")?;
@@ -5782,10 +5789,9 @@ fn install_virtual_keyboard(env: &JniEnv) -> Option<()> {
             return None;
         }
     }
-    let device_class = env.find_class("android/view/InputDevice")?;
     let name = env.new_string("PenguDroid Virtual Keyboard");
     let descriptor = env.new_string("pengudroid:virtual-keyboard");
-    let device = if modern {
+    let device = {
         let (class, builder) = new_instance(env, "android/view/InputDevice$Builder")?;
         for (method, value) in [("setId", -1), ("setGeneration", 1), ("setSources", 0x101), ("setKeyboardType", 2)] {
             let method = env.method_id(class, method, "(I)Landroid/view/InputDevice$Builder;")?;
@@ -5801,15 +5807,6 @@ fn install_virtual_keyboard(env: &JniEnv) -> Option<()> {
         env.call_object(builder, set_map, &[JValue { l: map }])?;
         let build = env.method_id(class, "build", "()Landroid/view/InputDevice;")?;
         env.call_object(builder, build, &[])?
-    } else {
-        let ctor = env.method_id(device_class, "<init>",
-            "(IIILjava/lang/String;IILjava/lang/String;ZIILandroid/view/KeyCharacterMap;ZZZZZ)V")?;
-        env.new_object(device_class, ctor, &[
-            JValue { i: -1 }, JValue { i: 1 }, JValue { i: 0 }, JValue { l: name },
-            JValue { i: 0 }, JValue { i: 0 }, JValue { l: descriptor }, JValue { z: 0 },
-            JValue { i: 0x101 }, JValue { i: 2 }, JValue { l: map },
-            JValue { z: 0 }, JValue { z: 0 }, JValue { z: 0 }, JValue { z: 0 }, JValue { z: 0 },
-        ])?
     };
     if device.is_null() { return None; }
     let data = marshal_object(env, device, "android/view/InputDevice")?;
@@ -6067,49 +6064,22 @@ fn install_display_replies(env: &JniEnv) {
     // `DisplayInfo.getDefaultMode()` reads
     // `supportedModes`; an empty array makes `findMode` throw
     // "Unable to locate mode 1".
-    if let Some(mode_class) = env.find_class("android/view/Display$Mode") {
-        let mut made = false;
-        for sig in ["(IIIF[F)V", "(IIIF)V"] {
-            let Some(ctor) = env.method_id(mode_class, "<init>", sig) else { continue };
-            let rates = env.new_float_array(1);
-            if !rates.is_null() {
-                env.set_float_array_region(rates, 0, &[60.0]);
-            }
-            let args: &[JValue] = if sig == "(IIIF[F)V" {
-                &[
-                    JValue { i: 1 },
-                    JValue { i: SURFACE_W },
-                    JValue { i: SURFACE_H },
-                    JValue { f: 60.0 },
-                    JValue { l: rates },
-                ]
-            } else {
-                &[
-                    JValue { i: 1 },
-                    JValue { i: SURFACE_W },
-                    JValue { i: SURFACE_H },
-                    JValue { f: 60.0 },
-                ]
-            };
-            let Some(mode) = env.new_object(mode_class, ctor, args) else { continue };
-            if let Some(arr) = env.new_object_array(1, mode_class, std::ptr::null_mut()) {
-                env.set_object_array_element(arr, 0, mode);
-                if let Some(id) = env.field_id(
-                    info_class,
-                    "supportedModes",
-                    "[Landroid/view/Display$Mode;",
-                ) {
-                    env.set_object_field(info, id, arr);
-                    made = true;
-                }
-            }
-            if made {
-                break;
-            }
-        }
-        if !made {
-            eprintln!("apphost: could not build a Display.Mode for supportedModes");
-        }
+    let mode = (|| -> Option<()> {
+        let class = env.find_class("android/view/Display$Mode")?;
+        // This constructor is present in the pinned API-37 framework source.
+        let ctor = env.method_id(class, "<init>", "(IIIF)V")?;
+        let mode = env.new_object(class, ctor, &[
+            JValue { i: 1 }, JValue { i: SURFACE_W }, JValue { i: SURFACE_H }, JValue { f: 60.0 },
+        ])?;
+        let modes = env.new_object_array(1, class, std::ptr::null_mut())?;
+        env.set_object_array_element(modes, 0, mode);
+        let field = env.field_id(info_class, "supportedModes", "[Landroid/view/Display$Mode;")?;
+        env.set_object_field(info, field, modes);
+        Some(())
+    })();
+    if mode.is_none() {
+        eprintln!("apphost: required Android 17 Display.Mode contract missing");
+        return;
     }
     set_int("layerStack", 0);
     set_int("displayGroupId", 0);
@@ -6167,8 +6137,8 @@ const WINDOW_SESSION_METHODS: &[(&str, u32)] = &[
 /// The numeric codes moved between releases (Android 17 inserted
 /// `relayout2`/`relayoutAsync2` and dropped `prepareToReplaceWindows` and
 /// `setInTouchMode`), so they are read from the class that will actually run
-/// instead of being hard-coded. Existing API-33 numbers stay in the shim as a
-/// fallback in case the fields are absent.
+/// instead of being hard-coded. Missing contracts remain unregistered; the
+/// shim never substitutes transaction numbers from another framework.
 fn install_window_session_codes(env: &JniEnv) {
     let Some(stub) = env.find_class("android/view/IWindowSession$Stub") else {
         eprintln!("apphost: IWindowSession$Stub not found");
@@ -6214,35 +6184,21 @@ fn install_window_session_codes(env: &JniEnv) {
 /// `94b4c16`). Writing it by hand would hard-code five nested framework
 /// layouts, so the host lets each object serialize itself and hands the bytes
 /// over.
+fn build_window_relayout_result(env: &JniEnv) -> Option<JObject> {
+    let (class, result) = new_instance(env, "android/view/WindowRelayoutResult")?;
+    let frames = build_client_window_frames(env)?;
+    let field = env.field_id(class, "frames", "Landroid/window/ClientWindowFrames;")?;
+    env.set_object_field(result, field, frames);
+    // Keep constructor-owned configuration/insets and nullable controls. Both
+    // synchronous replies and resized callbacks use this same API-37 object.
+    Some(result)
+}
+
 fn install_window_relayout_result(env: &JniEnv) {
-    let Some(result_class) = env.find_class("android/view/WindowRelayoutResult") else {
-        println!("apphost: WindowRelayoutResult absent (pre-API-37 framework)");
+    let Some(result) = build_window_relayout_result(env) else {
+        eprintln!("apphost: required Android 17 WindowRelayoutResult contract missing");
         return;
     };
-    let Some(ctor) = env.method_id(result_class, "<init>", "()V") else {
-        eprintln!("apphost: WindowRelayoutResult has no default constructor");
-        return;
-    };
-    let Some(result) = env.new_object(result_class, ctor, &[]) else {
-        eprintln!("apphost: cannot allocate WindowRelayoutResult");
-        return;
-    };
-    let Some(frames) = build_client_window_frames(env) else {
-        eprintln!("apphost: WindowRelayoutResult: no ClientWindowFrames");
-        return;
-    };
-    let Some(frames_field) = env.field_id(
-        result_class,
-        "frames",
-        "Landroid/window/ClientWindowFrames;",
-    ) else {
-        eprintln!("apphost: WindowRelayoutResult.frames not found");
-        return;
-    };
-    env.set_object_field(result, frames_field, frames);
-    // `mergedConfiguration`, `insetsState` are freshly allocated by the
-    // constructor; `activeControls` and `activityWindowInfo` are nullable and
-    // stay null, `syncSeqId` is 0 and `usesSyncedInsetsAnimation` false.
     let Some(bytes) = marshal_object(env, result, "android/view/WindowRelayoutResult") else {
         eprintln!("apphost: WindowRelayoutResult.marshall failed");
         return;
@@ -6282,96 +6238,76 @@ fn build_client_window_frames(env: &JniEnv) -> Option<JObject> {
     Some(frames)
 }
 
-/// Install the body of `IWindow.resized`, the callback that answers
-/// `IWindowSession.relayoutAsync`.
-///
-/// `ViewRootImpl` uses `relayoutAsync` when only the layout params changed
-/// (measured: NewPipe's player switching to immersive mode). It deliberately
-/// empties `mWinFrame` and waits for the window manager to send the new frame
-/// through this callback. Without it the window stays 0x0 forever, every
-/// `SurfaceView` measures to nothing and the decoder has no surface.
-///
-/// `IWindow.resized` in this framework is
-/// `(ClientWindowFrames, boolean reportDraw, MergedConfiguration, InsetsState,
-/// boolean forceLayout, boolean alwaysConsumeSystemBars, int displayId,
-/// int syncSeqId, int syncInputSeqId)`; the host marshals it because the first
-/// and fourth are framework types, and the shim prefixes the interface token.
+/// Android 17 IWindow.aidl: resized(WindowRelayoutResult, reportDraw,
+/// forceLayout, displayId, syncWithBuffers, dragResizing). The framework owns
+/// serialization of every nested parcelable; no earlier callback layout exists.
+fn window_resized_payload(env: &JniEnv) -> Option<Vec<u8>> {
+    let result = build_window_relayout_result(env)?;
+    let class = env.find_class("android/os/Parcel")?;
+    let obtain = env.static_method_id(class, "obtain", "()Landroid/os/Parcel;")?;
+    let parcel = env.call_static_object(class, obtain, &[])?;
+    let recycle = env.method_id(class, "recycle", "()V")?;
+    let bytes = (|| -> Option<Vec<u8>> {
+        let typed = env.method_id(class, "writeTypedObject", "(Landroid/os/Parcelable;I)V")?;
+        let boolean = env.method_id(class, "writeBoolean", "(Z)V")?;
+        let integer = env.method_id(class, "writeInt", "(I)V")?;
+        if !env.call_void(parcel, typed, &[JValue { l: result }, JValue { i: 0 }])
+            || !env.call_void(parcel, boolean, &[JValue { z: 1 }]) // reportDraw
+            || !env.call_void(parcel, boolean, &[JValue { z: 1 }]) // forceLayout
+            || !env.call_void(parcel, integer, &[JValue { i: 0 }]) // default display
+            || !env.call_void(parcel, boolean, &[JValue { z: 0 }]) // syncWithBuffers
+            || !env.call_void(parcel, boolean, &[JValue { z: 0 }]) { return None; } // dragResizing
+        let marshall = env.method_id(class, "marshall", "()[B")?;
+        let bytes = env.call_object(parcel, marshall, &[])?;
+        env.byte_array_copy(bytes)
+    })();
+    env.call_void(parcel, recycle, &[]);
+    bytes
+}
+
+/// Decode with the real API-37 CREATOR; a matching hand-written Rust parser
+/// could otherwise conceal a shifted nested parcelable or callback argument.
+fn probe_window_resized_payload(env: &JniEnv) -> Option<()> {
+    let _frame = env.local_frame(32)?;
+    let raw = window_resized_payload(env)?;
+    let class = env.find_class("android/os/Parcel")?;
+    let obtain = env.static_method_id(class, "obtain", "()Landroid/os/Parcel;")?;
+    let parcel = env.call_static_object(class, obtain, &[])?;
+    let recycle = env.method_id(class, "recycle", "()V")?;
+    let result = (|| -> Option<()> {
+        let bytes = env.new_byte_array(raw.len() as i32)?;
+        env.set_byte_array_region(bytes, 0, &raw);
+        let unmarshall = env.method_id(class, "unmarshall", "([BII)V")?;
+        let reset = env.method_id(class, "setDataPosition", "(I)V")?;
+        if !env.call_void(parcel, unmarshall, &[JValue { l: bytes }, JValue { i: 0 }, JValue { i: raw.len() as i32 }])
+            || !env.call_void(parcel, reset, &[JValue { i: 0 }]) { return None; }
+        let result_class = env.find_class("android/view/WindowRelayoutResult")?;
+        let creator_field = env.static_field_id(result_class, "CREATOR", "Landroid/os/Parcelable$Creator;")?;
+        let creator = env.static_object_field(result_class, creator_field);
+        let read = env.method_id(class, "readTypedObject", "(Landroid/os/Parcelable$Creator;)Ljava/lang/Object;")?;
+        let decoded = env.call_object(parcel, read, &[JValue { l: creator }])?;
+        if decoded.is_null() { return None; }
+        let boolean = env.method_id(class, "readBoolean", "()Z")?;
+        let integer = env.method_id(class, "readInt", "()I")?;
+        let remaining = env.method_id(class, "dataAvail", "()I")?;
+        if !env.call_boolean(parcel, boolean, &[])? || !env.call_boolean(parcel, boolean, &[])?
+            || env.call_int(parcel, integer, &[])? != 0
+            || env.call_boolean(parcel, boolean, &[])? || env.call_boolean(parcel, boolean, &[])?
+            || env.call_int(parcel, remaining, &[])? != 0 { return None; }
+        println!("window: API-37 resized parcel typed result and flags passed");
+        Some(())
+    })();
+    env.call_void(parcel, recycle, &[]);
+    result
+}
+
 fn install_resized_payload(env: &JniEnv) {
-    let Some(frames) = build_client_window_frames(env) else {
-        eprintln!("apphost: IWindow.resized: no ClientWindowFrames");
-        return;
-    };
-    let Some(parcel_class) = env.find_class("android/os/Parcel") else {
-        return;
-    };
-    let Some(obtain) = env.static_method_id(parcel_class, "obtain", "()Landroid/os/Parcel;") else {
-        return;
-    };
-    let Some(parcel) = env.call_static_object(parcel_class, obtain, &[]) else {
-        return;
-    };
-    let (Some(write_typed), Some(write_int)) = (
-        env.method_id(
-            parcel_class,
-            "writeTypedObject",
-            "(Landroid/os/Parcelable;I)V",
-        ),
-        env.method_id(parcel_class, "writeInt", "(I)V"),
-    ) else {
-        eprintln!("apphost: IWindow.resized: Parcel writers missing");
-        return;
-    };
-    env.call_void(
-        parcel,
-        write_typed,
-        &[JValue { l: frames }, JValue { i: 0 }],
-    );
-    env.call_void(parcel, write_int, &[JValue { i: 1 }]); // reportDraw
-    // A null `MergedConfiguration` means "keep the current one".
-    env.call_void(
-        parcel,
-        write_typed,
-        &[JValue { l: std::ptr::null_mut() }, JValue { i: 0 }],
-    );
-    // An empty `InsetsState`: no system bars, which is what the app already
-    // sees, and the client only reads it to update `mAttachInfo`.
-    let insets = new_instance(env, "android/view/InsetsState")
-        .map(|(_, obj)| obj)
-        .filter(|o| !o.is_null());
-    env.call_void(
-        parcel,
-        write_typed,
-        &[
-            JValue {
-                l: insets.unwrap_or(std::ptr::null_mut()),
-            },
-            JValue { i: 0 },
-        ],
-    );
-    env.call_void(parcel, write_int, &[JValue { i: 1 }]); // forceLayout
-    env.call_void(parcel, write_int, &[JValue { i: 0 }]); // alwaysConsumeSystemBars
-    env.call_void(parcel, write_int, &[JValue { i: 0 }]); // displayId
-    env.call_void(parcel, write_int, &[JValue { i: 0 }]); // syncSeqId
-    env.call_void(parcel, write_int, &[JValue { i: 0 }]); // syncInputSeqId
-    let Some(marshall) = env.method_id(parcel_class, "marshall", "()[B") else {
-        return;
-    };
-    let Some(bytes) = env.call_object(parcel, marshall, &[]) else {
-        eprintln!("apphost: Parcel.marshall for IWindow.resized failed");
-        return;
-    };
-    if let Some(data) = env.byte_array_copy(bytes) {
-        let words: Vec<String> = data
-            .chunks_exact(4)
-            .map(|w| format!("{}", i32::from_ne_bytes([w[0], w[1], w[2], w[3]])))
-            .collect();
-        println!(
-            "apphost: IWindow.resized payload ({} bytes, insets={}) = [{}]",
-            data.len(),
-            if insets.is_some() { "set" } else { "null" },
-            words.join(", ")
-        );
-        install_reply(&data, "__pengudroid_binder_set_resized_payload");
+    match window_resized_payload(env) {
+        Some(bytes) => {
+            install_reply(&bytes, "__pengudroid_binder_set_resized_payload");
+            println!("apphost: Android 17 IWindow.resized payload ({} bytes)", bytes.len());
+        }
+        None => eprintln!("apphost: required Android 17 IWindow.resized contract missing"),
     }
 }
 
@@ -6664,29 +6600,10 @@ fn system_compat_info(env: &JniEnv) -> Option<JObject> {
     if res.is_null() {
         return None;
     }
-    // Required is `Resources.getCompatibilityInfo()` on some releases; try it,
-    // then fall back to a static field on CompatibilityInfo.
     let res_class = env.find_class("android/content/res/Resources")?;
-    if let Some(m) = env.method_id(res_class, "getCompatibilityInfo", "()Landroid/content/res/CompatibilityInfo;") {
-        let ci = env.call_object(res, m, &[]);
-        if let Some(ci) = ci {
-            if !ci.is_null() {
-                eprintln!("apphost: borrowed CompatibilityInfo from Resources");
-                return Some(ci);
-            }
-        }
-    }
-    let ci_class = env.find_class("android/content/res/CompatibilityInfo")?;
-    for field in ["DEFAULT_COMPATIBILITY_INFO", "sDefaultCompatibilityInfo"] {
-        if let Some(id) = env.field_id(ci_class, field, "Landroid/content/res/CompatibilityInfo;") {
-            let v = env.static_object_field(ci_class, id);
-            if !v.is_null() {
-                eprintln!("apphost: using CompatibilityInfo.{field}");
-                return Some(v);
-            }
-        }
-    }
-    None
+    let method = env.method_id(res_class, "getCompatibilityInfo", "()Landroid/content/res/CompatibilityInfo;")?;
+    let compatibility = env.call_object(res, method, &[])?;
+    (!compatibility.is_null()).then_some(compatibility)
 }
 
 /// Print what *Java* sees for a few system properties.

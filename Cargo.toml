@@ -11,6 +11,7 @@ members = [
     "crates/pengudroid-daemon",
     "crates/pengudroid-cli",
     "crates/pengudroid-shim",
+    "crates/pengudroid-nativebridge",
 ]
 
 [workspace.package]
@@ -35,6 +36,7 @@ pengudroid-proto = { path = "crates/pengudroid-proto" }
 pengudroid-socket = { path = "crates/pengudroid-socket" }
 pengudroid-input = { path = "crates/pengudroid-input" }
 pengudroid-elf = { path = "crates/pengudroid-elf" }
+pengudroid-nativebridge = { path = "crates/pengudroid-nativebridge" }
 pengudroid-hostgpu = { path = "crates/pengudroid-hostgpu" }
 pengudroid-gleshim = { path = "crates/pengudroid-gleshim" }
 

@@ -195,11 +195,11 @@ mod tests {
     }
 }
 
-/// Android 13's native KeyCharacterMap parcel, including the JNI wrapper's
+/// Android 17's native KeyCharacterMap parcel, including the JNI wrapper's
 /// device id and presence flag. Native read/writeToParcel validate this layout
 /// again at runtime. See frameworks/native/libs/input/KeyCharacterMap.cpp.
 /// This is a US physical layout; compositor XKB layouts are a separate layer.
-pub fn virtual_character_map_parcel(modern: bool) -> Vec<u8> {
+pub fn virtual_character_map_parcel() -> Vec<u8> {
     let mut keys: Vec<(i32, char, char)> = (0..26)
         .map(|i| (29 + i, (b'a' + i as u8) as char, (b'A' + i as u8) as char))
         .collect();
@@ -213,10 +213,9 @@ pub fn virtual_character_map_parcel(modern: bool) -> Vec<u8> {
         (75, '\'', '"'), (76, '/', '?'),
     ]);
     keys.sort_by_key(|k| k.0);
-    let mut words = vec![-1i32, 1, 0];
-    // API 33 uses a C string; API 37 uses length-prefixed String8.
-    if modern { words.push(0); }
-    words.extend([4, 0, keys.len() as i32]);
+    // Device id, presence, empty length-prefixed String8 (length and NUL),
+    // keyboard type, overlay flag and key count. Only the API-37 layout exists.
+    let mut words = vec![-1i32, 1, 0, 0, 4, 0, keys.len() as i32];
     for (code, plain, shifted) in keys {
         let number = if plain.is_ascii_digit() { plain as i32 } else { 0 };
         words.extend([code, shifted as i32, number]);
@@ -232,7 +231,34 @@ pub fn virtual_character_map_parcel(modern: bool) -> Vec<u8> {
         }
         words.push(0); // end of behavior list
     }
-    if modern { words.push(0); } // no key-code remapping
-    words.extend([0, 0]); // no scan-code or HID usage overlays
+    words.extend([0, 0, 0]); // no key-code, scan-code or HID usage overlays
     words.into_iter().flat_map(i32::to_le_bytes).collect()
+}
+
+#[cfg(test)]
+mod parcel_tests {
+    use super::virtual_character_map_parcel;
+
+    #[test]
+    fn api37_character_map_uses_string8_and_all_three_overlay_lists() {
+        let bytes = virtual_character_map_parcel();
+        assert_eq!(bytes.len() % 4, 0);
+        let words: Vec<_> = bytes.chunks_exact(4)
+            .map(|word| i32::from_le_bytes(word.try_into().unwrap())).collect();
+        assert_eq!(&words[..6], &[-1, 1, 0, 0, 4, 0]);
+        assert!(words[6] > 0);
+        let mut cursor = 7;
+        let mut previous_key = -1;
+        for _ in 0..words[6] {
+            assert!(words[cursor] > previous_key, "native keys must be sorted");
+            previous_key = words[cursor];
+            cursor += 3; // key code, display label, digit
+            while words[cursor] != 0 {
+                assert_eq!(words[cursor], 1, "behavior presence flag");
+                cursor += 5; // presence, meta, character, fallback, replacement
+            }
+            cursor += 1;
+        }
+        assert_eq!(&words[cursor..], &[0, 0, 0]);
+    }
 }

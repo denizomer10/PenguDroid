@@ -61,35 +61,81 @@ pub struct HardwareBufferDesc {
     pub rfu1: u64,
 }
 
-/// `ANativeWindowBuffer` as hwui and EGL see it.
+/// `android_native_base_t`, including the native reference-counting interface.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NativeBase {
+    pub magic: i32,
+    pub version: i32,
+    pub reserved: [*mut c_void; 4],
+    pub inc_ref: Option<unsafe extern "C" fn(*mut NativeBase)>,
+    pub dec_ref: Option<unsafe extern "C" fn(*mut NativeBase)>,
+}
+
+pub const NATIVE_BUFFER_MAGIC: i32 = i32::from_be_bytes(*b"_bfr");
+
+/// The C `ANativeWindowBuffer` ABI, NOT the private `GraphicBuffer` layout.
 ///
-/// The first five fields are `ANativeWindowBufferCommon`; `handle` and
-/// `fenceFd` follow. Only the fields the render thread reads are meaningful.
+/// Source: frameworks/native android17-release, commit
+/// ae266dcb706d083868578cfedce381ef44488a07,
+/// libs/nativebase/include/nativebase/nativebase.h (blob
+/// 7ecdfbd74581b1b0b8a903372ffd8f1708d5baba). Fences are separate arguments,
+/// not members of this struct; `usage_deprecated` is an int, not the u64 usage.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct NativeWindowBuffer {
+    pub common: NativeBase,
     pub width: i32,
     pub height: i32,
     pub stride: i32,
     pub format: i32,
+    pub usage_deprecated: i32,
+    pub layer_count: usize,
+    pub reserved: [*mut c_void; 1],
+    pub handle: *const NativeHandle,
     pub usage: u64,
-    pub handle: *const c_void,
-    pub fence_fd: i32,
-    pub _pad: i32,
+    pub reserved_proc: [*mut c_void; 8 - (std::mem::size_of::<u64>() / std::mem::size_of::<*mut c_void>())],
 }
 
 impl Default for NativeWindowBuffer {
     fn default() -> Self {
         Self {
+            common: NativeBase {
+                magic: NATIVE_BUFFER_MAGIC,
+                version: std::mem::size_of::<Self>() as i32,
+                reserved: [std::ptr::null_mut(); 4],
+                inc_ref: None,
+                dec_ref: None,
+            },
             width: 0,
             height: 0,
             stride: 0,
             format: 0,
-            usage: 0,
+            usage_deprecated: 0,
+            layer_count: 0,
+            reserved: [std::ptr::null_mut(); 1],
             handle: std::ptr::null(),
-            fence_fd: -1,
-            _pad: 0,
+            usage: 0,
+            reserved_proc: [std::ptr::null_mut(); 8 - (std::mem::size_of::<u64>() / std::mem::size_of::<*mut c_void>())],
         }
+    }
+}
+
+impl NativeWindowBuffer {
+    fn for_hardware_buffer(desc: &HardwareBufferDesc) -> Self {
+        let mut buffer = Self {
+            width: desc.width as i32,
+            height: desc.height as i32,
+            stride: desc.stride as i32,
+            format: desc.format as i32,
+            usage_deprecated: desc.usage as i32,
+            layer_count: desc.layers as usize,
+            usage: desc.usage,
+            ..Self::default()
+        };
+        buffer.common.inc_ref = Some(native_buffer_acquire);
+        buffer.common.dec_ref = Some(native_buffer_release);
+        buffer
     }
 }
 
@@ -106,6 +152,36 @@ pub struct FakeHardwareBuffer {
     /// The gralloc0-style handle `AHardwareBuffer_getNativeHandle` returns.
     /// `window_buffer.handle` points at it.
     handle: NativeHandle,
+}
+
+// These callbacks recover only our own repr(C) owner, never a C++ subobject.
+unsafe extern "C" fn native_buffer_acquire(base: *mut NativeBase) {
+    if !base.is_null() {
+        let owner = (base as *mut u8).sub(std::mem::offset_of!(FakeHardwareBuffer, window_buffer));
+        AHardwareBuffer_acquire(owner as *mut FakeHardwareBuffer);
+    }
+}
+
+unsafe extern "C" fn native_buffer_release(base: *mut NativeBase) {
+    if !base.is_null() {
+        let owner = (base as *mut u8).sub(std::mem::offset_of!(FakeHardwareBuffer, window_buffer));
+        AHardwareBuffer_release(owner as *mut FakeHardwareBuffer);
+    }
+}
+
+// A native_handle_t header identifies its ABI, not its allocator. Do not decode
+// arbitrary vendor handles as our memfd metadata, even if their headers match.
+fn owned_handles() -> &'static std::sync::Mutex<std::collections::HashSet<usize>> {
+    static HANDLES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<usize>>> = std::sync::OnceLock::new();
+    HANDLES.get_or_init(Default::default)
+}
+
+fn register_handle(handle: *const NativeHandle) {
+    owned_handles().lock().unwrap_or_else(|e| e.into_inner()).insert(handle as usize);
+}
+
+fn unregister_handle(handle: *const NativeHandle) {
+    owned_handles().lock().unwrap_or_else(|e| e.into_inner()).remove(&(handle as usize));
 }
 
 fn bytes_for(desc: &HardwareBufferDesc) -> usize {
@@ -285,6 +361,7 @@ unsafe fn allocate_buffer(
         ],
     });
     *out_handle = Box::into_raw(handle);
+    register_handle(*out_handle);
     if !out_stride.is_null() {
         *out_stride = stride;
     }
@@ -346,6 +423,7 @@ pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper12importBufferEPK13nati
         copy.data[i] = dup;
     }
     *out = Box::into_raw(Box::new(copy));
+    register_handle(*out);
     0
 }
 
@@ -483,6 +561,7 @@ pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper10freeBufferEPK13native
     if handle.is_null() {
         return -22;
     }
+    unregister_handle(handle);
     release_cpu(handle as usize);
     let h = &*handle;
     if h.num_fds > 0 && !h.data.is_empty() {
@@ -807,16 +886,7 @@ pub unsafe extern "C" fn AHardwareBuffer_allocate(
         desc: d,
         fd,
         refs: AtomicI32::new(1),
-        window_buffer: NativeWindowBuffer {
-            width: d.width as i32,
-            height: d.height as i32,
-            stride: d.stride as i32,
-            format: d.format as i32,
-            usage: d.usage,
-            handle: std::ptr::null(),
-            fence_fd: -1,
-            _pad: 0,
-        },
+        window_buffer: NativeWindowBuffer::for_hardware_buffer(&d),
         handle: NativeHandle {
             version: NATIVE_HANDLE_VERSION,
             num_fds: 1,
@@ -834,7 +904,8 @@ pub unsafe extern "C" fn AHardwareBuffer_allocate(
         },
     });
     let mut buf = buf;
-    buf.window_buffer.handle = &buf.handle as *const NativeHandle as *const c_void;
+    buf.window_buffer.handle = &buf.handle;
+    register_handle(&buf.handle);
     *out = Box::into_raw(buf);
     0
 }
@@ -881,6 +952,7 @@ pub unsafe extern "C" fn AHardwareBuffer_release(buffer: *mut FakeHardwareBuffer
         return;
     }
     if b.refs.fetch_sub(1, Ordering::AcqRel) == 1 {
+        unregister_handle(&b.handle);
         release_cpu(&b.handle as *const NativeHandle as usize);
         libc::close(b.fd);
         drop(Box::from_raw(buffer));
@@ -917,16 +989,7 @@ pub unsafe extern "C" fn AHardwareBuffer_createFromHandle(
         desc: d,
         fd,
         refs: AtomicI32::new(1),
-        window_buffer: NativeWindowBuffer {
-            width: d.width as i32,
-            height: d.height as i32,
-            stride: d.stride as i32,
-            format: d.format as i32,
-            usage: d.usage,
-            handle: std::ptr::null(),
-            fence_fd: -1,
-            _pad: 0,
-        },
+        window_buffer: NativeWindowBuffer::for_hardware_buffer(&d),
         handle: NativeHandle {
             version: NATIVE_HANDLE_VERSION,
             num_fds: 1,
@@ -943,7 +1006,8 @@ pub unsafe extern "C" fn AHardwareBuffer_createFromHandle(
             ],
         },
     });
-    buf.window_buffer.handle = &buf.handle as *const NativeHandle as *const c_void;
+    buf.window_buffer.handle = &buf.handle;
+    register_handle(&buf.handle);
     *out = Box::into_raw(buf);
     0
 }
@@ -1007,33 +1071,48 @@ pub unsafe extern "C" fn AHardwareBuffer_getNativeHandle(
     }
 }
 
-/// Offset of `ANativeWindowBuffer::handle` inside an `android::GraphicBuffer`.
+/// `ANativeWindowBuffer* android::GraphicBuffer::getNativeBuffer() const`.
 ///
-/// `GraphicBuffer` derives from `ANativeWindowBuffer`, and in this release
-/// `toAHardwareBuffer()` is the identity, so a `GraphicBuffer*` *is* an
-/// `AHardwareBuffer*` — but not one of ours, so [`as_buf`] rejects it. The
-/// field offset was measured on the Android 13 x86_64 sysroot:
-/// `GraphicBuffer::unlock` loads the handle from `this+0x70`, and
-/// `needsReallocation` reads width/height/format/usage from
-/// `0x48`/`0x4c`/`0x54`/`0x78`.
-pub const GRAPHIC_BUFFER_HANDLE_OFFSET: usize = 0x70;
+/// Declared out-of-line in libs/ui/include/ui/GraphicBuffer.h and defined with
+/// the C++ base conversion in libs/ui/GraphicBuffer.cpp at the android17-release
+/// commit cited above. libs/ui/Android.bp builds it into libui without hidden
+/// visibility/a symbol map. Compiling that declaration derives this Itanium
+/// name; the independent C++ test fixture also checks it via dlsym.
+pub(crate) const GRAPHIC_BUFFER_GET_NATIVE_BUFFER: &[u8] =
+    b"_ZNK7android13GraphicBuffer15getNativeBufferEv\0";
+pub(crate) type GetNativeBuffer = unsafe extern "C" fn(*const c_void) -> *mut NativeWindowBuffer;
 
-/// The `native_handle_t` behind a real `android::GraphicBuffer`.
+/// Borrow the shim-owned memfd handle behind an acquired `GraphicBuffer`.
 ///
-/// This is what the video path needs: the decoder hands us a `GraphicBuffer`
-/// from the `BufferQueue` and the daemon imports its dma-buf.
-pub unsafe fn graphicbuffer_handle(gb: *const c_void) -> *const NativeHandle {
+/// # Safety
+/// `gb` must be live and belong to the libui providing `get_native_buffer`.
+/// Keep its acquired BufferItem/reference alive until the returned handle and
+/// fd are no longer used (BLAST waits for the daemon's snapshot ACK). This does
+/// not take ownership, duplicate/close the fd, or change CPU mapping lifetimes.
+pub(crate) unsafe fn graphicbuffer_handle(
+    gb: *const c_void,
+    get_native_buffer: GetNativeBuffer,
+) -> *const NativeHandle {
     if gb.is_null() {
         return std::ptr::null();
     }
-    let slot = (gb as *const u8).add(GRAPHIC_BUFFER_HANDLE_OFFSET) as *const *const NativeHandle;
-    let handle = *slot;
-    if handle.is_null() {
+    let native = get_native_buffer(gb);
+    if native.is_null() {
         return std::ptr::null();
     }
-    // A handle we did not allocate would be a layout mismatch; refuse rather
-    // than hand the daemon a garbage fd.
-    if (*handle).num_fds < 1 || (*handle).version != NATIVE_HANDLE_VERSION {
+    if (*native).common.magic != NATIVE_BUFFER_MAGIC
+        || (*native).common.version != std::mem::size_of::<NativeWindowBuffer>() as i32
+    {
+        return std::ptr::null();
+    }
+    let handle = (*native).handle;
+    // Check provenance BEFORE dereferencing: unknown handles may be shorter
+    // than our fixed-size NativeHandle, or carry a completely different payload.
+    if !owned_handles().lock().unwrap_or_else(|e| e.into_inner()).contains(&(handle as usize)) {
+        return std::ptr::null();
+    }
+    let h = &*handle;
+    if h.version != NATIVE_HANDLE_VERSION || h.num_fds != 1 || h.num_ints != 6 || h.data[0] < 0 {
         return std::ptr::null();
     }
     handle
@@ -1163,8 +1242,10 @@ mod tests {
         assert_eq!(h.data[2], 0x3231_5659);
         assert_eq!(h.data[3], 320);
         assert_eq!(h.data[4], 240);
-        unsafe { libc::close(h.data[0]) };
-        unsafe { drop(Box::from_raw(out as *mut NativeHandle)) };
+        unsafe {
+            assert_eq!(_ZN7android19GraphicBufferMapper10freeBufferEPK13native_handle(
+                std::ptr::null_mut(), out), 0);
+        }
     }
 
     /// `importBuffer` must hand back a handle its caller owns outright.
@@ -1206,14 +1287,15 @@ mod tests {
         assert_ne!(copy.data[0], original.data[0], "the fd is duplicated");
         assert_eq!(copy.data[1..7], original.data[1..7], "metadata is copied");
         // Both descriptors must be live: closing one leaves the other usable.
-        let dup = copy.data[0];
-        unsafe { libc::close(dup) };
+        unsafe {
+            assert_eq!(_ZN7android19GraphicBufferMapper10freeBufferEPK13native_handle(
+                std::ptr::null_mut(), imported), 0);
+        }
         let size = unsafe { libc::lseek(original.data[0], 0, libc::SEEK_END) };
         assert!(size > 0, "closing the copy must not close the original");
-        unsafe { libc::close(original.data[0]) };
         unsafe {
-            drop(Box::from_raw(out as *mut NativeHandle));
-            drop(Box::from_raw(imported as *mut NativeHandle));
+            assert_eq!(_ZN7android19GraphicBufferMapper10freeBufferEPK13native_handle(
+                std::ptr::null_mut(), out), 0);
         }
     }
 }

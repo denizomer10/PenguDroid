@@ -957,9 +957,32 @@ pub mod abi {
     /// The Android `HAL_PIXEL_FORMAT_RGBA_8888` value.
     pub const ANDROID_RGBA_8888: u32 = 1;
 
-    /// Android 16 (API 36) — what we advertise to guests.
-    pub const ANDROID_API_LEVEL: i32 = 36;
-    pub const ANDROID_RELEASE: &str = "16";
+    /// Android 17 (API 37) x86_64 — the only supported runtime platform.
+    pub const ANDROID_API_LEVEL: i32 = 37;
+    pub const ANDROID_RELEASE: &str = "17";
+
+    /// Guard generic overrides against changing an already validated platform
+    /// identity. `current` must come from the raw property store, not its
+    /// appcompat view. Protected properties may only be written identically;
+    /// an absent protected property (including an appcompat alias) stays absent.
+    ///
+    /// Trusted defaults/image ingestion validate the platform separately before
+    /// using this guard. Application target-SDK metadata is not platform identity.
+    pub fn validate_platform_property_override(name: &str, value: &str, current: Option<&str>) -> Result<(), String> {
+        let mut base = name;
+        while let Some(unwrapped) = base.strip_prefix("ro.appcompat_override.") {
+            base = unwrapped;
+        }
+        let protected = base.starts_with("ro.build.version.")
+            || base.starts_with("ro.product.cpu.")
+            || matches!(base, "ro.build.fingerprint" | "ro.system.build.fingerprint");
+        if protected && current != Some(value) {
+            return Err(format!(
+                "immutable Android {ANDROID_RELEASE} / API {ANDROID_API_LEVEL} x86_64 platform property {name}: current {current:?}, requested {value:?}"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// `ioctl` request numbers are `unsigned long` on Linux.
@@ -1029,6 +1052,56 @@ mod tests {
     }
 
     #[test]
+    fn platform_identity_is_android_17_api_37() {
+        assert_eq!(abi::ANDROID_API_LEVEL, 37);
+        assert_eq!(abi::ANDROID_RELEASE, "17");
+    }
+
+    #[test]
+    fn platform_contract_rejects_identity_changes_but_accepts_identical_values() {
+        for (name, current, replacement) in [
+            ("ro.build.version.sdk", "37", "33"),
+            ("ro.build.version.release", "17", "13"),
+            ("ro.build.version.sdk_full", "37.1", "37.0"),
+            ("ro.build.version.release_or_codename", "17", "16"),
+            ("ro.build.version.release_or_preview_display", "17", "16"),
+            ("ro.build.version.codename", "REL", "OldCodename"),
+            ("ro.build.fingerprint", "current-image", "old-image"),
+            ("ro.system.build.fingerprint", "current-image", "old-image"),
+            ("ro.product.cpu.abi", "x86_64", "x86"),
+            ("ro.product.cpu.abi2", "", "x86"),
+            ("ro.product.cpu.abilist", "x86_64", "x86_64,x86"),
+            ("ro.product.cpu.abilist64", "x86_64", "arm64-v8a"),
+            ("ro.product.cpu.abilist32", "", "x86"),
+        ] {
+            let error = abi::validate_platform_property_override(name, replacement, Some(current)).unwrap_err();
+            assert!(error.contains(name), "{error}");
+            assert!(error.contains("immutable"), "{error}");
+            assert!(abi::validate_platform_property_override(name, current, Some(current)).is_ok());
+            assert!(abi::validate_platform_property_override(name, current, None).is_err());
+            for prefix in ["ro.appcompat_override.", "ro.appcompat_override.ro.appcompat_override."] {
+                let alias = format!("{prefix}{name}");
+                assert!(abi::validate_platform_property_override(&alias, replacement, None).is_err());
+                assert!(abi::validate_platform_property_override(&alias, current, None).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn platform_contract_leaves_application_metadata_and_other_properties_writable() {
+        for name in [
+            "pengudroid.app.target_sdk",
+            "ro.app.target_sdk",
+            "debug.stagefright.c2-poolmask",
+            "persist.pengu.compat_probe",
+            "ro.appcompat_override.persist.pengu.compat_probe",
+        ] {
+            assert!(abi::validate_platform_property_override(name, "33", None).is_ok());
+            assert!(abi::validate_platform_property_override(name, "33", Some("37")).is_ok());
+        }
+    }
+
+    #[test]
     fn hardware_video_commands_preserve_timestamps_configuration_and_status() {
         roundtrip(Message::VideoDecoderOpen { surface_id: 42, codec: "h264".into(),
             device: "/dev/dri/renderD128".into(), extra: vec![0, 1, 0, 255] });
@@ -1094,7 +1167,7 @@ mod tests {
         roundtrip(Message::ListProps);
         roundtrip(Message::ListServices);
         roundtrip(Message::PropList {
-            pairs: vec![("ro.build.version.sdk".into(), "36".into())],
+            pairs: vec![("ro.build.version.sdk".into(), abi::ANDROID_API_LEVEL.to_string())],
             more: true,
         });
         roundtrip(Message::ServiceList {

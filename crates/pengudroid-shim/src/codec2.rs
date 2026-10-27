@@ -471,10 +471,10 @@ unsafe fn build() -> Option<Api> {
 }
 
 fn api() -> Option<&'static Api> {
-    // On by default: the real service answers `getConfigurable`,
-    // `getPoolClientManager`, `listComponents` (53 codecs, `video/avc`
-    // included) and `createInterface`. `PENGUDROID_NO_CODEC2_SERVICE=1` falls
-    // back to the hand-written stub replies.
+    // Native Codec2 replies are only available when this service can be built.
+    // Disabling it or failing initialization now makes Binder reject discovery
+    // and component calls; there is no fabricated codec list or handle fallback.
+    // The private C++ ABI below still needs target-matched API-37 validation.
     if std::env::var_os("PENGUDROID_NO_CODEC2_SERVICE").is_some() {
         return None;
     }

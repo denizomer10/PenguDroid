@@ -127,7 +127,11 @@ fn cli_drives_a_real_daemon() {
 
     // Properties: one, all, and a write that is read back.
     let one = cli(&runtime, &["getprop", "ro.build.version.sdk"]);
-    assert_eq!(stdout(&one).trim(), "[ro.build.version.sdk]: [36]");
+    assert_eq!(stdout(&one).trim(), "[ro.build.version.sdk]: [37]");
+    let downgrade = cli(&runtime, &["setprop", "ro.build.version.sdk", "33"]);
+    assert!(!downgrade.status.success(), "platform downgrade must be rejected");
+    let still_current = cli(&runtime, &["getprop", "ro.build.version.sdk"]);
+    assert_eq!(stdout(&still_current).trim(), "[ro.build.version.sdk]: [37]");
 
     let all = cli(&runtime, &["getprop"]);
     let text = stdout(&all);
