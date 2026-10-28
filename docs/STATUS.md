@@ -117,7 +117,6 @@ media: API-37 codec enumeration repeated 16 times: regular=60, all=60
 four API-37 CheckJNI gates and **326** Rust tests still pass.
 
 ### The gralloc mapper is now provided (2026-10-28)
-
 The earlier stopping point (kept here because it is what the fix addresses):
 with the service up, a bounded NewPipe run reaches the real decoder and aborts:
 
@@ -183,11 +182,60 @@ ERROR C2SoftAvcDec: fetchGraphicBlock for Output failed with status 22
 CCodecBufferChannel: [c2.android.avc.decoder#561] work failed to complete: 14
 ```
 
-So the remaining work is that surface/block-pool contract: the store must answer
-the output-surface allocator query the codec asks for (`BAD_INDEX (6)`), and
-`fetchGraphicBlock` must hand out a graphic block the software decoder accepts.
-Note the decoder the app chose is the software `C2SoftAvcDec`; wiring in the
-host VA-API decoder is a separate later step.
+So the remaining work is that surface/block-pool contract: `fetchGraphicBlock`
+must hand out a graphic block the software decoder accepts. Note the decoder the
+app chose is the software `C2SoftAvcDec`; wiring in the host VA-API decoder is a
+separate later step.
+
+The `BAD_INDEX (6)` allocator *query* is **not** the bug: `CCodecBufferChannel`
+tolerates `C2_BAD_INDEX` there and only logs because `params.size() != 1`; the
+store legitimately has no `C2PortSurfaceAllocatorTuning`. The real contract is
+below.
+
+### Surface block pool: measured root cause (2026-10-28)
+
+A deterministic reproducer now exists that needs no Wayland window and no app UI:
+`PENGUDROID_PROBE_MEDIA=1 PENGUDROID_PROBE_SURFACE=1` inside an `art-test` app
+bind configures `c2.android.avc.decoder` with an `ImageReader` surface, starts
+it, queues a real H.264 fixture and reads frames
+(`target/newpipe-api37-surf/app.log`). It reproduces the exact NewPipe failure.
+
+Two distinct defects are now separated:
+
+1. **Producer generation/usage query fails.** `C2BqBuffer: get generationNumber
+   failed <producerId>` comes from `getGenerationNumberAndUsage()`
+   (`frameworks/av/media/codec2/vndk/platform/C2BqBuffer.cpp:264`), which does
+   `dequeueBuffer(640x480, YCBCR_420_888)` and then `requestBuffer(slot)` on the
+   HIDL `IGraphicBufferProducer`. The dequeue succeeds — the shim's allocator
+   logs `[ahb] allocated 640x480 fmt=35 stride=640` — but `requestBuffer` does not
+   return a buffer, so `bqInformation` stays false and the pool is configured
+   with generation `0`.
+2. **ByteBuffer output reaches real decoding, then the mapper's unmap crashes.**
+   With the surface probe disabled, the same fixture is genuinely decoded: the
+   stack reaches `C2SoftAvcDec::process` and builds/destroys a `C2GraphicView`.
+   Destruction faults in `GraphicBufferMapper::unlock`:
+
+```
+Fatal signal 11 (SIGSEGV) SEGV_MAPERR fault addr 0x7f89c8e743ec
+#00 libui.so  android::GraphicBufferMapper::unlock+61
+#01 libcodec2_vndk.so  android::C2AllocationGralloc::unmap+107
+#02 libcodec2_vndk.so  _C2MappingBlock2DImpl::Mapped::~Mapped
+#06 libcodec2_soft_avcdec.so  android::C2SoftAvcDec::process+1679
+```
+
+The faulting address is the `native_handle_t*` itself, so `unlock` is
+ dereferencing a handle whose storage is no longer mapped. The shim's own
+`lock`/`unlock` interposition is therefore not on this path, or the handle it
+gets back has already been released by the extra `importBuffer` copy this shim
+returns (a `Box<NativeHandle>` the caller owns). That ownership question is the
+next thing to settle: `GraphicBuffer` and `C2AllocationGralloc` must observe the
+same handle for the same interval, and exactly one owner may release it.
+
+`GraphicBufferMapper::unlock`/`lock` are **not exported** by this API-37
+`libui.so` (`llvm-nm -D` lists `importBuffer`, `freeBuffer`, `getTransportSize`,
+`getPlaneLayouts`, … but no `lock`/`unlock`/`mMapper`), so they are inlined into
+`libcodec2_vndk` and cannot be interposed; the fix has to be correct handle
+lifetime plus a mapper the inlined path accepts, not another symbol hook.
 
 ### Beach Buggy Racing 2: measured blocker (unchanged by this pass)
 
