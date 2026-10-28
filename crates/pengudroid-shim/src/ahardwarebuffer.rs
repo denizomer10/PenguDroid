@@ -401,6 +401,25 @@ pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper12importBufferEPK13nati
     _generation: u32,
     out: *mut *const NativeHandle,
 ) -> i32 {
+    import_handle_copy(handle, out)
+}
+
+/// `android::GraphicBufferMapper::importBufferNoValidate(handle, &out)`.
+///
+/// API-37 `libcodec2_vndk.so` imports this two-argument form, so it has to be
+/// hosted too; the validation the caller skipped is about HAL descriptors this
+/// shim never produced.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper22importBufferNoValidateEPK13native_handlePS3_(
+    _this: *mut c_void,
+    handle: *const NativeHandle,
+    out: *mut *const NativeHandle,
+) -> i32 {
+    import_handle_copy(handle, out)
+}
+
+/// Copy `handle` and every fd it carries into a caller-owned record.
+unsafe fn import_handle_copy(handle: *const NativeHandle, out: *mut *const NativeHandle) -> i32 {
     if handle.is_null() || out.is_null() {
         return -22;
     }
@@ -440,6 +459,30 @@ pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper4lockEPK13native_handle
     handle: *const NativeHandle,
     _usage: u32,
     _bounds: *const c_void,
+    addr: *mut *mut c_void,
+    bytes_per_pixel: *mut i32,
+    stride: *mut i32,
+) -> i32 {
+    lock_body(handle, addr, bytes_per_pixel, stride)
+}
+
+/// `android::GraphicBufferMapper::lock(handle, usage, bounds, &addr)`.
+///
+/// This four-argument form is the one API-37 `libcodec2_vndk.so` imports; the
+/// wider form above is a different overload. Both map the same block.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper4lockEPK13native_handlejRKNS_4RectEPPv(
+    _this: *mut c_void,
+    handle: *const NativeHandle,
+    _usage: u32,
+    _bounds: *const c_void,
+    addr: *mut *mut c_void,
+) -> i32 {
+    lock_body(handle, addr, std::ptr::null_mut(), std::ptr::null_mut())
+}
+
+unsafe fn lock_body(
+    handle: *const NativeHandle,
     addr: *mut *mut c_void,
     bytes_per_pixel: *mut i32,
     stride: *mut i32,
@@ -496,6 +539,33 @@ pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper6unlockEPK13native_hand
     _this: *mut c_void,
     handle: *const NativeHandle,
 ) -> i32 {
+    unlock_body(handle)
+}
+
+/// `android::GraphicBufferMapper::unlock(handle, base::unique_fd*)`.
+///
+/// This is the symbol API-37 `libcodec2_vndk.so` imports (verified with
+/// `llvm-nm -D`). It is a member function, so `this` occupies the first
+/// argument register. The library's own implementation dereferences
+/// `this->mMapper` and virtual-calls slot `0x50`; with no gralloc HAL behind it
+/// that read faulted at `GraphicBufferMapper::unlock+61`. Hosting the symbol
+/// keeps the guest off that path entirely.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper6unlockEPK13native_handlePNS_4base14unique_fd_implINS4_13DefaultCloserEEE(
+    _this: *mut c_void,
+    handle: *const NativeHandle,
+    fence: *mut i32,
+) -> i32 {
+    if !fence.is_null() {
+        // The mapping is released synchronously, so there is no release fence.
+        // Writing -1 is what an empty `base::unique_fd` already holds; it also
+        // stops the caller from closing an fd this shim never owned.
+        *fence = -1;
+    }
+    unlock_body(handle)
+}
+
+unsafe fn unlock_body(handle: *const NativeHandle) -> i32 {
     if handle.is_null() {
         return -22;
     }
@@ -812,9 +882,9 @@ type MapperImportBuffer = unsafe extern "C" fn(*mut c_void, *const NativeHandle,
 type MapperFreeBuffer = unsafe extern "C" fn(*mut c_void, *const NativeHandle) -> i32;
 type MapperValidateBufferSize = unsafe extern "C" fn(*mut c_void, *const NativeHandle, u32, u32, i32, u32, u64, u32) -> i32;
 type MapperGetTransportSize = unsafe extern "C" fn(*mut c_void, *const NativeHandle, *mut u32, *mut u32) -> i32;
-type MapperLock = unsafe extern "C" fn(*mut c_void, *const NativeHandle, u64, *const c_void, *mut *mut c_void, *mut i32, *mut i32) -> i32;
+type MapperLock = unsafe extern "C" fn(*mut c_void, *const NativeHandle, u64, *const c_void, *mut *mut c_void) -> i32;
 type MapperLockYcbcr = unsafe extern "C" fn(*mut c_void, *const NativeHandle, u64, *const c_void, i32, *mut AndroidYcbcr) -> i32;
-type MapperUnlock = unsafe extern "C" fn(*mut c_void, *const NativeHandle) -> i32;
+type MapperUnlock = unsafe extern "C" fn(*mut c_void, *const NativeHandle, *mut i32) -> i32;
 type MapperDumpDebugInfo = unsafe extern "C" fn(*mut c_void, *mut c_void);
 
 unsafe extern "C" fn mapper_dtor_complete(_this: *mut c_void) {}
@@ -858,16 +928,17 @@ unsafe extern "C" fn mapper_get_transport_size(_this: *mut c_void, handle: *cons
     _ZN7android19GraphicBufferMapper16getTransportSizeEPK13native_handlePjS4_(
         std::ptr::null_mut(), handle, num_fds, num_ints)
 }
-unsafe extern "C" fn mapper_lock(_this: *mut c_void, handle: *const NativeHandle, usage: u64, bounds: *const c_void, addr: *mut *mut c_void, bytes_per_pixel: *mut i32, stride: *mut i32) -> i32 {
-    _ZN7android19GraphicBufferMapper4lockEPK13native_handlejRKNS_4RectEPPvPiS9_(
-        std::ptr::null_mut(), handle, usage as u32, bounds, addr, bytes_per_pixel, stride)
+unsafe extern "C" fn mapper_lock(_this: *mut c_void, handle: *const NativeHandle, usage: u64, bounds: *const c_void, addr: *mut *mut c_void) -> i32 {
+    _ZN7android19GraphicBufferMapper4lockEPK13native_handlejRKNS_4RectEPPv(
+        std::ptr::null_mut(), handle, usage as u32, bounds, addr)
 }
 unsafe extern "C" fn mapper_lock_ycbcr(_this: *mut c_void, handle: *const NativeHandle, usage: u64, bounds: *const c_void, _usage: i32, out: *mut AndroidYcbcr) -> i32 {
     _ZN7android19GraphicBufferMapper9lockYCbCrEPK13native_handlejRKNS_4RectEP13android_ycbcr(
         std::ptr::null_mut(), handle, usage as u32, bounds, out)
 }
-unsafe extern "C" fn mapper_unlock(_this: *mut c_void, handle: *const NativeHandle) -> i32 {
-    _ZN7android19GraphicBufferMapper6unlockEPK13native_handle(std::ptr::null_mut(), handle)
+unsafe extern "C" fn mapper_unlock(_this: *mut c_void, handle: *const NativeHandle, fence: *mut i32) -> i32 {
+    _ZN7android19GraphicBufferMapper6unlockEPK13native_handlePNS_4base14unique_fd_implINS4_13DefaultCloserEEE(
+        std::ptr::null_mut(), handle, fence)
 }
 unsafe extern "C" fn mapper_dump_debug_info(_this: *mut c_void, _out: *mut c_void) {}
 

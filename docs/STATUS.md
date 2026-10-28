@@ -194,6 +194,59 @@ below.
 
 ### Surface block pool: measured root cause (2026-10-28)
 
+**Update: the decoder crash is fixed; ByteBuffer output now decodes.** The
+fault was not a lifetime bug at all. API-37 `libcodec2_vndk.so` imports two
+symbols this shim was not defining (`llvm-nm -D`, verified):
+
+```
+_ZN7android19GraphicBufferMapper6unlockEPK13native_handlePNS_4base14unique_fd_implINS4_13DefaultCloserEEE
+_ZN7android19GraphicBufferMapper4lockEPK13native_handlejRKNS_4RectEPPv
+```
+
+The shim only provided the single-argument `unlock(handle)` and a seven-argument
+`lock(...)` overload, so both guest calls resolved to `libui`'s own
+implementations. `libui`'s `unlock` is `this->mMapper`, then `*(mMapper)`,
+then `callq *0x50(%rax)` (disassembled at `libui+0x2a41a`), and `mMapper` is
+unusable without a gralloc HAL — that is the measured SIGSEGV. Three symbols are
+now hosted with their exact API-37 signatures: the two above plus
+`importBufferNoValidate(native_handle const*, native_handle const**)`. The
+hosted vtable slots were aligned to the same ABI (`importBuffer` 2-arg,
+`lock` 4-arg, `unlock` with a fence out-parameter).
+
+Verified with `PENGUDROID_PROBE_MEDIA=1` (ByteBuffer mode, real H.264 fixture):
+
+```
+[ahb] import 0x7f9754136690 -> 0x7f9754637110 fds=1
+[ahb] lockYCbCr ... [ahb] unlock 0x7f9754637110
+media: MediaCodec.start = true
+media: queueInputBuffer(24732 bytes) = true
+media: dequeueOutputBuffer[1] = Some(0) size=24576 flags=0
+media: output format width=128 height=128
+media: dequeueOutputBuffer[2] = Some(1) size=0 flags=4   # EOS
+```
+
+24576 bytes is exactly one 128x128 YV12 frame, the fatal signal count is zero,
+and `GraphicBufferMapper::unlock` no longer appears in any backtrace. So the
+software AVC decoder and the shim's CPU mapper work end to end.
+
+**Still open: surface output.** With `PENGUDROID_PROBE_SURFACE=1` the pool is
+created and configured, but the HIDL producer handshake still fails:
+
+```
+[ahb] allocated 640x480 fmt=35 stride=640 (1228800 bytes)
+[ahb] free 0x7f20ac039020 owned=true
+WARN C2BqBuffer: get generationNumber failed <producerId>
+ERROR C2SoftAvcDec: fetchGraphicBlock for Output failed with status 22
+```
+
+The buffer is allocated by the real `BufferQueueProducer::dequeueBuffer` and
+freed immediately, so `requestBuffer` returned nothing;
+`getGenerationNumberAndUsage()` (`C2BqBuffer.cpp:264`) therefore reports no
+buffer queue information and the component cannot take a graphic block. That
+HIDL `IGraphicBufferProducer` callback path is the next thing to host.
+
+The earlier stopping point is kept below for context.
+
 A deterministic reproducer now exists that needs no Wayland window and no app UI:
 `PENGUDROID_PROBE_MEDIA=1 PENGUDROID_PROBE_SURFACE=1` inside an `art-test` app
 bind configures `c2.android.avc.decoder` with an `ImageReader` surface, starts
