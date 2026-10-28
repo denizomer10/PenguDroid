@@ -482,9 +482,13 @@ mod tests {
         writer.join().unwrap();
 
         // cat's unread stdout eventually stalls its stdin too. Release must not
-        // wait for pipe.write_all or for an audio server to start reading again.
-        let t = track(2, 2, 256 * 1024);
-        assert_eq!(t.write(&vec![0; 256 * 1024], false), 256 * 1024);
+        // wait for a pipe write or for an audio server to start reading again.
+        // The payload must exceed the sink chain's total absorption (both pipes
+        // plus cat's own buffering): measured 816 KiB with 64 KiB pipes on the
+        // dev host, and a stall cannot be asserted while everything still fits
+        // downstream, so keep several times that margin.
+        let t = track(2, 2, 8 * 1024 * 1024);
+        assert_eq!(t.write(&vec![0; 8 * 1024 * 1024], false), 8 * 1024 * 1024);
         t.start_with(|_, _| {
             let mut child = std::process::Command::new("/bin/cat")
                 .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();

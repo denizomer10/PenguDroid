@@ -48,6 +48,21 @@ loaded/contended run. A serialized rerun completes each probe in seconds. The
 new logs are `target/workspace-tests-audio-verified.log` and
 `target/audio-api37-gate-rerun.log`.
 
+### Sink-stall test made deterministic (2026-10-28)
+
+The engine test
+`blocked_writer_is_released_and_sink_pipe_cannot_trap_the_finalizer` was racy,
+not just red once: its 256 KiB payload is smaller than the sink chain's total
+absorption, so whether `occupied() > 0` held after 50 ms depended on whether the
+pump thread lost the scheduling race (it failed 3/3 solo, and could pass under a
+loaded parallel suite). Measured on this host (`/bin/cat` is uutils coreutils,
+64 KiB pipes, stdout never read) the chain absorbs **835,584 bytes** before
+stalling. The engine was never at fault — it already writes through a
+non-blocking pipe with a 3 ms retry and `release()` never waits on I/O — so the
+fix is the payload only: 8 MiB, several times any plausible pipe+buffer
+absorption, making the stall premise deterministic. 3/3 solo reruns pass and
+the suite number above is now stable.
+
 ### A real NewPipe launch on this machine (2026-10-28)
 
 A bounded 75 s launch (`pengudroid launch NewPipe_v0.29.1.apk --backend art
