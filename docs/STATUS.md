@@ -224,12 +224,17 @@ Fatal signal 11 (SIGSEGV) SEGV_MAPERR fault addr 0x7f89c8e743ec
 ```
 
 The faulting address is the `native_handle_t*` itself, so `unlock` is
- dereferencing a handle whose storage is no longer mapped. The shim's own
+dereferencing a handle whose storage is no longer mapped. The shim's own
 `lock`/`unlock` interposition is therefore not on this path, or the handle it
 gets back has already been released by the extra `importBuffer` copy this shim
-returns (a `Box<NativeHandle>` the caller owns). That ownership question is the
-next thing to settle: `GraphicBuffer` and `C2AllocationGralloc` must observe the
-same handle for the same interval, and exactly one owner may release it.
+returns (a `Box<NativeHandle>` the caller owns).
+
+**A bounded retire-on-free pool was tried and rejected:** keeping released
+handle records alive did not stop the fault, so the faulting pointer is not one
+of the records this shim allocated. It must be identified before any further
+change: log the address returned by `importBuffer`, the address the
+`C2AllocationGralloc` retains, and the faulting `rdi`, then make exactly one
+owner responsible for that interval. Do not guess a lifetime rule.
 
 `GraphicBufferMapper::unlock`/`lock` are **not exported** by this API-37
 `libui.so` (`llvm-nm -D` lists `importBuffer`, `freeBuffer`, `getTransportSize`,
