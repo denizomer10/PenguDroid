@@ -2,7 +2,237 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
-## Current handoff — API-37 media discovery no longer aborts (2026-10-27)
+## Current handoff — API-37 AudioTrack adapter hosted and verified (2026-10-28)
+
+Android 17 / API 37 / x86_64 remains the only runtime. The previous handoff's
+audio task — a descriptor-checked AudioSystem/AudioTrack JNI adapter with a
+CheckJNI gate — is implemented, integrated and now **verified on this
+checkout**. Playback (video or audible audio) is still **not** established.
+
+### What the adapter is
+
+`crates/pengudroid-shim/src/audiotrack/` hosts AudioTrack and AudioSystem at
+the JNI boundary; it never invokes a real `AudioTrack` C++ native with a hosted
+integer handle. The pieces:
+
+- `contract.rs` reflects the loaded classes' own `getDeclaredMethods`, derives
+  each descriptor, and validates a **closed** typed table before any pointer is
+  registered, so a stale `native_setup` signature or a new/renamed native fails
+  loudly. `runtime_contract.rs` is the independent DEX oracle (framework.jar
+SHA-256 `55f235f3…`); 57 AudioTrack + 2 AudioSystem entries, 4 of them static.
+- `api37.rs` registers exactly those pointers; `engine.rs` owns the bounded
+  streaming queue into the existing `pw-cat`/`aplay` sink; `jni.rs` is only the
+  standard JNI C table (no private C++ layouts).
+- Registration is a **closed boundary**: `sysroot.rs` calls
+  `__pengudroid_register_audio_api37` only *after* the original
+  `libandroid_runtime` groups run. Audio is never name-patched through the
+  exported `AndroidRuntime::registerNativeMethods` interposer, which keeps the
+  original `internalRegisterMethodsOrDie` path authoritative for audio.
+
+### Verified evidence (2026-10-28)
+
+- `android17_audio_track_under_checkjni` ran (not skipped) and **passed** via
+  `PENGUDROID_TEST_ANDROID17_SYSROOT=.toolchain/sysroot-android17`. A direct
+  probe (`-Xint -Xcheck:jni`) reproduces in **~3 s**:
+  `audio: hosted API37 AudioSystem=2 AudioTrack=57 output_rate=48000` and
+  `audio: API-37 AudioTrack initialized session=3 min=3528 rate=48000 wrote=44100/44100 head 9844 -> 11025`.
+- `cargo test --workspace --offline`: **326 passed, 0 failed**. All four API-37
+  CheckJNI gates (`core`, `blast`, `media` discovery, `audio`) ran and passed.
+- `python3 -B -m unittest discover -s tools -p 'test_*.py'`: **123 passed**, `OK`.
+- `git diff --check`: clean.
+- `cargo build --workspace --offline`: clean (warnings only).
+
+A previously retained log (`target/workspace-tests-audio-device.log`) showed all
+four gates failing with `ART probe timed out`; that was a transient
+loaded/contended run. A serialized rerun completes each probe in seconds. The
+new logs are `target/workspace-tests-audio-verified.log` and
+`target/audio-api37-gate-rerun.log`.
+
+### A real NewPipe launch on this machine (2026-10-28)
+
+A bounded 75 s launch (`pengudroid launch NewPipe_v0.29.1.apk --backend art
+--component org.schabi.newpipe.MainActivity`, private daemon socket, host
+Wayland/PipeWire session preserved) confirmed the adapter is live in a real app
+and that the app draws on the host GPU:
+
+- `audio: API37 RegisterNatives android/media/AudioTrack descriptors=57 rc=0`
+  and `audio: hosted API37 AudioSystem=2 AudioTrack=57` appear in the app's own
+  log, i.e. the adapter installs on the real registration path.
+- The guest attached, installed the window session, built a `SurfaceControl`,
+scheduled traversals, bound `PlayerService`, loaded real YouTube content over
+  HTTP/2 and ran its SQLite database. No fatal signal; the run ended only at the
+  timeout.
+- `PENGUDROID_DUMP_FRAME` captured **four 720×1280 frames** written by
+  `gleshim`, so hwui really draws on the host GPU through the dma-buf path. One
+  frame is the rendered NewPipe *Live* feed; an earlier one is the first-run
+  dialog.
+
+**Not established by that run:** no MediaCodec/Codec2 activity occurred and no
+`AudioTrack` was constructed (`audio: API37 setup` never printed), because no
+stream was played. This is UI rendering evidence, not video or audio playback.
+
+### Host hardware video, measured here (2026-10-28)
+
+On this machine (single **Intel CometLake-U UHD**, iHD VA-API 1.22):
+
+- `pengudroid video-decode-test` decoded a 128×128 H.264 fixture and exported a
+  synchronized NV12 dma-buf (`objects=1, planes=2`, luma readback 64 = fixture).
+- `pengudroid-hostgpu --test hardware_video` ran **2,000** decode/flush/export
+  cycles: fd count 5 → 5, RSS 31 424 → 31 424 KiB (bounded).
+- `pengudroid-daemon --lib hardware_video_import` passed the two-plane
+  compositor import against the live Wayland session.
+
+So the **host** half of hardware video is working here. "Every GPU" is not
+demonstrable here either: only one Intel iGPU is present, AMD is unvalidated,
+and no NVIDIA/NVDEC backend exists.
+
+### Native Codec2 service unblocked: 60 codecs, `video/avc` present (2026-10-28)
+
+The in-process codec2 service (`crates/pengudroid-shim/src/codec2.rs`) had never
+come up on API 37, so `MediaCodecList` saw only the APEX AAC codec and **no
+video decoder could be created**. Two defects were fixed:
+
+- **`Parcel::setData` does not exist on API 37.** `libhidlbase.so` exports
+  `setDataSize`/`setDataCapacity`/`setDataPosition` but no `setData`, so
+  `build()` returned at the first `dlsym` and the store was never constructed
+  (`[codec2] dlsym …setDataEPKhm failed`). The request parcel is now filled
+  with the exported `Parcel::write(const void*, size_t)` (with `setData` kept as
+  an optional alternative for runtimes that export it), then rewound with
+  `setDataPosition(0)`.
+- **The parcel backing store was misaligned.** A `[u8; PARCEL_BYTES]` on the
+  stack is byte-aligned, so writing the objects array at `0x48`/`0x50` faulted
+  with `misaligned pointer dereference` once the service actually ran. It is now
+  `#[repr(C, align(16))]`.
+
+Verified with `PENGUDROID_PROBE_MEDIA_LIST=1` (`target/api37-codec2-service-up.log`):
+
+```
+[codec2] service up: platform=0x… store=0x… bn=0x…
+Codec2Client: Available Codec2 services: "default" "__ApexCodecs__"
+[codec2] built traits reply for 36 codecs
+media: API-37 codec enumeration repeated 16 times: regular=60, all=60
+```
+
+60 codecs instead of one, and `video/avc` is in the list (`C2SoftAvcDec`). All
+four API-37 CheckJNI gates and **326** Rust tests still pass.
+
+### The gralloc mapper is now provided (2026-10-28)
+
+The earlier stopping point (kept here because it is what the fix addresses):
+with the service up, a bounded NewPipe run reaches the real decoder and aborts:
+
+```
+CCodecBufferChannel: [c2.android.avc.decoder#231] Created input block pool … OK (0)
+… Configured output block pool ids 21 => OK
+Codec2Client: setOutputSurface -- generation=… consumer usage=0xb00
+FATAL GraphicBufferMapper: gralloc-mapper is missing
+```
+
+The stack is `CCodec::start` → `CCodecBufferChannel::start` →
+`Codec2Client::Component::setOutputSurface` →
+`C2BufferQueueBlockPool::Impl::configureProducer` →
+`BufferQueueProducer::dequeueBuffer` → `GraphicBuffer::GraphicBuffer`
+(`target/newpipe-api37-avc-surface.log`).
+
+The mechanism is **measured, not guessed** (`system/apex/com.android.media.swcodec/lib64/libui.so`,
+BuildID `4fdd6c3b…`): `GraphicBuffer::GraphicBuffer()` has the entire
+mapper-selection chain **inlined** into it (`0x2fc60`–`0x2fd0f`). It constructs
+`Gralloc5Mapper`, checks `isLoaded()` (a virtual call through `*0x10`), then
+`Gralloc4Mapper` (PLT), then — only when
+`android_get_device_api_level() <= 35` — `Gralloc3Mapper`/`Gralloc2Mapper`, and
+finishes with `__android_log_assert("gralloc-mapper is missing")` when every one
+is unloaded. All four are unloaded because the gralloc HAL is absent here
+(`Failed to get isDeclared for android.hardware.graphics.allocator.IAllocator/default`).
+
+Because the chain is inlined into libui's own constructor, the shim's
+interposed `GraphicBufferMapper`/`GraphicBufferAllocator` constructors were
+never on this path — symbol interposition only covers cross-library PLT calls.
+`Gralloc5Mapper` is built by a *direct* call and cannot be hooked, but
+`Gralloc4Mapper` **is** a PLT call, so `ahardwarebuffer.rs` now interposes
+`_ZN7android14Gralloc4MapperC1Ev`/`C2Ev` and installs a mapper table whose
+`isLoaded()` is true and whose buffer operations reuse the shim's existing
+memfd-backed `GraphicBufferMapper` implementations. The three slot offsets this
+depends on were read from the **real call sites** (`isLoaded` at `*0x10`,
+`importBuffer` at `*0x20`, `freeBuffer` at `*0x28`), not copied from a static
+image: a naive read of `_ZTVN7android14Gralloc4MapperE` comes back mostly zero
+because RELRO relocations are not materialised on disk.
+
+Verified on device (`target/newpipe-api37-gralloc-mapper.log`):
+
+```
+[ahb] Gralloc4Mapper constructed: hosted mapper installed
+[ahb] allocated 640x480 fmt=35 stride=640 (1228800 bytes) fd=181
+[ahb] allocated 384x240 fmt=842094169 stride=384 (368640 bytes) fd=221
+```
+
+The `gralloc-mapper is missing` abort is **gone** (zero occurrences), the
+bounded run stays alive for its whole window, and `c2.android.aac.decoder`
+**and** `c2.android.avc.decoder` are created and passed `setOutputSurface`.
+All four API-37 CheckJNI gates and **326** Rust tests still pass.
+
+### New stopping point: the surface-backed output block pool
+
+The decoder now fails one layer deeper, inside codec2's block pool for a
+`Surface` output (`target/newpipe-api37-gralloc-mapper.log`):
+
+```
+CCodecBufferChannel: [c2.android.avc.decoder#561] Query output surface allocator returned 0 params => BAD_INDEX (6)
+CCodecBufferChannel: [c2.android.avc.decoder#561] Created output block pool with allocatorID 18 => poolID 21 - OK
+SimpleC2Component: Using output block pool with poolID 21 => got 21 - 0
+ERROR C2SoftAvcDec: fetchGraphicBlock for Output failed with status 22
+CCodecBufferChannel: [c2.android.avc.decoder#561] work failed to complete: 14
+```
+
+So the remaining work is that surface/block-pool contract: the store must answer
+the output-surface allocator query the codec asks for (`BAD_INDEX (6)`), and
+`fetchGraphicBlock` must hand out a graphic block the software decoder accepts.
+Note the decoder the app chose is the software `C2SoftAvcDec`; wiring in the
+host VA-API decoder is a separate later step.
+
+### Beach Buggy Racing 2: measured blocker (unchanged by this pass)
+
+`pengudroid doctor 'Beach+Buggy+Racing+2_2026.10.05_APKPure.xapk'` reports 18
+native libraries, `ABIs: arm64-v8a`, `host ABI (x86_64): no`, `loadable (host):
+0/18`, verdict *not runnable natively: ARM-only code (needs the ARM translator)*.
+No `libberberis_arm64.so` exists in this checkout and the native-bridge build
+stops at a real dependency closure (`libandroid` → `libandroid_common` →
+`android.hardware.power-ndk_shared`); the upstream route is a full AOSP
+`m berberis_all` with `BUILD_BERBERIS_ARM64_TO_X86_64`, whose build system is not
+present. **No guest instruction has ever been translated**, so BBR2 cannot be
+opened from this checkout. Staging its ARM64 libraries alone would not change
+that: the shim does not yet route ARM paths to a translator either.
+
+### Device compatibility profile integrated
+
+`crates/pengudroid-device` (Pixel 11 metadata, see [DEVICE_SHIM.md](DEVICE_SHIM.md))
+is now wired into the daemon property store: `props.rs::defaults()` populates it
+*after* the base/image defaults, and both `Props::set` and persisted ingestion
+(`load_into`) plus `PENGUDROID_PROP_*` env overrides run through
+`validate_platform_property_override`, which now also rejects
+`is_protected_profile_key` writes (including nested
+`ro.appcompat_override.` wrappers). Runtime API/CPU identity is unaffected.
+
+### Still open in the audio path (measured this run)
+
+The gate proves the JNI contract, the session allocator, the minimum-buffer
+helper and PCM consumption by the queue — **not** audible output:
+
+1. Audio focus in this path is incomplete: the audio `AudioSystem` path emits
+   `UNKNOWN_TRANSACTION target=8 (audio) code=2/4/5: API-37 audio-focus Stub
+   transactions not installed`. Core focus (the separate AIDL audio-focus gate)
+   passes; these AudioSystem codes are not yet installed and are non-fatal here.
+2. The probe (and the `art_framework` harness) points `XDG_RUNTIME_DIR` at a
+   temporary directory, so the sink logs `pw_context_connect() failed: Host is
+   down`. That is the isolated harness, not a host without audio: this desktop
+   runs PipeWire + WirePlumber with a live `pipewire-0` socket. The gate proves
+   PCM consumption by the queue (`9844 -> 11025`), not audible output.
+3. NewPipe audio initialization is still unverified; the earlier ExoPlayer
+   `AudioSink$InitializationException` is not claimed fixed by this pass.
+4. Previously recorded blockers are unchanged: video Codec2/gralloc
+   integration, the boot-image read-barrier mismatch, real hardware media
+   integration, ARM64 translation, and resource lifetime auditing.
+
+## Prior handoff — API-37 media discovery no longer aborts (2026-10-27)
 
 Android 17 / API 37 / x86_64 remains the only runtime. The next real NewPipe
 playback blocker was a fatal HIDL manager cast, not graphics-stats telemetry.

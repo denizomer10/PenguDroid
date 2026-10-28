@@ -770,6 +770,154 @@ pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper9lockYCbCrEPK13native_h
     0
 }
 
+// --- a mapper the inlined GraphicBuffer constructor accepts ---------------
+//
+// `GraphicBuffer::GraphicBuffer()` has the entire gralloc-mapper selection
+// chain *inlined* into it (measured in API-37 `libui`, `0x2fc60`-`0x2fd0f`): it
+// builds `Gralloc5Mapper`, then `Gralloc4Mapper` **through the PLT**, then (only
+// when `android_get_device_api_level() <= 35`) `Gralloc3Mapper`/`Gralloc2Mapper`,
+// calls `isLoaded()` on each and ends in
+// `__android_log_assert("gralloc-mapper is missing")` when all of them are
+// unloaded. That is what aborts `BufferQueueProducer::dequeueBuffer` while a
+// `MediaCodec` output surface is being configured.
+//
+// `Gralloc5Mapper` is built by a *direct* call, so it cannot be hooked;
+// `Gralloc4Mapper` is a PLT call, so it can. Interposing that constructor and
+// installing a mapper table whose `isLoaded()` is true makes the inlined code
+// settle on version 4 and route its buffer operations to this shim's
+// memfd-backed handles.
+//
+// The slot order is the AOSP `android::GrallocMapper` interface. The offsets
+// this code depends on were read from the *call sites* in the real `libui`:
+// the selection chain calls `isLoaded` at `*0x10`, `GraphicBufferMapper::importBuffer`
+// dispatches through `*0x20` and `freeBuffer` through `*0x28`. The argument
+// lists are those published by `libui`'s own mangled names
+// (`createDescriptor(void*, void*)`, `importBuffer(native_handle const*,
+// native_handle const**)`, `validateBufferSize(...,jjijmj)`,
+// `lock(...,mRKNS_4RectEiPPvPiS9_)`, `lockYCbCr(...,P13android_ycbcr)`).
+
+type MapperDtor = unsafe extern "C" fn(*mut c_void);
+type MapperIsLoaded = unsafe extern "C" fn(*mut c_void) -> bool;
+type MapperCreateDescriptor = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32;
+type MapperImportBuffer = unsafe extern "C" fn(*mut c_void, *const NativeHandle, *mut *const NativeHandle) -> i32;
+type MapperFreeBuffer = unsafe extern "C" fn(*mut c_void, *const NativeHandle) -> i32;
+type MapperValidateBufferSize = unsafe extern "C" fn(*mut c_void, *const NativeHandle, u32, u32, i32, u32, u64, u32) -> i32;
+type MapperGetTransportSize = unsafe extern "C" fn(*mut c_void, *const NativeHandle, *mut u32, *mut u32) -> i32;
+type MapperLock = unsafe extern "C" fn(*mut c_void, *const NativeHandle, u64, *const c_void, *mut *mut c_void, *mut i32, *mut i32) -> i32;
+type MapperLockYcbcr = unsafe extern "C" fn(*mut c_void, *const NativeHandle, u64, *const c_void, i32, *mut AndroidYcbcr) -> i32;
+type MapperUnlock = unsafe extern "C" fn(*mut c_void, *const NativeHandle) -> i32;
+type MapperDumpDebugInfo = unsafe extern "C" fn(*mut c_void, *mut c_void);
+
+unsafe extern "C" fn mapper_dtor_complete(_this: *mut c_void) {}
+
+/// The deleting destructor. The object came from `operator new`; libc++'s
+/// `operator delete` bottoms out in `free`, so releasing it the same way is
+/// what the allocation expects.
+unsafe extern "C" fn mapper_dtor_deleting(this: *mut c_void) {
+    libc::free(this);
+}
+
+/// The single bit the inlined selection chain checks. This shim owns every
+/// buffer it hands out, so the mapper is always usable.
+unsafe extern "C" fn mapper_is_loaded(_this: *mut c_void) -> bool {
+    true
+}
+
+/// This shim carries no gralloc metadata, so describing a buffer is reported
+/// as unsupported instead of writing something invented into the caller's
+/// buffer.
+unsafe extern "C" fn mapper_create_descriptor(_this: *mut c_void, _info: *mut c_void, _out: *mut c_void) -> i32 {
+    -22
+}
+
+/// Reuse the shim's own `GraphicBufferMapper::importBuffer`, which duplicates
+/// the handle and its descriptors: `GraphicBuffer` frees whichever handle it
+/// was given, so two buffers over one block each need their own copy.
+unsafe extern "C" fn mapper_import_buffer(_this: *mut c_void, handle: *const NativeHandle, out: *mut *const NativeHandle) -> i32 {
+    _ZN7android19GraphicBufferMapper12importBufferEPK13native_handlejjjimjPS3_(
+        std::ptr::null_mut(), handle, 0, 0, 0, 0, 0, 0, out)
+}
+unsafe extern "C" fn mapper_free_buffer(_this: *mut c_void, handle: *const NativeHandle) -> i32 {
+    _ZN7android19GraphicBufferMapper10freeBufferEPK13native_handle(std::ptr::null_mut(), handle)
+}
+/// A handle this shim produced always matches its own allocation, so there is
+/// nothing to validate against a HAL descriptor.
+unsafe extern "C" fn mapper_validate_buffer_size(_this: *mut c_void, _handle: *const NativeHandle, _width: u32, _height: u32, _format: i32, _layers: u32, _usage: u64, _stride: u32) -> i32 {
+    0
+}
+unsafe extern "C" fn mapper_get_transport_size(_this: *mut c_void, handle: *const NativeHandle, num_fds: *mut u32, num_ints: *mut u32) -> i32 {
+    _ZN7android19GraphicBufferMapper16getTransportSizeEPK13native_handlePjS4_(
+        std::ptr::null_mut(), handle, num_fds, num_ints)
+}
+unsafe extern "C" fn mapper_lock(_this: *mut c_void, handle: *const NativeHandle, usage: u64, bounds: *const c_void, addr: *mut *mut c_void, bytes_per_pixel: *mut i32, stride: *mut i32) -> i32 {
+    _ZN7android19GraphicBufferMapper4lockEPK13native_handlejRKNS_4RectEPPvPiS9_(
+        std::ptr::null_mut(), handle, usage as u32, bounds, addr, bytes_per_pixel, stride)
+}
+unsafe extern "C" fn mapper_lock_ycbcr(_this: *mut c_void, handle: *const NativeHandle, usage: u64, bounds: *const c_void, _usage: i32, out: *mut AndroidYcbcr) -> i32 {
+    _ZN7android19GraphicBufferMapper9lockYCbCrEPK13native_handlejRKNS_4RectEP13android_ycbcr(
+        std::ptr::null_mut(), handle, usage as u32, bounds, out)
+}
+unsafe extern "C" fn mapper_unlock(_this: *mut c_void, handle: *const NativeHandle) -> i32 {
+    _ZN7android19GraphicBufferMapper6unlockEPK13native_handle(std::ptr::null_mut(), handle)
+}
+unsafe extern "C" fn mapper_dump_debug_info(_this: *mut c_void, _out: *mut c_void) {}
+
+/// The object's vptr must point at the *address point*, i.e. the first entry
+/// after the offset-to-top and typeinfo slots, so this struct starts with the
+/// complete-object destructor. Slot `n` therefore sits at `8 * n`.
+#[repr(C)]
+struct GrallocMapperVtable {
+    dtor_complete: MapperDtor,
+    dtor_deleting: MapperDtor,
+    is_loaded: MapperIsLoaded,
+    create_descriptor: MapperCreateDescriptor,
+    import_buffer: MapperImportBuffer,
+    free_buffer: MapperFreeBuffer,
+    validate_buffer_size: MapperValidateBufferSize,
+    get_transport_size: MapperGetTransportSize,
+    lock: MapperLock,
+    lock_ycbcr: MapperLockYcbcr,
+    unlock: MapperUnlock,
+    dump_debug_info: MapperDumpDebugInfo,
+}
+
+static GRALLOC_MAPPER_VTABLE: GrallocMapperVtable = GrallocMapperVtable {
+    dtor_complete: mapper_dtor_complete,
+    dtor_deleting: mapper_dtor_deleting,
+    is_loaded: mapper_is_loaded,
+    create_descriptor: mapper_create_descriptor,
+    import_buffer: mapper_import_buffer,
+    free_buffer: mapper_free_buffer,
+    validate_buffer_size: mapper_validate_buffer_size,
+    get_transport_size: mapper_get_transport_size,
+    lock: mapper_lock,
+    lock_ycbcr: mapper_lock_ycbcr,
+    unlock: mapper_unlock,
+    dump_debug_info: mapper_dump_debug_info,
+};
+
+/// `android::Gralloc4Mapper::Gralloc4Mapper()`.
+///
+/// Reached from `GraphicBuffer::GraphicBuffer()`'s inlined selection chain
+/// through the PLT. Installing the hosted mapper table here is what keeps that
+/// chain from reaching `LOG_ALWAYS_FATAL("gralloc-mapper is missing")`.
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android14Gralloc4MapperC1Ev(this: *mut c_void) {
+    if this.is_null() {
+        return;
+    }
+    *(this as *mut *const GrallocMapperVtable) = &GRALLOC_MAPPER_VTABLE;
+    if std::env::var_os("PENGUDROID_TRACE_AHB").is_some() {
+        eprintln!("[ahb] Gralloc4Mapper constructed: hosted mapper installed");
+    }
+}
+
+/// `android::Gralloc4Mapper::Gralloc4Mapper()` (complete-object alias).
+#[no_mangle]
+pub unsafe extern "C" fn _ZN7android14Gralloc4MapperC2Ev(this: *mut c_void) {
+    _ZN7android14Gralloc4MapperC1Ev(this)
+}
+
 /// `GraphicBufferMapper::lockAsync(handle, usage, bounds, addr, fenceFd, bpp, stride)`.
 ///
 /// Note the `int fenceFd` between `addr` and `bytesPerPixel`: the mangled name

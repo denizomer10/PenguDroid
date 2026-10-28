@@ -31,7 +31,9 @@ use crate::binder::push_buffer_object;
 
 /// `android::hardware::Parcel` field offsets, measured from libhidlbase.
 ///
-/// `Parcel::setData` stores the buffer at `0x28` and the size at `0x30`;
+/// The request bytes live at `0x28` (pointer) and `0x30` (size), whether they
+/// arrive through `Parcel::setData` (older runtimes) or `Parcel::write` (the
+/// exported API-37 path);
 /// `readObject<T>` reads `mDataPos` at `0x40`, the offsets array at `0x48` and
 /// its length at `0x50`; `ipcObjectsCount` reads `0x50`. The constructor zeroes
 /// everything up to `0x78`.
@@ -308,6 +310,13 @@ unsafe fn make_func(operator: usize) -> *const FuncObj {
 type ParcelCtor = unsafe extern "C" fn(*mut c_void);
 type ParcelDtor = unsafe extern "C" fn(*mut c_void);
 type SetData = unsafe extern "C" fn(*mut c_void, *const u8, usize) -> i32;
+/// `Parcel::write(const void*, size_t) -> status_t`.
+///
+/// API 37's `libhidlbase.so` does not export `Parcel::setData`, so this real
+/// HIDL method is the way to place the transaction bytes in a Parcel: it
+/// allocates the parcel's own buffer and copies into it from the current
+/// position (0 on a freshly constructed parcel).
+type WriteBytes = unsafe extern "C" fn(*mut c_void, *const u8, usize) -> i32;
 type SetDataPosition = unsafe extern "C" fn(*mut c_void, usize) -> i32;
 type OnTransact = unsafe extern "C" fn(*mut c_void, u32, *const c_void, *mut c_void, u32) -> i32;
 /// `BHwBinder::transact(code, data, reply, flags, std::function<void(Parcel&)>)`.
@@ -320,10 +329,32 @@ type GetPlatformStore = unsafe extern "C" fn(*mut [u64; 2]);
 type StoreCtor = unsafe extern "C" fn(*mut c_void, *const [u64; 2]);
 type BnCtor = unsafe extern "C" fn(*mut c_void, *const *mut c_void);
 
+/// Pointer-aligned backing store for a HIDL `Parcel`.
+///
+/// The fields at `0x28`… are pointers and `usize`s, so the storage must carry
+/// pointer alignment. A plain `[u8; PARCEL_BYTES]` on the stack is only
+/// byte-aligned, and writing the objects array into it faulted with
+/// `misaligned pointer dereference` once the codec2 service actually ran.
+#[repr(C, align(16))]
+struct ParcelStorage([u8; PARCEL_BYTES]);
+impl ParcelStorage {
+    fn new() -> Self {
+        Self([0u8; PARCEL_BYTES])
+    }
+    fn as_ptr(&self) -> *const u8 {
+        self.0.as_ptr()
+    }
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.0.as_mut_ptr()
+    }
+}
+
 struct Api {
     parcel_ctor: ParcelCtor,
     parcel_dtor: ParcelDtor,
-    set_data: SetData,
+    /// Present only on runtimes that export it; `None` on API 37.
+    set_data: Option<SetData>,
+    write_bytes: WriteBytes,
     set_data_position: SetDataPosition,
     on_transact: Transact,
     store: *mut c_void,
@@ -346,6 +377,20 @@ fn trace_enabled() -> bool {
 
 unsafe fn diag(line: &str) {
     libc::write(2, line.as_ptr() as *const c_void, line.len());
+}
+
+/// Resolve `name` from the already-loaded `soname`; a miss is not traced.
+unsafe fn sym_optional(soname: &[u8], name: &[u8]) -> Option<*mut c_void> {
+    let handle = libc::dlopen(soname.as_ptr() as *const c_char, libc::RTLD_NOW | libc::RTLD_GLOBAL);
+    if handle.is_null() {
+        return None;
+    }
+    let p = libc::dlsym(handle, name.as_ptr() as *const c_char);
+    if p.is_null() {
+        None
+    } else {
+        Some(p)
+    }
 }
 
 /// Resolve `name` from the already-loaded `soname`.
@@ -394,7 +439,12 @@ unsafe fn build() -> Option<Api> {
     }
     let parcel_ctor = sym(b"libhidlbase.so\0", b"_ZN7android8hardware6ParcelC1Ev\0")?;
     let parcel_dtor = sym(b"libhidlbase.so\0", b"_ZN7android8hardware6ParcelD1Ev\0")?;
-    let set_data = sym(b"libhidlbase.so\0", b"_ZN7android8hardware6Parcel7setDataEPKhm\0")?;
+    // API 37 removed `Parcel::setData`; `Parcel::write` is the exported method
+    // that fills a fresh parcel with bytes. Keep `setData` as an optional
+    // alternative so this stays correct if a runtime exports both.
+    let set_data = sym_optional(b"libhidlbase.so\0", b"_ZN7android8hardware6Parcel7setDataEPKhm\0");
+    let write_bytes =
+        sym(b"libhidlbase.so\0", b"_ZN7android8hardware6Parcel5writeEPKvm\0")?;
     let set_data_position =
         sym(b"libhidlbase.so\0", b"_ZNK7android8hardware6Parcel15setDataPositionEm\0")?;
     let get_platform_store =
@@ -461,7 +511,8 @@ unsafe fn build() -> Option<Api> {
     Some(Api {
         parcel_ctor: std::mem::transmute(parcel_ctor),
         parcel_dtor: std::mem::transmute(parcel_dtor),
-        set_data: std::mem::transmute(set_data),
+        set_data: set_data.map(|p| std::mem::transmute(p)),
+        write_bytes: std::mem::transmute(write_bytes),
         set_data_position: std::mem::transmute(set_data_position),
         on_transact: std::mem::transmute(transact),
         store: bn,
@@ -652,13 +703,21 @@ pub(crate) unsafe fn dispatch(code: u32, data: &[u8], objects: &[u64]) -> Option
         }
     }
 
-    // The request parcel: `setData` allocates and copies the bytes, then we
-    // install the offsets array. `Parcel::~Parcel` frees both with `free`, so
-    // the array has to come from `malloc`.
-    let mut request = [0u8; PARCEL_BYTES];
-    (api.parcel_ctor)(request.as_mut_ptr() as *mut c_void);
-    if (api.set_data)(request.as_mut_ptr() as *mut c_void, data.as_ptr(), data.len()) != 0 {
-        (api.parcel_dtor)(request.as_mut_ptr() as *mut c_void);
+    // The request parcel: the bytes are copied into the parcel's own buffer
+    // (either through `setData` or, on API 37, `write`), then we install the
+    // offsets array. `Parcel::~Parcel` frees both with `free`, so the array has
+    // to come from `malloc`.
+    let mut request = ParcelStorage::new();
+    let request_ptr = request.as_mut_ptr() as *mut c_void;
+    (api.parcel_ctor)(request_ptr);
+    let loaded = match api.set_data {
+        Some(set_data) => set_data(request_ptr, data.as_ptr(), data.len()),
+        // `write` appends at the current position, which is 0 on a fresh
+        // parcel; the read side is rewound with `setDataPosition(0)` below.
+        None => (api.write_bytes)(request_ptr, data.as_ptr(), data.len()),
+    };
+    if loaded != 0 {
+        (api.parcel_dtor)(request_ptr);
         return None;
     }
     let offsets = if objects.is_empty() {
@@ -679,7 +738,7 @@ pub(crate) unsafe fn dispatch(code: u32, data: &[u8], objects: &[u64]) -> Option
     *(base.add(PARCEL_NEXT_OBJECT_HINT) as *mut usize) = 0;
     (api.set_data_position)(request.as_mut_ptr() as *mut c_void, 0);
 
-    let mut reply = [0u8; PARCEL_BYTES];
+    let mut reply = ParcelStorage::new();
     (api.parcel_ctor)(reply.as_mut_ptr() as *mut c_void);
     // Balance the request parcel's destructor, which `decStrong`s every local
     // binder it holds.
