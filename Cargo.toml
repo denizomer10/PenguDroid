@@ -12,6 +12,7 @@ members = [
     "crates/pengudroid-cli",
     "crates/pengudroid-shim",
     "crates/pengudroid-nativebridge",
+    "crates/pengudroid-device",
 ]
 
 [workspace.package]
@@ -39,6 +40,7 @@ pengudroid-elf = { path = "crates/pengudroid-elf" }
 pengudroid-nativebridge = { path = "crates/pengudroid-nativebridge" }
 pengudroid-hostgpu = { path = "crates/pengudroid-hostgpu" }
 pengudroid-gleshim = { path = "crates/pengudroid-gleshim" }
+pengudroid-device = { path = "crates/pengudroid-device" }
 
 [profile.release]
 opt-level = "z"

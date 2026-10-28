@@ -975,7 +975,8 @@ pub mod abi {
         }
         let protected = base.starts_with("ro.build.version.")
             || base.starts_with("ro.product.cpu.")
-            || matches!(base, "ro.build.fingerprint" | "ro.system.build.fingerprint");
+            || matches!(base, "ro.build.fingerprint" | "ro.system.build.fingerprint")
+            || pengudroid_device::is_protected_profile_key(base);
         if protected && current != Some(value) {
             return Err(format!(
                 "immutable Android {ANDROID_RELEASE} / API {ANDROID_API_LEVEL} x86_64 platform property {name}: current {current:?}, requested {value:?}"

@@ -7,3 +7,4 @@ license.workspace = true
 description = "Wire protocol and ABI constants shared across PenguDroid components."
 
 [dependencies]
+pengudroid-device.workspace = true

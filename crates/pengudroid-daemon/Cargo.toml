@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 pengudroid-proto.workspace = true
+pengudroid-device.workspace = true
 pengudroid-socket.workspace = true
 pengudroid-hostgpu.workspace = true
 libc.workspace = true

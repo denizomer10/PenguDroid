@@ -1306,7 +1306,7 @@ fn default_props_with_overrides(overrides: impl IntoIterator<Item = (String, Str
     let mut props = BTreeMap::new();
     let sdk = ANDROID_API_LEVEL.to_string();
     let sdk_full = format!("{ANDROID_API_LEVEL}.0");
-    let fingerprint = format!("PenguDroid/pengudroid/pengudroid:{ANDROID_RELEASE}/PENGUDROID/userdebug:user/release-keys");
+    let fingerprint = format!("google/pixel11/pixel11:{ANDROID_RELEASE}/CP2A.260605.012/eng.pengudroid:user/release-keys");
     let seed: &[(&str, &str)] = &[
         ("ro.build.version.sdk", &sdk),
         ("ro.build.version.sdk_full", &sdk_full),
@@ -1348,11 +1348,11 @@ fn default_props_with_overrides(overrides: impl IntoIterator<Item = (String, Str
         ("ro.product.device", "pengudroid"),
         ("ro.product.brand", "PenguDroid"),
         ("ro.product.board", "pengudroid"),
-        ("ro.product.first_api_level", "31"),
-        ("ro.build.id", "PENGUDROID"),
-        ("ro.build.display.id", "PenguDroid build"),
-        ("ro.build.type", "userdebug"),
-        ("ro.build.tags", "test-keys"),
+        ("ro.product.first_api_level", "37"),
+        ("ro.build.id", "CP2A.260605.012"),
+        ("ro.build.display.id", "CP2A.260605.012"),
+        ("ro.build.type", "user"),
+        ("ro.build.tags", "release-keys"),
         ("ro.build.user", "pengudroid"),
         ("ro.build.host", "pengudroid"),
         ("ro.build.date.utc", "0"),
@@ -1363,8 +1363,11 @@ fn default_props_with_overrides(overrides: impl IntoIterator<Item = (String, Str
         ("ro.boot.product.hardware.sku", "unknown"),
         ("ro.hw_timeout_multiplier", "1"),
         ("ro.treble.enabled", "false"),
-        ("ro.soc.manufacturer", "PenguDroid"),
-        ("ro.soc.model", "PenguDroid"),
+        // The compatibility profile reports a Pixel 11 product identity, but the
+        // SoC string stays truthful: this process runs x86_64 host code, and
+        // claiming a Tensor part would invite apps to load unavailable ARM64 code.
+        ("ro.soc.manufacturer", "pengudroid"),
+        ("ro.soc.model", "pengudroid"),
         ("ro.sf.lcd_density", "420"),
         // `libhidlbase` waits for `hwservicemanager.ready` before it will hand
         // out any HIDL service. The manager is emulated in-process (the broker
@@ -1378,6 +1381,11 @@ fn default_props_with_overrides(overrides: impl IntoIterator<Item = (String, Str
     ];
     for (k, v) in seed {
         props.insert(k.to_string(), v.to_string());
+    }
+    // Pixel 11 compatibility metadata. It changes app-visible product strings
+    // and release-like debug/root flags, but no runtime ABI or host privilege.
+    for (key, value) in pengudroid_device::DEFAULT_PROFILE {
+        props.insert((*key).to_string(), (*value).to_string());
     }
     for (key, value) in overrides {
         if let Some(rest) = key.strip_prefix("PENGUDROID_PROP_") {
@@ -5475,7 +5483,9 @@ mod tests {
         assert_eq!(props.get("ro.build.version.sdk"), Some(&ANDROID_API_LEVEL.to_string()));
         assert_eq!(props.get("ro.build.version.release").map(String::as_str), Some(ANDROID_RELEASE));
         assert_eq!(props.get("ro.build.version.incremental").map(String::as_str), Some("image-build"));
-        assert_eq!(props.get("ro.product.model").map(String::as_str), Some("PenguDroid"));
+        // The Pixel 11 compatibility profile is applied after the image's version
+        // metadata, and it owns the product identity, not the runtime ABI.
+        assert_eq!(props.get("ro.product.model").map(String::as_str), Some("Pixel 11"));
         assert_eq!(props.get("ro.product.cpu.abilist").map(String::as_str), Some("x86_64"));
         assert_eq!(props.get("ro.product.cpu.abilist32").map(String::as_str), Some(""));
     }
@@ -5596,10 +5606,16 @@ mod tests {
         ] {
             assert_eq!(props.get(key).map(String::as_str), Some(ANDROID_RELEASE), "{key}");
         }
-        let fingerprint = format!("PenguDroid/pengudroid/pengudroid:{ANDROID_RELEASE}/PENGUDROID/userdebug:user/release-keys");
+        let fingerprint = format!("google/pixel11/pixel11:{ANDROID_RELEASE}/CP2A.260605.012/eng.pengudroid:user/release-keys");
         for key in ["ro.build.fingerprint", "ro.system.build.fingerprint"] {
             assert_eq!(props.get(key), Some(&fingerprint), "{key}");
         }
+        assert_eq!(props.get("ro.product.model").map(String::as_str), Some("Pixel 11"));
+        assert_eq!(props.get("ro.product.manufacturer").map(String::as_str), Some("Google"));
+        assert_eq!(props.get("ro.build.type").map(String::as_str), Some("user"));
+        assert_eq!(props.get("ro.build.tags").map(String::as_str), Some("release-keys"));
+        assert_eq!(props.get("ro.debuggable").map(String::as_str), Some("0"));
+        assert_eq!(props.get("ro.secure").map(String::as_str), Some("1"));
         for key in ["ro.product.cpu.abilist", "ro.product.cpu.abilist64", "ro.product.cpu.abi"] {
             assert_eq!(props.get(key).map(String::as_str), Some("x86_64"), "{key}");
         }

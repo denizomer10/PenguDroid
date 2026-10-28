@@ -13,8 +13,8 @@ Only .toolchain/nativebridge-build/ is written. No sources are patched. Compiler
 runs are serial, capped in address space, CPU/wall time, and output size. Every
 command, selected module, source pin and first blocker is retained in report.json.
 A separately checksummed last-successful-early.json survives failed probes. Platform
-imports are only inspected, not yet linked; they require the completed extractor
-manifest to pin each imported file. Never inspect or repair an extraction stage.
+imports require the completed extractor manifest to pin each imported file;
+shared-link inputs are rechecked immediately before use. Never inspect or repair an extraction stage.
 """
 
 import argparse
@@ -80,7 +80,7 @@ METADATA = {
     "vendor_available", "product_available", "ramdisk_available", "vendor_ramdisk_available",
     "recovery_available", "apex_available", "visibility", "licenses", "min_sdk_version",
     "sdk_version", "compile_multilib", "enabled", "tidy", "tidy_flags", "tidy_checks",
-    "tidy_disabled_srcs", "tidy_checks_as_errors", "owner", "double_loadable",
+    "tidy_disabled_srcs", "tidy_checks_as_errors", "owner", "double_loadable", "defaults_visibility",
     "unique_host_soname", "static_ndk_lib", "stubs", "header_abi_checker",
 }
 CC_FIELDS = {
@@ -98,6 +98,7 @@ RULE_FIELDS = {
     "python_binary_host": {"main", "srcs", "libs"},
     "python_library_host": {"srcs", "libs"},
     "genrule": {"out", "srcs", "tools", "cmd"},
+    "genrule_defaults": {"out", "srcs", "tools", "cmd"},
 }
 
 
@@ -131,6 +132,30 @@ EXTRAS = (
     BOOT.Artifact("bionic_libdl_bp", "bionic", "06356e41c5ed7b12220b24c05ba4fdb873b126a7",
                   "extra/bionic-libdl/Android.bp", blob="eb6afbf93b271ceb205a7a4e91e21ca791592370",
                   subtree="libdl/Android.bp", limit=50_000),
+    BOOT.Artifact("power_aidl_bp", "hardware/interfaces", "0162af698935100a590b7359581ac8b1b80693e5",
+                  "extra/hardware-interfaces/power/aidl/Android.bp", blob="1e1b51122fb4a4a8b0359135d7b315b9973db5fb",
+                  subtree="power/aidl/Android.bp", limit=50_000),
+    BOOT.Artifact("arect_bp", "frameworks/native", "ae266dcb706d083868578cfedce381ef44488a07",
+                  "extra/frameworks-native/libs/arect/Android.bp", blob="cbba7118b66291733bd6f702103722bb35e6495f",
+                  subtree="libs/arect/Android.bp", limit=20_000),
+    BOOT.Artifact("arect_headers", "frameworks/native", "ae266dcb706d083868578cfedce381ef44488a07",
+                  "extra/frameworks-native/libs/arect/include", tree="4ebbfb3ac0ab19c6b981fa6ee4782e15a2abecf3",
+                  subtree="libs/arect/include", limit=100_000),
+    BOOT.Artifact("libandroid_platform_headers", "frameworks/base", "94b4c163b7dfe5ce3607f7bb8456f9573f7de57d",
+                  "extra/frameworks-base/native/android/include_platform", tree="66e8f444f6bb64c938e61bcee9d594c80a9f4a5f",
+                  subtree="native/android/include_platform", limit=200_000),
+    BOOT.Artifact("npumanager_bp", "packages/modules/NpuManager", "d194f8ada2cab31b8487fb3aaac6fd383fc7e07f",
+                  "extra/npumanager/ndk/Android.bp", blob="b8af5827649d2b89aa416ffc7982d005f96f3ae6",
+                  subtree="ndk/Android.bp", limit=50_000),
+    BOOT.Artifact("npumanager_headers", "packages/modules/NpuManager", "d194f8ada2cab31b8487fb3aaac6fd383fc7e07f",
+                  "extra/npumanager/ndk/include", tree="6f4548099a4d2542588903b70dd16869bccede59",
+                  subtree="ndk/include", limit=200_000),
+    BOOT.Artifact("libdl_private_headers", "bionic", "06356e41c5ed7b12220b24c05ba4fdb873b126a7",
+                  "extra/bionic-libdl/include_private", tree="49dffaf48ec5021635e74fb1c45e30c50b8ea8a1",
+                  subtree="libdl/include_private", limit=100_000),
+    BOOT.Artifact("soong_bp", "build/soong", "6722dd8833db7482df1a2543ca3fcf67ddf0f7b1",
+                  "extra/soong/Android.bp", blob="7c1d0963c27e8830f3bb1eaf81a182e5154d2979",
+                  subtree="Android.bp", limit=50_000),
     BOOT.Artifact("soong_global", "build/soong", "6722dd8833db7482df1a2543ca3fcf67ddf0f7b1",
                   "extra/soong/global.go", blob="2188687602d4badafd300dff8c018c70cd5b8245",
                   subtree="cc/config/global.go", limit=100_000),
@@ -225,9 +250,9 @@ def tokenize(text):
 
 
 class Blueprints:
-    def __init__(self, roots):
+    def __init__(self, roots, source_dirs=None):
         self.modules, self.resolved, self.used, self.inherited = {}, {}, {}, {}
-        self.roots = roots
+        self.roots, self.source_dirs = roots, source_dirs or {}
         for root in roots.values():
             for path in sorted(root.rglob("Android.bp")):
                 self.index_file(path)
@@ -268,6 +293,9 @@ class Blueprints:
                     self.modules[name] = (kind, path, body, copy.deepcopy(variables))
                     break
 
+    def source_directory(self, blueprint):
+        return self.source_dirs.get(blueprint, blueprint.parent)
+
     def canonical(self, name):
         if name.startswith("//"):
             namespace, separator, module = name[2:].partition(":")
@@ -303,25 +331,42 @@ class Blueprints:
                     raise BuildError(f"unsupported {selector} selectors: {sorted(set(variants) - allowed)}")
         except BuildError as error:
             raise BuildError(f"{name} ({path}): {error}") from error
+        source_dir = self.source_directory(path)
         def paths(properties):
             for key, value in properties.items():
                 if isinstance(value, dict):
                     paths(value)
                 elif key in PATH_FIELDS:
-                    properties[key] = [str(path.parent / p) if not p.startswith(":") else p for p in value]
+                    properties[key] = [str(source_dir / p) if not p.startswith(":") else p for p in value]
                 elif key == "main":
-                    properties[key] = str(path.parent / value)
+                    properties[key] = str(source_dir / value)
 
         paths(raw)
         result = {}
         for default in raw.get("defaults", []):
             default = self.canonical(default)
-            if default in self.modules and self.modules[default][0] != "cc_defaults":
-                raise BuildError(f"unsupported defaults module {default} for {name}")
+            expected_default = "genrule_defaults" if _kind in ("genrule", "genrule_defaults") else "cc_defaults"
+            if default in self.modules and self.modules[default][0] != expected_default:
+                raise BuildError(f"unsupported defaults module {default} for {name}; expected {expected_default}")
             result = merge(result, self.raw_props(default, stack + (name,)))
         result = merge(result, raw)
         self.inherited[name] = result
         return copy.deepcopy(result)
+
+    def packaging_only_header_kind(self, kind):
+        if kind in RULE_FIELDS:
+            return kind
+        declaration = self.modules.get(kind)
+        if declaration is None or declaration[0] != "soong_config_module_type":
+            return kind
+        descriptor = Values(declaration[2], declaration[3]).value()
+        # Only a proven packaging-only extension can be projected to headers.
+        # Compilation of the custom type is still unsupported.
+        if (not isinstance(descriptor, dict) or descriptor.get("module_type") != "cc_library"
+                or descriptor.get("properties") != ["apex_available"]
+                or set(descriptor) - {"name", "module_type", "config_namespace", "bool_variables", "properties"}):
+            raise BuildError(f"custom header rule may change compilation/headers: {kind}")
+        return "cc_library"
 
     def props(self, name, stack=(), linkage=None, headers_only=False):
         name = self.canonical(name)
@@ -348,9 +393,23 @@ class Blueprints:
             selected = merge(selected, raw.get(linkage, {}))
         # Product/Soong config, nested arch-feature selectors, and unknown
         # properties are intentionally NOT ignored or guessed.
-        if kind not in RULE_FIELDS:
+        rule_kind = self.packaging_only_header_kind(kind) if headers_only else kind
+        if rule_kind not in RULE_FIELDS:
             raise BuildError(f"unsupported Blueprint rule {name} ({kind})")
-        unsupported = set(selected) - METADATA - RULE_FIELDS[kind]
+        unsupported = set(selected) - METADATA - RULE_FIELDS[rule_kind]
+        if headers_only and rule_kind != kind:
+            descriptor = Values(self.modules[kind][2], self.modules[kind][3]).value()
+            if not isinstance(descriptor, dict):
+                raise BuildError(f"invalid custom rule descriptor: {kind}")
+            config = selected.get("soong_config_variables", {})
+            if set(config) - set(descriptor.get("bool_variables", [])):
+                raise BuildError(f"unknown packaging-only Soong variable in {name}")
+            for choice in config.values():
+                if not isinstance(choice, dict) or set(choice) - {"apex_available", "conditions_default"}:
+                    raise BuildError(f"custom config changes more than packaging: {name}")
+                if set(choice.get("conditions_default", {})) - {"apex_available"}:
+                    raise BuildError(f"custom default changes more than packaging: {name}")
+            unsupported -= {"soong_config_variables", "nocrt", "native_coverage"}
         # Resolving a dependency's exported include paths is not compiling it.
         # Sanitizer/profile settings must block compilation, but do not propagate
         # into consumers of its headers. Header-changing product selectors and
@@ -363,7 +422,7 @@ class Blueprints:
                 unsupported.discard("product_variables")
         if unsupported:
             raise BuildError(f"unsupported properties in {name}: {', '.join(sorted(unsupported))}")
-        if kind != "cc_defaults":
+        if kind not in ("cc_defaults", "genrule_defaults"):
             if selected.get("enabled") is False or selected.get("device_supported") is False:
                 raise BuildError(f"Android x86_64 variant disabled: {name}")
             if selected.get("compile_multilib", "both") not in ("both", "64", "first"):
@@ -374,7 +433,8 @@ class Blueprints:
             self.props(default, stack + (name,), linkage=linkage, headers_only=headers_only)
         self.used[name] = {"kind": kind, "blueprint": str(path), "blueprint_sha256": BOOT.sha256_file(path),
                            "selected_properties": selected, "linkage": linkage,
-                           "usage": "exported headers only" if headers_only else "compile"}
+                           "usage": "exported headers only" if headers_only else "compile",
+                           "source_directory": str(self.source_directory(path))}
         self.resolved[key] = selected
         return selected
 
@@ -463,14 +523,16 @@ def describe_platform_sources(model):
     def visit(module, blueprint, declarations, unresolved):
         if module in declarations:
             return
-        if module not in model.modules or model.modules[module][1] != blueprint:
+        if module not in model.modules or (model.modules[module][1] != blueprint and model.modules[module][0] != "cc_defaults"):
             unresolved.append(module)
             return
         kind, _, tokens, variables = model.modules[module]
         props = Values(tokens, variables).value()
         if not isinstance(props, dict):
             raise BuildError(f"platform provider must have a property map: {module}")
-        declarations[module] = {"kind": kind, "properties": props}
+        declarations[module] = {"kind": kind, "properties": props,
+                                "blueprint": str(model.modules[module][1]),
+                                "blueprint_sha256": BOOT.sha256_file(model.modules[module][1])}
         for default in props.get("defaults", []):
             visit(default, blueprint, declarations, unresolved)
 
@@ -590,9 +652,10 @@ class PlatformImports:
 
 
 class NativeBuild:
-    def __init__(self, model, runner, sysroot):
+    def __init__(self, model, runner, sysroot, platform_imports=None):
         self.model, self.runner, self.root, self.sysroot = model, runner, runner.root, sysroot
-        self.generated = {}
+        self.platform_imports = platform_imports
+        self.generated, self.built, self.building = {}, {}, []
 
     def python_tool(self, name, seen=()):
         if name in seen:
@@ -704,25 +767,53 @@ class NativeBuild:
             argv += ["-frtti" if props.get("rtti") else "-fno-rtti"]
         return argv + ["-O0", "-g0", "-fno-lto", "-c", str(source), "-o", str(obj)]
 
-    def build(self, name):
+    def build(self, name, linkage=None):
         name = self.model.canonical(name)
-        props = self.model.props(name)
-        kind, blueprint, _, _ = self.model.modules[name]
-        if kind not in ("cc_library_static", "cc_library_shared"):
-            raise BuildError(f"only explicit static/shared modules supported for early compile: {name} ({kind})")
+        if name not in self.model.modules:
+            self.model.props(name, tuple(n for n, _ in self.building))
+        declared = self.model.modules[name][0]
+        if declared in ("cc_library_static", "cc_library_shared"):
+            required = "static" if declared.endswith("_static") else "shared"
+            if linkage is not None and linkage != required:
+                raise BuildError(f"requested {linkage} variant unavailable: {name} ({declared})")
+            linkage = required
+        if linkage not in ("static", "shared"):
+            raise BuildError(f"explicit static/shared build variant required: {name} ({declared})")
+        key = (name, linkage)
+        if key in self.built:
+            return self.built[key]
+        if key in self.building:
+            raise BuildError(f"cyclic native dependency: {self.building} -> {key}")
+        self.building.append(key)
+        try:
+            result = self._build(name, linkage)
+            self.built[key] = result
+        finally:
+            self.building.pop()
+        if self.building:
+            self.runner.report.setdefault("dependency_artifacts", []).append(result)
+        return result
+
+    def _build(self, name, linkage):
+        props = self.model.props(name, linkage=linkage)
+        declared, blueprint, _, _ = self.model.modules[name]
+        if declared not in ("cc_library_static", "cc_library_shared", "cc_library"):
+            raise BuildError(f"unsupported native library rule: {name} ({declared})")
+        kind = "cc_library_" + linkage
         if props.get("sdk_version") not in (None, ""):
             raise BuildError(f"SDK module compilation is not the API37 platform variant: {name}")
         if props.get("stl") not in (None, "libc++") or "system_shared_libs" in props:
             raise BuildError(f"non-default STL/system libraries not implemented for compilation: {name}")
         includes = [str(ROOT / "extra/platform-headers"), str(DEPS / "sources/logging/liblog/include"),
-                    str(blueprint.parent)] + props.get("export_include_dirs", []) + props.get("local_include_dirs", []) + props.get("include_dirs", [])
+                    str(self.model.source_directory(blueprint))] + props.get("export_include_dirs", []) + props.get("local_include_dirs", []) + props.get("include_dirs", [])
         for key in ("header_libs", "static_libs", "whole_static_libs", "shared_libs"):
             for dep in props.get(key, []):
                 includes += self.exports(dep, (name,), linkage="shared" if key == "shared_libs" else "static")
         includes += [str(self.generate(gen)) for gen in props.get("generated_headers", [])]
-        if props.get("generated_sources"):
-            raise BuildError(f"generated-source compilation not implemented: {name}: {props['generated_sources']}")
         sources = self.model.files(props.get("srcs", []))
+        for generator in props.get("generated_sources", []):
+            directory = self.generate(generator)
+            sources += [str(directory / output) for output in self.model.props(generator)["out"]]
         excluded = set(self.model.files(props.get("exclude_srcs", [])))
         sources = [s for s in sources if s not in excluded]
         platform = DEPS / "toolchain/libcxx/android/x86_64"
@@ -738,19 +829,58 @@ class NativeBuild:
             objects.append(obj)
         result = {"module": name, "objects": [str(p) for p in objects], "kind": kind}
         output = self.root / "lib" / (name + (".a" if kind == "cc_library_static" else ".so"))
+        whole = [self.build(dep, "static") for dep in dict.fromkeys(props.get("whole_static_libs", []))]
+        result["whole_static_archives"] = [{k: archive[k] for k in ("module", "output", "sha256")} for archive in whole]
+        result["static_link_requirements"] = list(dict.fromkeys(
+            props.get("static_libs", []) + [dep for archive in whole for dep in archive["static_link_requirements"]]))
+        result["shared_link_requirements"] = list(dict.fromkeys(
+            props.get("shared_libs", []) + [dep for archive in whole for dep in archive["shared_link_requirements"]]))
         if kind == "cc_library_static":
-            if props.get("whole_static_libs"):
-                raise BuildError(f"whole-static archive merging not implemented: {name}")
-            self.runner.run([str(LLVM / "llvm-ar"), "rcsD", str(output), *map(str, objects)], "archive " + name)
+            # qL flattens archives and preserves duplicate member basenames; r
+            # would silently replace them. Never put nested .a files in an .a.
+            operation = "qcsDL" if whole else "rcsD"
+            self.runner.run([str(LLVM / "llvm-ar"), operation, str(output), *map(str, objects),
+                             *(archive["output"] for archive in whole)], "archive " + name)
         else:
-            if any(props.get(k) for k in ("static_libs", "whole_static_libs", "shared_libs", "ldflags")):
-                raise BuildError(f"full dependency/shared link not implemented: {name}; no missing library will be stubbed")
+            if props.get("ldflags"):
+                raise BuildError(f"unsupported shared linker flags in {name}: {props['ldflags']}; no flags discarded")
+            static, linked, visiting = [], set(), set()
+            shared_names = list(result["shared_link_requirements"])
+            def collect_static(dep):
+                dep = self.model.canonical(dep)
+                if dep in visiting:
+                    raise BuildError(f"cyclic static link requirements at {dep}")
+                if dep in linked:
+                    return
+                visiting.add(dep)
+                archive = self.build(dep, "static")
+                static.append(archive)
+                shared_names.extend(archive["shared_link_requirements"])
+                for child in archive["static_link_requirements"]:
+                    collect_static(child)
+                visiting.remove(dep)
+                linked.add(dep)
+            for dep in result["static_link_requirements"]:
+                collect_static(dep)
+            shared = []
+            for dep in dict.fromkeys(shared_names):
+                dep = self.model.canonical(dep)
+                if dep in PLATFORM_SHARED:
+                    if self.platform_imports is None:
+                        raise BuildError(f"verified platform import required for {dep}; no stub fallback")
+                    shared.append(str(self.platform_imports.inspect(dep)))
+                else:
+                    shared.append(self.build(dep, "shared")["output"])
+            result["static_archives"] = [{k: archive[k] for k in ("module", "output", "sha256")} for archive in static]
+            result["shared_inputs"] = shared
             libdir = self.sysroot / "usr/lib/x86_64-linux-android/37"
             argv = [str(LLVM / "ld.lld"), "--threads=1", "-m", "elf_x86_64", "-shared", "--no-undefined",
                     "-z", "max-page-size=16384", "--soname=" + output.name]
             for script in props.get("linker_scripts", []):
                 argv += ["-T", script]
-            argv += [str(libdir / "crtbegin_so.o"), *map(str, objects), "--as-needed",
+            argv += [str(libdir / "crtbegin_so.o"), *map(str, objects), "--start-group", "--whole-archive",
+                     *(archive["output"] for archive in whole), "--no-whole-archive",
+                     *(archive["output"] for archive in static), "--end-group", *shared, "--as-needed",
                      str(platform / "lib/libc++.so"), f"-L{libdir}", "-lc", "-lm", "-ldl",
                      str(DEPS / "toolchain/libclang_rt.builtins-x86_64-android.a"),
                      str(libdir / "crtend_so.o"), "-o", str(output)]
@@ -760,6 +890,14 @@ class NativeBuild:
         self.runner.run([str(LLVM / "llvm-readelf"), "-h", "-s", str(output)], "inspect " + name)
         result["elf_machine"] = "x86_64"
         result["runtime_tested"] = False
+        if name == "libberberis_arm64":
+            record = self.runner.run([str(LLVM / "llvm-readelf"), "--wide", "--dyn-syms", "--dynamic", str(output)],
+                                     "verify translator dynamic entry")
+            entries = [line.split() for line in Path(record["log"]).read_text().splitlines()]
+            if not any(len(f) >= 8 and f[3:6] == ["OBJECT", "GLOBAL", "DEFAULT"] and f[6] != "UND"
+                       and f[7].split("@", 1)[0] == "NativeBridgeItf" for f in entries):
+                raise BuildError("translator shared library is missing its global dynamic NativeBridgeItf export")
+            result["native_bridge_itf_dynamic_export"] = True
         if name == "libberberis_native_bridge_arm64":
             record = self.runner.run([str(LLVM / "llvm-nm"), "--defined-only", str(output)], "verify bridge entry archive")
             if not re.search(r"(?m)^\S+ [BD] NativeBridgeItf$", Path(record["log"]).read_text()):
@@ -904,7 +1042,9 @@ def main():
                       "platform_libcxx_abi": "std::__1 (not NDK std::__ndk1)",
                       "offline": args.offline, "no_source_patches": True,
                       "platform_root": str(args.platform_root), "platform_root_access": "read-only; completed manifest only",
-                      "platform_linking_implemented": False,
+                      "platform_linking_implemented": True,
+                      "shared_link_scope": "explicit static/whole/shared dependencies; nonempty ldflags remain unsupported",
+                      "whole_static_merging": "llvm-ar qcsDL; deterministic non-thin flattened archives",
                       "scope": "early native compilation, not complete Soong platform defaults/ABI/sanitizer variants"}}
         model = None
         try:
@@ -937,7 +1077,12 @@ def main():
             roots["build-support/bionic-libc"] = ROOT / "extra/bionic-libc"
             roots["frameworks/base"] = ROOT / "extra/frameworks-base"
             roots["build-support/bionic-libdl"] = ROOT / "extra/bionic-libdl"
-            model = Blueprints(roots)
+            roots["hardware/interfaces"] = ROOT / "extra/hardware-interfaces"
+            roots["frameworks/native"] = ROOT / "extra/frameworks-native"
+            roots["packages/modules/NpuManager"] = ROOT / "extra/npumanager"
+            roots["build/soong"] = ROOT / "extra/soong"
+            source_dirs = {ROOT / "extra/bionic-libc/Android.bp": DEPS / "sources/bionic/libc"}
+            model = Blueprints(roots, source_dirs)
             report["platform_sources"] = describe_platform_sources(model)
             # Keep proof that the Android root retains its real bridge entry dependency.
             report["bridge_goal"] = model.props("libberberis_arm64")
@@ -949,6 +1094,7 @@ def main():
             report["compiler_version"] = Path(version["log"]).read_text()
             imports = PlatformImports(args.platform_root, runner, report["platform_imports"])
             platform_ready = imports.probe()
+            build.platform_imports = imports
             if args.check_platform:
                 report["goals"] = ["verify platform shared imports"]
                 if not platform_ready:
@@ -957,7 +1103,7 @@ def main():
                 report["requested_goals_passed"] = True
                 report["blocker"] = "Platform inputs inspected only; source/header/codegen and full shared-link closure remain."
                 return 0
-            goals: list[str] = list(args.module or EARLY_GOALS)
+            goals: list[str] = list(dict.fromkeys(args.module or EARLY_GOALS))
             if args.towards_bridge and "libberberis_arm64" not in goals:
                 goals.append("libberberis_arm64")
             report["goals"] = goals
@@ -967,7 +1113,7 @@ def main():
                 built = {a["module"] for a in report["artifacts"]}
                 report["early_steps_passed"] = set(EARLY_GOALS) <= built
             report["requested_goals_passed"] = True
-            report["blocker"] = "Dependency/whole-static closure and libberberis_arm64 shared link remain unimplemented."
+            report["blocker"] = "Requested native goals built; full translator/guest/loader/runtime closure is not established."
         except (BuildError, BOOT.BootstrapError, OSError, ValueError, subprocess.SubprocessError) as error:
             report["blocker"] = str(error)
             print(str(error), file=sys.stderr)
@@ -975,8 +1121,10 @@ def main():
             if model is not None:
                 report["modules"] = model.used
             report["retry"] = [sys.executable, "-B", str(Path(__file__).resolve())] + sys.argv[1:]
+            translator_built = any(a.get("native_bridge_itf_dynamic_export") for a in report["artifacts"])
+            report["translator_shared_built"] = translator_built
             publish_report(report)
-            print(f"Report: {ROOT / 'report.json'}\nTranslator built: NO", flush=True)
+            print(f"Report: {ROOT / 'report.json'}\nTranslator shared built: {'YES' if translator_built else 'NO'}\nARM64 execution tested: NO", flush=True)
         return 0 if report.get("requested_goals_passed") else 1
 
 

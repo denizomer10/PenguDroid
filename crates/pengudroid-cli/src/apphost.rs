@@ -2193,6 +2193,229 @@ fn enable_texture_view(env: &JniEnv, thread: JObject, package: &str) {
     println!("apphost: texture_view preference committed = {ok:?}");
 }
 
+/// `PENGUDROID_PROBE_AUDIO_API37=1`: build a real `AudioTrack` through the
+/// `Builder` path the framework uses and require that it initializes, reports a
+/// positive session, and consumes PCM.
+///
+/// This is the gate for `crates/pengudroid-shim/src/audiotrack/`. Media discovery
+/// and a decoded AAC buffer do not prove the audio sink works: the session id and
+/// the minimum-buffer query are separate JNI entry points, and a wrong
+/// `native_setup` signature would only surface here.
+pub fn probe_audio_api37(env: &JniEnv) -> bool {
+    // AudioAttributes.USAGE_MEDIA / CONTENT_TYPE_MUSIC, AudioFormat
+    // ENCODING_PCM_16BIT / CHANNEL_OUT_STEREO, AudioTrack MODE_STREAM.
+    const USAGE_MEDIA: i32 = 1;
+    const CONTENT_TYPE_MUSIC: i32 = 2;
+    const PCM_16BIT: i32 = 2;
+    const CHANNEL_OUT_STEREO: i32 = 0xC;
+    const MODE_STREAM: i32 = 1;
+    const STATE_INITIALIZED: i32 = 1;
+    const RATE: i32 = 44_100;
+
+    let run = || -> Option<()> {
+        let trace = std::env::var_os("PENGUDROID_TRACE_AUDIO37").is_some();
+        macro_rules! stage {
+            ($name:expr) => { if trace { eprintln!("audio37: {}", $name); } };
+        }
+        stage!("local frame");
+        let _frame = env.local_frame(64)?;
+
+        // `AudioSystem.newAudioSessionId` is a static native that the adapter
+        // hosts; two calls must not repeat an id.
+        stage!("AudioSystem.newAudioSessionId");
+        let system = env.find_class("android/media/AudioSystem")?;
+        let new_session = env.static_method_id(system, "newAudioSessionId", "()I")?;
+        let first = env.call_static_int(system, new_session, &[])?;
+        let second = env.call_static_int(system, new_session, &[])?;
+        if first <= 0 || second <= 0 || first == second {
+            eprintln!("audio: newAudioSessionId returned {first} then {second}");
+            return None;
+        }
+
+        let track_class = env.find_class("android/media/AudioTrack")?;
+        // The static preflight helpers are where the old shim passed a stream type
+        // as a sample rate. Both must answer a plausible hosted value.
+        stage!("AudioTrack.getMinBufferSize");
+        let min_size = env.static_method_id(track_class, "getMinBufferSize", "(III)I")?;
+        let minimum = env.call_static_int(track_class, min_size, &[
+            JValue { i: RATE }, JValue { i: CHANNEL_OUT_STEREO }, JValue { i: PCM_16BIT },
+        ])?;
+        if minimum <= 0 || minimum % 4 != 0 {
+            eprintln!("audio: getMinBufferSize = {minimum}");
+            return None;
+        }
+        let native_rate = env.static_method_id(track_class, "getNativeOutputSampleRate", "(I)I")?;
+        let hosted_rate = env.call_static_int(track_class, native_rate, &[JValue { i: 3 }])?;
+        if hosted_rate < 8_000 {
+            eprintln!("audio: getNativeOutputSampleRate(STREAM_MUSIC) = {hosted_rate}");
+            return None;
+        }
+
+        let (attributes_class, attributes_builder) =
+            new_instance(env, "android/media/AudioAttributes$Builder")?;
+        stage!("AudioAttributes.Builder");
+        for (method, value) in [("setUsage", USAGE_MEDIA), ("setContentType", CONTENT_TYPE_MUSIC)] {
+            let id = env.method_id(
+                attributes_class, method,
+                "(I)Landroid/media/AudioAttributes$Builder;",
+            )?;
+            env.call_object(attributes_builder, id, &[JValue { i: value }]);
+        }
+        let build_attributes = env.method_id(
+            attributes_class, "build", "()Landroid/media/AudioAttributes;",
+        )?;
+        let attributes = env.call_object(attributes_builder, build_attributes, &[])?;
+        if attributes.is_null() {
+            eprintln!("audio: AudioAttributes.Builder.build returned null");
+            return None;
+        }
+
+        let (format_class, format_builder) = new_instance(env, "android/media/AudioFormat$Builder")?;
+        stage!("AudioFormat.Builder");
+        for (method, value) in [
+            ("setEncoding", PCM_16BIT),
+            ("setSampleRate", RATE),
+            ("setChannelMask", CHANNEL_OUT_STEREO),
+        ] {
+            let id = env.method_id(
+                format_class, method, "(I)Landroid/media/AudioFormat$Builder;",
+            )?;
+            env.call_object(format_builder, id, &[JValue { i: value }]);
+        }
+        let build_format = env.method_id(format_class, "build", "()Landroid/media/AudioFormat;")?;
+        let format = env.call_object(format_builder, build_format, &[])?;
+        if format.is_null() {
+            eprintln!("audio: AudioFormat.Builder.build returned null");
+            return None;
+        }
+
+        let (builder_class, builder) = new_instance(env, "android/media/AudioTrack$Builder")?;
+        stage!("AudioTrack.Builder");
+        // `AudioTrack`'s constructor needs an `AttributionSource`. With no context
+        // it falls back to `AttributionSource.myAttributionSource()`, which needs
+        // `ActivityThread.currentAttributionSource()`, i.e. a bound Application.
+        // A device always has one; this standalone gate supplies the framework's
+        // own system context instead of faking a global application object.
+        let thread_class = env.find_class("android/app/ActivityThread")?;
+        stage!("ActivityThread.currentActivityThread");
+        let current = env.static_method_id(
+            thread_class, "currentActivityThread", "()Landroid/app/ActivityThread;",
+        )?;
+        let mut thread = env.call_static_object(thread_class, current, &[])?;
+        if thread.is_null() {
+            if !prepare_main_thread(env) {
+                eprintln!("audio: cannot prepare the main thread for AttributionSource");
+                return None;
+            }
+            thread = env.call_static_object(thread_class, current, &[])?;
+            if thread.is_null() {
+                eprintln!("audio: ActivityThread.currentActivityThread() is null");
+                return None;
+            }
+        }
+        // Android 17 moved `ContextImpl` to `android.app`; the JNI signature has
+        // to match the runtime class exactly.
+        let system_context = env.method_id(
+            thread_class, "getSystemContext", "()Landroid/app/ContextImpl;",
+        )?;
+        stage!("ActivityThread.getSystemContext");
+        let context = env.call_object(thread, system_context, &[])?;
+        stage!("ActivityThread.getSystemContext returned");
+        if context.is_null() {
+            eprintln!("audio: ActivityThread.getSystemContext() returned null");
+            return None;
+        }
+        for (method, signature, argument) in [
+            ("setContext",
+             "(Landroid/content/Context;)Landroid/media/AudioTrack$Builder;",
+             JValue { l: context }),
+            ("setAudioAttributes",
+             "(Landroid/media/AudioAttributes;)Landroid/media/AudioTrack$Builder;",
+             JValue { l: attributes }),
+            ("setAudioFormat",
+             "(Landroid/media/AudioFormat;)Landroid/media/AudioTrack$Builder;",
+             JValue { l: format }),
+        ] {
+            let id = env.method_id(builder_class, method, signature)?;
+            stage!(method);
+            env.call_object(builder, id, &[argument]);
+        }
+        let set_buffer = env.method_id(
+            builder_class, "setBufferSizeInBytes", "(I)Landroid/media/AudioTrack$Builder;",
+        )?;
+        env.call_object(builder, set_buffer, &[JValue { i: minimum * 2 }]);
+        let set_mode = env.method_id(
+            builder_class, "setTransferMode", "(I)Landroid/media/AudioTrack$Builder;",
+        )?;
+        env.call_object(builder, set_mode, &[JValue { i: MODE_STREAM }]);
+        let build = env.method_id(builder_class, "build", "()Landroid/media/AudioTrack;")?;
+        stage!("AudioTrack.Builder.build");
+        let track = env.call_object(builder, build, &[])?;
+        if track.is_null() {
+            eprintln!("audio: AudioTrack.Builder.build returned null");
+            return None;
+        }
+
+        let state = env.method_id(track_class, "getState", "()I")?;
+        stage!("AudioTrack state");
+        let session = env.method_id(track_class, "getAudioSessionId", "()I")?;
+        let track_state = env.call_int(track, state, &[])?;
+        let track_session = env.call_int(track, session, &[])?;
+        if track_state != STATE_INITIALIZED || track_session <= 0 {
+            eprintln!("audio: track state={track_state} session={track_session}");
+            return None;
+        }
+
+        let play = env.method_id(track_class, "play", "()V")?;
+        let write = env.method_id(track_class, "write", "([BII)I")?;
+        let head = env.method_id(track_class, "getPlaybackHeadPosition", "()I")?;
+        let stop = env.method_id(track_class, "stop", "()V")?;
+        let release = env.method_id(track_class, "release", "()V")?;
+        if !env.call_void(track, play, &[]) {
+            eprintln!("audio: play() threw");
+            return None;
+        }
+
+        let frames = RATE / 4; // 250 ms of stereo s16
+        stage!("AudioTrack write");
+        let mut pcm = Vec::with_capacity(frames as usize * 4);
+        for n in 0..frames {
+            let t = n as f32 / RATE as f32;
+            let sample = ((t * 440.0 * std::f32::consts::TAU).sin() * 8_000.0) as i16;
+            pcm.extend_from_slice(&sample.to_le_bytes());
+            pcm.extend_from_slice(&sample.to_le_bytes());
+        }
+        let array = env.new_byte_array(pcm.len() as i32)?;
+        env.set_byte_array_region(array, 0, &pcm);
+        let accepted = env.call_int(
+            track, write,
+            &[JValue { l: array }, JValue { i: 0 }, JValue { i: pcm.len() as i32 }],
+        )?;
+        let before = env.call_int(track, head, &[])?;
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let after = env.call_int(track, head, &[])?;
+        env.call_void(track, stop, &[]);
+        env.call_void(track, release, &[]);
+
+        if accepted < 0 {
+            eprintln!("audio: write() rejected {accepted} bytes");
+            return None;
+        }
+        println!(
+            "audio: API-37 AudioTrack initialized session={track_session} min={minimum} rate={hosted_rate} \
+             wrote={accepted}/{} head {before} -> {after}",
+            pcm.len()
+        );
+        Some(())
+    };
+    if run().is_some() {
+        true
+    } else {
+        env.describe_exception();
+        false
+    }
+}
+
 /// `PENGUDROID_PROBE_AUDIO=1`: build an `AudioTrack`, play half a second of PCM
 /// and report whether the playback head advanced.
 ///

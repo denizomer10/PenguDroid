@@ -136,7 +136,9 @@ fn cli_drives_a_real_daemon() {
     let all = cli(&runtime, &["getprop"]);
     let text = stdout(&all);
     assert!(text.lines().count() >= 10, "{text}");
-    assert!(text.contains("[ro.product.model]: [PenguDroid]"), "{text}");
+    assert!(text.contains("[ro.product.model]: [Pixel 11]"), "{text}");
+    assert!(text.contains("[ro.debuggable]: [0]"), "{text}");
+    assert!(text.contains("[ro.secure]: [1]"), "{text}");
 
     assert!(cli(&runtime, &["setprop", "debug.e2e", "yes"]).status.success());
     let read = cli(&runtime, &["getprop", "debug.e2e"]);

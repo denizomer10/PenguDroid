@@ -24,13 +24,11 @@ pub fn defaults() -> BTreeMap<String, String> {
         ("ro.product.cpu.abilist64", "x86_64".to_string()),
         ("ro.product.cpu.abilist32", String::new()),
         ("ro.build.version.codename", "REL".to_string()),
-        ("ro.build.version.security_patch", "2025-06-05".to_string()),
-        ("ro.product.model", "PenguDroid".to_string()),
-        ("ro.product.manufacturer", "PenguDroid".to_string()),
-        ("ro.product.name", "pengudroid".to_string()),
-        ("ro.product.device", "pengudroid".to_string()),
-        ("ro.debuggable", "1".to_string()),
-        ("ro.secure", "0".to_string()),
+        ("ro.build.version.security_patch", "2026-06-05".to_string()),
+        ("ro.product.model", "Pixel 11".to_string()),
+        ("ro.product.manufacturer", "Google".to_string()),
+        ("ro.product.name", "pixel11".to_string()),
+        ("ro.product.device", "pixel11".to_string()),
         ("ro.kernel.qemu", "0".to_string()),
         ("ro.hardware", "pengudroid".to_string()),
         ("ro.build.characteristics", "default".to_string()),
@@ -38,6 +36,9 @@ pub fn defaults() -> BTreeMap<String, String> {
     ];
     for (k, v) in pairs {
         m.insert(k.to_string(), v);
+    }
+    for (key, value) in pengudroid_device::DEFAULT_PROFILE {
+        m.insert((*key).to_string(), (*value).to_string());
     }
     // Environment overrides: PENGUDROID_PROP_<name> where <name> cannot contain
     // dots, so this suits simple names like `PENGUDROID_PROP_debuggable`.

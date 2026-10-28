@@ -1,0 +1,10 @@
+[package]
+name = "pengudroid-device"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Static device compatibility-profile metadata for PenguDroid."
+
+[dependencies]

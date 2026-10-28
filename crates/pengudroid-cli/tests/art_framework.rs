@@ -3,7 +3,13 @@
 //! KeyCharacterMap parcel mismatch. No compositor or APK is needed here.
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+/// Each probe starts a complete ART process (hundreds of MiB, seconds of
+/// framework init). Running them concurrently thrashes a small machine and
+/// makes every gate hit its deadline, so they take turns.
+static PROBE_LOCK: Mutex<()> = Mutex::new(());
 
 struct Run { child: Child, dir: PathBuf }
 impl Drop for Run {
@@ -16,6 +22,7 @@ impl Drop for Run {
 
 fn run_framework_probe(sysroot: &Path, label: &str, blast: bool, native_display: bool,
     extra_env: &[(&str, &str)]) -> String {
+    let _turn = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let binary = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("pengudroid");
     let dir = std::env::temp_dir().join(format!("pd-framework-{}-{label}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -44,7 +51,7 @@ fn run_framework_probe(sysroot: &Path, label: &str, blast: bool, native_display:
     command.envs(extra_env.iter().copied());
     let child = command.spawn().unwrap();
     let mut run = Run { child, dir };
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let status = loop {
         if let Some(status) = run.child.try_wait().unwrap() { break status; }
         assert!(Instant::now() < deadline, "ART probe timed out:\n{}", std::fs::read_to_string(&log).unwrap_or_default());
@@ -93,6 +100,20 @@ fn android17_media_discovery_without_codec2_under_checkjni() {
     assert!(text.contains("hidl instances code=13 android.hardware.media.c2@1.0::IComponentStore: []"), "{text}");
     assert!(!text.contains("received incompatible service"), "{text}");
     assert!(!text.contains("Retrying..."), "{text}");
+}
+
+/// Audio is judged by a real `AudioTrack`, not by decoded bytes: the session
+/// allocator, the minimum-buffer helper and the 15-argument `native_setup` are
+/// separate JNI contracts reached from different framework paths. A wrong
+/// signature or a missing hosted sink shows up here and nowhere else.
+#[test]
+fn android17_audio_track_under_checkjni() {
+    let Some(sysroot) = optional_android17_sysroot() else { return; };
+    let text = run_framework_probe(&sysroot, "api37-audio", false, false, &[
+        ("PENGUDROID_PROBE_AUDIO_API37", "1"),
+    ]);
+    assert!(text.contains("audio: hosted API37 AudioSystem=2 AudioTrack=57"), "{text}");
+    assert!(text.contains("audio: API-37 AudioTrack initialized"), "{text}");
 }
 
 /// Core API-37 migration gate. BLAST lifecycle has its own gate; neither test

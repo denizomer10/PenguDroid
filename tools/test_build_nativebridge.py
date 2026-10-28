@@ -376,11 +376,10 @@ class BuildTests(unittest.TestCase):
         runner.run.assert_not_called()
 
     def test_missing_link_dependencies_are_not_stubbed(self):
-        model = self.model('''cc_library_shared {name:"entry",static_libs:["dep"]}
-                              cc_library_static {name:"dep"}''')
+        model = self.model('cc_library_shared {name:"entry",static_libs:["missing_dep"]}')
         runner = mock.Mock(root=self.root)
         native = build.NativeBuild(model, runner, self.root)
-        with self.assertRaisesRegex(build.BuildError, "no missing library will be stubbed"):
+        with self.assertRaisesRegex(build.BuildError, "unresolved Blueprint module missing_dep"):
             native.build("entry")
         runner.run.assert_not_called()
 
@@ -633,6 +632,93 @@ class BuildTests(unittest.TestCase):
                 with self.subTest(field=field), self.assertRaises(build.BuildError):
                     build.early_snapshot(candidate)
 
+    def test_standalone_blueprint_uses_verified_original_source_directory(self):
+        source = self.root / "metadata"
+        source.mkdir()
+        blueprint = source / "Android.bp"
+        blueprint.write_text('cc_library_headers {name:"headers",export_include_dirs:["platform"]}')
+        canonical = self.root / "verified-slice/libc"
+        (canonical / "platform").mkdir(parents=True)
+        model = build.Blueprints({"metadata":source}, {blueprint:canonical})
+        self.assertEqual(model.props("headers")["export_include_dirs"], [str(canonical / "platform")])
+        self.assertEqual(model.used["headers"]["blueprint"], str(blueprint))
+        self.assertEqual(model.used["headers"]["source_directory"], str(canonical))
+
+    def test_only_proven_packaging_custom_rules_can_project_headers(self):
+        model = self.model('''
+            soong_config_module_type {name:"packaging_cc",module_type:"cc_library",config_namespace:"ANDROID",
+                                      bool_variables:["release_flag"],properties:["apex_available"]}
+            packaging_cc {name:"safe",export_include_dirs:["include"],
+                          soong_config_variables:{release_flag:{apex_available:["platform"],conditions_default:{apex_available:["runtime"]}}}}
+            soong_config_module_type {name:"flag_cc",module_type:"cc_library",bool_variables:["flag"],properties:["cflags"]}
+            flag_cc {name:"unsafe",export_include_dirs:["include"]}
+            packaging_cc {name:"undeclared",soong_config_variables:{unknown:{apex_available:[]}}}
+            packaging_cc {name:"header_change",soong_config_variables:{release_flag:{conditions_default:{export_include_dirs:["wrong"]}}}}
+        ''')
+        self.assertEqual(model.props("safe", linkage="shared", headers_only=True)["export_include_dirs"],
+                         [str(self.root / "source/include")])
+        with self.assertRaisesRegex(build.BuildError, "unsupported Blueprint rule"):
+            model.props("safe", linkage="shared")
+        for name in ("unsafe", "undeclared", "header_change"):
+            with self.subTest(name=name), self.assertRaises(build.BuildError):
+                model.props(name, linkage="shared", headers_only=True)
+
+    def test_whole_static_cycles_fail_before_archiving(self):
+        model = self.model('''cc_library_static {name:"a",whole_static_libs:["b"]}
+                              cc_library_static {name:"b",whole_static_libs:["a"]}''')
+        runner = mock.Mock(root=self.root)
+        native = build.NativeBuild(model, runner, self.root)
+        with self.assertRaisesRegex(build.BuildError, "cyclic native dependency"):
+            native.build("a")
+        runner.run.assert_not_called()
+        self.assertEqual(native.building, [])
+        self.assertFalse(native.built)
+
+    def test_explicit_native_linkage_is_required_and_never_substituted(self):
+        model = self.model('''cc_library {name:"both"} cc_library_shared {name:"shared"}''')
+        native = build.NativeBuild(model, mock.Mock(root=self.root), self.root)
+        with self.assertRaisesRegex(build.BuildError, "explicit static/shared build variant"):
+            native.build("both")
+        with self.assertRaisesRegex(build.BuildError, "static variant unavailable"):
+            native.build("shared", "static")
+
+    def test_generated_sources_do_not_omit_a_native_host_tool(self):
+        model = self.model('''cc_library_static {name:"entry",generated_sources:["generated"]}
+            genrule {name:"generated",tools:["native_tool"],out:["generated.cc"],cmd:"$(location native_tool) $(out)"}
+            cc_binary_host {name:"native_tool",srcs:["generator.cc"]}''')
+        runner = mock.Mock(root=self.root)
+        with self.assertRaisesRegex(build.BuildError, "unimplemented host codegen tool native_tool"):
+            build.NativeBuild(model, runner, self.root).build("entry")
+        runner.run.assert_not_called()
+
+    def test_nonempty_link_flags_are_not_silently_dropped(self):
+        model = self.model('cc_library_shared {name:"entry",ldflags:["-Wl,--some-unsupported-flag"]}')
+        runner = mock.Mock(root=self.root)
+        with self.assertRaisesRegex(build.BuildError, "no flags discarded"):
+            build.NativeBuild(model, runner, self.root).build("entry")
+        runner.run.assert_not_called()
+
+    def test_genrule_defaults_keep_declared_outputs_tools_and_input_order(self):
+        model = self.model('''
+            genrule_defaults {name:"common",out:["one.h","two.h"],tools:["generator"],
+                              cmd:"$(location generator) $(out) $(in)",srcs:["first.json"]}
+            genrule {name:"generated",defaults:["common"],srcs:["second.json"]}
+        ''')
+        props = model.props("generated")
+        self.assertEqual(props["out"], ["one.h", "two.h"])
+        self.assertEqual(props["tools"], ["generator"])
+        self.assertEqual([Path(p).name for p in props["srcs"]], ["first.json", "second.json"])
+        self.assertIn("$(out) $(in)", props["cmd"])
+
+    def test_codegen_defaults_cannot_be_used_as_cc_defaults_or_vice_versa(self):
+        model = self.model('''genrule_defaults {name:"gen_defaults",out:["out.cc"]}
+            cc_defaults {name:"cc_defaults",cflags:["-DWRONG"]}
+            genrule {name:"bad_gen",defaults:["cc_defaults"]}
+            cc_library_static {name:"bad_cc",defaults:["gen_defaults"]}''')
+        for name in ("bad_gen", "bad_cc"):
+            with self.subTest(name=name), self.assertRaisesRegex(build.BuildError, "unsupported defaults module"):
+                model.props(name)
+
     def test_resource_and_goal_policy(self):
         self.assertLess(build.MEMORY, 1_500_000_000)
         self.assertIn("libberberis_native_bridge_arm64", build.EARLY_GOALS)
@@ -726,6 +812,132 @@ ret
             self.assertEqual(build.PlatformImports(platform, runner, records).inspect("fixture"), library)
         self.assertEqual(records["fixture"]["status"], "verified link input only")
         self.assertFalse(records["fixture"]["needed_closure_verified"])
+
+    def test_generated_cpp_source_is_actually_compiled(self):
+        source = self.root / "source"
+        (source / "Android.bp").write_text('''
+            python_binary_host {name:"generator",main:"generator.py",srcs:["generator.py"]}
+            genrule {name:"generated",tools:["generator"],out:["generated.cc"],cmd:"$(location generator) $(out)"}
+            cc_library_static {name:"entry",generated_sources:["generated"]}
+        ''')
+        (source / "generator.py").write_text('import sys\nfrom pathlib import Path\nPath(sys.argv[1]).write_text(\'extern "C" int generated_answer() { return 37; }\\n\')\n')
+        bootstrap = json.loads((build.DEPS / "manifest.json").read_text())
+        report = {"commands":[]}
+        runner = build.Runner(self.root, report, 30)
+        native = build.NativeBuild(build.Blueprints({"fixture":source}), runner, Path(bootstrap["preflight"]["sysroot"]))
+        artifact = native.build("entry")
+        self.assertEqual(len(artifact["objects"]), 1)
+        compile = next(c["argv"] for c in report["commands"] if c["label"].startswith("compile entry"))
+        self.assertIn(str(self.root / "gen/generated/generated.cc"), compile)
+        record = runner.run([str(build.LLVM / "llvm-nm"), "--defined-only", artifact["output"]], "check generated object")
+        self.assertIn("T generated_answer", Path(record["log"]).read_text())
+        self.assertFalse(list(source.rglob("__pycache__")))
+
+    def test_whole_archive_duplicates_and_transitive_static_link_are_preserved(self):
+        source = self.root / "source"
+        (source / "a").mkdir()
+        (source / "b").mkdir()
+        (source / "a/same.c").write_text("int left(void) { return 10; }\n")
+        (source / "b/same.c").write_text("int unreferenced_right(void) { return 20; }\n")
+        (source / "ordinary.c").write_text("extern int leaf(void); int ordinary(void) { return leaf(); }\n")
+        (source / "leaf.c").write_text("#ifndef STATIC_VARIANT\n#error wrong linkage\n#endif\nint leaf(void) { return 27; }\n")
+        (source / "entry.c").write_text("extern int left(void); extern int ordinary(void); int entry(void) { return left()+ordinary(); }\n")
+        (source / "Android.bp").write_text('''
+            cc_library_static {name:"left",srcs:["a/same.c"]}
+            cc_library_static {name:"right",srcs:["b/same.c"]}
+            cc_library_static {name:"bundle",whole_static_libs:["left","right"]}
+            cc_library_static {name:"ordinary",srcs:["ordinary.c"],static_libs:["leaf"]}
+            cc_library {name:"leaf",srcs:["leaf.c"],static:{cflags:["-DSTATIC_VARIANT"]}}
+            cc_library_shared {name:"entry",srcs:["entry.c"],static_libs:["ordinary"],whole_static_libs:["bundle"]}
+        ''')
+        bootstrap = json.loads((build.DEPS / "manifest.json").read_text())
+        report = {"commands":[]}
+        runner = build.Runner(self.root, report, 30)
+        native = build.NativeBuild(build.Blueprints({"fixture":source}), runner, Path(bootstrap["preflight"]["sysroot"]))
+        bundle = native.build("bundle")
+        record = runner.run([str(build.LLVM / "llvm-ar"), "t", bundle["output"]], "check flattened members")
+        members = Path(record["log"]).read_text().splitlines()
+        self.assertEqual(members, ["000-same.o", "000-same.o"])
+        before = len(report["commands"])
+        self.assertIs(native.build("bundle"), bundle)
+        self.assertEqual(len(report["commands"]), before)
+        artifact = native.build("entry")
+        self.assertEqual([a["module"] for a in artifact["static_archives"]], ["ordinary", "leaf"])
+        record = runner.run([str(build.LLVM / "llvm-nm"), "--dynamic", "--defined-only", artifact["output"]], "check whole-static retention")
+        symbols = Path(record["log"]).read_text()
+        for name in ("left", "unreferenced_right", "ordinary", "leaf", "entry"):
+            self.assertIn("T " + name, symbols)
+        self.assertIn("leaf", {a["module"] for a in report["dependency_artifacts"]})
+
+    def test_exact_power_alias_and_platform_header_exports(self):
+        if not (build.ROOT / "extra/hardware-interfaces/power/aidl/Android.bp").is_file():
+            self.skipTest("requires the pinned power/platform header slices")
+        roots = self.platform_header_roots()
+        model = build.Blueprints(roots, {build.ROOT / "extra/bionic-libc/Android.bp":build.DEPS / "sources/bionic/libc"})
+        props = model.props("android.hardware.power-ndk_shared")
+        self.assertEqual(props["shared_libs"], ["android.hardware.power-V7-ndk"])
+        self.assertNotIn("export_shared_lib_headers", props)
+        audit = build.describe_platform_sources(model)
+        self.assertEqual(audit["libandroid"]["unresolved_source_defaults"], [])
+        self.assertEqual(audit["libdl_android"]["unresolved_source_defaults"], [])
+        native = build.NativeBuild(model, mock.Mock(root=self.root), self.root)
+        android = native.exports("libandroid", linkage="shared")
+        self.assertEqual(set(android), {str(build.ROOT / "extra/frameworks-base/native/android/include_platform"),
+                                       str(build.ROOT / "extra/frameworks-native/libs/arect/include"),
+                                       str(build.ROOT / "extra/npumanager/ndk/include")})
+        dl = native.exports("libdl_android", linkage="shared")
+        self.assertIn(str(build.DEPS / "sources/bionic/libc/platform"), dl)
+        self.assertTrue(all(Path(p).is_dir() for p in android + dl))
+
+    def platform_header_roots(self):
+        return {"frameworks/base":build.ROOT / "extra/frameworks-base",
+                "frameworks/native":build.ROOT / "extra/frameworks-native",
+                "hardware/interfaces":build.ROOT / "extra/hardware-interfaces",
+                "packages/modules/NpuManager":build.ROOT / "extra/npumanager",
+                "build/soong":build.ROOT / "extra/soong",
+                "libnativehelper":build.ROOT / "extra/libnativehelper",
+                "bionic":build.DEPS / "sources/bionic",
+                "bionic-libc":build.ROOT / "extra/bionic-libc",
+                "bionic-libdl":build.ROOT / "extra/bionic-libdl"}
+
+    def test_link_uses_genuine_verified_api37_platform_libraries(self):
+        if not (build.PLATFORM_ROOT / build.RUNTIME_MANIFEST).is_file():
+            self.skipTest("requires the completed verified API37 runtime")
+        source = self.root / "source"
+        (source / "Android.bp").write_text('''
+            cc_library_static {name:"facade",srcs:["probe.cc"],export_include_dirs:["include"],
+                header_libs:["jni_headers"],export_header_lib_headers:["jni_headers"],
+                shared_libs:["libandroid","libdl_android"]}
+            cc_library_shared {name:"platform_link_probe",srcs:["entry.cc"],static_libs:["facade"]}
+        ''')
+        (source / "include").mkdir()
+        (source / "include/probe.h").write_text('#include <android/native_activity.h>\nextern "C" void probe(ANativeActivity*);\n')
+        (source / "entry.cc").write_text('#include "probe.h"\nextern "C" void entry(ANativeActivity* a) { probe(a); }\n')
+        (source / "probe.cc").write_text('''#include "probe.h"
+#include <android/dlext_private.h>
+extern "C" void probe(ANativeActivity* activity) {
+  ANativeActivity_finish(activity);
+  android_set_16kb_appcompat_mode(false);
+}
+''')
+        roots = self.platform_header_roots()
+        roots["fixture"] = source
+        bootstrap = json.loads((build.DEPS / "manifest.json").read_text())
+        report, records = {"commands":[]}, {}
+        runner = build.Runner(self.root, report, 30)
+        imports = build.PlatformImports(build.PLATFORM_ROOT, runner, records)
+        model = build.Blueprints(roots, {build.ROOT / "extra/bionic-libc/Android.bp":build.DEPS / "sources/bionic/libc"})
+        native = build.NativeBuild(model, runner, Path(bootstrap["preflight"]["sysroot"]), imports)
+        artifact = native.build("platform_link_probe")
+        self.assertEqual(set(records), {"libandroid", "libdl_android"})
+        self.assertEqual([a["module"] for a in artifact["static_archives"]], ["facade"])
+        self.assertEqual(artifact["shared_inputs"], [records[n]["path"] for n in ("libandroid", "libdl_android")])
+        self.assertFalse(any("usr/lib/x86_64-linux-android/37/libandroid" in p for p in artifact["shared_inputs"]))
+        record = runner.run([str(build.LLVM / "llvm-readelf"), "--dynamic", artifact["output"]], "check genuine platform NEEDED")
+        dynamic = Path(record["log"]).read_text()
+        self.assertIn("[libandroid.so]", dynamic)
+        self.assertIn("[libdl_android.so]", dynamic)
+        self.assertFalse(artifact["runtime_tested"])
 
     def test_pinned_platform_providers_are_real_libraries_not_ndk_declarations(self):
         if not (build.ROOT / "extra/frameworks-base/native/android/Android.bp").is_file():

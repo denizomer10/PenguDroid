@@ -945,6 +945,31 @@ pub fn art_main(args: &[String]) -> i32 {
                     return 1;
                 }
             }
+            // `AudioSystem`/`AudioTrack` register through `RegisterMethodsOrDie`
+            // *inside* `libandroid_runtime`, so the shim's exported
+            // `registerNativeMethods` interposer never sees them. Install the
+            // descriptor-checked API-37 adapter only after the real groups ran: it
+            // must replace exactly those natives, and a missing contract has to
+            // fail here instead of leaving a C++ pointer path reachable.
+            if register_libs.iter().any(|lib| lib.contains("libandroid_runtime")) {
+                let symbol = unsafe {
+                    libc::dlsym(
+                        libc::RTLD_DEFAULT,
+                        c"__pengudroid_register_audio_api37".as_ptr(),
+                    )
+                };
+                if symbol.is_null() {
+                    eprintln!("audio: the shim does not export the API-37 audio adapter");
+                    return 1;
+                }
+                type Register = unsafe extern "C" fn(*mut c_void) -> c_int;
+                let register: Register = unsafe { std::mem::transmute(symbol) };
+                let rc = unsafe { register(env.0) };
+                if rc != 0 {
+                    eprintln!("audio: API-37 audio adapter installation failed ({rc})");
+                    return 1;
+                }
+            }
             if let Some(setup) = &bridge_setup {
                 if let Some(spec) = bridge_selftest.as_deref() {
                     // Direct Itf driving. Note this translator's initializer
@@ -1078,6 +1103,12 @@ pub fn art_main(args: &[String]) -> i32 {
             if std::env::var_os("PENGUDROID_PROBE_SETTINGS").is_some() {
                 if !crate::apphost::probe_settings(&env) {
                     eprintln!("settings: Binder/Parcel probe failed");
+                    return 1;
+                }
+            }
+            if std::env::var_os("PENGUDROID_PROBE_AUDIO_API37").is_some() {
+                if !crate::apphost::probe_audio_api37(&env) {
+                    eprintln!("audio: API-37 AudioTrack gate failed");
                     return 1;
                 }
             }
