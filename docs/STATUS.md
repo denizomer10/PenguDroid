@@ -325,6 +325,56 @@ validated with the ByteBuffer probe before touching the surface path again.
 `libcodec2_vndk` and cannot be interposed; the fix has to be correct handle
 lifetime plus a mapper the inlined path accepts, not another symbol hook.
 
+### Roblox (x86_64): launches, renders the splash, blocked by the network (2026-10-28)
+
+This is the first real third-party app with large native code to run on this
+checkout, and it is an x86_64 path — **no ARM translation involved**.
+
+`pengudroid launch …apkm --backend art --component
+com.roblox.client.startup.ActivitySplash` (bounded 90 s, private daemon socket,
+`target/roblox-api37-run/`):
+
+- APKM extracted to `base.apk` + `split_config.x86_64.apk`; the split is passed
+  as `ApplicationInfo.splitSourceDirs`, and the APK's 88 MB of assets were
+  unpacked.
+- `RobloxApplication.onCreate` ran, `handleBindApplication` returned normally,
+  and `ActivitySplash.onCreate` / `InitHelper.setView` executed.
+- **`libroblox.so` loaded** — 122,979,704 bytes of real x86_64 code — plus
+  `libzstd-jni-1.5.7-6.so`, `libbacktrace-native.so` and the framework
+  connectivity JNI libraries. No `UnsatisfiedLinkError`, no fatal signal, zero
+  `SIGSEGV` in the whole log.
+- **55 frames were captured and all 55 are distinct**, so the splash is drawn
+  continuously on the host GPU. The image is the real Roblox splash: the black
+  ROBLOX wordmark on `#f5f5f5` with an animated "Loading ..." line.
+- `pengudroid ps`-visible ordinary process; the guest stayed alive for the whole
+  90 s window and only the harness ended it.
+
+**Why it stops at the splash — an external network block, not a PenguDroid
+bug.** The app waits for `clientsettingscdn.roblox.com` and TLS fails:
+
+```
+javax.net.ssl.SSLPeerUnverifiedException: Hostname clientsettingscdn.roblox.com not verified:
+  DN: CN=*.btk.gov.tr, O=Bilgi Teknolojileri ve İletişim Kurumu, ST=Ankara, C=TR
+  issuer: Sectigo Public Server Authentication CA OV R36
+ClientSettingsRequest: can't parse flag json.
+```
+
+The host itself is intercepted identically, so this is not the guest's CA store
+(the sysroot has 145 CA certificates and TLS works for other hosts):
+
+```
+curl https://www.youtube.com/            -> 200
+curl https://api.github.com/            -> 200
+curl https://clientsettingscdn.roblox.com/ -> 000 (hostname mismatch)
+openssl s_client … clientsettingscdn.roblox.com -> CN=*.btk.gov.tr
+```
+
+So Roblox reaches its own splash and then cannot fetch client settings from this
+network. Reaching the main menu requires a network where the Roblox domains are
+not intercepted; nothing in PenguDroid can honestly change that, and adding the
+intercepting CA to the guest trust store would deliberately weaken TLS for every
+app.
+
 ### Beach Buggy Racing 2: measured blocker (unchanged by this pass)
 
 `pengudroid doctor 'Beach+Buggy+Racing+2_2026.10.05_APKPure.xapk'` reports 18
