@@ -424,6 +424,9 @@ pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper12importBufferEPK13nati
     }
     *out = Box::into_raw(Box::new(copy));
     register_handle(*out);
+    if std::env::var_os("PENGUDROID_TRACE_AHB").is_some() {
+        eprintln!("[ahb] import {handle:p} -> {:p} fds={}", *out, fds);
+    }
     0
 }
 
@@ -496,6 +499,9 @@ pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper6unlockEPK13native_hand
     if handle.is_null() {
         return -22;
     }
+    if std::env::var_os("PENGUDROID_TRACE_AHB").is_some() {
+        eprintln!("[ahb] unlock {handle:p}");
+    }
     if let Some(dir) = std::env::var_os("PENGUDROID_DUMP_GBUF") {
         let h = &*handle;
         if h.num_fds >= 1 && !h.data.is_empty() {
@@ -564,6 +570,9 @@ pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper10freeBufferEPK13native
     unregister_handle(handle);
     release_cpu(handle as usize);
     let h = &*handle;
+    if std::env::var_os("PENGUDROID_TRACE_AHB").is_some() {
+        eprintln!("[ahb] free {handle:p} owned={} fds={}", h.num_fds > 0, h.num_fds);
+    }
     if h.num_fds > 0 && !h.data.is_empty() {
         libc::close(h.data[0]);
     }

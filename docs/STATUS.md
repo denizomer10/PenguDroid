@@ -231,10 +231,20 @@ returns (a `Box<NativeHandle>` the caller owns).
 
 **A bounded retire-on-free pool was tried and rejected:** keeping released
 handle records alive did not stop the fault, so the faulting pointer is not one
-of the records this shim allocated. It must be identified before any further
-change: log the address returned by `importBuffer`, the address the
-`C2AllocationGralloc` retains, and the faulting `rdi`, then make exactly one
-owner responsible for that interval. Do not guess a lifetime rule.
+of the records this shim allocated.
+
+Measured identity of the faulting handle (`PENGUDROID_TRACE_AHB=1`, ByteBuffer
+probe): `importBuffer` received `0x7f8618136690` and returned the shim's copy
+`0x7f8618637110`; `lockYCbCr` then reached the shim successfully; the faulting
+`rdi` was `0x7f81e065c3ec` — neither address. There is **no** `[ahb] unlock`
+line, so the fault happens inside `libui`'s own `unlock` on a handle this shim
+never imported and never allocated a map for. The remaining work is therefore
+the `importBuffer` ownership contract: on a device the mapper hands back the
+handle the buffer keeps, and `freeBuffer` releases that same handle exactly
+once. This shim currently returns an unrelated `Box<NativeHandle>` copy, so
+`GraphicBuffer` and `C2AllocationGralloc` end up observing different handles.
+The next change must make those agree (single owner, single release) and be
+validated with the ByteBuffer probe before touching the surface path again.
 
 `GraphicBufferMapper::unlock`/`lock` are **not exported** by this API-37
 `libui.so` (`llvm-nm -D` lists `importBuffer`, `freeBuffer`, `getTransportSize`,
