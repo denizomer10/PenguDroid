@@ -245,6 +245,26 @@ freed immediately, so `requestBuffer` returned nothing;
 buffer queue information and the component cannot take a graphic block. That
 HIDL `IGraphicBufferProducer` callback path is the next thing to host.
 
+Measured further on this checkout:
+
+- `PENGUDROID_TRACE_BINDER=1` shows **no** binder transaction for the producer,
+  so `dequeueBuffer`/`requestBuffer` are in-process calls on real `libgui`.
+- Adding a trace to `GraphicBufferMapper::importBuffer` proves the conversion
+  never reaches it (`[ahb] importBuffer` never prints), so `requestBuffer` fails
+  before `hgbp_h2b` produces a `GraphicBuffer`. The slot buffer is then detached,
+  which is the `[ahb] free … owned=true` line.
+- The block pool falls back to its own allocator (`mProducerId == 0`): it logs
+  `[ahb] allocated 384x240 fmt=842094169 stride=384`, and the next observable
+  event is `fetchGraphicBlock for Output failed with status 22`
+  (`C2_BAD_VALUE`), i.e. `C2AllocationGralloc` rejects the block this shim's
+  allocator produced.
+
+Next two measurements, in order: (1) why `BufferQueueProducer::requestBuffer`
+returns a non-OK status or an unconvertible `HBuffer` for a slot this shim's
+allocator filled, and (2) which check inside `C2AllocationGralloc` returns
+`C2_BAD_VALUE` for a memfd-backed handle. Both are local calls; no HAL can be
+blamed and no binder work is involved.
+
 The earlier stopping point is kept below for context.
 
 A deterministic reproducer now exists that needs no Wayland window and no app UI:

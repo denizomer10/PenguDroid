@@ -401,6 +401,12 @@ pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper12importBufferEPK13nati
     _generation: u32,
     out: *mut *const NativeHandle,
 ) -> i32 {
+    if std::env::var_os("PENGUDROID_TRACE_AHB").is_some() {
+        eprintln!(
+            "[ahb] importBuffer {_width}x{_height} fmt={_format:#x} usage={_usage:#x} width={_width} bufid={_buffer_id} gen={_generation} stride={}",
+            if !handle.is_null() && (*handle).num_ints >= 1 { (*handle).data[1] } else { 0 }
+        );
+    }
     import_handle_copy(handle, out)
 }
 
