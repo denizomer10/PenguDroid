@@ -383,10 +383,8 @@ pub fn launch(args: &[String]) -> i32 {
             // `handleLaunchActivity` for the manifest's launcher activity. That
             // is the only path that reaches `ViewRootImpl.performTraversals` and
             // therefore the only one that draws.
-            // `--component` overrides the manifest's launcher activity. Roblox
-            // keeps the useful activity behind its splash, and the splash only
-            // starts it after a native callback that never arrives here; naming
-            // `ActivityNativeMain` directly is the only way in.
+            // `--component` overrides only the initial activity. Later activity
+            // transitions still need the hosted framework lifecycle.
             let activity = component
                 .clone()
                 .or_else(|| info.main_activity_name().map(|s| s.to_string()));

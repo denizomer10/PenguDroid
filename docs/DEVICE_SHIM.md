@@ -62,6 +62,26 @@ privileges, changes UIDs, conceals superuser access, intercepts root detectors,
 nor configures an actual ADB service. Existing UID handling is outside its
 boundary. Applications may still detect the compatibility layer or reject it.
 
+## Separate Java process-identity boundary
+
+`crates/pengudroid-cli/src/process_identity.rs` is independent of this property
+profile. Before application initialization it maps the four API-37 Java/libcore
+UID/GID query natives to the app UID already used by `ApplicationInfo.uid`
+(currently 10000). This prevents an ordinary Linux user such as UID 1000 from
+being misclassified as Android's privileged `SYSTEM_UID`.
+
+The adapter does not interpose host libc/native identity queries, change Linux
+credentials, grant or remove privileges, or provide a security sandbox. It
+refuses a real/effective root host UID and does not conceal later root
+credentials. Native code still observes host identities; this is not universal
+identity virtualization, root detection evasion, or attestation. WebView's
+privilege/provider checks remain intact, and WebView is not advertised without
+a working hosted provider. The API-37 CheckJNI gate checks the Java mapping and
+unchanged host identities separately; see [STATUS.md](STATUS.md).
+
+Removing `pengudroid-device` does not remove this process-identity adapter, just
+as removing that adapter does not alter the profile's properties.
+
 ## Parent integration and removal boundary
 
 Workspace membership, dependency wiring, and daemon/shim consumers are left to

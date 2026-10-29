@@ -20,7 +20,32 @@ memory/resource growth, GPU graphics and hardware video decode across Intel,
 AMD and NVIDIA, and Beach Buggy Racing 2. None is established merely by building
 the workspace or reporting a GPU capability.
 
-## Current checkout: 2026-10-27 (runtime restored)
+## Current application-hosting checkpoint (2026-10-29)
+
+All **six** serialized API-37 CheckJNI gates pass: core services, BLAST lifecycle,
+media discovery, AudioTrack, main-thread dispatch and Java process identity.
+The last two cover application-bootstrap defects measured in Roblox:
+
+- `prepare_main_thread` now publishes `ActivityThread.sMainThreadHandler` from
+  the actual instance's `getHandler()` after attach, as `ActivityThread.main`
+  does. Background `SharedPreferences` notifications and posted Runnables are
+  exercised through the real main Looper, not a substitute executor.
+- `process_identity.rs` gives Java/libcore queries the same app UID/GID as
+  `ApplicationInfo.uid` (currently 10000). Its API-37 `nativeGet*()I` callbacks
+  use the pinned `@CriticalNative` zero-argument ABI. Host libc queries and
+  credentials are unchanged; real/effective root is rejected. This metadata
+  translation is not a sandbox or root/attestation concealment.
+- A failed app bind now exits unsuccessfully before entering the main Looper.
+
+Roblox advances into native settings/cookie initialization, but **WebView is
+not hosted**. The supplied runtime's real x86_64 provider APK is a candidate,
+not an implemented package/update-service/native-loading backend. Do not
+advertise `android.software.webview` or bypass provider/security checks merely
+to move its unsupported-capability exception. A NewPipe launch rendered its
+video-detail UI but failed in the media path; stable playback is not verified.
+See [STATUS.md](STATUS.md) for the captures, exact remaining work and failures.
+
+## Runtime restoration checkpoint (2026-10-27)
 
 `.toolchain/sysroot-android17` now exists in this checkout. It was produced by
 `tools/prepare-android17.py` from the archive below after verifying its SHA-256,

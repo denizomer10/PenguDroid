@@ -66,6 +66,7 @@ mod slot {
     pub const SET_INT_FIELD: usize = 109;
     pub const SET_FLOAT_FIELD: usize = 111;
     pub const GET_STATIC_OBJECT_FIELD: usize = 145;
+    pub const SET_STATIC_OBJECT_FIELD: usize = 154;
     pub const GET_ARRAY_LENGTH: usize = 171;
     pub const GET_DIRECT_BUFFER_ADDRESS: usize = 230;
     pub const GET_OBJECT_ARRAY_ELEMENT: usize = 173;
@@ -249,6 +250,14 @@ impl JniEnv {
         let f: unsafe extern "C" fn(*mut c_void, JClass, JFieldId) -> JObject =
             unsafe { self.func(slot::GET_STATIC_OBJECT_FIELD) };
         unsafe { f(self.0, class, field) }
+    }
+
+    /// `SetStaticObjectField(clazz, field, value)`.
+    pub fn set_static_object_field(&self, class: JClass, field: JFieldId, value: JObject) -> bool {
+        let f: unsafe extern "C" fn(*mut c_void, JClass, JFieldId, JObject) =
+            unsafe { self.func(slot::SET_STATIC_OBJECT_FIELD) };
+        unsafe { f(self.0, class, field, value) };
+        self.exception_check()
     }
 
     /// `GetObjectField(obj, field)`.
@@ -625,6 +634,7 @@ mod tests {
         assert_eq!(slot::GET_METHOD_ID, 33);
         assert_eq!(slot::GET_STATIC_METHOD_ID, 113);
         assert_eq!(slot::CALL_STATIC_VOID_METHOD_A, 143);
+        assert_eq!(slot::SET_STATIC_OBJECT_FIELD, 154);
         assert_eq!(slot::NEW_STRING_UTF, 167);
         assert_eq!(slot::EXCEPTION_CHECK, 228);
     }

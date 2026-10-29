@@ -1074,7 +1074,10 @@ pub fn art_main(args: &[String]) -> i32 {
                         eprintln!("apphost: main-thread preparation failed; not binding the app");
                         return 1;
                     }
-                    bind_application_now(&env, &classpath);
+                    if !bind_application_now(&env, &classpath) {
+                        eprintln!("apphost: application bind failed; not entering the main Looper");
+                        return 1;
+                    }
                     crate::apphost::loop_forever(&env);
                     return 0;
                 }
@@ -1083,6 +1086,16 @@ pub fn art_main(args: &[String]) -> i32 {
             if std::env::var_os("PENGUDROID_PROBE_MAIN_THREAD").is_some()
                 && !crate::apphost::prepare_main_thread(&env) {
                 eprintln!("apphost: main-thread probe failed");
+                return 1;
+            }
+            if std::env::var_os("PENGUDROID_PROBE_PROCESS_IDENTITY").is_some()
+                && !crate::process_identity::probe(&env) {
+                eprintln!("apphost: process-identity probe failed");
+                return 1;
+            }
+            if std::env::var_os("PENGUDROID_PROBE_MAIN_DISPATCH").is_some()
+                && !crate::main_thread_probe::run(&env) {
+                eprintln!("apphost: main-thread dispatch probe failed");
                 return 1;
             }
             if std::env::var_os("PENGUDROID_PROBE_MEDIA_LIST").is_some() {
@@ -1771,15 +1784,12 @@ fn app_target_sdk(target_sdk: Option<u32>) -> i32 {
     target_sdk.map(|sdk| sdk as i32).unwrap_or(37)
 }
 
-/// Bind an APK into the `ActivityThread` that `main` creates.
-///
-/// Runs on the calling thread (the one that created the VM). `ActivityThread`
-/// only exists once `main` has started on the helper thread, so this polls for
-/// the instance before binding.
-fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) {
+/// Bind an APK on the prepared ActivityThread's main Looper thread.
+/// Failure must propagate before the caller enters the application's main loop.
+fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) -> bool {
     let Some(apk) = classpath.first().cloned() else {
         eprintln!("apphost: --bind-app needs --classpath <apk>");
-        return;
+        return false;
     };
     let mut thread = std::ptr::null_mut();
     for _ in 0..300 {
@@ -1793,13 +1803,13 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) {
     }
     if thread.is_null() {
         eprintln!("apphost: ActivityThread.currentActivityThread() is null");
-        return;
+        return false;
     }
     let info = match crate::apk::read_apk(&apk) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("apphost: {e}");
-            return;
+            return false;
         }
     };
     let package = if info.package.is_empty() {
@@ -1933,7 +1943,7 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) {
         // (empty dex path, so the APK's classes are unreachable).
         uid: 10_000,
     };
-    crate::apphost::bind_application(env, thread, &spec);
+    crate::apphost::bind_application(env, thread, &spec)
 }
 
 /// Start libbinder's thread pool in this process.
@@ -2067,6 +2077,12 @@ fn run_main(env: &crate::jni::JniEnv, class: &str, args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binding_without_classpath_fails_before_accessing_jni() {
+        let env = crate::jni::JniEnv(std::ptr::null_mut());
+        assert!(!bind_application_now(&env, &[]));
+    }
 
     // Synthetic metadata and ELF headers only. No test loads an Android runtime
     // or uses either of the user's .toolchain sysroot directories as a fixture.

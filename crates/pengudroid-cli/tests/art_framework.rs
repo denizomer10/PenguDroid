@@ -116,6 +116,41 @@ fn android17_audio_track_under_checkjni() {
     assert!(text.contains("audio: API-37 AudioTrack initialized"), "{text}");
 }
 
+/// Guest identity is a Java metadata view only. This uses the same PROBE_LOCK
+/// as the other ART gates, and deliberately rejects a root host process.
+#[test]
+fn android17_process_identity_under_checkjni() {
+    let Some(sysroot) = optional_android17_sysroot() else { return; };
+    let text = run_framework_probe(&sysroot, "api37-process-identity", false, false, &[
+        ("PENGUDROID_PROBE_PROCESS_IDENTITY", "1"),
+    ]);
+    for expected in [
+        "process-identity: API-37 Linux nativeGetuid/nativeGeteuid/nativeGetgid/nativeGetegid registered (CriticalNative), uid=10000 gid=10000",
+        "process-identity: Java Linux/Os uid=10000 euid=10000 gid=10000 egid=10000; Process.myUid=10000",
+        "process-identity: host libc getuid/geteuid/getgid/getegid unchanged",
+        "process-identity: stable guest uid/gid=10000 passed",
+    ] { assert!(text.contains(expected), "missing {expected}:\n{text}"); }
+    assert!(!text.contains("JNI DETECTED ERROR"), "{text}");
+}
+
+/// Exercise the main-handler publication skipped when hosting ActivityThread
+/// without its main(): background preference notifications must reach the main
+/// Looper, not just find a non-null Handler. The helper shares PROBE_LOCK.
+#[test]
+fn android17_main_dispatch_under_checkjni() {
+    let Some(sysroot) = optional_android17_sysroot() else { return; };
+    let text = run_framework_probe(&sysroot, "api37-main-dispatch", false, false, &[
+        ("PENGUDROID_PROBE_MAIN_THREAD", "1"),
+        ("PENGUDROID_PROBE_MAIN_DISPATCH", "1"),
+    ]);
+    for expected in [
+        "main-dispatch: sMainThreadHandler identity and main Looper passed",
+        "main-dispatch: background SharedPreferences.notifyListeners dispatched on main",
+        "main-dispatch: background Handler.post Runnable executed by API-37 Looper.loopOnce",
+    ] { assert!(text.contains(expected), "missing {expected}:\n{text}"); }
+    assert!(!text.contains("JNI DETECTED ERROR"), "{text}");
+}
+
 /// Core API-37 migration gate. BLAST lifecycle has its own gate; neither test
 /// establishes Android-17 app rendering or media compatibility.
 #[test]

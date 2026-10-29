@@ -808,6 +808,10 @@ pub fn probe_platform_state(env: &JniEnv) -> bool {
 /// `ActivityThread.currentActivityThread()`.
 pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bool {
     let _ = APP_PACKAGE.set(spec.package.to_string());
+    if !crate::process_identity::install(env, spec.uid) {
+        eprintln!("apphost: cannot install the Android application process identity");
+        return false;
+    }
     if install_service_manager_abi(env).is_none() {
         eprintln!("apphost: cannot resolve framework ServiceManager ABI");
         return false;
@@ -3191,7 +3195,33 @@ pub fn prepare_main_thread(env: &JniEnv) -> bool {
         eprintln!("apphost: ActivityThread.attach threw");
         return false;
     }
+    // ActivityThread.main publishes this after attach, not in attach itself.
+    // SharedPreferences' background notifications post through this static;
+    // without it a successful commit throws before the app can finish startup.
+    let Some(main_handler_field) = env.static_field_id(
+        thread_class, "sMainThreadHandler", "Landroid/os/Handler;",
+    ) else {
+        eprintln!("apphost: Android 17 ActivityThread.sMainThreadHandler missing");
+        return false;
+    };
+    let main_handler = env.static_object_field(thread_class, main_handler_field);
+    if !env.exception_check() { return false; }
+    if main_handler.is_null() {
+        let Some(get_handler) = env.method_id(thread_class, "getHandler", "()Landroid/os/Handler;") else {
+            eprintln!("apphost: Android 17 ActivityThread.getHandler missing");
+            return false;
+        };
+        let Some(handler) = env.call_object(thread, get_handler, &[]).filter(|handler| !handler.is_null()) else {
+            eprintln!("apphost: ActivityThread.getHandler returned no main handler");
+            return false;
+        };
+        if !env.set_static_object_field(thread_class, main_handler_field, handler) {
+            eprintln!("apphost: cannot publish ActivityThread.sMainThreadHandler");
+            return false;
+        }
+    }
     println!("apphost: ActivityThread attached on the main thread");
+    println!("apphost: ActivityThread main handler published before application bind");
     true
 }
 

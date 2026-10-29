@@ -2,7 +2,158 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
-## Current handoff — API-37 AudioTrack adapter hosted and verified (2026-10-28)
+## Current handoff — main-thread startup and Java process identity fixed (2026-10-29)
+
+**Android 17 / API 37 / x86_64 only.** This checkpoint supersedes the older
+Roblox network-only diagnosis below. TLS/client-settings fetching now succeeds;
+two measured application-hosting defects were fixed. **Roblox still does not
+reach its menu, and NewPipe playback is not stable.** No capability, GPU-vendor
+coverage, leak-free playback, or ARM translation is inferred from passing tests.
+
+### The actual splash failure, not a guessed Activity transition
+
+The previous run ended after `fastflag_load_success` / `native_lib_wait_fetch_end`.
+Two bounded SIGQUIT captures (`target/roblox-settings-diag/`) and a real
+`-Xcheck:jni -Xjnitrace:NativeGLInterface` run (`target/roblox-jni-diag/`) separated
+JSON processing from JNI: `readLocalFlags` resolves its class and methods and
+`NewObjectV` returns a non-null `ClientLocalFlags`. No sustained wait inside that
+native method was demonstrated.
+
+An opt-in JVMTI exception capture then exposed what the app's ordinary log hid
+(`target/roblox-exceptions-diag/app.log:1147`):
+
+```
+SharedPreferencesImpl$EditorImpl.notifyListeners:
+  NullPointerException: Handler.post(...) on a null object reference
+  caught by th.f.h, in the settings-completion path
+```
+
+`prepare_main_thread` recreated `Looper.prepareMainLooper`, `new ActivityThread`
+and `attach`, but omitted **`ActivityThread.sMainThreadHandler = thread.getHandler()`**,
+which the real API-37 `ActivityThread.main` performs immediately after attach.
+`apphost.rs` now publishes that exact Handler, before application binding, and
+preserves an already-published one as the framework does. Missing contracts or a
+failed JNI write fail startup. `jni.rs` adds standard `SetStaticObjectField`.
+
+The new `main_thread_probe.rs` uses real framework objects, an attached background
+thread, `SharedPreferencesImpl$EditorImpl.notifyListeners`, and
+`Looper.loopOnce(Looper,long,int)`. It checks Handler/Looper identity and executes
+a posted `FutureTask` marker on the main thread. Empty but non-null standard
+collections deliberately exercise the notification's posting path; this is not a
+test of application listener callbacks. Globals, local frames, worker attachment,
+timeout callbacks and temporary preferences storage have explicit cleanup.
+
+**Red/green evidence:** `android17_main_dispatch_under_checkjni` failed before the
+fix with `sMainThreadHandler is null` (~2.9 s), then passed after it. Retained logs:
+`target/main-handler-regression-before.log`, `target/main-handler-regression-after.log`.
+Roblox then advanced to `fetch_flag_begin/end`, native engine/crashpad setup, and
+cookie initialization (`target/roblox-main-handler/`). No `startActivity` attempt
+was observed; the absent activity-transition host remains a possible later
+blocker, not the demonstrated cause of this splash stop.
+
+### Java application identity must not equal Android's SYSTEM_UID
+
+The next exception was `WebViewFactory.getProvider`: **"WebView is not allowed in
+privileged processes"** (`target/roblox-handler-exceptions/app.log`). This machine's
+ordinary Linux user is UID 1000, which Android interprets as `SYSTEM_UID`, while
+the hosted `ApplicationInfo.uid` was already 10000.
+
+`process_identity.rs` now installs the app UID at the **Java/libcore JNI boundary**
+before app initialization. The pinned API-37 `core-libart.jar` has instance Java
+`Linux.getuid/geteuid/getgid/getegid` wrappers backed by private static
+**`@CriticalNative nativeGet*()I`** methods. The four registered callbacks therefore
+have the exact zero-argument ABI, not `(JNIEnv*, jobject)`. Wrapper/native modifiers,
+method signatures, API level and application-UID range are checked before
+registration. This artifact's SHA-256 is
+`981354781d1bd379cebc6036f8ebe404f852da36d9484a2b1672a8f5e857bf3b`.
+
+The mapping is immutable within an app process, uses the same `spec.uid` as
+`ApplicationInfo` (currently 10000), and supports user-0 normal app UIDs only.
+Real/effective host root is rejected, including a root check in every callback.
+**Host libc/native identity queries and credentials remain untouched.** This is
+Java compatibility metadata, not a security sandbox, privilege drop, root
+concealment, hardware identity, or attestation. Native libraries still observe
+host identities. See [DEVICE_SHIM.md](DEVICE_SHIM.md).
+
+`android17_process_identity_under_checkjni` verifies all four Java `Linux` and
+`Os` queries plus `Process.myUid`, repeats them, and independently verifies all
+four host libc IDs are unchanged. Seven synthetic policy tests cover the range,
+immutability, rejected root credentials and transparent uninstalled state.
+Failed `bind_application` results now propagate through `bind_application_now`:
+an unbound guest exits unsuccessfully instead of silently entering the Looper.
+The negative no-classpath launch returned status 1 and never entered it
+(`target/bootstrap-bind-failure.log`).
+
+### Current Roblox blocker: a real WebView provider is not hosted
+
+After both fixes, a bounded 55 s API-37/CheckJNI exception capture
+(`target/roblox-process-identity/`) stays alive and captures splash frames, but
+cookie setup throws a **bare** `UnsupportedOperationException`. The privileged
+UID message is gone. The actual API-37 DEX (`framework.jar!/classes4.dex`,
+`WebViewFactory.getProvider`, code item `0x3c9a24`) checks `isWebViewSupported()`
+at code-unit PC 45 and throws the no-argument exception at PCs 147–152 when
+`hasSystemFeature("android.software.webview")` is false. PC 163 in the captured
+stack is the lock-cleanup **rethrow**, not the original check.
+
+PenguDroid does not advertise WebView, correctly: there is no implemented
+`webviewupdate` service or provider package/loading contract. **Do not flip the
+feature flag just to move the error.** A genuine provider candidate is already
+in the API-37 tree:
+
+- `system/product/app/webview/webview.apk`, package `com.android.webview`, version
+  `145.0.7632.218` / `763221807`, 333,998,538 bytes.
+- Real ELF64 x86_64 `libwebviewchromium.so`, 185,797,040 bytes; the expected
+  `WebViewChromiumFactoryProviderForT.create(WebViewDelegate)` exists.
+- APK signing blocks were observed, **not cryptographically verified** here.
+
+Next, in order: validate the actual provider package/signers and install
+package-name-keyed metadata (the current one-caller cached PackageInfo and
+placeholder signatures cannot stand in for it); host the loaded Stub's
+`IWebViewUpdateService.waitForAndGetProvider` with a framework-marshalled
+`WebViewProviderResponse`; handle provider package dependency/context/resource
+loading; perform actual x86_64 native/RELRO/factory initialization. Only then
+publish WebView support and gate real `CookieManager` construction. Keep version,
+signature and privileged-process checks intact. Factory/cookie initialization
+would still not establish page rendering or renderer-service support.
+
+### NewPipe regression attempt: rendered UI, then a measured media crash
+
+The bounded `target/newpipe-main-handler/` launch was **not a passing smoke**.
+It rendered a 720x1280 video-detail/comments frame with a loading spinner, bound
+`PlayerService`, and reached real AAC/AVC codec activity. The known surface-pool
+failure remains (`get generationNumber failed`, `fetchGraphicBlock ... status 22`).
+It then exited with status 1 after ~22 s: `MediaCodec_loop` entered
+`JMediaCodec::handleCallback` → JNI `CallVoidMethodV` → ART interpreter stack-overflow
+handling, followed by `Check failed: top_shadow_frame_ != nullptr` / SIGSEGV.
+Its causal relationship to these bootstrap changes has **not** been isolated;
+do not call this run stable playback or a clean regression pass. The native
+callback/thread stack contract needs a deterministic CheckJNI reproducer in
+addition to the two pending surface-block-pool measurements recorded below.
+
+Native SIGQUIT visibility has a separate identified limit: this API-37
+`libunwindstack` requests signal **33**, which glibc/NPTL reserves and rejects
+with EINVAL. Do not bypass glibc with raw `rt_sigaction(33)` or remap only the
+installation while leaving `tgkill(33)` unchanged. No signal workaround was
+shipped in this pass.
+
+### Validation of this checkpoint
+
+- `PENGUDROID_TEST_ANDROID17_SYSROOT=/home/pc/PenguDroid/.toolchain/sysroot-android17
+  cargo test --workspace --offline -j 2`: **336 passed, 0 failed**, including all
+  **six** serialized real API-37 CheckJNI gates (core, BLAST, media discovery,
+  AudioTrack, main dispatch, process identity). Runtime gates were not skipped.
+- `python3 -B -m unittest discover -s tools -p 'test_*.py'`: **123 passed**.
+- Workspace build passes with existing warnings; `git diff --check` is clean.
+- Logs: `target/bootstrap-identity-workspace-tests.log`,
+  `target/bootstrap-identity-tool-tests.log`, `target/process-identity-gate.log`.
+- ART/application probes ran serially; app/daemon process groups were reaped.
+  Short samples are **not** evidence of leak-free sustained operation.
+
+BBR2 remains ARM64-only with no working translator; Intel/AMD/NVIDIA hardware
+playback coverage is unchanged. No old runtime fallback, container, VM, mounted
+image, TLS weakening, game-binary patch, or repository visibility change was used.
+
+## Prior handoff — API-37 AudioTrack adapter hosted and verified (2026-10-28)
 
 Android 17 / API 37 / x86_64 remains the only runtime. The previous handoff's
 audio task — a descriptor-checked AudioSystem/AudioTrack JNI adapter with a
