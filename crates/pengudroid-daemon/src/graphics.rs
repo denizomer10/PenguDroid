@@ -53,7 +53,7 @@ mod imp {
     use std::collections::HashMap;
     use std::os::fd::AsFd;
 
-    use pengudroid_proto::abi;
+    use pengudroid_proto::{abi, BufferCrop};
     use wayland_client::globals::{registry_queue_init, GlobalListContents};
     use wayland_client::protocol::{
         wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_registry, wl_region,
@@ -1135,17 +1135,30 @@ mod imp {
         /// Snapshot decoder-owned CPU memory and submit it through wl_shm.
         /// Every frame has separate storage until the compositor releases it.
         pub fn present_shm(&mut self, id: u32, fd: std::os::fd::OwnedFd,
-            width: u32, height: u32, stride: u32, format: u32) -> Result<(), String> {
+            width: u32, height: u32, stride: u32, format: u32, crop: BufferCrop) -> Result<(), String> {
+            let source_size = crop.dimensions(width, height)?;
             if !self.frame_slot_available(id)? { return Ok(()); }
-            let pixels = crate::software::snapshot(fd, width, height, stride, format)?;
-            let source_size = (width, height);
+            let pixels = crate::software::snapshot(fd, width, height, stride, format, crop)?;
             let surface = self.state.surfaces.get(&id).unwrap();
             // wp_viewporter scales on the compositor/GPU. Only the legacy
             // path without a viewport needs a CPU-resized snapshot.
             let (width, height) = if surface.subsurface.is_some() && surface.viewport.is_none() {
                 (surface.width, surface.height)
-            } else { (width, height) };
+            } else { source_size };
             let pixels = crate::software::resize(pixels, source_size.0, source_size.1, width, height)?;
+            if let Ok(dir) = std::env::var("PENGUDROID_DUMP_PRESENT") {
+                // Diagnostic: proves what the compositor is about to attach,
+                // including a YUV video frame after the CPU conversion.
+                let path = std::path::Path::new(&dir)
+                    .join(format!("present-{id}-{width}x{height}.ppm"));
+                if std::fs::metadata(&path).is_err() {
+                    let mut out = format!("P6\n{width} {height}\n255\n").into_bytes();
+                    for pixel in pixels.chunks_exact(4) {
+                        out.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+                    }
+                    let _ = std::fs::write(&path, out);
+                }
+            }
             let region = AshmemRegion::create("pengudroid-video-snapshot", pixels.len() as u64)
                 .map_err(|e| e.to_string())?;
             region.map_mut().map_err(|e| e.to_string())?.as_mut_slice().copy_from_slice(&pixels);
@@ -1726,7 +1739,7 @@ mod imp {
             let source = AshmemRegion::create("pd-frame-lifetime", 128 * 72 * 4).unwrap();
             let original = graphics.state.surfaces[&id].buffer.id();
             for _ in 0..1000 {
-                graphics.present_shm(id, source.try_clone_fd().unwrap(), 128, 72, 512, 1).unwrap();
+                graphics.present_shm(id, source.try_clone_fd().unwrap(), 128, 72, 512, 1, BufferCrop::full(128, 72)).unwrap();
                 assert!(graphics.state.surfaces[&id].pending_frames.len() <= 3);
             }
             graphics.queue.roundtrip(&mut graphics.state).unwrap();
@@ -1889,7 +1902,7 @@ mod imp {
         }
         #[allow(clippy::too_many_arguments)]
         pub fn present_shm(&mut self, _id: u32, _fd: std::os::fd::OwnedFd,
-            _width: u32, _height: u32, _stride: u32, _format: u32) -> Result<(), String> {
+            _width: u32, _height: u32, _stride: u32, _format: u32, _crop: pengudroid_proto::BufferCrop) -> Result<(), String> {
             Err("graphics built without the `wayland` feature".into())
         }
         pub fn present_video_dmabuf(&mut self, _id: u32, _frame: pengudroid_hostgpu::video::ExportedFrame)

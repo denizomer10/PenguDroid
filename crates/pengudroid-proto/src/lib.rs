@@ -27,7 +27,9 @@ use std::fmt;
 ///
 /// v2 added property/service enumeration, guest-to-guest calls, process
 /// unregistration and detached launches (`QueryRun`).
-pub const PROTO_VERSION: u16 = 2;
+/// v3 adds a mandatory per-frame source crop to `PresentShm`; v2 peers must
+/// reconnect with matching binaries rather than interpreting allocation padding.
+pub const PROTO_VERSION: u16 = 3;
 
 /// Marker used by the daemon's pid/heartbeat file.
 pub const PROTO_MAGIC: u32 = 0x5044_5247; // "PDRG"
@@ -241,6 +243,33 @@ impl InputKind {
     }
 }
 
+/// Visible source pixels in allocation coordinates, with exclusive right/bottom.
+/// This also matches Android's four-int32 `ARect`/`Rect` coordinate layout.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferCrop {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+impl BufferCrop {
+    /// Full allocation bounds. Dimensions are validated before sampling, not
+    /// clamped or inferred from the destination surface or pixel format.
+    pub const fn full(width: i32, height: i32) -> Self {
+        Self { left: 0, top: 0, right: width, bottom: height }
+    }
+
+    pub fn dimensions(self, allocation_width: u32, allocation_height: u32) -> Result<(u32, u32), &'static str> {
+        if self.left < 0 || self.top < 0 || self.right <= self.left || self.bottom <= self.top
+            || self.right as u32 > allocation_width || self.bottom as u32 > allocation_height {
+            return Err("software frame crop is empty or outside the allocation");
+        }
+        Ok(((self.right - self.left) as u32, (self.bottom - self.top) as u32))
+    }
+}
+
 /// Every control-plane message.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
@@ -287,8 +316,10 @@ pub enum Message {
     DestroySurface { surface_id: u32 },
     SetSurfaceOptions { surface_id: u32, fps_meter: bool },
     /// Snapshot a CPU buffer (memfd passed out-of-band), never a GPU dma-buf.
-    /// `format` is an Android HAL pixel format; `stride` is bytes per row.
-    PresentShm { surface_id: u32, width: u32, height: u32, stride: u32, format: u32 },
+    /// `width`/`height` describe the allocation, `stride` is bytes per row, and
+    /// `format` is an Android HAL pixel format. Only `crop` is displayed; even
+    /// full-frame callers must supply explicit bounds for this submission.
+    PresentShm { surface_id: u32, width: u32, height: u32, stride: u32, format: u32, crop: BufferCrop },
     /// Present a dma-buf (fd passed out-of-band) on an existing surface.
     PresentDmabuf {
         surface_id: u32,
@@ -527,12 +558,16 @@ impl Message {
             }
             DestroySurface { surface_id } => e.u32(*surface_id),
             SetSurfaceOptions { surface_id, fps_meter } => { e.u32(*surface_id); e.u8(u8::from(*fps_meter)); }
-            PresentShm { surface_id, width, height, stride, format } => {
+            PresentShm { surface_id, width, height, stride, format, crop } => {
                 e.u32(*surface_id);
                 e.u32(*width);
                 e.u32(*height);
                 e.u32(*stride);
                 e.u32(*format);
+                e.i32(crop.left);
+                e.i32(crop.top);
+                e.i32(crop.right);
+                e.i32(crop.bottom);
             }
             PresentDmabuf { surface_id, width, height, stride, fourcc, modifier, offset } => {
                 e.u32(*surface_id);
@@ -730,6 +765,7 @@ impl Message {
             K::PresentShm => PresentShm {
                 surface_id: d.u32()?, width: d.u32()?, height: d.u32()?,
                 stride: d.u32()?, format: d.u32()?,
+                crop: BufferCrop { left: d.i32()?, top: d.i32()?, right: d.i32()?, bottom: d.i32()? },
             },
             K::PresentDmabuf => PresentDmabuf {
                 surface_id: d.u32()?,
@@ -1138,8 +1174,45 @@ mod tests {
     }
 
     #[test]
+    fn software_frame_crop_roundtrip_and_v2_body_rejection() {
+        for crop in [BufferCrop::full(512, 240), BufferCrop::full(426, 240),
+            BufferCrop { left: 3, top: 5, right: 129, bottom: 117 },
+            BufferCrop { left: i32::MIN, top: -1, right: i32::MAX, bottom: 0 }] {
+            let message = Message::PresentShm { surface_id: 4, width: 512, height: 240,
+                stride: 512, format: 0x3231_5659, crop };
+            roundtrip(message.clone());
+            let frame = message.to_frame();
+            // A v2 PresentShm body ended after the original five u32 fields.
+            assert!(matches!(Message::from_body(&frame[4..4 + 1 + 5 * 4]), Err(ProtoError::Truncated)));
+            for missing in 1..=16 {
+                assert!(matches!(Message::from_body(&frame[4..frame.len() - missing]), Err(ProtoError::Truncated)));
+            }
+        }
+    }
+
+    #[test]
+    fn software_crop_bounds_are_checked_before_subtraction() {
+        assert_eq!(BufferCrop::full(426, 240).dimensions(512, 240), Ok((426, 240)));
+        assert_eq!(BufferCrop { left: 3, top: 5, right: 129, bottom: 117 }.dimensions(512, 240), Ok((126, 112)));
+        for crop in [
+            BufferCrop { left: -1, top: 0, right: 4, bottom: 4 },
+            BufferCrop { left: 0, top: -1, right: 4, bottom: 4 },
+            BufferCrop { left: 4, top: 0, right: 4, bottom: 4 },
+            BufferCrop { left: 0, top: 4, right: 4, bottom: 4 },
+            BufferCrop { left: 3, top: 0, right: 2, bottom: 4 },
+            BufferCrop { left: 0, top: 3, right: 4, bottom: 2 },
+            BufferCrop::full(5, 4), BufferCrop::full(4, 5),
+            BufferCrop { left: i32::MIN, top: 0, right: i32::MAX, bottom: 4 },
+            BufferCrop::full(i32::MAX, i32::MAX),
+        ] {
+            assert!(crop.dimensions(4, 4).is_err(), "accepted {crop:?}");
+        }
+    }
+
+    #[test]
     fn roundtrip_complex() {
-        roundtrip(Message::PresentShm { surface_id: 4, width: 426, height: 240, stride: 852, format: 4 });
+        roundtrip(Message::PresentShm { surface_id: 4, width: 426, height: 240, stride: 852, format: 4,
+            crop: BufferCrop::full(426, 240) });
         roundtrip(Message::SetSurfaceOptions { surface_id: 4, fps_meter: true });
         roundtrip(Message::SetSurfaceOptions { surface_id: 4, fps_meter: false });
         roundtrip(Message::RunApk {

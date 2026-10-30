@@ -2,7 +2,124 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
-## Current handoff — main-thread startup and Java process identity fixed (2026-10-29)
+## Current handoff — activity roundtrip and video crop verified; ARM64 guest runtime still blocked (2026-10-31)
+
+**Android 17 / API 37 / x86_64 only on the host.** This checkpoint verifies the
+hosted Activity lifecycle on a real NewPipe run (Main → Settings → finish →
+resume), routes input to the focused visible window only, and fixes the decoded
+video's padding by propagating the per-frame BufferQueue crop all the way to the
+compositor. The ARM64 translator still cannot execute guest code: the guest
+runtime quartet is missing and the loader is now **fail-closed** about it. It
+does **not** claim Beach Buggy Racing 2 runs.
+
+### NewPipe: click → detail → decoded video frames
+
+Two implementation pieces landed:
+
+* **Hosted `startActivity`.** The broker resolves
+  `IActivityTaskManager.startActivity`, `IActivityManager.startActivity` and
+  `IActivityManager.finishActivity` from the loaded API-37 Stubs, parses the
+  API-37 transaction forward (header, interface token, caller binder, calling
+  package, optional feature id, then `Intent`), validates the explicit
+  component and the hosted package, and queues the raw transaction. The main
+  thread now runs API-37 `Looper.loopOnce(Looper,long,int)` between queued
+  transitions instead of blocking in `Looper.loop()`; it replays
+  `handleLaunchActivity` / `handleResumeActivity` / `handlePauseActivity` /
+  `handleStopActivity` / `handleDestroyActivity` with a distinct local `Binder`
+  token per activity. Unknown or unhostable starts return a transport
+  `UNKNOWN_TRANSACTION`; no fake success.
+* **A real NewPipe navigation run, with the round trip.**
+  `target/newpipe-activity-roundtrip/`: `PENGUDROID_PROBE_START_ACTIVITY` opens
+  `SettingsActivity` from the resumed `MainActivity`, the synthetic tap at
+  `(48,56)` hits its toolbar Up button and the broker records
+  `finish token=2` for the **correct** activity; `handleResumeActivity` brings
+  the previous one back (`activity finished; the previous one is resumed`),
+  with zero `JNI DETECTED ERROR` lines. Input is delivered to the focused
+  visible root only (`IsSameObject`, stopped roots excluded), so a tap no
+  longer clicks the Activity underneath.
+* **Per-frame video crop.** The decoder intentionally allocates `ALIGN128(width)`
+  (512×240 for a 426×240 stream); the visible rectangle arrives as the
+  `BufferItem.mCrop` (offset 32 in the pinned API-37 layout, frameworks/native
+  `ae266dcb706d`). `blast.rs` now reads it on **every** acquired frame and sends
+  it in `PresentShm`; the protocol bumped **v2 → v3** with an explicit
+  `BufferCrop` (exclusive right/bottom), and the daemon converts only that
+  rectangle while still addressing YUV planes by allocation stride/height.
+  Measured: `first software frame submitted (512x240 format=842094169
+  crop=BufferCrop { left: 0, top: 0, right: 426, bottom: 240 })`, 690+ decoded
+  frames, and the compositor dumps are `present-4-426x240.ppm` (previously
+  `512x240` with a green margin) plus `present-7-1280x720.ppm` after the quality
+  switch. Right-edge pixel sampling shows real content, not padding.
+
+Reproduction (bounded, no daemon reuse; `PENGUDROID_DUMP_PRESENT` needs an
+**existing** directory):
+
+```sh
+mkdir -p target/newpipe-activity-roundtrip/frames-crop
+# dismiss NewPipe's first-run "Keep Android Open" dialog (OK ≈ 600,579 on the
+# 720x1280 window), then open the first feed item 12 s later:
+PENGUDROID_DUMP_PRESENT=$PWD/target/newpipe-activity-roundtrip/frames-crop \
+PENGUDROID_SYNTH_CLICK='600,579@8000;150,300@12000' SMOKE_SECONDS=45 \
+  python3 -B target/newpipe-activity-roundtrip/smoke.py
+```
+
+Synthetic-click delays are **cumulative** (each `@ms` waits before that tap),
+and `PENGUDROID_CLICK_TEXT`/probes run after all taps.
+
+Remaining NewPipe gaps: the `HardwareRenderer` graphics-stats buffer is still
+refused (`requestBuffer` NPE, non-fatal WARN), `ParceledListSlice` NPEs remain,
+audio reaches the PipeWire sink (`pw-cat` is alive during playback) but the
+audio content itself is unverified, and leak-free long playback is untested (a
+45 s sample ends at ~429 MB RSS, stable over its final seconds — not a leak
+measurement).
+
+### Digitalis ARM64 translator: built, loads, guest-runtime blocker measured
+
+`tools/build-nativebridge.py --towards-bridge --seconds 1800` now reports
+`Translator shared built: YES`:
+
+* `libberberis_arm64.so`, 37,719,928 bytes, SHA-256
+  `11fec1897d6ec4cb5faa19eb14753db980e7d4ea43d5dcf2383d36581e976f35`,
+  global dynamic `NativeBridgeItf` v8.
+* `tools/prepare-arm64-guest.py` verifies and extracts the matching
+  `aosp_arm64` GSI (`CP2A.260605.012`, SHA-256
+  `8e545e1e1e977c3b43b4e54a3af463f3e7d1c3177b120e772138334e15f48f75`), stages
+  832 guest files under `system/bin/arm64` and `system/lib64/arm64`, and builds
+  `libnative_bridge_vdso.so`.
+* Real run: `LoadNativeBridge = true`, `PreInitializeNativeBridge = true`,
+  `Initialized Berberis (aarch64)`, then
+  `FATAL ... couldn't find "__native_bridge_config_static_tls" symbol in linker`.
+  The stock GSI `linker64` is not the native-bridge product's modified linker.
+  The loader is now **fail-closed** about this state: tool staging (schema 1 and
+  schema 2 `staged-only`) is rejected before `JNI_CreateJavaVM`, and a
+  manifest-free bundle must pass the real ELF contract
+  (`__native_bridge_config_static_tls`, `__native_bridge_get_host_pthread`, the
+  VDSO hooks). The selected translator is preloaded by exact path and proven
+  identical to its basename before `LoadNativeBridge`, and
+  `NativeBridgeGetSignalHandler`'s callback is chained over ART's handler
+  instead of being misread as a `struct sigaction`.
+* Next concrete task: build the four `.native_bridge` modules from a matching
+  Android-17 Soong product (`native_bridge_guest_linker`,
+  `libnative_bridge_guest_libc`, `native_bridge_guest_app_process`,
+  `libnative_bridge_vdso`). The cached Bionic tree is header slices only, so
+  this is not a small extension of `tools/build-nativebridge.py`; until it
+  lands, BBR2 is **not** runnable here.
+
+See [NATIVE_BRIDGE.md](NATIVE_BRIDGE.md) for the build flags, source pins, and
+the exact driver changes.
+
+### Validation on this checkout
+
+* `cargo test --workspace --offline -j 2` with
+  `PENGUDROID_TEST_ANDROID17_SYSROOT=$PWD/.toolchain/sysroot-android17`:
+  **365 tests, 0 failures** (all seven serialized real API-37 CheckJNI gates
+  ran, including the activity-request roundtrip gate).
+* `python3 -B -m unittest discover -s tools -p 'test_*.py'`: **167 tests, 0
+  failures** (44 cover ARM64 guest preparation).
+* `cargo build --workspace --offline -j 2`: passed. `git diff --check`: clean.
+* The ARM64 guest extraction and translator build are local `.toolchain`
+  artifacts; neither is committed or redistributed.
+
+## Previous handoff — main-thread startup and Java process identity fixed (2026-10-29)
 
 **Android 17 / API 37 / x86_64 only.** This checkpoint supersedes the older
 Roblox network-only diagnosis below. TLS/client-settings fetching now succeeds;

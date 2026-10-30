@@ -217,48 +217,44 @@ prefix, creating the VM, registering the framework natives and invoking
 
 ### 2.4 Where the translator stops, precisely
 
-Two things were fixed after the first bring-up, and two are still open.
+The ARM64-to-x86_64 translator is now built from the pinned Digitalis source
+tree, not inferred from an older `ndk_translation` artifact:
 
-**Fixed: ART and the translator both want SIGSEGV.** The bridge installs its
-handlers inside `NativeBridgeItf.initialize` (during `LoadNativeBridge`, i.e.
-before the VM exists), and then `Runtime::Init` → `FaultManager::Init` replaces
-them with ART's crash dumper. Both runtimes share this one process, so the
-guest's lazy-translation faults would be handed to ART. `NativeBridgeGetSignalHandler
-(sig)` returns the bridge's own action; `--init-bridge` now reinstalls it for
-SIGILL/SIGBUS/SIGFPE/SIGSEGV once the VM is up, converting Bionic's 32-byte
-`struct sigaction` to glibc's 152-byte one through the shim. (On a device
-`sigchain` does the equivalent.)
+* `tools/build-nativebridge.py --towards-bridge --seconds 1800` produces
+  `libberberis_arm64.so` (37,719,928 bytes,
+  SHA-256 `11fec1897d6ec4cb5faa19eb14753db980e7d4ea43d5dcf2383d36581e976f35`)
+  with a global dynamic `NativeBridgeItf` export (version 8).
+* The matching ARM64 guest runtime is extracted from the *same*
+  `CP2A.260605.012` `aosp_arm64` GSI by `tools/prepare-arm64-guest.py`, which
+  verifies SHA-256
+  `8e545e1e1e977c3b43b4e54a3af463f3e7d1c3177b120e772138334e15f48f75`, expands
+  `system.img` without mounting it, and stages 832 files under
+  `system/bin/arm64/` and `system/lib64/arm64/` in the API-37 x86_64 sysroot.
 
-**Fixed: the guest ELF is validated strictly.** Swapping in a hand-built ARM64
-binary produced `unsupported e_shentsize: 0x0 (expected 0x40)` and then
-`invalid e_shstrndx`, i.e. ndk_translation insists on a complete section-header
-table and a real `.shstrtab` even for a static executable.
+A real `art-test --init-bridge arm64` run now reaches:
 
-**Open: the guest runtime's handshake.** `InitializeNativeBridge` calls into the
-bridge's `exec` slot, which starts `/system/bin/arm64/app_process64` on a
-thread. Two outcomes were observed:
+```
+art: LoadNativeBridge(libberberis_arm64.so) = true
+art: PreInitializeNativeBridge(/tmp/pengudroid-bridge, arm64) = true
+pengudroid:log INFO berberis: Initialized Berberis (aarch64)
+pengudroid:log FATAL berberis: native_bridge_initialize:
+  couldn't find "__native_bridge_config_static_tls" symbol in linker
+```
 
-* with the real guest `app_process64`, the process dies in
-  `ndk_translation_HandleNoExec` (guest code translation);
-* with a trivial static ARM64 program that only does `write(2)` + `exit(2)`,
-  there is no crash and no output: every thread ends up blocked on a futex (one
-  on `do_sigtimedwait`, the translator's signal catcher), so the guest is
-  waiting for a handshake it never gets.
+**Open: the guest linker is the stock GSI linker.** Digitalis expects the
+native-bridge product's *modified* ARM64 linker
+(`frameworks/libs/native_bridge_support/android_api/linker`), which exports
+`__native_bridge_config_static_tls` and configures the guest's static TLS. The
+AOSP ARM64 GSI ships the stock `linker64`, which does not. The matching guest
+`libc` is likewise built with the native-bridge support hooks. Building those
+two ARM64 artifacts (and replacing the staged stock copies) is the next concrete
+step; the translator itself no longer has a bring-up blocker in this tree.
 
-So the translator itself initialises and parses guest ELFs, but running a guest
-*Android userspace* — guest bionic init, guest linker namespaces, guest ART for
-the ARM ABI — is the remaining piece, and that is what the emulator's own
-`system.img` boots. Reaching that from a bare `JNI_CreateJavaVM` means
-implementing the second half of an emulator.
-
-**What that means for “make the game open”.** Beach Buggy Racing 2 needs ARM64
-execution *and* `system_server`; a working ARM guest userspace would provide the
-first and would itself need the second. The only configuration known to open
-this game is an Android system image with ARM translation booted as a real
-system (the emulator, or Waydroid-style container). This host does have
-`/dev/kvm`, so that is possible as a *VM/container* — a different architecture
-from PenguDroid's “apps as host processes” premise, and a decision for the
-project owner rather than something to silently switch to.
+**What that means for “make the game open”.** Beach Buggy Racing 2 is ARM64-only.
+The translator now loads and initializes, but without the modified guest
+linker/TLS handshake the guest never starts. This is a build-integration gap,
+not a claim that the game runs. Do not substitute an x86_64 copy, patch the game
+binaries, or silently fall back to a container: none of those are PenguDroid.
 
 **Consequences for real games.**
 

@@ -88,6 +88,92 @@ into `lib/arm64` as the canonical layout (the crate copies APK libraries there),
 but it does not claim the bridge rejects `arm64-v8a` — it does not. A "tighter"
 rule invented on our side would reject libraries the bridge accepts.
 
+## Build result (2026-10-29)
+
+`tools/build-nativebridge.py` now builds the ARM64-to-x86_64 translator on this
+host without a Soong checkout:
+
+```
+python3 -B tools/build-nativebridge.py --towards-bridge --seconds 1800
+# Translator shared built: YES
+```
+
+Measured artifact:
+
+* `.toolchain/nativebridge-build/run-g5xion4t/lib/libberberis_arm64.so`
+* 37,719,928 bytes, SHA-256
+  `11fec1897d6ec4cb5faa19eb14753db980e7d4ea43d5dcf2383d36581e976f35`
+* ELF64 x86_64 shared object with a global dynamic `NativeBridgeItf`
+  (version 8, 168-byte table).
+
+What the driver had to add to get there, all measured against the pinned
+`android17-release` sources:
+
+1. The `libopenjdkjvmti_headers` slice (`art/openjdkjvmti/include`, pinned at
+   `b753cf97923c3695338d21466fa14c57b480a59a`); the header-only module is
+   declared by the driver because upstream `art_defaults` is outside the slice.
+2. `-Wno-vla-cxx-extension` and
+   `-Wno-missing-designated-field-initializers` *after* the module's `-Werror`
+   (both are AOSP global cflags/newer-Clang diagnostics).
+3. A host build for `cc_binary_host` code generators. The host uses the pinned
+   glibc libc++ headers/static libraries, a small `liblog` shim, `-DANDROID`
+   (the Digitalis `logging.h` contract), and a 64 MiB stack. The generated
+   `gen_riscv64_to_x86_64_intrinsics` runs before the ARM64 objects compile.
+4. `sanitize` and `afdo` are inert: this driver never passes `-fsanitize` or
+   `-fprofile-use`. `libz` is allowed to be a static archive with an empty
+   `system_shared_libs`; `liblog` is imported from the verified API-37 GSI
+   instead of being compiled from an incomplete `system/core` slice.
+5. The build needs 6 GiB of virtual address space and up to 300 s per command
+   for `heavy_optimizer/arm64/frontend.cc` (measured 3.75 GiB RSS, 77.5 s).
+
+## ARM64 guest runtime
+
+The translator starts `/system/bin/arm64/app_process64` and needs the guest
+linker, libc and framework libraries under `/system/lib64/arm64`.
+`tools/prepare-arm64-guest.py` extracts the official **same-build**
+`aosp_arm64` GSI (`CP2A.260605.012`, archive SHA-256
+`8e545e1e1e977c3b43b4e54a3af463f3e7d1c3177b120e772138334e15f48f75`) without
+mounting it, verifies the archive, and stages 832 guest files. It also builds
+`libnative_bridge_vdso.so` from the cached `native_bridge_support` source (the
+preparation tool records this input identity honestly as **not pinned**; it
+records source hash, tool identity and arguments rather than enforcing a pin).
+
+A real run now gets through `LoadNativeBridge` and `PreInitializeNativeBridge`
+and into `native_bridge_initialize`, then stops at:
+
+```
+FATAL berberis: native_bridge_initialize:
+  couldn't find "__native_bridge_config_static_tls" symbol in linker
+```
+
+The stock GSI `linker64` is not the native-bridge product's modified linker;
+the latter exports that symbol and configures the guest's static TLS, and the
+guest libc is built with the matching hooks. Building
+`native_bridge_guest_linker` and `libnative_bridge_guest_libc` from
+`frameworks/libs/native_bridge_support` + the matching Bionic tree is the next
+concrete task. Until then no ARM64 app, including BBR2, is claimed to run.
+
+The runtime is deliberately **fail-closed** about this now:
+
+* `tools/prepare-arm64-guest.py` publishes a schema-2 manifest whose
+  `bridge_compatibility.state` is `staged-only`, and refuses to adopt or rewrite
+  the legacy schema-1 stock staging.
+* `pengudroid-cli/src/sysroot.rs` refuses any staging manifest before
+  `JNI_CreateJavaVM`, and checks the source-defined ELF contracts of a
+  manifest-free bundle instead: the guest linker must export
+  `__native_bridge_config_static_tls` and `__native_bridge_get_host_pthread`,
+  the guest libc must import `native_bridge_intercept_symbol`, and the VDSO must
+  export its four hooks. Stock GSI binaries fail these checks by construction.
+* The selected translator is preloaded by exact path and its basename
+  resolution is proven identical (same `NativeBridgeItf` object) before
+  `LoadNativeBridge`, so the state machine and the direct self-test cannot
+  silently drive different libraries.
+* `NativeBridgeGetSignalHandler` yields a **callback** (`bool (*)(int,
+  siginfo_t*, void*)`), not a `struct sigaction`. The shim chains that callback
+  ahead of the previous ART handler and re-raises the default disposition when
+  nothing handles the fault; a missing or failing chain adapter is an error,
+  never a replaced ART handler.
+
 ## Using it
 
 ### Host requirements
@@ -105,10 +191,9 @@ records that as the caller's responsibility so the boundary stays explicit.
 ### Self-test
 
 ```
-PENGUDROID_NATIVE_BRIDGE_LIB=/path/to/prepared \
 PENGUDROID_PROP_ro.dalvik.vm.native.bridge=libberberis_arm64.so \
 ./target/debug/pengudroid art-test --sysroot <api37-tree> \
-    --init-bridge arm64 \
+    --bridge-lib /path/to/prepared --init-bridge arm64 \
     --bridge-selftest /path/lib/arm64/libfixture.so#pengudroid_fixture_answer
 ```
 
@@ -194,17 +279,12 @@ identity, per-file SHA-256, in-tree symlinks, ELF machine/SONAME and required
 defined exports. That gate verifies **link inputs only** — not their transitive
 loader closure, and nothing is executed.
 
-**Still blocked:** no `libberberis_arm64.so` exists. The towards-bridge build
-stops at a real header/default closure that is not guessed or stubbed:
-
-```
-libberberis_arm64 -> libandroid -> libandroid_common
-                  -> android.hardware.power-ndk_shared
-```
-
-Whole-static dependency merging and the native host-codegen generator are also
-unimplemented. **No guest instruction has been translated.** Nothing here
-establishes that Beach Buggy Racing 2 runs.
+**Historical (superseded by "Build result" above):** this section described the
+point before whole-static flattening, verified platform imports and the host
+codegen build landed. The translator shared object now builds; the remaining
+blocker is the guest runtime, not the translator. No guest instruction has been
+translated **on this host** yet. Nothing here establishes that Beach Buggy
+Racing 2 runs.
 
 ## Verified, and not verified
 
@@ -223,13 +303,19 @@ Verified in this checkout, with no Android runtime:
   `x86_64` paths.
 * An API-37 AArch64 guest library cross-builds and links with Bionic versions.
 
-**Not verified:** no real bridge binary exists on this machine, so no guest
-instruction has been translated by PenguDroid. The native-only driver builds
-individual Android variants (above) but does not yet link
-`libberberis_arm64.so`; a full AOSP `m berberis_all` with
-`enable_arm64_to_x86_64.mk` remains the supported upstream route. The sources
-are present, the Android build system is not. Nothing here establishes that
-Beach Buggy Racing 2 runs.
+**Not verified:** the translator binary exists and loads (`LoadNativeBridge =
+true`, `PreInitializeNativeBridge = true`, `Initialized Berberis (aarch64)`),
+but no guest instruction has been translated on this host: initialization stops
+at the missing `__native_bridge_config_static_tls` guest-linker hook described
+above. The full guest-runtime quartet must come from a matching Android-17
+Soong product build (`native_bridge_guest_linker.native_bridge`,
+`libnative_bridge_guest_libc.native_bridge`,
+`native_bridge_guest_app_process.native_bridge`,
+`libnative_bridge_vdso.native_bridge`); the cached Bionic tree is header slices
+only, so extending `tools/build-nativebridge.py` into a Bionic builder is not a
+small change. A full AOSP product build with `enable_arm64_to_x86_64.mk` remains
+the supported upstream route. Nothing here establishes that Beach Buggy Racing
+2 runs.
 
 ## What Beach Buggy Racing 2 needs
 

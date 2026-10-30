@@ -43,6 +43,8 @@ use std::ffi::CStr;
 use std::os::raw::{c_char, c_void};
 use std::sync::Mutex;
 
+use pengudroid_proto::BufferCrop;
+
 use crate::ahardwarebuffer::{GetNativeBuffer, GRAPHIC_BUFFER_GET_NATIVE_BUFFER};
 use crate::audiotrack::{jni_find_class, jni_slot, NativeMethod};
 
@@ -126,17 +128,49 @@ type AcquireBuffer =
 type ReleaseBuffer =
     unsafe extern "C" fn(*mut c_void, *const c_void, *const c_void, *mut UnusedOptional) -> i32;
 
+/// Borrowed LP64 prefix, not an owning Rust representation of the C++ object.
+/// frameworks/native@ae266dcb706d083868578cfedce381ef44488a07
+/// libs/gui/include/gui/BufferItem.h (blob 2f85c62a549388f4c1df38f56a593e42296bd3f2)
+/// orders sp<GraphicBuffer>, sp<Fence>, shared_ptr<FenceTime>, then Rect.
+/// system/core@545d2487e38192a2ce25040897ced877cf6b4f53's StrongPointer.h
+/// has one pointer; Flattenable and Rect's LightFlattenablePod bases are empty.
+/// The pinned platform libc++ __memory/shared_ptr.h has two pointer members.
+/// Rect derives from ARect (four int32s), giving mCrop offset 32 on LP64.
+#[repr(C)]
+struct BufferItemPrefix {
+    graphic_buffer: *mut c_void,
+    _fence: *mut c_void,
+    _fence_time: [usize; 2],
+    crop: BufferCrop,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<usize>() == 8);
+    assert!(std::mem::size_of::<BufferCrop>() == 16);
+    assert!(std::mem::size_of::<BufferItemPrefix>() == 48);
+};
+
+/// `item` must be a live, acquired API-37 BufferItem. Copy metadata only; the
+/// caller still owns the acquired item and must release it after the snapshot.
+unsafe fn buffer_item_metadata(item: *const c_void) -> (*mut c_void, BufferCrop) {
+    let prefix = &*item.cast::<BufferItemPrefix>();
+    (prefix.graphic_buffer, prefix.crop)
+}
+
 /// One disengaged libc++ `optional<std::function<void(const sp<GraphicBuffer>&)>>`.
 ///
-/// `std::function` is three pointers (24 bytes); libc++ stores the engaged flag
-/// at the next byte, so the whole `optional` is 32 bytes with 8-byte alignment.
-/// All-zero therefore means "not engaged".
+/// Measured from the API-37 `libgui.so` `BufferItemConsumer::releaseBuffer`
+/// prologue: `cmpb $0x0, 0x30(%r12)` is the engaged check, so the engaged byte
+/// is at offset 48 and the object is larger than 48 bytes. A previous 32-byte
+/// all-zero block put that read past the end of the Rust object; adjacent stack
+/// bytes were non-zero, the callee treated the optional as engaged and called a
+/// garbage `std::function` vtable (SIGSEGV in `releaseBuffer+0x2e5`).
 #[repr(C, align(8))]
-pub struct UnusedOptional(pub [u64; 4]);
+pub struct UnusedOptional(pub [u64; 8]);
 
 impl UnusedOptional {
     fn empty() -> Self {
-        UnusedOptional([0; 4])
+        UnusedOptional([0; 8])
     }
 }
 type SetDefaultSize = unsafe extern "C" fn(*mut c_void, u32, u32) -> i32;
@@ -734,6 +768,12 @@ fn fourcc_for(format: i32) -> (u32, u32) {
         1 => (0x3432_4241, 4),          // RGBA_8888 -> DRM_FORMAT_ABGR8888
         0x22 => (0x3432_4258, 4),       // RGBX_8888 -> DRM_FORMAT_XBGR8888
         0x16 => (0x4834_4241, 8),       // RGBA_F16 -> DRM_FORMAT_ABGR16161616F
+        // Software decoders write YUV 4:2:0 into this buffer. The stride in
+        // `PresentShm` is a *byte* stride, so these formats must not be scaled
+        // by an RGB bytes-per-pixel value.
+        0x3231_5659 => (0x3231_5659, 1), // YV12 -> DRM_FORMAT_YVU420
+        0x23 => (0x3231_564e, 1),        // YCbCr_420_888 -> NV12
+        0x11 | 0x21 => (0x3231_564e, 1), // NV21 / YCrCb_420_SP
         _ => (0x3432_4241, 4),
     }
 }
@@ -821,7 +861,11 @@ fn consumer_loop(addr: usize) {
                 pid: std::process::id() as i32,
             };
             if c.send_message(&hello, &[]).is_ok() {
-                if let Ok((Message::Welcome { .. }, _)) = c.recv_message() {
+                if let Ok((Message::Welcome { version, .. }, _)) = c.recv_message() {
+                    if version != PROTO_VERSION {
+                        eprintln!("[blast] video: daemon protocol v{version} != v{PROTO_VERSION}; restart matching daemon before presenting crops");
+                        return;
+                    }
                     conn = Some(c);
                     break;
                 }
@@ -862,10 +906,9 @@ fn consumer_loop(addr: usize) {
             std::thread::sleep(std::time::Duration::from_millis(5));
             continue;
         }
-        // android17-release BufferItem.h: mGraphicBuffer is the first member,
-        // Flattenable<BufferItem> is empty, and StrongPointer.h's sp<T> holds a
-        // single T*. No private GraphicBuffer fields are read here.
-        let gb = unsafe { *(item.as_ptr() as *const *mut c_void) };
+        // Crop belongs to this submission, not to the allocation/slot. Copy it
+        // anew after every acquire, even when GraphicBuffer storage is reused.
+        let (gb, crop) = unsafe { buffer_item_metadata(item_ptr) };
 
         if !gb.is_null() {
             let handle = unsafe { crate::ahardwarebuffer::graphicbuffer_handle(gb, gui.get_native_buffer) };
@@ -897,7 +940,7 @@ fn consumer_loop(addr: usize) {
                         // the compositor connection. Snapshot via wl_shm instead.
                         let msg = Message::PresentShm {
                             surface_id, width, height, stride: stride * bpp,
-                            format: format as u32,
+                            format: format as u32, crop,
                         };
                         match conn.send_message(&msg, &[fd]).and_then(|_| conn.recv_message()) {
                             Ok((Message::Ack, _)) => {
@@ -922,7 +965,7 @@ fn consumer_loop(addr: usize) {
                                 if !announced {
                                     announced = true;
                                     eprintln!(
-                                        "[blast] video: first software frame submitted ({width}x{height} format={format})"
+                                        "[blast] video: first software frame submitted ({width}x{height} format={format} crop={crop:?})"
                                     );
                                 } else if trace && presented % 30 == 0 {
                                     eprintln!("[blast] video: {presented} frames");
@@ -985,7 +1028,17 @@ unsafe fn dump_rgb565(
     format: i32,
     index: u64,
 ) {
-    let bpp: usize = if format == 4 { 2 } else { 4 };
+    let bpp: usize = match format {
+        4 => 2,
+        1 | 2 | 5 | 0x22 => 4,
+        // The compositor converts YUV for display; this debug dump writes RGB
+        // PPMs and must not interpret a planar frame as packed pixels.
+        0x3231_5659 | 0x23 | 0x11 | 0x21 => {
+            eprintln!("[blast] video: skipping RGB dump of YUV format {format:#x}");
+            return;
+        }
+        _ => 4,
+    };
     let size = stride as usize * height as usize * bpp;
     let mut raw = vec![0u8; size];
     let dup = libc::dup(fd);
@@ -1287,6 +1340,53 @@ mod tests {
         a.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
         b.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
         (a, b)
+    }
+
+    #[test]
+    fn buffer_item_prefix_matches_the_pinned_lp64_metadata_contract() {
+        use std::mem::{align_of, offset_of, size_of};
+        assert_eq!(offset_of!(BufferItemPrefix, graphic_buffer), 0);
+        assert_eq!(offset_of!(BufferItemPrefix, _fence), 8);
+        assert_eq!(offset_of!(BufferItemPrefix, _fence_time), 16);
+        assert_eq!(offset_of!(BufferItemPrefix, crop), 32);
+        assert_eq!(size_of::<BufferItemPrefix>(), 48);
+        assert_eq!(align_of::<BufferItemPrefix>(), 8);
+        assert_eq!([offset_of!(BufferCrop, left), offset_of!(BufferCrop, top),
+            offset_of!(BufferCrop, right), offset_of!(BufferCrop, bottom)], [0, 4, 8, 12]);
+    }
+
+    #[test]
+    fn acquired_metadata_copies_each_frames_crop_without_caching_or_clamping() {
+        let mut item = BufferItemPrefix {
+            graphic_buffer: 0x1234usize as *mut c_void,
+            _fence: std::ptr::null_mut(), _fence_time: [0; 2],
+            crop: BufferCrop::full(426, 240),
+        };
+        let (gb, crop) = unsafe { buffer_item_metadata((&item as *const BufferItemPrefix).cast()) };
+        assert_eq!(gb, item.graphic_buffer);
+        assert_eq!(crop, BufferCrop::full(426, 240));
+        item.crop = BufferCrop { left: 3, top: 5, right: 129, bottom: 117 };
+        let (next_gb, next_crop) = unsafe { buffer_item_metadata((&item as *const BufferItemPrefix).cast()) };
+        assert_eq!(next_gb, gb);
+        assert_eq!(next_crop, item.crop);
+        assert_ne!(next_crop, crop);
+        item.crop.left = -1;
+        let (_, invalid) = unsafe { buffer_item_metadata((&item as *const BufferItemPrefix).cast()) };
+        assert_eq!(invalid.left, -1, "invalid crops must reach validation, not become full-frame");
+    }
+
+    /// API-37 `libgui` reads the engaged flag of
+    /// `optional<function<void(const sp<GraphicBuffer>&)>>` at byte 0x30. The
+    /// struct must be at least that large, all-zero, and 8-byte aligned.
+    #[test]
+    fn unused_optional_covers_the_api37_engaged_flag() {
+        assert!(std::mem::size_of::<UnusedOptional>() >= 0x31);
+        assert_eq!(std::mem::align_of::<UnusedOptional>(), 8);
+        let empty = UnusedOptional::empty();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(&empty as *const UnusedOptional as *const u8, std::mem::size_of::<UnusedOptional>())
+        };
+        assert!(bytes.iter().all(|&b| b == 0));
     }
 
     #[test]

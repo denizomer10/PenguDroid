@@ -151,6 +151,24 @@ fn android17_main_dispatch_under_checkjni() {
     assert!(!text.contains("JNI DETECTED ERROR"), "{text}");
 }
 
+/// The real generated proxies must preserve typed Intent data and distinct
+/// tokens. Hand-written parcels once omitted both TSYS and the presence word.
+#[test]
+fn android17_activity_requests_under_checkjni() {
+    let Some(sysroot) = optional_android17_sysroot() else { return; };
+    let text = run_framework_probe(&sysroot, "api37-activities", false, false, &[
+        ("PENGUDROID_PROBE_MAIN_THREAD", "1"),
+        ("PENGUDROID_PROBE_ACTIVITY_REQUESTS", "1"),
+    ]);
+    for expected in [
+        "activity: generated API-37 startActivity proxy preserved component, action, URI, flags and extras",
+        "activity: rejected starts return fatal framework results and enqueue nothing",
+        "activity: finishActivity identifies two distinct registered tokens; unknown token rejected",
+        "activity: asynchronous main Handler wakeup dispatched before the idle-queue watchdog",
+    ] { assert!(text.contains(expected), "missing {expected}:\n{text}"); }
+    assert!(!text.contains("JNI DETECTED ERROR"), "{text}");
+}
+
 /// Core API-37 migration gate. BLAST lifecycle has its own gate; neither test
 /// establishes Android-17 app rendering or media compatibility.
 #[test]

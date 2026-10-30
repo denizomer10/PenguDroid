@@ -3441,30 +3441,126 @@ type RealPpoll = unsafe extern "C" fn(
     *const libc::sigset_t,
 ) -> c_int;
 
-/// Install a signal action that a *guest* library built for Bionic handed us.
+/// A native bridge signal callback. `NativeBridgeGetSignalHandler(sig)` returns
+/// this function pointer — never a `struct sigaction` — and the callback returns
+/// `true` when it consumed the fault. Guests need those callbacks installed:
+/// without them the translator cannot resolve the page faults it uses for lazy
+/// code translation, and ART's fault manager ends up handling them instead
+/// (which looks like a silent crash).
+type BridgeSignalHandler = unsafe extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void) -> bool;
+
+const BRIDGE_SIGNAL_SLOTS: usize = 65;
+
+/// Callbacks are published before guest code can fault and are read without
+/// locks from the signal handler itself.
+static BRIDGE_CALLBACKS: [std::sync::atomic::AtomicUsize; BRIDGE_SIGNAL_SLOTS] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; BRIDGE_SIGNAL_SLOTS];
+/// The `libc::sigaction` displaced by ours. It is boxed because a signal may
+/// arrive while an installation is replaced, and deliberately never freed.
+static BRIDGE_PREVIOUS: [std::sync::atomic::AtomicUsize; BRIDGE_SIGNAL_SLOTS] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; BRIDGE_SIGNAL_SLOTS];
+/// `sigaction` resolved once at install time: resolving symbols inside a signal
+/// handler is not async-signal-safe.
+static BRIDGE_REAL_SIGACTION: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Install `callback` for `signum`, chaining to whatever handler ART (or the
+/// application) had installed: the bridge callback runs first and a `false`
+/// result forwards the fault instead of swallowing it.
 ///
-/// `libnativebridge` exports `NativeBridgeGetSignalHandler(sig)`, which returns
-/// the translator's own `struct sigaction` (Bionic layout). Guests need those
-/// handlers installed: without them the translator cannot resolve the page
-/// faults it uses for lazy code translation, and ART's fault manager ends up
-/// handling them instead (which looks like a silent crash).
-///
-/// The action is converted to glibc's layout and installed through the real
-/// `sigaction` (`dlsym(RTLD_NEXT)`), never through our own interposed one.
+/// The action is installed through the real `sigaction` (`dlsym(RTLD_NEXT)`),
+/// never through our own interposed Bionic-layout one. Repeated installation
+/// only replaces the callback; it never forwards our own action to itself.
 #[no_mangle]
 pub unsafe extern "C" fn __pengudroid_install_bridge_handler(
     signum: c_int,
-    act: *const c_void,
+    callback: Option<BridgeSignalHandler>,
 ) -> c_int {
-    if act.is_null() {
+    use std::sync::atomic::Ordering;
+    let Some(callback) = callback else {
+        return -1;
+    };
+    if signum <= 0 || signum as usize >= BRIDGE_SIGNAL_SLOTS {
         return -1;
     }
+    let slot = signum as usize;
     let Some(real) = dlsym_next::<RealSigaction>(b"sigaction\0") else {
         return -1;
     };
-    let bionic = &*(act as *const BionicSigAction);
-    let gact = sigaction_to_glibc(bionic);
-    real(signum, &gact, std::ptr::null_mut())
+    BRIDGE_REAL_SIGACTION.store(real as usize, Ordering::Release);
+    if BRIDGE_PREVIOUS[slot].load(Ordering::Acquire) == 0 {
+        let handler: unsafe extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void) = bridge_chain_handler;
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handler as usize;
+        action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+        libc::sigemptyset(&mut action.sa_mask);
+        let mut previous: libc::sigaction = std::mem::zeroed();
+        if real(signum, &action, &mut previous) != 0 {
+            return -1;
+        }
+        BRIDGE_PREVIOUS[slot].store(Box::into_raw(Box::new(previous)) as usize, Ordering::Release);
+    }
+    BRIDGE_CALLBACKS[slot].store(callback as usize, Ordering::Release);
+    0
+}
+
+unsafe extern "C" fn bridge_chain_handler(
+    signum: c_int,
+    info: *mut libc::siginfo_t,
+    context: *mut c_void,
+) {
+    use std::sync::atomic::Ordering;
+    if signum <= 0 || signum as usize >= BRIDGE_SIGNAL_SLOTS {
+        return;
+    }
+    let slot = signum as usize;
+    let callback = BRIDGE_CALLBACKS[slot].load(Ordering::Acquire);
+    if callback != 0 {
+        let callback: BridgeSignalHandler = std::mem::transmute(callback);
+        if callback(signum, info, context) {
+            return;
+        }
+    }
+    forward_previous_bridge_handler(slot, signum, info, context);
+}
+
+unsafe fn forward_previous_bridge_handler(
+    slot: usize,
+    signum: c_int,
+    info: *mut libc::siginfo_t,
+    context: *mut c_void,
+) {
+    use std::sync::atomic::Ordering;
+    let previous = BRIDGE_PREVIOUS[slot].load(Ordering::Acquire) as *const libc::sigaction;
+    if !previous.is_null() {
+        let action = &*previous;
+        if action.sa_sigaction == libc::SIG_IGN {
+            return;
+        }
+        if action.sa_sigaction != libc::SIG_DFL && action.sa_sigaction != libc::SIG_ERR {
+            if action.sa_flags & libc::SA_SIGINFO != 0 {
+                let handler: unsafe extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void) =
+                    std::mem::transmute(action.sa_sigaction);
+                handler(signum, info, context);
+            } else {
+                let handler: unsafe extern "C" fn(c_int) = std::mem::transmute(action.sa_sigaction);
+                handler(signum);
+            }
+            return;
+        }
+    }
+    // No usable previous handler: restore the default disposition and re-raise,
+    // so the process gets exactly the termination/core semantics it would have
+    // had without this chain.
+    let real = BRIDGE_REAL_SIGACTION.load(Ordering::Acquire);
+    if real != 0 {
+        let real: RealSigaction = std::mem::transmute(real);
+        let mut default: libc::sigaction = std::mem::zeroed();
+        default.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut default.sa_mask);
+        real(signum, &default, std::ptr::null_mut());
+    }
+    libc::raise(signum);
 }
 
 /// `sigemptyset(set)`.

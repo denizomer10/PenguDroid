@@ -16,7 +16,7 @@
 //! and ART ELF header must identify this target; legacy flat layouts are not
 //! accepted. Framework boot jars come from `system/etc/classpaths/bootclasspath.pb`.
 
-use std::ffi::{c_char, c_int, c_void, CString};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -519,6 +519,194 @@ fn de_bionic_dir(src: &Path, dst: &Path) -> Result<usize, String> {
     Ok(written)
 }
 
+const DEFAULT_NATIVE_BRIDGE: &str = "libberberis_arm64.so";
+const GUEST_STAGING_MANIFEST: &str = "pengudroid-arm64-guest.json";
+const GUEST_LINKER_HOOKS: &[&str] = &[
+    "__native_bridge_config_static_tls", "__native_bridge_get_host_pthread",
+];
+const GUEST_VDSO_HOOKS: &[&str] = &[
+    "native_bridge_trace", "native_bridge_intercept_symbol", "native_bridge_post_init",
+    "native_bridge_call_guest",
+];
+
+/// Tool schema 1 contains stock guest binaries; schema 2 is explicitly staged-only.
+/// Neither schema defines an executable/compatible state. Refuse any such marker
+/// (including malformed ones), rather than inventing a JSON-compatible status.
+fn validate_bridge_guest(root: &Path) -> Result<(), String> {
+    let manifest = root.join(GUEST_STAGING_MANIFEST);
+    match std::fs::symlink_metadata(&manifest) {
+        Ok(_) => return Err(format!(
+            "ARM64 guest {} is staged-only (including legacy schema-1 stock staging): \
+             stock GSI linker64/libc are not native-bridge variants. \
+             Staging manifests do not authorize bridge execution; supply a separate \
+             native-bridge guest bundle, not an edited staging manifest", manifest.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("cannot inspect ARM64 guest manifest {}: {error}", manifest.display())),
+    }
+    // These are necessary source-defined contracts, not proof that a bundle can
+    // boot. Manifest-free, manually supplied native-bridge bundles remain usable.
+    guest_elf_contract(&root.join("system/bin/arm64/linker64"), GUEST_LINKER_HOOKS, &[])?;
+    guest_elf_contract(&root.join("system/lib64/arm64/libc.so"), &["__libc_init", "pthread_self"],
+                       &["native_bridge_intercept_symbol"])?;
+    guest_elf_contract(&root.join("system/lib64/arm64/libnative_bridge_vdso.so"), GUEST_VDSO_HOOKS, &[])?;
+    guest_elf_contract(&root.join("system/bin/arm64/app_process64"), &[], &[])?;
+    Ok(())
+}
+
+fn guest_elf_contract(path: &Path, exports: &[&str], imports: &[&str]) -> Result<(), String> {
+    const MAX_GUEST_ELF: u64 = 64 * 1024 * 1024;
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("ARM64 native-bridge guest requires {}: {error}", path.display()))?;
+    let mut data = Vec::new();
+    file.take(MAX_GUEST_ELF + 1).read_to_end(&mut data)
+        .map_err(|error| format!("cannot read ARM64 guest {}: {error}", path.display()))?;
+    if data.len() as u64 > MAX_GUEST_ELF {
+        return Err(format!("ARM64 guest ELF {} exceeds the 64 MiB inspection limit", path.display()));
+    }
+    let elf = pengudroid_elf::parse(&data)
+        .map_err(|error| format!("invalid ARM64 guest ELF {}: {error}", path.display()))?;
+    if elf.class != pengudroid_elf::Class::Elf64 || elf.machine != 183
+        || !matches!(data.get(16..18), Some([2, 0] | [3, 0]))
+    {
+        return Err(format!("ARM64 native-bridge guest {} must be an ELF64 AArch64 executable/library", path.display()));
+    }
+    for (kind, required, symbols) in [("export", exports, &elf.exports), ("import", imports, &elf.imports)] {
+        for symbol in required {
+            if !symbols.iter().any(|name| name == symbol) {
+                return Err(format!(
+                    "ARM64 native-bridge guest {} is missing required dynamic {kind} {symbol}; \
+                     stock GSI linker/libc are not native-bridge variants", path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BridgeLibrary {
+    path: PathBuf,
+    name: String,
+}
+
+/// An explicit file is authoritative; a directory must contain the requested
+/// library. Without a source, leave soname lookup to the dynamic loader.
+fn select_bridge_library(name: &str, source: Option<&Path>) -> Result<BridgeLibrary, String> {
+    let (dir, name) = match source {
+        Some(source) if source.is_file() => {
+            let name = source.file_name().and_then(|name| name.to_str())
+                .ok_or_else(|| format!("invalid native bridge filename: {}", source.display()))?;
+            let dir = source.parent().filter(|dir| !dir.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            (Some(dir), name)
+        }
+        Some(source) if source.is_dir() => (Some(source), name),
+        Some(source) => return Err(format!(
+            "native bridge source {} is not a file or directory", source.display()
+        )),
+        None => (None, name),
+    };
+    // The cached API-37 LoadNativeBridge checks an ASCII letter first, then
+    // letters/digits/._-. In particular it rejects slash-containing paths.
+    if !name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        || !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        || Path::new(name).file_name().and_then(|name| name.to_str()) != Some(name)
+        || Path::new(name).components().count() != 1
+    {
+        return Err(format!(
+            "invalid native bridge library name {name:?}; expected a filename, \
+             or use --bridge-lib for an explicit file"
+        ));
+    }
+    let path = dir.map(|dir| dir.join(name)).unwrap_or_else(|| PathBuf::from(name));
+    if source.is_some() && !path.is_file() {
+        return Err(format!("requested native bridge translator {} is not a file", path.display()));
+    }
+    Ok(BridgeLibrary { path, name: name.to_string() })
+}
+
+struct PreloadedBridge {
+    // The VM/guest threads retain bridge pointers for the process lifetime.
+    // Keep both loader references, even when the owning Rust frame returns.
+    handle: *mut c_void,
+    name_handle: *mut c_void,
+    translator: std::cell::RefCell<Translator>,
+}
+
+fn verify_bridge_handles(selected: *mut c_void, by_name: *mut c_void) -> Result<(), String> {
+    if selected.is_null() || by_name.is_null() || selected != by_name {
+        return Err("native bridge basename does not resolve to the explicitly preloaded translator; \
+                    refusing LoadNativeBridge and a mismatched direct self-test".into());
+    }
+    Ok(())
+}
+
+fn preload_bridge_library(library: &BridgeLibrary, explicit: bool) -> Result<PreloadedBridge, String> {
+    use std::os::unix::fs::MetadataExt;
+    let path = if explicit {
+        std::fs::canonicalize(&library.path)
+            .map_err(|error| format!("cannot resolve native bridge {}: {error}", library.path.display()))?
+    } else {
+        library.path.clone()
+    };
+    let selected = if explicit {
+        Some(std::fs::metadata(&path).map_err(|error| format!("cannot inspect {}: {error}", path.display()))?)
+    } else { None };
+    let cpath = CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| "native bridge path contains a NUL byte".to_string())?;
+    let cname = CString::new(library.name.as_str())
+        .map_err(|_| "native bridge name contains a NUL byte".to_string())?;
+    let handle = unsafe { libc::dlopen(cpath.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+    if handle.is_null() {
+        return Err(format!("dlopen selected translator {} failed: {}", path.display(), dlerror()));
+    }
+    let symbol = unsafe { libc::dlsym(handle, c"NativeBridgeItf".as_ptr()) };
+    let mut origin: libc::Dl_info = unsafe { std::mem::zeroed() };
+    if symbol.is_null() || unsafe { libc::dladdr(symbol, &mut origin) } == 0 || origin.dli_fname.is_null() {
+        return Err(format!("selected translator {} has no attributable NativeBridgeItf", path.display()));
+    }
+    if let Some(selected) = selected {
+        use std::os::unix::ffi::OsStrExt;
+        let loaded_path = Path::new(std::ffi::OsStr::from_bytes(unsafe { CStr::from_ptr(origin.dli_fname) }.to_bytes()));
+        let loaded = std::fs::metadata(loaded_path)
+            .map_err(|error| format!("cannot identify loaded translator {}: {error}", loaded_path.display()))?;
+        if (selected.dev(), selected.ino()) != (loaded.dev(), loaded.ino()) {
+            return Err(format!("NativeBridgeItf came from {}, not selected translator {}", loaded_path.display(), path.display()));
+        }
+    }
+    // NOLOAD must find this already-loaded object under the slash-free name
+    // that AOSP will use. Never load an alternative candidate to satisfy it.
+    let name_handle = unsafe { libc::dlopen(cname.as_ptr(), libc::RTLD_NOW | libc::RTLD_NOLOAD) };
+    verify_bridge_handles(handle, name_handle)?;
+    if unsafe { libc::dlsym(name_handle, c"NativeBridgeItf".as_ptr()) } != symbol {
+        return Err("native bridge basename resolves a different NativeBridgeItf".into());
+    }
+    // Retain the validated table now. Self-tests must not reopen a later path.
+    let translator = Translator::open(Path::new(&library.name)).map_err(|error| error.to_string())?;
+    Ok(PreloadedBridge { handle, name_handle, translator: std::cell::RefCell::new(translator) })
+}
+
+fn requested_bridge_isa(init: Option<&str>, selftest: Option<&str>) -> Result<Option<&'static str>, String> {
+    if let Some(isa) = init {
+        if isa != pengudroid_nativebridge::ARM64_ISA {
+            return Err(format!(
+                "unsupported native bridge ISA {isa:?}; expected arm64 for Android 17 / API 37 x86_64"
+            ));
+        }
+    }
+    if let Some(spec) = selftest {
+        if !matches!(spec.split_once('#'), Some((lib, symbol)) if !lib.is_empty() && !symbol.is_empty()) {
+            return Err("--bridge-selftest expects <lib>#<symbol> with both parts nonempty".into());
+        }
+    }
+    Ok((init.is_some() || selftest.is_some()).then_some(pengudroid_nativebridge::ARM64_ISA))
+}
+
+fn require_bridge_success(operation: &str, success: bool) -> Result<(), String> {
+    if success { Ok(()) } else { Err(format!("native bridge {operation} failed")) }
+}
+
 /// `pengudroid art-test --sysroot <dir>`
 pub fn art_test(args: &[String]) -> i32 {
     let mut root: Option<PathBuf> = None;
@@ -531,8 +719,20 @@ pub fn art_test(args: &[String]) -> i32 {
             "--sysroot" => {
                 root = it.next().map(PathBuf::from);
             }
-            "--native-bridge" => native_bridge = it.next().cloned(),
-            "--bridge-lib" => bridge_lib = it.next().cloned(),
+            "--native-bridge" => {
+                let Some(name) = it.next() else {
+                    eprintln!("pengudroid: --native-bridge requires a library name");
+                    return 2;
+                };
+                native_bridge = Some(name.clone());
+            }
+            "--bridge-lib" => {
+                let Some(source) = it.next() else {
+                    eprintln!("pengudroid: --bridge-lib requires a file or directory");
+                    return 2;
+                };
+                bridge_lib = Some(source.clone());
+            }
             other if other.starts_with('-') => {
                 passthrough.push(other.to_string());
                 // Options that take a value: keep the next token with them.
@@ -655,13 +855,35 @@ pub fn art_test(args: &[String]) -> i32 {
         // Stripping the versions makes those references resolve by name
         // against the shim or glibc itself.
         let prepared = work.join("bridge-libs");
-        match de_bionic_dir(Path::new(dir), &prepared) {
+        let name = native_bridge.clone()
+            .or_else(|| std::env::var("PENGUDROID_PROP_ro.dalvik.vm.native.bridge").ok())
+            .unwrap_or_else(|| DEFAULT_NATIVE_BRIDGE.to_string());
+        let source = match select_bridge_library(&name, Some(Path::new(dir))) {
+            Ok(source) => source,
+            Err(error) => {
+                eprintln!("pengudroid: {error}");
+                return 1;
+            }
+        };
+        // Prepare the translator's directory so its sibling dependencies are
+        // available too, but never substitute another translator on failure.
+        let bridge_dir = source.path.parent().unwrap_or_else(|| Path::new("."));
+        match de_bionic_dir(bridge_dir, &prepared) {
             Ok(n) => println!("art: prepared {n} bridge libraries in {}", prepared.display()),
             Err(e) => {
                 eprintln!("pengudroid: {e}");
                 return 1;
             }
         }
+        let prepared_bridge = match select_bridge_library(&source.name, Some(&prepared)) {
+            Ok(bridge) => bridge,
+            Err(error) => {
+                eprintln!("pengudroid: prepared translator is unavailable: {error}");
+                return 1;
+            }
+        };
+        cmd.env("PENGUDROID_BRIDGE_LIB_PATH", &prepared_bridge.path);
+        native_bridge = Some(prepared_bridge.name);
         ld_path = format!("{}:{ld_path}", prepared.display());
     }
     // `libpengudroid_gleshim.so` implements Bionic's `libEGL`/`libGLESv2` on the
@@ -799,8 +1021,20 @@ pub fn art_main(args: &[String]) -> i32 {
                     }
                 }
             }
-            "--init-bridge" => init_bridge = it.next().cloned(),
-            "--bridge-selftest" => bridge_selftest = it.next().cloned(),
+            "--init-bridge" => {
+                let Some(isa) = it.next() else {
+                    eprintln!("art: --init-bridge requires the arm64 ISA");
+                    return 2;
+                };
+                init_bridge = Some(isa.clone());
+            }
+            "--bridge-selftest" => {
+                let Some(spec) = it.next() else {
+                    eprintln!("art: --bridge-selftest expects <lib>#<symbol>");
+                    return 2;
+                };
+                bridge_selftest = Some(spec.clone());
+            }
             "--bind-app" => bind_app = true,
             "--dump-class" => dump_class = it.next().cloned(),
             "--java-props" => java_props = true,
@@ -828,6 +1062,13 @@ pub fn art_main(args: &[String]) -> i32 {
             _ => {}
         }
     }
+    let bridge_isa = match requested_bridge_isa(init_bridge.as_deref(), bridge_selftest.as_deref()) {
+        Ok(isa) => isa,
+        Err(error) => {
+            eprintln!("art: {error}");
+            return 2;
+        }
+    };
     let Some(root) = root else {
         eprintln!("art: --sysroot is required");
         return 2;
@@ -839,6 +1080,12 @@ pub fn art_main(args: &[String]) -> i32 {
             return 1;
         }
     };
+    if bridge_isa.is_some() {
+        if let Err(error) = validate_bridge_guest(&layout.root) {
+            diag(&format!("art: {error}"));
+            return 1;
+        }
+    }
     let lib = libs
         .as_ref()
         .map(|d| d.join("libart.so"))
@@ -903,12 +1150,21 @@ pub fn art_main(args: &[String]) -> i32 {
         ignore_unrecognized: 1,
     };
 
-    let bridge_setup = if let Some(isa) = init_bridge.as_deref().or(bridge_selftest.as_deref().map(|_| "arm64")) {
+    let bridge_setup = if let Some(isa) = bridge_isa {
         let data_dir = std::env::var_os("PENGUDROID_BRIDGE_DATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir().join("pengudroid-bridge"));
-        let _ = std::fs::create_dir_all(&data_dir);
-        setup_native_bridge(libs.as_deref(), &data_dir, isa)
+        if let Err(error) = std::fs::create_dir_all(&data_dir) {
+            diag(&format!("art: cannot create bridge data directory {}: {error}", data_dir.display()));
+            return 1;
+        }
+        match setup_native_bridge(libs.as_deref(), &data_dir, isa) {
+            Ok(setup) => Some(setup),
+            Err(error) => {
+                diag(&format!("art: {error}"));
+                return 1;
+            }
+        }
     } else {
         None
     };
@@ -934,6 +1190,19 @@ pub fn art_main(args: &[String]) -> i32 {
             println!("art: JNIEnv::GetVersion() = 0x{version:08x}");
             if std::env::var_os("PENGUDROID_DUMP_JNI").is_some() {
                 dump_jni_table(&env);
+            }
+            // A requested bridge must be ready before JNI_OnLoad or any app
+            // work can run. Direct self-tests still perform the guest bootstrap.
+            if let Some(setup) = &bridge_setup {
+                let result = if let Some(spec) = bridge_selftest.as_deref() {
+                    require_bridge_success("selftest", run_bridge_selftest(setup, &env, spec))
+                } else {
+                    finish_native_bridge(setup, &env)
+                };
+                if let Err(error) = result {
+                    diag(&format!("art: {error}"));
+                    return 1;
+                }
             }
             for lib in &jni_libs {
                 if load_jni_library(&env, vm, lib) != 0 {
@@ -968,22 +1237,6 @@ pub fn art_main(args: &[String]) -> i32 {
                 if rc != 0 {
                     eprintln!("audio: API-37 audio adapter installation failed ({rc})");
                     return 1;
-                }
-            }
-            if let Some(setup) = &bridge_setup {
-                if let Some(spec) = bridge_selftest.as_deref() {
-                    // Direct Itf driving. Note this translator's initializer
-                    // itself starts a guest app_process on a thread (measured:
-                    // `GuestLoader::StartAppProcessInNewThread` inside the
-                    // initializer), so "direct" here does not mean "no guest
-                    // bootstrap" — it means we drive the Itf table instead of
-                    // libnativebridge's state machine.
-                    if !run_bridge_selftest(setup, &env, spec) {
-                        eprintln!("art: bridge selftest failed");
-                        return 1;
-                    }
-                } else {
-                    finish_native_bridge(setup, &env);
                 }
             }
             if version != crate::jni::JNI_VERSION_1_6 {
@@ -1091,6 +1344,11 @@ pub fn art_main(args: &[String]) -> i32 {
             if std::env::var_os("PENGUDROID_PROBE_PROCESS_IDENTITY").is_some()
                 && !crate::process_identity::probe(&env) {
                 eprintln!("apphost: process-identity probe failed");
+                return 1;
+            }
+            if std::env::var_os("PENGUDROID_PROBE_ACTIVITY_REQUESTS").is_some()
+                && !crate::apphost::probe_activity_requests(&env) {
+                eprintln!("apphost: activity-request probe failed");
                 return 1;
             }
             if std::env::var_os("PENGUDROID_PROBE_MAIN_DISPATCH").is_some()
@@ -1219,9 +1477,8 @@ unsafe extern "C" fn bridge_get_native_methods(
 /// The native bridge, loaded but not yet handed the VM.
 struct BridgeSetup {
     handle: *mut c_void,
-    /// Where the translator itself was loaded from, for the direct self-test.
-    /// The `NativeBridgeItf` table is parsed by `pengudroid-nativebridge`.
-    translator_path: PathBuf,
+    /// Exact preloaded object and retained table, shared with the direct self-test.
+    translator: PreloadedBridge,
     initialize: unsafe extern "C" fn(*mut c_void, *const c_char) -> bool,
     isa: String,
 }
@@ -1231,50 +1488,50 @@ struct BridgeSetup {
 /// `app_process` does `LoadNativeBridge` and `PreInitializeNativeBridge` before
 /// `JNI_CreateJavaVM`, and `InitializeNativeBridge` afterwards; the order is
 /// load-bearing because each step asserts the previous one happened.
-fn setup_native_bridge(libs: Option<&Path>, data_dir: &Path, isa: &str) -> Option<BridgeSetup> {
-    let dir = libs.map(|d| d.display().to_string()).unwrap_or_default();
-    let path = if dir.is_empty() {
-        "libnativebridge.so".to_string()
-    } else {
-        format!("{dir}/libnativebridge.so")
-    };
-    let cpath = CString::new(path.as_str()).ok()?;
+fn setup_native_bridge(libs: Option<&Path>, data_dir: &Path, isa: &str) -> Result<BridgeSetup, String> {
+    requested_bridge_isa(Some(isa), None)?;
+    let name = std::env::var("PENGUDROID_PROP_ro.dalvik.vm.native.bridge")
+        .unwrap_or_else(|_| DEFAULT_NATIVE_BRIDGE.to_string());
+    let explicit = std::env::var_os("PENGUDROID_BRIDGE_LIB_PATH").map(PathBuf::from);
+    let translator = select_bridge_library(&name, explicit.as_deref())?;
+    let cname = CString::new(translator.name.as_str())
+        .map_err(|_| "native bridge library name contains a NUL byte".to_string())?;
+
+    let cdata = CString::new(data_dir.as_os_str().as_encoded_bytes())
+        .map_err(|_| format!("bridge data directory {} contains a NUL byte", data_dir.display()))?;
+    let cisa = CString::new(isa).map_err(|_| "native bridge ISA contains a NUL byte".to_string())?;
+    let path = libs.map(|dir| dir.join("libnativebridge.so"))
+        .unwrap_or_else(|| PathBuf::from("libnativebridge.so"));
+    let cpath = CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| format!("native bridge loader path {} contains a NUL byte", path.display()))?;
     let handle = unsafe { libc::dlopen(cpath.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
     if handle.is_null() {
-        diag(&format!("art: dlopen {path} failed: {}", dlerror()));
-        return None;
+        return Err(format!("dlopen {} failed: {}", path.display(), dlerror()));
     }
     let load = unsafe { libc::dlsym(handle, c"LoadNativeBridge".as_ptr()) };
     let pre = unsafe { libc::dlsym(handle, c"PreInitializeNativeBridge".as_ptr()) };
     let init = unsafe { libc::dlsym(handle, c"InitializeNativeBridge".as_ptr()) };
-    if load.is_null() || pre.is_null() || init.is_null() {
-        diag("art: libnativebridge is missing part of the state machine");
-        return None;
+    for (name, symbol) in [("LoadNativeBridge", load), ("PreInitializeNativeBridge", pre), ("InitializeNativeBridge", init)] {
+        if symbol.is_null() {
+            return Err(format!("{} does not export {name}", path.display()));
+        }
     }
-
-    let name = std::env::var("PENGUDROID_PROP_ro.dalvik.vm.native.bridge")
-        .unwrap_or_else(|_| "libberberis_arm64.so".to_string());
-    let cname = CString::new(name.as_str()).ok()?;
+    let preloaded = preload_bridge_library(&translator, explicit.is_some())?;
+    verify_bridge_handles(preloaded.handle, preloaded.name_handle)?;
     type Load = unsafe extern "C" fn(*const c_char, *const RuntimeCallbacks) -> bool;
     let f: Load = unsafe { std::mem::transmute(load) };
     let loaded = unsafe { f(cname.as_ptr(), &BRIDGE_CALLBACKS) };
-    diag(&format!("art: LoadNativeBridge({name}) = {loaded}"));
-    if !loaded {
-        return None;
-    }
+    diag(&format!("art: LoadNativeBridge({}) = {loaded}", translator.name));
+    require_bridge_success(&format!("LoadNativeBridge({})", translator.name), loaded)?;
 
     type PreInit = unsafe extern "C" fn(*const c_char, *const c_char) -> bool;
-    let cdata = CString::new(data_dir.display().to_string()).ok()?;
-    let cisa = CString::new(isa).ok()?;
     let f: PreInit = unsafe { std::mem::transmute(pre) };
     let pre_ok = unsafe { f(cdata.as_ptr(), cisa.as_ptr()) };
     diag(&format!(
         "art: PreInitializeNativeBridge({}, {isa}) = {pre_ok}",
         data_dir.display()
     ));
-    if !pre_ok {
-        return None;
-    }
+    require_bridge_success("PreInitializeNativeBridge", pre_ok)?;
 
     // ART needs a 1 GiB region space immediately after this point. Report the
     // limits and probe the allocation, because a bridge that changed either is
@@ -1305,35 +1562,19 @@ fn setup_native_bridge(libs: Option<&Path>, data_dir: &Path, isa: &str) -> Optio
         diag(&format!("art: {probe_len} byte probe mmap ok at {probe:p}"));
         unsafe { libc::munmap(probe, probe_len) };
     }
-    // Load the translator a second time through our own handle: the self-test
-    // drives its table directly, without libnativebridge's state machine
-    // (which would start a guest app_process).
-    let translator_path = match libs {
-        Some(dir) => dir.join(&name),
-        None => PathBuf::from(&name),
-    };
-    let ctranslator = CString::new(translator_path.as_os_str().as_encoded_bytes())
-        .unwrap_or_else(|_| cname.clone());
-    let translator = unsafe { libc::dlopen(ctranslator.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
-    if translator.is_null() {
-        diag(&format!("art: dlopen({name}) failed: {}", dlerror()));
-        return None;
-    }
-
-    Some(BridgeSetup {
+    Ok(BridgeSetup {
         handle,
-        translator_path,
+        translator: preloaded,
         initialize: unsafe { std::mem::transmute(init) },
         isa: isa.to_string(),
     })
 }
 
-/// Alternative call shapes for the translator's initialiser.
 /// Drive the translator's `NativeBridgeItf` table directly.
 ///
-/// libnativebridge's state machine calls `Itf.initialize` *and* something that
-/// starts `/system/bin/arm64/app_process64` on a thread. For running an ARM
-/// library inside our own (x86_64) ART we only need the first half:
+/// This bypasses libnativebridge's state machine, not the guest bootstrap:
+/// Digitalis initialization still requires its modified ARM64 linker, libc,
+/// and `/system/bin/arm64/app_process64`.
 ///
 /// ```text
 /// NativeBridgeItf.initialize(runtime_cbs, private_dir, "arm64")
@@ -1353,13 +1594,7 @@ fn run_bridge_selftest(setup: &BridgeSetup, env: &crate::jni::JniEnv, spec: &str
             return false;
         }
     };
-    let mut translator = match Translator::open(&setup.translator_path) {
-        Ok(translator) => translator,
-        Err(error) => {
-            diag(&format!("art: {error}"));
-            return false;
-        }
-    };
+    let mut translator = setup.translator.translator.borrow_mut();
     diag(&format!(
         "art: NativeBridgeItf.version = {} ({})",
         translator.version(),
@@ -1369,7 +1604,10 @@ fn run_bridge_selftest(setup: &BridgeSetup, env: &crate::jni::JniEnv, spec: &str
     let data_dir = std::env::var_os("PENGUDROID_BRIDGE_DATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("pengudroid-bridge"));
-    let _ = std::fs::create_dir_all(&data_dir);
+    if let Err(error) = std::fs::create_dir_all(&data_dir) {
+        diag(&format!("art: cannot create bridge data directory {}: {error}", data_dir.display()));
+        return false;
+    }
     if let Err(error) = translator.initialize(&BRIDGE_CALLBACKS, &data_dir, &setup.isa) {
         diag(&format!("art: {error}"));
         return false;
@@ -1416,68 +1654,63 @@ fn run_bridge_selftest(setup: &BridgeSetup, env: &crate::jni::JniEnv, spec: &str
     true
 }
 
-/// Re-install the translator's signal handlers over ART's.
-///
-/// Both runtimes live in this one process. The bridge installs its handlers in
-/// `Itf.initialize` (during `LoadNativeBridge`, before the VM), then ART's
-/// `FaultManager::Init` replaces them with its crash dumper while the VM comes
-/// up. Guest code needs the bridge's handlers to resolve the lazy-translation
-/// page faults, so they are put back once the VM exists.
-fn install_bridge_handlers(handle: *mut c_void) {
-    let get = unsafe { libc::dlsym(handle, c"NativeBridgeGetSignalHandler".as_ptr()) };
-    if get.is_null() {
-        diag("art: libnativebridge has no NativeBridgeGetSignalHandler");
-        return;
-    }
-    type GetHandler = unsafe extern "C" fn(c_int) -> *const c_void;
-    let f: GetHandler = unsafe { std::mem::transmute(get) };
-    let install = unsafe {
-        libc::dlsym(
-            libc::RTLD_DEFAULT,
-            c"__pengudroid_install_bridge_handler".as_ptr(),
-        )
-    };
-    if install.is_null() {
-        diag("art: shim does not export __pengudroid_install_bridge_handler");
-        return;
-    }
-    type Install = unsafe extern "C" fn(c_int, *const c_void) -> c_int;
-    let g: Install = unsafe { std::mem::transmute(install) };
-    for sig in [4, 7, 8, 11] {
-        let act = unsafe { f(sig) };
-        if act.is_null() {
-            diag(&format!("art: bridge has no handler for signal {sig}"));
+type BridgeSignalHandler = unsafe extern "C" fn(c_int, *mut libc::siginfo_t, *mut c_void) -> bool;
+type GetBridgeSignalHandler = unsafe extern "C" fn(c_int) -> Option<BridgeSignalHandler>;
+type InstallBridgeSignalHandler = unsafe extern "C" fn(c_int, Option<BridgeSignalHandler>) -> c_int;
+
+/// NativeBridgeGetSignalHandler returns a bool callback, never a sigaction.
+/// Null means the bridge does not request chaining for that signal.
+fn chain_bridge_handlers(get: GetBridgeSignalHandler, install: Option<InstallBridgeSignalHandler>) -> Result<(), String> {
+    for sig in [libc::SIGILL, libc::SIGBUS, libc::SIGFPE, libc::SIGSEGV] {
+        let callback = unsafe { get(sig) };
+        if callback.is_none() {
             continue;
         }
-        let rc = unsafe { g(sig, act) };
-        diag(&format!("art: installed bridge handler for signal {sig} (rc={rc})"));
+        let install = install.ok_or("native bridge requires signal chaining, but the shim has no safe chaining adapter")?;
+        let rc = unsafe { install(sig, callback) };
+        if rc != 0 {
+            return Err(format!("native bridge cannot safely chain signal {sig} (adapter rc={rc}); ART handlers were not replaced"));
+        }
     }
+    Ok(())
+}
+
+fn install_bridge_handlers(handle: *mut c_void) -> Result<(), String> {
+    let get = unsafe { libc::dlsym(handle, c"NativeBridgeGetSignalHandler".as_ptr()) };
+    if get.is_null() {
+        return Err("libnativebridge has no NativeBridgeGetSignalHandler; cannot validate signal chaining".into());
+    }
+    let install = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"__pengudroid_install_bridge_handler".as_ptr()) };
+    let install = if install.is_null() { None } else {
+        Some(unsafe { std::mem::transmute::<*mut c_void, InstallBridgeSignalHandler>(install) })
+    };
+    chain_bridge_handlers(unsafe { std::mem::transmute::<*mut c_void, GetBridgeSignalHandler>(get) }, install)
 }
 
 /// Step 3: hand the live VM to the bridge.
-fn finish_native_bridge(setup: &BridgeSetup, env: &crate::jni::JniEnv) {
-    let Ok(cisa) = CString::new(setup.isa.as_str()) else {
-        return;
-    };
+fn finish_native_bridge(setup: &BridgeSetup, env: &crate::jni::JniEnv) -> Result<(), String> {
+    let cisa = CString::new(setup.isa.as_str())
+        .map_err(|_| "native bridge ISA contains a NUL byte".to_string())?;
     let ok = unsafe { (setup.initialize)(env.0, cisa.as_ptr()) };
     diag(&format!("art: InitializeNativeBridge({}) = {ok}", setup.isa));
+    require_bridge_success("InitializeNativeBridge", ok)?;
 
-    // ART's FaultManager::Init() installed its own SIGSEGV/SIGBUS/SIGILL/SIGFPE
-    // actions while the VM came up, silently replacing the translator's. Both
-    // runtimes live in this one process, so the guest's lazy-translation faults
-    // would land in ART's crash dumper. Re-install the bridge's handlers now
-    // that the VM is up (on a device, sigchain does the equivalent).
-    install_bridge_handlers(setup.handle);
+    // Preserve ART's chain; non-null native-bridge callbacks need a real chain
+    // API, not a replacement kernel sigaction.
+    install_bridge_handlers(setup.handle)?;
     let available = unsafe { libc::dlsym(setup.handle, c"NativeBridgeAvailable".as_ptr()) };
     if !available.is_null() {
         let g: unsafe extern "C" fn() -> bool = unsafe { std::mem::transmute(available) };
-        diag(&format!("art: NativeBridgeAvailable() = {}", unsafe { g() }));
+        let ok = unsafe { g() };
+        diag(&format!("art: NativeBridgeAvailable() = {ok}"));
+        require_bridge_success("NativeBridgeAvailable", ok)?;
     }
     let version = unsafe { libc::dlsym(setup.handle, c"NativeBridgeGetVersion".as_ptr()) };
     if !version.is_null() {
         let g: unsafe extern "C" fn() -> u32 = unsafe { std::mem::transmute(version) };
         diag(&format!("art: NativeBridgeGetVersion() = {}", unsafe { g() }));
     }
+    Ok(())
 }
 
 /// Append a diagnostic line to `$PENGUDROID_ART_DIAG` (and stderr).
@@ -1924,6 +2157,11 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) -> bool 
         min_sdk: info.min_sdk.map(|v| v as i32).unwrap_or(23),
         app_class: info.application_class.as_deref(),
         providers: &usable_providers,
+        // A hosted `startActivity` builds the target `ActivityInfo` from the
+        // manifest entry, so every activity is available to the host, not just
+        // the initial one.
+        activities: &info.activities,
+        application_theme: info.application_theme,
         // `ActivityInfo.theme` decides whether AppCompat accepts the activity:
         // with no theme the framework falls back to the platform default and
         // `setContentView` throws "You need to use a Theme.AppCompat theme".
@@ -2166,6 +2404,108 @@ mod tests {
     }
 
     #[test]
+    fn bridge_directory_selects_the_requested_translator_not_the_directory_name() {
+        let fixture = Fixture::empty();
+        fixture.write("bridge-libs/libcustom_arm64.so", b"translator");
+        fixture.write("bridge-libs/libberberis_arm64.so", b"not requested");
+        let source = select_bridge_library("libcustom_arm64.so", Some(&fixture.0.join("bridge-libs"))).unwrap();
+        assert_eq!(source.path, fixture.0.join("bridge-libs/libcustom_arm64.so"));
+        assert_eq!(source.name, "libcustom_arm64.so");
+
+        fixture.write("prepared/libcustom_arm64.so", b"prepared translator");
+        let prepared = select_bridge_library(&source.name, Some(&fixture.0.join("prepared"))).unwrap();
+        assert_eq!(prepared.path, fixture.0.join("prepared/libcustom_arm64.so"));
+        assert_eq!(prepared.name, source.name);
+    }
+
+    #[test]
+    fn explicit_bridge_file_is_used_consistently_instead_of_the_default_or_requested_name() {
+        let fixture = Fixture::empty();
+        fixture.write("source/libexplicit.so", b"translator");
+        for name in [DEFAULT_NATIVE_BRIDGE, "libcustom_arm64.so"] {
+            let source = select_bridge_library(name, Some(&fixture.0.join("source/libexplicit.so"))).unwrap();
+            assert_eq!(source.path, fixture.0.join("source/libexplicit.so"));
+            assert_eq!(source.name, "libexplicit.so");
+            fixture.write("prepared/libexplicit.so", b"prepared translator");
+            let prepared = select_bridge_library(&source.name, Some(&fixture.0.join("prepared"))).unwrap();
+            assert_eq!(prepared.path, fixture.0.join("prepared/libexplicit.so"));
+            assert_eq!(prepared.name, source.name);
+        }
+    }
+
+    #[test]
+    fn bridge_soname_lookup_does_not_guess_an_art_library_path() {
+        let selected = select_bridge_library("libcustom_arm64.so", None).unwrap();
+        assert_eq!(selected.path, Path::new("libcustom_arm64.so"));
+        assert_eq!(selected.name, "libcustom_arm64.so");
+    }
+
+    #[test]
+    fn missing_requested_or_prepared_bridge_never_falls_back() {
+        let fixture = Fixture::empty();
+        fixture.write("source/libberberis_arm64.so", b"not requested");
+        fixture.write("source/libnb.so", b"legacy translator");
+        let error = select_bridge_library("libmissing.so", Some(&fixture.0.join("source"))).unwrap_err();
+        assert!(error.contains("source/libmissing.so") && error.contains("not a file"), "{error}");
+
+        fixture.write("prepared/libnb.so", b"legacy translator");
+        let error = select_bridge_library(DEFAULT_NATIVE_BRIDGE, Some(&fixture.0.join("prepared"))).unwrap_err();
+        assert!(error.contains("prepared/libberberis_arm64.so"), "{error}");
+        let error = select_bridge_library(DEFAULT_NATIVE_BRIDGE, Some(&fixture.0.join("missing.so"))).unwrap_err();
+        assert!(error.contains("missing.so") && error.contains("not a file or directory"), "{error}");
+
+        std::fs::create_dir(fixture.0.join("source/libdirectory.so")).unwrap();
+        let error = select_bridge_library("libdirectory.so", Some(&fixture.0.join("source"))).unwrap_err();
+        assert!(error.contains("libdirectory.so") && error.contains("not a file"), "{error}");
+    }
+
+    #[test]
+    fn bridge_names_cannot_escape_the_prepared_directory_or_be_empty() {
+        let fixture = Fixture::empty();
+        for name in ["", ".", "..", "../libbridge.so", "/libbridge.so", "nested/libbridge.so", "libbridge.so/", "lib\0bridge.so"] {
+            for source in [None, Some(fixture.0.as_path())] {
+                let error = select_bridge_library(name, source).unwrap_err();
+                assert!(error.contains("invalid native bridge library name"), "{name:?}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn unrequested_bridge_remains_disabled_for_x86_64_apps() {
+        assert_eq!(requested_bridge_isa(None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn bridge_requests_accept_only_arm64_and_selftest_implies_arm64() {
+        assert_eq!(requested_bridge_isa(Some("arm64"), None).unwrap(), Some("arm64"));
+        assert_eq!(requested_bridge_isa(None, Some("/lib/arm64/fixture.so#answer")).unwrap(), Some("arm64"));
+        assert_eq!(requested_bridge_isa(Some("arm64"), Some("fixture.so#answer")).unwrap(), Some("arm64"));
+        for isa in ["", "arm", "arm64-v8a", "ARM64", "x86", "x86_64", "riscv64", "arm64\0"] {
+            for selftest in [None, Some("fixture.so#answer")] {
+                let error = requested_bridge_isa(Some(isa), selftest).unwrap_err();
+                assert!(error.contains("expected arm64") && error.contains("API 37"), "{isa:?}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_bridge_selftest_is_rejected_before_runtime_setup() {
+        for spec in ["", "fixture.so", "#answer", "fixture.so#", "#"] {
+            let error = requested_bridge_isa(None, Some(spec)).unwrap_err();
+            assert!(error.contains("--bridge-selftest expects <lib>#<symbol>"), "{spec:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn every_requested_bridge_stage_fails_closed_on_false() {
+        for stage in ["LoadNativeBridge", "PreInitializeNativeBridge", "InitializeNativeBridge", "NativeBridgeAvailable", "selftest"] {
+            assert!(require_bridge_success(stage, true).is_ok());
+            let error = require_bridge_success(stage, false).unwrap_err();
+            assert_eq!(error, format!("native bridge {stage} failed"));
+        }
+    }
+
+    #[test]
     fn detects_android17_x86_64_layout() {
         let fixture = Fixture::android17();
         // A legacy flat library must not override the supported layout.
@@ -2384,5 +2724,51 @@ mod tests {
         for target in [1, 23, 33, 35, 36, 37, 38, 10_000] {
             assert_eq!(app_target_sdk(Some(target)), target as i32);
         }
+    }
+
+    /// `NativeBridgeGetSignalHandler` yields a callback, not a sigaction. A
+    /// non-null callback must never be installed without a real chain adapter,
+    /// and an adapter failure must be reported instead of logged.
+    #[test]
+    fn bridge_signal_chain_fails_closed_without_a_safe_adapter() {
+        unsafe extern "C" fn callback(_: c_int, _: *mut libc::siginfo_t, _: *mut c_void) -> bool {
+            true
+        }
+        unsafe extern "C" fn get(sig: c_int) -> Option<BridgeSignalHandler> {
+            (sig == libc::SIGSEGV).then_some(callback)
+        }
+        assert!(chain_bridge_handlers(get, None).is_err());
+    }
+
+    #[test]
+    fn bridge_signal_chain_installs_only_non_null_callbacks_and_propagates_failures() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        static INSTALLED: AtomicUsize = AtomicUsize::new(0);
+        static FAIL: AtomicBool = AtomicBool::new(false);
+        static SAW_CALLBACK: AtomicBool = AtomicBool::new(false);
+        unsafe extern "C" fn callback(_: c_int, _: *mut libc::siginfo_t, _: *mut c_void) -> bool {
+            SAW_CALLBACK.store(true, Ordering::SeqCst);
+            true
+        }
+        unsafe extern "C" fn get(sig: c_int) -> Option<BridgeSignalHandler> {
+            (sig == libc::SIGBUS).then_some(callback)
+        }
+        unsafe extern "C" fn install(sig: c_int, cb: Option<BridgeSignalHandler>) -> c_int {
+            assert_eq!(sig, libc::SIGBUS);
+            assert!(cb.is_some());
+            INSTALLED.fetch_add(1, Ordering::SeqCst);
+            if FAIL.load(Ordering::SeqCst) { -1 } else { 0 }
+        }
+        unsafe extern "C" fn no_handlers(_: c_int) -> Option<BridgeSignalHandler> {
+            None
+        }
+
+        assert!(chain_bridge_handlers(no_handlers, None).is_ok());
+        assert_eq!(INSTALLED.load(Ordering::SeqCst), 0);
+        assert!(chain_bridge_handlers(get, Some(install)).is_ok());
+        assert_eq!(INSTALLED.load(Ordering::SeqCst), 1);
+        FAIL.store(true, Ordering::SeqCst);
+        assert!(chain_bridge_handlers(get, Some(install)).is_err());
+        assert_eq!(INSTALLED.load(Ordering::SeqCst), 2);
     }
 }

@@ -181,7 +181,8 @@ fn software_video_frames_keep_wayland_connection_alive() {
     let pixels = [0, 0xf8].repeat(32 * 32);
     assert_eq!(unsafe { libc::write(fd.as_raw_fd(), pixels.as_ptr().cast(), pixels.len()) }, pixels.len() as isize);
     for _ in 0..8 {
-        assert_eq!(request(Message::PresentShm { surface_id, width: 32, height: 32, stride: 64, format: 4 }, &[fd.as_raw_fd()]), Message::Ack);
+        assert_eq!(request(Message::PresentShm { surface_id, width: 32, height: 32, stride: 64, format: 4,
+            crop: pengudroid_proto::BufferCrop::full(32, 32) }, &[fd.as_raw_fd()]), Message::Ack);
     }
     // Two video queues in one window must be siblings, never nested under the
     // newest video layer. Retiring the first queue must not retire the second.
@@ -192,12 +193,14 @@ fn software_video_frames_keep_wayland_connection_alive() {
     assert_eq!(request(Message::DestroySurface { surface_id }, &[]), Message::Ack);
     assert_eq!(request(Message::PresentShm {
         surface_id: sibling_id, width: 32, height: 32, stride: 64, format: 4,
+        crop: pengudroid_proto::BufferCrop::full(32, 32),
     }, &[fd.as_raw_fd()]), Message::Ack);
     // EGL window destruction must invalidate its video layers. Acking frames
     // on an orphan would keep the BLAST consumer stuck on an invisible layer.
     assert_eq!(request(Message::DestroySurface { surface_id: parent_id }, &[]), Message::Ack);
     assert!(matches!(request(Message::PresentShm {
         surface_id: sibling_id, width: 32, height: 32, stride: 64, format: 4,
+        crop: pengudroid_proto::BufferCrop::full(32, 32),
     }, &[fd.as_raw_fd()]), Message::Error { .. }));
     assert!(matches!(request(Message::CreateSubsurface {
         parent_pid: std::process::id() as i32, x: 0, y: 0, width: 16, height: 16,
@@ -213,6 +216,7 @@ fn software_video_frames_keep_wayland_connection_alive() {
     let Message::SubsurfaceCreated { surface_id: replacement } = child else { panic!("{child:?}") };
     assert_eq!(request(Message::PresentShm {
         surface_id: replacement, width: 32, height: 32, stride: 64, format: 4,
+        crop: pengudroid_proto::BufferCrop::full(32, 32),
     }, &[fd.as_raw_fd()]), Message::Ack);
     assert_eq!(request(Message::Shutdown, &[]), Message::Goodbye);
 }

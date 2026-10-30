@@ -222,13 +222,15 @@ class BuildTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaisesRegex(build.BuildError, field):
                 model.props(name)
 
-    def test_header_exports_do_not_silently_disable_sanitizers_for_compilation(self):
+    def test_sanitizer_properties_are_explicitly_inert_not_silently_applied(self):
         model = self.model('''cc_library_static {name:"entry", export_include_dirs:["include"],
                               sanitize:{misc_undefined:["integer"]}}''')
+        self.assertIn("sanitize", build.METADATA)
         native = build.NativeBuild(model, mock.Mock(root=self.root), self.root)
         self.assertEqual(native.exports("entry"), [str(self.root / "source/include")])
-        with self.assertRaisesRegex(build.BuildError, "unsupported properties.*sanitize"):
-            native.build("entry")
+        props = model.props("entry")
+        argv = native.compile_command(props, "source.cc", self.root / "out.o", [])
+        self.assertFalse(any(argument.startswith("-fsanitize") for argument in argv))
 
     def test_unknown_variant_selectors_fail_closed(self):
         model = self.model('''cc_library_static {name:"target_typo",target:{android_x86_65:{cflags:["WRONG"]}}}
@@ -311,7 +313,7 @@ class BuildTests(unittest.TestCase):
         (self.root / "source/generator.py").write_text("pass\n")
         runner = mock.Mock(root=self.root)
         native = build.NativeBuild(model, runner, self.root)
-        for name, error in (("shell", "shell genrule"), ("unlisted", "declared Python tool"), ("escape", "unsafe generated")):
+        for name, error in (("shell", "shell genrule"), ("unlisted", "declared tool"), ("escape", "unsafe generated")):
             with self.subTest(name=name), self.assertRaisesRegex(build.BuildError, error):
                 native.generate(name)
         runner.run.assert_not_called()
@@ -370,8 +372,8 @@ class BuildTests(unittest.TestCase):
                               cc_library_shared {name:"no_system",system_shared_libs:[]}''')
         runner = mock.Mock(root=self.root)
         native = build.NativeBuild(model, runner, self.root)
-        for name in ("ndk", "no_system"):
-            with self.subTest(name=name), self.assertRaisesRegex(build.BuildError, "non-default STL/system"):
+        for name, error in (("ndk", "non-default STL"), ("no_system", "non-default system libraries")):
+            with self.subTest(name=name), self.assertRaisesRegex(build.BuildError, error):
                 native.build(name)
         runner.run.assert_not_called()
 
@@ -687,7 +689,7 @@ class BuildTests(unittest.TestCase):
             genrule {name:"generated",tools:["native_tool"],out:["generated.cc"],cmd:"$(location native_tool) $(out)"}
             cc_binary_host {name:"native_tool",srcs:["generator.cc"]}''')
         runner = mock.Mock(root=self.root)
-        with self.assertRaisesRegex(build.BuildError, "unimplemented host codegen tool native_tool"):
+        with self.assertRaisesRegex(build.BuildError, "module is not host-supported: native_tool"):
             build.NativeBuild(model, runner, self.root).build("entry")
         runner.run.assert_not_called()
 
@@ -720,7 +722,8 @@ class BuildTests(unittest.TestCase):
                 model.props(name)
 
     def test_resource_and_goal_policy(self):
-        self.assertLess(build.MEMORY, 1_500_000_000)
+        self.assertGreaterEqual(build.MEMORY, 6_000_000_000)
+        self.assertLessEqual(build.MEMORY, 8_000_000_000)
         self.assertIn("libberberis_native_bridge_arm64", build.EARLY_GOALS)
         self.assertNotIn("berberis_all", build.EARLY_GOALS)
         self.assertNotIn("linux_glibc", build.AXES)

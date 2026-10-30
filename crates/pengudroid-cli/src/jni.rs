@@ -49,7 +49,9 @@ mod slot {
     pub const PUSH_LOCAL_FRAME: usize = 19;
     pub const POP_LOCAL_FRAME: usize = 20;
     pub const NEW_GLOBAL_REF: usize = 21;
+    pub const DELETE_GLOBAL_REF: usize = 22;
     pub const DELETE_LOCAL_REF: usize = 23;
+    pub const IS_SAME_OBJECT: usize = 24;
     pub const GET_OBJECT_CLASS: usize = 31;
     pub const GET_METHOD_ID: usize = 33;
     pub const CALL_OBJECT_METHOD_A: usize = 36;
@@ -137,6 +139,41 @@ impl JniEnv {
             self.describe_exception();
             None
         }
+    }
+
+    /// `NewGlobalRef(obj)`.
+    ///
+    /// A global reference survives `PopLocalFrame` and can therefore back a
+    /// retained framework object (an `ActivityClientRecord`, for example).
+    pub fn new_global_ref(&self, obj: JObject) -> Option<JObject> {
+        if obj.is_null() {
+            return None;
+        }
+        let f: unsafe extern "C" fn(*mut c_void, JObject) -> JObject =
+            unsafe { self.func(slot::NEW_GLOBAL_REF) };
+        let global = unsafe { f(self.0, obj) };
+        if global.is_null() {
+            self.describe_exception();
+            return None;
+        }
+        Some(global)
+    }
+
+    /// `DeleteGlobalRef(obj)`.
+    pub fn delete_global_ref(&self, obj: JObject) {
+        if obj.is_null() {
+            return;
+        }
+        let f: unsafe extern "C" fn(*mut c_void, JObject) =
+            unsafe { self.func(slot::DELETE_GLOBAL_REF) };
+        unsafe { f(self.0, obj) };
+    }
+
+    /// JNI handles can differ while referring to the same Java object.
+    pub fn is_same_object(&self, left: JObject, right: JObject) -> bool {
+        let same: unsafe extern "C" fn(*mut c_void, JObject, JObject) -> u8 =
+            unsafe { self.func(slot::IS_SAME_OBJECT) };
+        unsafe { same(self.0, left, right) != 0 }
     }
 
     /// `GetVersion()` — used to validate the table layout.
@@ -631,6 +668,7 @@ mod tests {
         // which is why `GetStaticMethodID` is 113 and not 149.
         assert_eq!(slot::GET_VERSION, 4);
         assert_eq!(slot::FIND_CLASS, 6);
+        assert_eq!(slot::IS_SAME_OBJECT, 24);
         assert_eq!(slot::GET_METHOD_ID, 33);
         assert_eq!(slot::GET_STATIC_METHOD_ID, 113);
         assert_eq!(slot::CALL_STATIC_VOID_METHOD_A, 143);

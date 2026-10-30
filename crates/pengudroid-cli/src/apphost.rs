@@ -47,6 +47,10 @@ use std::path::Path;
 
 use crate::jni::{JClass, JFieldId, JMethodId, JObject, JValue, JniEnv};
 
+#[path = "activity_probe.rs"]
+mod activity_probe;
+pub use activity_probe::run as probe_activity_requests;
+
 /// Everything `handleBindApplication` needs to know about the app.
 pub struct AppSpec<'a> {
     pub package: &'a str,
@@ -79,8 +83,17 @@ pub struct AppSpec<'a> {
     /// every one of those stays uninitialised and the app dies on
     /// "WorkManager is not initialized properly".
     pub providers: &'a [crate::apk::Component],
+    /// The manifest's `<activity>` entries.
+    ///
+    /// A hosted `startActivity` needs the same `ActivityInfo` a device's package
+    /// manager would supply: at minimum the component's theme, otherwise an
+    /// AppCompat activity falls back to the platform theme and throws. Only
+    /// components in this list (and in the hosted package) can be launched.
+    pub activities: &'a [crate::apk::Component],
+    /// `android:theme` of `<application>`, used when an activity declares none.
+    pub application_theme: Option<u32>,
     /// `android:theme` resource id for the launched activity, if the manifest
-    /// declares one (the activity's own, else the application's).
+    /// declares one.
     pub theme: Option<u32>,
     /// Android uid for the app. There is no package manager here, so a fixed
     /// value is used; it only has to be stable and non-zero.
@@ -808,6 +821,11 @@ pub fn probe_platform_state(env: &JniEnv) -> bool {
 /// `ActivityThread.currentActivityThread()`.
 pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bool {
     let _ = APP_PACKAGE.set(spec.package.to_string());
+    if install_hosted_package(env, spec.package).is_none()
+        || install_hosted_activities(spec.activities.iter().map(|entry| entry.name.as_str())).is_none() {
+        eprintln!("apphost: cannot publish the hosted package to the binder broker");
+        return false;
+    }
     if !crate::process_identity::install(env, spec.uid) {
         eprintln!("apphost: cannot install the Android application process identity");
         return false;
@@ -3234,13 +3252,376 @@ pub fn loop_forever(env: &JniEnv) {
     let Some(looper_class) = env.find_class("android/os/Looper") else {
         return;
     };
-    let Some(loop_fn) = env.static_method_id(looper_class, "loop", "()V") else {
+    // `Looper.loop()` blocks inside `MessageQueue.next()` forever, so the main
+    // thread can never replay an activity transition the broker recorded while
+    // the queue is idle. API 37's `loopOnce(Looper,long,int)` dispatches exactly
+    // one message (it is the body of `loop()`), which leaves control here
+    // between messages.
+    let Some(once) = env.static_method_id(looper_class, "loopOnce", "(Landroid/os/Looper;JI)Z") else {
+        eprintln!("apphost: Android 17 Looper.loopOnce is missing; refusing to fake a main loop");
         return;
     };
-    println!("apphost: entering Looper.loop()");
+    let Some(my_looper) = env.static_method_id(looper_class, "myLooper", "()Landroid/os/Looper;") else {
+        return;
+    };
+    let Some(main) = env.call_static_object(looper_class, my_looper, &[]) else {
+        return;
+    };
+    if main.is_null() {
+        eprintln!("apphost: no main Looper is installed");
+        return;
+    }
+    let in_loop_field = env.field_id(looper_class, "mInLoop", "Z");
+    if let Some(field) = in_loop_field {
+        env.set_boolean_field(main, field, true);
+    }
+    // `Looper.loop()` clears and then records the calling identity before every
+    // dispatch. Reproduce that so binder work done from a message sees the same
+    // identity it would on a device.
+    let Some(binder_class) = env.find_class("android/os/Binder") else {
+        return;
+    };
+    let Some(clear_identity) = env.static_method_id(binder_class, "clearCallingIdentity", "()J") else {
+        return;
+    };
+    let _ = env.call_static_long(binder_class, clear_identity, &[]);
+    let Some(identity) = env.call_static_long(binder_class, clear_identity, &[]) else {
+        return;
+    };
+    println!("apphost: entering the main Looper (API-37 loopOnce driver)");
     install_crash_handler();
-    let _ = env.call_static_void(looper_class, loop_fn, &[]);
-    eprintln!("apphost: Looper.loop() returned");
+    let Some(_waker) = ActivityHostWaker::start(env) else {
+        eprintln!("apphost: cannot start the activity-host main-queue waker");
+        return;
+    };
+    let mut scratch = vec![0u8; ACTIVITY_REQUEST_SCRATCH];
+    loop {
+        drain_activity_requests(env, &mut scratch);
+        match env.call_static_boolean(
+            looper_class,
+            once,
+            &[
+                JValue { l: main },
+                JValue { j: identity },
+                JValue { i: -1 }, // no slow-dispatch threshold override
+            ],
+        ) {
+            Some(true) => {}
+            Some(false) => break,
+            None => {
+                eprintln!("apphost: Looper.loopOnce threw");
+                break;
+            }
+        }
+    }
+    if let Some(field) = in_loop_field {
+        env.set_boolean_field(main, field, false);
+    }
+    eprintln!("apphost: main Looper returned");
+}
+
+/// Wake MessageQueue.next even when an activity request originates on a worker
+/// and the main queue has no scheduled messages. A native Looper wake alone is
+/// insufficient: MessageQueue.next polls again until a Java Message is ready.
+/// The asynchronous, no-op Handler message also passes synchronization barriers.
+struct ActivityHostWaker {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ActivityHostWaker {
+    fn start(env: &JniEnv) -> Option<Self> {
+        let vm = env.get_java_vm()? as usize;
+        let symbol = shim_symbol("__pengudroid_binder_take_activity_wakeup")?;
+        let pending: unsafe extern "C" fn() -> bool = unsafe { std::mem::transmute(symbol) };
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = stop.clone();
+        let (ready, started) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let Some(env) = attach_current_thread(vm as *mut c_void) else { return; };
+            let run = || -> Option<()> {
+                let _frame = env.local_frame(16)?;
+                let looper = env.find_class("android/os/Looper")?;
+                let get = env.static_method_id(looper, "getMainLooper", "()Landroid/os/Looper;")?;
+                let main = env.call_static_object(looper, get, &[])?;
+                if main.is_null() { return None; }
+                let class = env.find_class("android/os/Handler")?;
+                let create = env.static_method_id(class, "createAsync", "(Landroid/os/Looper;)Landroid/os/Handler;")?;
+                let handler = env.call_static_object(class, create, &[JValue { l: main }])?;
+                if handler.is_null() { return None; }
+                let send = env.method_id(class, "sendEmptyMessage", "(I)Z")?;
+                ready.send(()).ok()?;
+                while !stopping.load(std::sync::atomic::Ordering::Acquire) {
+                    if unsafe { pending() } && env.call_boolean(handler, send, &[JValue { i: 0 }]) != Some(true) {
+                        eprintln!("apphost: main Handler rejected activity wakeup");
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Some(())
+            };
+            let _ = run();
+            // All local refs (including the Handler) were popped before detach.
+            unsafe {
+                let table = *(vm as *const *const *const c_void);
+                let detach: unsafe extern "C" fn(*mut c_void) -> i32 = std::mem::transmute(*table.add(5));
+                detach(vm as *mut c_void);
+            }
+        });
+        let mut waker = Self { stop, worker: Some(worker) };
+        if started.recv_timeout(std::time::Duration::from_secs(5)).is_err() {
+            waker.stop.store(true, std::sync::atomic::Ordering::Release);
+            return None;
+        }
+        Some(waker)
+    }
+}
+
+impl Drop for ActivityHostWaker {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+    }
+}
+
+/// Scratch size for one activity request record.
+const ACTIVITY_REQUEST_SCRATCH: usize = 512 * 1024 + 2080;
+
+struct ActivityRequestRecord {
+    op: u8,
+    #[allow(dead_code)]
+    result: i32,
+    token: u64,
+    package: String,
+    class: String,
+    intent_offset: usize,
+    parcel: Vec<u8>,
+}
+
+fn parse_activity_request(bytes: &[u8]) -> Option<ActivityRequestRecord> {
+    if bytes.len() < 32 {
+        return None;
+    }
+    let word = |at: usize| -> Option<u32> {
+        Some(u32::from_ne_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+    };
+    let op = u8::try_from(word(0)?).ok()?;
+    let result = word(4)? as i32;
+    let token = u64::from_ne_bytes(bytes[8..16].try_into().ok()?);
+    let pkg_len = word(16)? as usize;
+    let cls_len = word(20)? as usize;
+    let intent_offset = word(24)? as usize;
+    let parcel_len = word(28)? as usize;
+    let pkg_start = 32usize;
+    let cls_start = pkg_start.checked_add(pkg_len)?;
+    let parcel_start = cls_start.checked_add(cls_len)?;
+    let end = parcel_start.checked_add(parcel_len)?;
+    if end != bytes.len() || op > 1 || (op == 0 && (intent_offset == 0 || intent_offset >= parcel_len))
+        || (op == 1 && (token == 0 || parcel_len != 0 || pkg_len != 0 || cls_len != 0)) {
+        return None;
+    }
+    Some(ActivityRequestRecord {
+        op,
+        result,
+        token,
+        package: String::from_utf8(bytes[pkg_start..cls_start].to_vec()).ok()?,
+        class: String::from_utf8(bytes[cls_start..parcel_start].to_vec()).ok()?,
+        intent_offset,
+        parcel: bytes[parcel_start..end].to_vec(),
+    })
+}
+
+/// Unmarshall the framework `Intent` from the broker's transaction bytes.
+fn unmarshall_activity_intent(env: &JniEnv, bytes_in: &[u8], offset: usize) -> Option<JObject> {
+    if offset == 0 || offset >= bytes_in.len() {
+        return None;
+    }
+    let parcel_class = env.find_class("android/os/Parcel")?;
+    let obtain = env.static_method_id(parcel_class, "obtain", "()Landroid/os/Parcel;")?;
+    let parcel = env.call_static_object(parcel_class, obtain, &[])?;
+    if parcel.is_null() {
+        return None;
+    }
+    let unmarshall = env.method_id(parcel_class, "unmarshall", "([BII)V")?;
+    let bytes = env.new_byte_array(bytes_in.len() as i32)?;
+    env.set_byte_array_region(bytes, 0, bytes_in);
+    if !env.call_void(
+        parcel,
+        unmarshall,
+        &[
+            JValue { l: bytes },
+            JValue { i: offset as i32 },
+            JValue { i: (bytes_in.len() - offset) as i32 },
+        ],
+    ) {
+        return None;
+    }
+    let reset = env.method_id(parcel_class, "setDataPosition", "(I)V")?;
+    if !env.call_void(parcel, reset, &[JValue { i: 0 }]) { return None; }
+    let intent_class = env.find_class("android/content/Intent")?;
+    let creator_field = env.static_field_id(
+        intent_class,
+        "CREATOR",
+        "Landroid/os/Parcelable$Creator;",
+    )?;
+    let creator = env.static_object_field(intent_class, creator_field);
+    if creator.is_null() {
+        eprintln!("apphost: Intent.CREATOR is null");
+        return None;
+    }
+    let creator_class = env.find_class("android/os/Parcelable$Creator")?;
+    let create = env.method_id(
+        creator_class,
+        "createFromParcel",
+        "(Landroid/os/Parcel;)Ljava/lang/Object;",
+    )?;
+    let intent = env.call_object(creator, create, &[JValue { l: parcel }]);
+    if let Some(recycle) = env.method_id(parcel_class, "recycle", "()V") {
+        env.call_void(parcel, recycle, &[]);
+    }
+    intent.filter(|intent| !intent.is_null())
+}
+
+fn handle_activity_start(env: &JniEnv, request: &ActivityRequestRecord) -> bool {
+    let Some(_frame) = env.local_frame(64) else { return false; };
+    let intent = match unmarshall_activity_intent(env, &request.parcel, request.intent_offset) {
+        Some(intent) => intent,
+        None => {
+            eprintln!(
+                "apphost: cannot unmarshall the Intent for {}/{}",
+                request.package, request.class
+            );
+            return false;
+        }
+    };
+    let mut guard = HOSTED_ACTIVITY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(state) = guard.as_mut() else {
+        eprintln!(
+            "apphost: startActivity for {}/{} arrived without a hosted activity",
+            request.package, request.class
+        );
+        return false;
+    };
+    let Some(entry) = state
+        .activities
+        .iter()
+        .find(|entry| entry.name == request.class)
+        .cloned()
+    else {
+        eprintln!(
+            "apphost: {} is not declared in the APK manifest",
+            request.class
+        );
+        return false;
+    };
+    let thread = state.thread as JObject;
+    let thread_class = state.thread_class as JClass;
+    let previous = state.stack.last().copied();
+    if let Some(previous) = previous {
+        if !pause_activity(env, thread, thread_class, previous.record as JObject, false) {
+            eprintln!("apphost: cannot pause the previous activity");
+        }
+    }
+    let Some(record) = launch_hosted_activity(
+        env,
+        thread_class,
+        thread,
+        state.loaded_apk as JObject,
+        state.app_info as JObject,
+        &request.package,
+        &request.class,
+        entry.theme,
+        intent,
+    ) else {
+        // The transition failed after the previous activity was paused; put it
+        // back in front rather than leaving the app with no resumed activity.
+        if let Some(previous) = previous {
+            resume_existing_activity(env, thread, thread_class, previous.record as JObject);
+        }
+        return false;
+    };
+    if let Some(previous) = previous {
+        stop_activity(env, thread, thread_class, previous.record as JObject);
+    }
+    state.stack.push(record);
+    let depth = state.stack.len();
+    println!(
+        "apphost: activity stack now {depth} deep; {} is resumed",
+        request.class
+    );
+    true
+}
+
+fn handle_activity_finish(env: &JniEnv, token: u64) -> bool {
+    let Some(_frame) = env.local_frame(32) else { return false; };
+    let mut guard = HOSTED_ACTIVITY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(state) = guard.as_mut() else {
+        return false;
+    };
+    let Some(index) = state.stack.iter().position(|record| record.token == token) else {
+        eprintln!("apphost: finishActivity for unknown token {token}");
+        return false;
+    };
+    let was_top = index + 1 == state.stack.len();
+    let record = state.stack.remove(index);
+    let thread = state.thread as JObject;
+    let thread_class = state.thread_class as JClass;
+    if was_top && !pause_activity(env, thread, thread_class, record.record as JObject, true) {
+        eprintln!("apphost: cannot pause the finishing activity");
+    }
+    destroy_activity(env, thread, thread_class, record.record as JObject);
+    drop(ActivityTokenRegistration {
+        id: record.token, env: *env, parcel: record.token_parcel as JObject,
+    });
+    env.delete_global_ref(record.record as JObject);
+    if was_top {
+        if let Some(previous) = state.stack.last().copied() {
+            resume_existing_activity(env, thread, thread_class, previous.record as JObject);
+            println!("apphost: activity finished; the previous one is resumed");
+        } else {
+            println!("apphost: last activity finished");
+        }
+    }
+    true
+}
+
+/// Replay every activity transition the binder broker recorded since the last
+/// message.
+///
+/// This runs on the main thread between `Looper.loopOnce` calls. It must not run
+/// inside a dispatch: `handleLaunchActivity` creates a `Handler` and drives
+/// `Activity` callbacks, and the framework expects those to happen from the
+/// thread that owns the main `Looper`.
+fn drain_activity_requests(env: &JniEnv, scratch: &mut [u8]) {
+    let Some(take) = shim_symbol("__pengudroid_binder_take_activity_request") else {
+        return;
+    };
+    // SAFETY: the shim exports this exact signature.
+    let take: unsafe extern "C" fn(*mut u8, usize, *mut usize) -> i32 =
+        unsafe { std::mem::transmute(take) };
+    loop {
+        let mut len = 0usize;
+        let rc = unsafe { take(scratch.as_mut_ptr(), scratch.len(), &mut len) };
+        if rc != 0 {
+            break;
+        }
+        if len == 0 || len > scratch.len() {
+            continue;
+        }
+        let Some(request) = parse_activity_request(&scratch[..len]) else {
+            eprintln!("apphost: malformed activity request record ({len} bytes)");
+            continue;
+        };
+        match request.op {
+            0 => {
+                handle_activity_start(env, &request);
+            }
+            1 => {
+                handle_activity_finish(env, request.token);
+            }
+            other => eprintln!("apphost: unknown activity operation {other}"),
+        }
+    }
 }
 
 /// Take the fault-handler slot right before the first frame is produced.
@@ -4092,8 +4473,8 @@ fn spawn_input_pump(env: &JniEnv) {
         let mut last = (0.0f32, 0.0f32);
         let mut buf = [0u8; 16];
 
-        // Deliver one motion event to every window root. Each root recycles the
-        // event it is handed, so a fresh instance is obtained per root.
+        // Deliver to the focused visible root only. Broadcasting one tap to all
+        // roots also clicks the stopped Activity underneath a new one.
         let inject = |action: i32, x: f32, y: f32, down_time: i64| {
             let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else {
                 return;
@@ -4103,13 +4484,11 @@ fn spawn_input_pump(env: &JniEnv) {
                 return;
             }
             let count = env.call_int(roots, size_m, &[]).unwrap_or(0);
-            for i in 0..count {
-                let Some(root) = env.call_object(roots, get_m, &[JValue { i }]) else {
-                    continue;
-                };
-                if root.is_null() {
-                    continue;
-                }
+            if std::env::var_os("PENGUDROID_TRACE_INPUT").is_some() {
+                println!("input: synthetic action={action} at {x:.0},{y:.0} -> {count} root(s)");
+            }
+            let Some(root) = keyboard_root(&env, roots, root_class, size_m, get_m) else { return; };
+            {
                 let now = env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
                 let Some(event) = env.call_static_object(
                     motion_class,
@@ -4123,10 +4502,10 @@ fn spawn_input_pump(env: &JniEnv) {
                         JValue { i: 0 },
                     ],
                 ) else {
-                    continue;
+                    return;
                 };
                 if event.is_null() {
-                    continue;
+                    return;
                 }
                 env.call_void(root, dispatch, &[JValue { l: event }]);
             }
@@ -4487,6 +4866,7 @@ fn keyboard_root(env: &JniEnv, roots: JObject, root_class: JClass,
     let visibility = env.method_id(view_class, "getVisibility", "()I")?;
     let has_focus = env.method_id(view_class, "hasWindowFocus", "()Z")?;
     let change_focus = env.method_id(root_class, "windowFocusChanged", "(Z)V")?;
+    let stopped = env.field_id(root_class, "mStopped", "Z")?;
     let count = env.call_int(roots, size, &[])?;
     let mut windows = Vec::new();
     let mut target = None;
@@ -4499,7 +4879,8 @@ fn keyboard_root(env: &JniEnv, roots: JObject, root_class: JClass,
         windows.push((root, view));
         let flags = env.int_field(params, flags_field);
         // FLAG_NOT_FOCUSABLE, and hidden roots, cannot take physical keys.
-        if flags & 8 != 0 || env.call_int(view, visibility, &[]) != Some(0) { continue; }
+        if flags & 8 != 0 || env.boolean_field(root, stopped)
+            || env.call_int(view, visibility, &[]) != Some(0) { continue; }
         let rank = (env.int_field(params, type_field), i);
         if target.as_ref().map_or(true, |(best, _)| rank > *best) {
             target = Some((rank, root));
@@ -4507,7 +4888,7 @@ fn keyboard_root(env: &JniEnv, roots: JObject, root_class: JClass,
     }
     let (_, target) = target?;
     for (root, view) in windows {
-        let focused = root == target;
+        let focused = env.is_same_object(root, target);
         if env.call_boolean(view, has_focus, &[]) != Some(focused) {
             env.call_void(root, change_focus, &[JValue { z: focused as u8 }]);
         }
@@ -4663,6 +5044,55 @@ fn ensure_looper(env: &JniEnv) {
     }
 }
 
+/// One `<activity>` the host may launch.
+#[derive(Clone)]
+struct ActivityEntry {
+    name: String,
+    exported: bool,
+    /// The component's theme, already falling back to the application theme.
+    theme: Option<u32>,
+}
+
+/// The main-thread activity host's retained state.
+///
+/// JNI references are stored as addresses because every method here runs on
+/// the thread that created them; the `ActivityClientRecord`s are global refs so
+/// they survive the per-request local frame.
+struct HostedActivityState {
+    thread: usize,
+    thread_class: usize,
+    loaded_apk: usize,
+    app_info: usize,
+    package: String,
+    activities: Vec<ActivityEntry>,
+    /// Owned records, oldest first; the last one is resumed.
+    stack: Vec<HostedActivityRecord>,
+}
+
+#[derive(Clone, Copy)]
+struct HostedActivityRecord {
+    record: usize,
+    token: u64,
+    token_parcel: usize,
+}
+
+static HOSTED_ACTIVITY: std::sync::Mutex<Option<HostedActivityState>> =
+    std::sync::Mutex::new(None);
+
+fn loaded_apk_application_info(env: &JniEnv, loaded_apk: JObject) -> JObject {
+    let Some(apk_class) = env.find_class("android/app/LoadedApk") else {
+        return std::ptr::null_mut();
+    };
+    let Some(field) = env.field_id(
+        apk_class,
+        "mApplicationInfo",
+        "Landroid/content/pm/ApplicationInfo;",
+    ) else {
+        return std::ptr::null_mut();
+    };
+    env.object_field(loaded_apk, field)
+}
+
 /// Start an Activity through `ActivityThread.handleLaunchActivity`.
 ///
 /// This is what `system_server` triggers with `scheduleLaunchActivity`; calling
@@ -4693,59 +5123,10 @@ fn launch_activity(
         eprintln!("apphost: cannot launch an Activity before the app is bound");
         return false;
     }
-
-    // ActivityInfo
-    let Some(ai_class) = env.find_class("android/content/pm/ActivityInfo") else {
+    let app_info = loaded_apk_application_info(env, loaded_apk);
+    if app_info.is_null() {
+        eprintln!("apphost: LoadedApk.mApplicationInfo is null");
         return false;
-    };
-    let Some((_, activity_info)) = new_instance(env, "android/content/pm/ActivityInfo") else {
-        eprintln!("apphost: cannot allocate ActivityInfo");
-        return false;
-    };
-    if let Some(id) = env.field_id(ai_class, "name", "Ljava/lang/String;") {
-        env.set_object_field(activity_info, id, env.new_string(activity_name));
-    }
-    if let Some(id) = env.field_id(ai_class, "packageName", "Ljava/lang/String;") {
-        env.set_object_field(activity_info, id, env.new_string(spec.package));
-    }
-    if let Some(id) = env.field_id(
-        ai_class,
-        "applicationInfo",
-        "Landroid/content/pm/ApplicationInfo;",
-    ) {
-        let app_info = env.object_field(loaded_apk, env.field_id(
-            env.find_class("android/app/LoadedApk").unwrap_or(std::ptr::null_mut()),
-            "mApplicationInfo",
-            "Landroid/content/pm/ApplicationInfo;",
-        ).unwrap_or(std::ptr::null_mut()));
-        if !app_info.is_null() {
-            env.set_object_field(activity_info, id, app_info);
-        }
-    }
-    if let Some(id) = env.field_id(ai_class, "exported", "Z") {
-        env.set_boolean_field(activity_info, id, true);
-    }
-    // `Activity.attach` passes `(info.flags & ActivityInfo.FLAG_HARDWARE_ACCELERATED)
-    // != 0` to `Window.setWindowManager`, and that is what puts
-    // `FLAG_HARDWARE_ACCELERATED` on the window attributes — without it
-    // `ViewRootImpl.enableHardwareAcceleration` never creates a renderer and
-    // nothing is drawn.
-    if let Some(id) = env.field_id(ai_class, "flags", "I") {
-        // `ActivityInfo.FLAG_HARDWARE_ACCELERATED` is 0x200 in this build
-        // (read out with `--dump-class`).
-        env.set_int_field(activity_info, id, 0x200);
-    }
-    if let Some(theme) = spec.theme {
-        if let Some(id) = env.field_id(ai_class, "theme", "I") {
-            env.set_int_field(activity_info, id, theme as i32);
-        }
-    }
-    // `AppCompatDelegate` asks `PackageManager.getActivityInfo` for the
-    // component while the activity is being created; without an answer it logs
-    // `NameNotFoundException` and falls back to the platform theme, which is
-    // not an AppCompat theme. Publish the same object the launch uses.
-    if let Some(bytes) = marshal_object(env, activity_info, "android/content/pm/ActivityInfo") {
-        install_reply(&bytes, "__pengudroid_binder_set_activity_info");
     }
 
     // Intent naming the component.
@@ -4809,15 +5190,172 @@ fn launch_activity(
         }
     }
 
+    let Some(record) = launch_hosted_activity(
+        env,
+        thread_class,
+        thread,
+        loaded_apk,
+        app_info,
+        spec.package,
+        activity_name,
+        spec.theme,
+        intent,
+    ) else {
+        return false;
+    };
+
+    let activities: Vec<ActivityEntry> = spec
+        .activities
+        .iter()
+        .map(|component| ActivityEntry {
+            name: component.name.clone(),
+            exported: component.exported,
+            theme: component.theme.or(spec.application_theme),
+        })
+        .collect();
+    let declared = activities.len();
+    *HOSTED_ACTIVITY.lock().unwrap_or_else(|e| e.into_inner()) = Some(HostedActivityState {
+        thread: thread as usize,
+        thread_class: thread_class as usize,
+        loaded_apk: loaded_apk as usize,
+        app_info: app_info as usize,
+        package: spec.package.to_string(),
+        activities,
+        stack: vec![record],
+    });
+    println!("apphost: activity host ready ({declared} declared activities)");
+    // Diagnostic: exercise the real `Activity.startActivity` -> binder broker ->
+    // main-thread host path without a synthetic touch. The app must still be
+    // the caller, so this goes through the same `IActivityTaskManager`
+    // transaction a click would produce.
+    if let Ok(target) = std::env::var("PENGUDROID_PROBE_START_ACTIVITY") {
+        probe_start_activity(env, record.record as JObject, spec.package, &target);
+    }
+    true
+}
+
+/// Call `Activity.startActivity` for `target` on the resumed activity.
+fn probe_start_activity(
+    env: &JniEnv,
+    record: JObject,
+    package: &str,
+    target: &str,
+) {
+    let _frame = env.local_frame(16);
+    let Some(record_class) = env.find_class("android/app/ActivityThread$ActivityClientRecord") else {
+        return;
+    };
+    let Some(activity_field) = env.field_id(record_class, "activity", "Landroid/app/Activity;") else {
+        return;
+    };
+    let activity = env.object_field(record, activity_field);
+    if activity.is_null() {
+        eprintln!("apphost: cannot start {target}: the initial activity is null");
+        return;
+    }
+    let Some(intent_class) = env.find_class("android/content/Intent") else {
+        return;
+    };
+    let Some(ctor) = env.method_id(intent_class, "<init>", "()V") else {
+        return;
+    };
+    let Some(intent) = env.new_object(intent_class, ctor, &[]) else {
+        return;
+    };
+    let Some(set_class_name) = env.method_id(
+        intent_class,
+        "setClassName",
+        "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;",
+    ) else {
+        return;
+    };
+    let package = env.new_string(package);
+    let target = env.new_string(target);
+    if env
+        .call_object(intent, set_class_name, &[JValue { l: package }, JValue { l: target }])
+        .is_none()
+    {
+        eprintln!("apphost: Intent.setClassName threw in the startActivity probe");
+        return;
+    }
+    let Some(activity_class) = env.find_class("android/app/Activity") else {
+        return;
+    };
+    let Some(start) = env.method_id(activity_class, "startActivity", "(Landroid/content/Intent;)V") else {
+        return;
+    };
+    println!("apphost: startActivity probe calling Activity.startActivity");
+    if env.call_void(activity, start, &[JValue { l: intent }]) {
+        println!("apphost: startActivity probe returned");
+    } else {
+        eprintln!("apphost: startActivity probe threw");
+    }
+}
+
+/// Create one Activity, attach it, resume it and make its window visible.
+///
+/// Returns a global reference to the `ActivityClientRecord`, or `None` when the
+/// framework rejected the launch. The record's token is a distinct local
+/// `Binder`, so `ActivityThread.mActivities` keeps every hosted activity rather
+/// than collapsing them onto a null key.
+#[allow(clippy::too_many_arguments)]
+fn launch_hosted_activity(
+    env: &JniEnv,
+    thread_class: JClass,
+    thread: JObject,
+    loaded_apk: JObject,
+    app_info: JObject,
+    package: &str,
+    activity_name: &str,
+    theme: Option<u32>,
+    intent: JObject,
+) -> Option<HostedActivityRecord> {
+    let _frame = env.local_frame(64)?;
+    // ActivityInfo
+    let ai_class = env.find_class("android/content/pm/ActivityInfo")?;
+    let (_, activity_info) = new_instance(env, "android/content/pm/ActivityInfo")?;
+    if let Some(id) = env.field_id(ai_class, "name", "Ljava/lang/String;") {
+        env.set_object_field(activity_info, id, env.new_string(activity_name));
+    }
+    if let Some(id) = env.field_id(ai_class, "packageName", "Ljava/lang/String;") {
+        env.set_object_field(activity_info, id, env.new_string(package));
+    }
+    if let Some(id) = env.field_id(
+        ai_class,
+        "applicationInfo",
+        "Landroid/content/pm/ApplicationInfo;",
+    ) {
+        env.set_object_field(activity_info, id, app_info);
+    }
+    if let Some(id) = env.field_id(ai_class, "exported", "Z") {
+        env.set_boolean_field(activity_info, id, true);
+    }
+    // `Activity.attach` passes `(info.flags & ActivityInfo.FLAG_HARDWARE_ACCELERATED)
+    // != 0` to `Window.setWindowManager`, and that is what puts
+    // `FLAG_HARDWARE_ACCELERATED` on the window attributes — without it
+    // `ViewRootImpl.enableHardwareAcceleration` never creates a renderer and
+    // nothing is drawn.
+    if let Some(id) = env.field_id(ai_class, "flags", "I") {
+        // `ActivityInfo.FLAG_HARDWARE_ACCELERATED` is 0x200 in this build
+        // (read out with `--dump-class`).
+        env.set_int_field(activity_info, id, 0x200);
+    }
+    if let Some(theme) = theme {
+        if let Some(id) = env.field_id(ai_class, "theme", "I") {
+            env.set_int_field(activity_info, id, theme as i32);
+        }
+    }
+    // `AppCompatDelegate` asks `PackageManager.getActivityInfo` for the
+    // component while the activity is being created; without an answer it logs
+    // `NameNotFoundException` and falls back to the platform theme, which is
+    // not an AppCompat theme. Publish the same object the launch uses.
+    if let Some(bytes) = marshal_object(env, activity_info, "android/content/pm/ActivityInfo") {
+        install_reply(&bytes, "__pengudroid_binder_set_activity_info");
+    }
+
     // ActivityClientRecord
-    let Some(rec_class) = env.find_class("android/app/ActivityThread$ActivityClientRecord") else {
-        return false;
-    };
-    let Some((_, record)) = new_instance(env, "android/app/ActivityThread$ActivityClientRecord")
-    else {
-        eprintln!("apphost: cannot allocate ActivityClientRecord");
-        return false;
-    };
+    let rec_class = env.find_class("android/app/ActivityThread$ActivityClientRecord")?;
+    let (_, record) = new_instance(env, "android/app/ActivityThread$ActivityClientRecord")?;
     let mut set = |field: &str, sig: &str, value: JObject| {
         if let Some(id) = env.field_id(rec_class, field, sig) {
             env.set_object_field(record, id, value);
@@ -4828,6 +5366,12 @@ fn launch_activity(
     set("activityInfo", "Landroid/content/pm/ActivityInfo;", activity_info);
     set("intent", "Landroid/content/Intent;", intent);
     set("packageInfo", "Landroid/app/LoadedApk;", loaded_apk);
+    // A real launch carries the activity token assigned by the task manager.
+    // The framework uses it as the key of `mActivities`; null would make every
+    // hosted activity overwrite the previous one.
+    let (_, token) = new_instance(env, "android/os/Binder")?;
+    set("token", "Landroid/os/IBinder;", token);
+    let registration = register_activity_token(env, token)?;
     // The activity gets its own `Resources`, built from this override
     // configuration. Leaving it null makes `ResourcesManager` fall back to a
     // bare `Configuration` whose locale list is null, and
@@ -4857,31 +5401,216 @@ fn launch_activity(
     let Some(handle) = env.method_id(thread_class, "handleLaunchActivity",
         "(Landroid/app/ActivityThread$ActivityClientRecord;Landroid/app/servertransaction/PendingTransactionActions;ILandroid/content/Intent;)Landroid/app/Activity;") else {
         eprintln!("apphost: Android 17 ActivityThread.handleLaunchActivity contract missing");
-        return false;
+        return None;
     };
-    let Some((_, pending)) = new_instance(env, "android/app/servertransaction/PendingTransactionActions") else { return false; };
+    let (_, pending) = new_instance(env, "android/app/servertransaction/PendingTransactionActions")?;
     let args = [JValue { l: record }, JValue { l: pending },
         JValue { i: 0 }, // Context.DEVICE_ID_DEFAULT
         JValue { l: std::ptr::null_mut() }];
     println!("apphost: calling handleLaunchActivity for {activity_name}");
     match env.call_object(thread, handle, &args) {
         Some(activity) if activity.is_null() => {
-            eprintln!("apphost: handleLaunchActivity returned null");
-            false
+            eprintln!("apphost: handleLaunchActivity returned null for {activity_name}");
+            None
         }
         Some(_) => {
-            println!("apphost: handleLaunchActivity returned an Activity");
+            println!("apphost: handleLaunchActivity returned an Activity for {activity_name}");
             resume_activity(env, thread_class, thread, record);
             // `handleResumeActivity` calls `makeVisible()` only when it decides the
             // activity will be visible; drive it explicitly so the decor view is
             // attached and the first traversal reaches `performDraw`.
             force_visible(env, record);
-            true
+            let record = env.new_global_ref(record)?;
+            let token = registration.id;
+            let token_parcel = registration.parcel as usize;
+            std::mem::forget(registration); // released when this record is destroyed
+            Some(HostedActivityRecord { record: record as usize, token, token_parcel })
         }
         None => {
-            eprintln!("apphost: handleLaunchActivity threw");
-            false
+            eprintln!("apphost: handleLaunchActivity threw for {activity_name}");
+            None
         }
+    }
+}
+
+struct ActivityTokenRegistration {
+    id: u64,
+    env: JniEnv,
+    parcel: JObject,
+}
+impl Drop for ActivityTokenRegistration {
+    fn drop(&mut self) {
+        forget_activity_token(self.id);
+        if let Some(class) = self.env.find_class("android/os/Parcel") {
+            if let Some(recycle) = self.env.method_id(class, "recycle", "()V") {
+                self.env.call_void(self.parcel, recycle, &[]);
+            }
+        }
+        self.env.delete_global_ref(self.parcel);
+    }
+}
+
+fn forget_activity_token(id: u64) {
+    if let Some(forget) = shim_symbol("__pengudroid_binder_forget_activity_token") {
+        let forget: unsafe extern "C" fn(u64) = unsafe { std::mem::transmute(forget) };
+        unsafe { forget(id) };
+    }
+}
+
+/// Register using Parcel.writeStrongBinder, so the broker sees the token's
+/// native Binder identity without interpreting JNI reference values or private
+/// JavaBBinder memory. IDs are process-local and never reused.
+fn register_activity_token(env: &JniEnv, token: JObject) -> Option<ActivityTokenRegistration> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let parcel_class = env.find_class("android/os/Parcel")?;
+    let obtain = env.static_method_id(parcel_class, "obtain", "()Landroid/os/Parcel;")?;
+    let recycle = env.method_id(parcel_class, "recycle", "()V")?;
+    let write_interface = env.method_id(parcel_class, "writeInterfaceToken", "(Ljava/lang/String;)V")?;
+    let write_binder = env.method_id(parcel_class, "writeStrongBinder", "(Landroid/os/IBinder;)V")?;
+    let write_long = env.method_id(parcel_class, "writeLong", "(J)V")?;
+    let exception = env.method_id(parcel_class, "readException", "()V")?;
+    let manager = env.find_class("android/os/ServiceManager")?;
+    let get = env.static_method_id(manager, "getService", "(Ljava/lang/String;)Landroid/os/IBinder;")?;
+    let broker = env.call_static_object(manager, get, &[JValue { l: env.new_string("pengudroid.activity_host") }])?;
+    if broker.is_null() { return None; }
+    let binder_class = env.find_class("android/os/IBinder")?;
+    let transact = env.method_id(binder_class, "transact", "(ILandroid/os/Parcel;Landroid/os/Parcel;I)Z")?;
+    let request = env.call_static_object(parcel_class, obtain, &[])?;
+    let reply = env.call_static_object(parcel_class, obtain, &[])?;
+    let admitted = env.call_void(request, write_interface, &[JValue { l: env.new_string("org.pengudroid.IHostedActivity") }])
+        && env.call_void(request, write_binder, &[JValue { l: token }])
+        && env.call_void(request, write_long, &[JValue { j: id as i64 }])
+        && env.call_boolean(broker, transact, &[
+            JValue { i: 1 }, JValue { l: request }, JValue { l: reply }, JValue { i: 0 },
+        ]) == Some(true)
+        && env.call_void(reply, exception, &[]);
+    env.call_void(reply, recycle, &[]);
+    // A Java Binder alone retains its native holder weakly. Keep the original
+    // Parcel's strong Binder reference until activity destruction; otherwise a
+    // later writeStrongBinder can create a different JavaBBinder/weakref pair.
+    if admitted {
+        if let Some(parcel) = env.new_global_ref(request) {
+            return Some(ActivityTokenRegistration { id, env: *env, parcel });
+        }
+        forget_activity_token(id);
+    }
+    env.call_void(request, recycle, &[]);
+    None
+}
+
+/// Pause a record with the API-37 `handlePauseActivity` signal.
+fn pause_activity(
+    env: &JniEnv,
+    thread: JObject,
+    thread_class: JClass,
+    record: JObject,
+    finished: bool,
+) -> bool {
+    let Some(handle) = env.method_id(
+        thread_class,
+        "handlePauseActivity",
+        "(Landroid/app/ActivityThread$ActivityClientRecord;ZZZLandroid/app/servertransaction/PendingTransactionActions;Ljava/lang/String;)V",
+    ) else {
+        eprintln!("apphost: Android 17 ActivityThread.handlePauseActivity contract missing");
+        return false;
+    };
+    let Some((_, pending)) = new_instance(env, "android/app/servertransaction/PendingTransactionActions") else {
+        return false;
+    };
+    let reason = env.new_string("pengudroid");
+    env.call_void(
+        thread,
+        handle,
+        &[
+            JValue { l: record },
+            JValue { z: finished as u8 },
+            JValue { z: 0 }, // userLeaving
+            JValue { z: 0 }, // autoEnteringPip
+            JValue { l: pending },
+            JValue { l: reason },
+        ],
+    )
+}
+
+/// Start and resume a record that was previously paused and stopped.
+fn resume_existing_activity(
+    env: &JniEnv,
+    thread: JObject,
+    thread_class: JClass,
+    record: JObject,
+) {
+    let Some(record_class) = env.find_class("android/app/ActivityThread$ActivityClientRecord") else { return; };
+    let Some(stopped) = env.field_id(record_class, "stopped", "Z") else { return; };
+    // A failed launch rolls back from PAUSED, whereas finishing the next
+    // activity returns to a STOPPED record. Only the latter needs onRestart /
+    // onStart; API 37 deliberately throws when asked to start a paused record.
+    if env.boolean_field(record, stopped) {
+        let Some(handle) = env.method_id(
+            thread_class,
+            "handleStartActivity",
+            "(Landroid/app/ActivityThread$ActivityClientRecord;Landroid/app/servertransaction/PendingTransactionActions;Landroid/app/ActivityOptions$SceneTransitionInfo;)V",
+        ) else { return; };
+        let Some((_, pending)) = new_instance(env, "android/app/servertransaction/PendingTransactionActions") else { return; };
+        if !env.call_void(thread, handle, &[
+            JValue { l: record }, JValue { l: pending }, JValue { l: std::ptr::null_mut() },
+        ]) { return; }
+    }
+    resume_activity(env, thread_class, thread, record);
+    force_visible(env, record);
+}
+
+/// Stop a paused record and hide its decor view, as a device does once the next
+/// activity has been resumed.
+fn stop_activity(env: &JniEnv, thread: JObject, thread_class: JClass, record: JObject) {
+    let Some(handle) = env.method_id(
+        thread_class,
+        "handleStopActivity",
+        "(Landroid/app/ActivityThread$ActivityClientRecord;Landroid/app/servertransaction/PendingTransactionActions;ZLjava/lang/String;)V",
+    ) else {
+        eprintln!("apphost: Android 17 ActivityThread.handleStopActivity contract missing");
+        return;
+    };
+    let Some((_, pending)) = new_instance(env, "android/app/servertransaction/PendingTransactionActions") else {
+        return;
+    };
+    let reason = env.new_string("pengudroid");
+    if !env.call_void(
+        thread,
+        handle,
+        &[
+            JValue { l: record },
+            JValue { l: pending },
+            JValue { z: 0 },
+            JValue { l: reason },
+        ],
+    ) {
+        eprintln!("apphost: handleStopActivity threw");
+    }
+}
+
+/// Destroy a record after it finished.
+fn destroy_activity(env: &JniEnv, thread: JObject, thread_class: JClass, record: JObject) {
+    let Some(handle) = env.method_id(
+        thread_class,
+        "handleDestroyActivity",
+        "(Landroid/app/ActivityThread$ActivityClientRecord;ZZLjava/lang/String;)V",
+    ) else {
+        eprintln!("apphost: Android 17 ActivityThread.handleDestroyActivity contract missing");
+        return;
+    };
+    let reason = env.new_string("pengudroid");
+    if !env.call_void(
+        thread,
+        handle,
+        &[
+            JValue { l: record },
+            JValue { z: 1 }, // finishing
+            JValue { z: 0 }, // getNonConfigInstance
+            JValue { l: reason },
+        ],
+    ) {
+        eprintln!("apphost: handleDestroyActivity threw");
     }
 }
 
@@ -5176,6 +5905,7 @@ fn force_visible(env: &JniEnv, record: JObject) {
     let Some(activity_class) = env.find_class("android/app/Activity") else {
         return;
     };
+    let Some(decor_field) = env.field_id(activity_class, "mDecor", "Landroid/view/View;") else { return; };
     if let Some(make_visible) = env.method_id(activity_class, "makeVisible", "()V") {
         if !env.call_void(activity, make_visible, &[]) {
             eprintln!("apphost: Activity.makeVisible threw");
@@ -5227,6 +5957,8 @@ fn force_visible(env: &JniEnv, record: JObject) {
     let Some(schedule) = env.method_id(root_class, "scheduleTraversals", "()V") else {
         return;
     };
+    let decor = env.object_field(activity, decor_field);
+    let Some(view_field) = env.field_id(root_class, "mView", "Landroid/view/View;") else { return; };
     for index in 0..count {
         let Some(root) = env.call_object(roots, get_m, &[JValue { i: index }]) else {
             continue;
@@ -5234,6 +5966,8 @@ fn force_visible(env: &JniEnv, record: JObject) {
         if root.is_null() {
             continue;
         }
+        if decor.is_null() || !env.is_same_object(env.object_field(root, view_field), decor) { continue; }
+        // Never make another, stopped Activity visible while resuming this one.
         // `isViewVisible()` is false while `mAppVisible` is false, and
         // `performTraversals` then skips `performDraw` entirely. On a device the
         // window manager flips this; here the field is set directly.
@@ -5701,8 +6435,57 @@ fn install_application_transactions(env: &JniEnv) -> Option<()> {
     let setter = shim_symbol("__pengudroid_binder_set_application_transactions")?;
     let setter: unsafe extern "C" fn(u32, u32, u32, u32, u32) -> bool = unsafe { std::mem::transmute(setter) };
     if !unsafe { setter(codes[0], codes[1], codes[2], codes[3], codes[4]) } { return None; }
-    println!("binder: framework application transaction codes = {codes:?}");
+
+    // Activity transitions are resolved from the loaded API-37 Stubs too. Both
+    // `startActivity` entry points exist: `Context.startActivity` uses the task
+    // manager, older helpers the activity manager. `finishActivity` is only on
+    // the activity manager.
+    let mut lifecycle = [0u32; 4];
+    for (out, (class, field)) in lifecycle.iter_mut().zip([
+        ("android/app/IActivityTaskManager$Stub", "TRANSACTION_startActivity"),
+        ("android/app/IActivityManager$Stub", "TRANSACTION_startActivity"),
+        ("android/app/IActivityManager$Stub", "TRANSACTION_finishActivity"),
+        ("android/app/IActivityClientController$Stub", "TRANSACTION_finishActivity"),
+    ]) {
+        let class = env.find_class(class)?;
+        let field = env.static_field_id(class, field, "I")?;
+        *out = u32::try_from(env.static_int_field(class, field)).ok()?;
+    }
+    let setter = shim_symbol("__pengudroid_binder_set_activity_lifecycle_transactions")?;
+    let setter: unsafe extern "C" fn(u32, u32, u32, u32) -> bool = unsafe { std::mem::transmute(setter) };
+    if !unsafe { setter(lifecycle[0], lifecycle[1], lifecycle[2], lifecycle[3]) } { return None; }
+    let activity_manager = env.find_class("android/app/ActivityManager")?;
+    let mut results = [0i32; 4];
+    for (out, field) in results.iter_mut().zip([
+        "START_SUCCESS", "START_INTENT_NOT_RESOLVED", "START_CLASS_NOT_FOUND", "START_CANCELED",
+    ]) {
+        *out = env.static_int_field(activity_manager, env.static_field_id(activity_manager, field, "I")?);
+    }
+    let setter = shim_symbol("__pengudroid_binder_set_activity_start_results")?;
+    let setter: unsafe extern "C" fn(*const i32, usize) -> bool = unsafe { std::mem::transmute(setter) };
+    if !unsafe { setter(results.as_ptr(), results.len()) } { return None; }
+    println!(
+        "binder: framework application transaction codes = {codes:?}, activity lifecycle = {lifecycle:?}"
+    );
     Some(())
+}
+
+/// Tell the broker which package it is hosting, so `startActivity` can reject a
+/// component another app would have to resolve.
+fn install_hosted_package(env: &JniEnv, package: &str) -> Option<()> {
+    let _frame = env.local_frame(4)?;
+    let setter = shim_symbol("__pengudroid_binder_set_hosted_package")?;
+    let setter: unsafe extern "C" fn(*const u8, usize) -> bool = unsafe { std::mem::transmute(setter) };
+    if !unsafe { setter(package.as_ptr(), package.len()) } { return None; }
+    println!("binder: hosted package = {package}");
+    Some(())
+}
+
+fn install_hosted_activities<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<()> {
+    let bytes = names.into_iter().collect::<Vec<_>>().join("\0").into_bytes();
+    let setter = shim_symbol("__pengudroid_binder_set_hosted_activities")?;
+    let setter: unsafe extern "C" fn(*const u8, usize) -> bool = unsafe { std::mem::transmute(setter) };
+    unsafe { setter(bytes.as_ptr(), bytes.len()) }.then_some(())
 }
 
 /// API 37 exposes both binder and Service-union methods. All four contracts

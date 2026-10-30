@@ -374,8 +374,16 @@ unsafe fn allocate_buffer(
     0
 }
 
-/// `android::GraphicBufferMapper::importBuffer(handle, width, height, format,
-/// usage, bufferId, generationNumber, out)`.
+/// `android::GraphicBufferMapper::importBuffer(handle, width, height,
+/// layerCount, format, usage, stride, out)`.
+///
+/// API-37 declaration (`GraphicBufferMapper.h`):
+/// `status_t importBuffer(const native_handle_t*, uint32_t width, uint32_t height,
+/// uint32_t layerCount, PixelFormat format, uint64_t usage, uint32_t stride,
+/// buffer_handle_t* outHandle)`. The mangled name only encodes those eight
+/// parameters; an earlier hosted form omitted `layerCount` and shifted the
+/// output pointer into the wrong stack slot, so the caller's `outHandle` stayed
+/// null while this function reported success.
 ///
 /// The real implementation goes to the gralloc mapper HAL. Our handles are
 /// memfd-backed and we are their only producer, so `lock` maps the returned
@@ -393,18 +401,23 @@ unsafe fn allocate_buffer(
 pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper12importBufferEPK13native_handlejjjimjPS3_(
     _this: *mut c_void,
     handle: *const NativeHandle,
-    _width: u32,
-    _height: u32,
-    _format: u32,
-    _usage: i32,
-    _buffer_id: u64,
-    _generation: u32,
+    width: u32,
+    height: u32,
+    layer_count: u32,
+    format: i32,
+    usage: u64,
+    stride: u32,
     out: *mut *const NativeHandle,
 ) -> i32 {
     if std::env::var_os("PENGUDROID_TRACE_AHB").is_some() {
+        let (fds, ints, observed_stride) = if handle.is_null() {
+            (0, 0, 0)
+        } else {
+            ((*handle).num_fds, (*handle).num_ints,
+                if (*handle).num_ints >= 1 { (*handle).data[1] } else { 0 })
+        };
         eprintln!(
-            "[ahb] importBuffer {_width}x{_height} fmt={_format:#x} usage={_usage:#x} width={_width} bufid={_buffer_id} gen={_generation} stride={}",
-            if !handle.is_null() && (*handle).num_ints >= 1 { (*handle).data[1] } else { 0 }
+            "[ahb] importBuffer {width}x{height} fmt={format:#x} layers={layer_count} usage={usage:#x} stride={stride} handle={handle:p} fds={fds} ints={ints} handle_stride={observed_stride}"
         );
     }
     import_handle_copy(handle, out)
@@ -421,6 +434,14 @@ pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper22importBufferNoValidat
     handle: *const NativeHandle,
     out: *mut *const NativeHandle,
 ) -> i32 {
+    if std::env::var_os("PENGUDROID_TRACE_AHB").is_some() {
+        let (fds, ints) = if handle.is_null() {
+            (0, 0)
+        } else {
+            ((*handle).num_fds, (*handle).num_ints)
+        };
+        eprintln!("[ahb] importBufferNoValidate handle={handle:p} fds={fds} ints={ints}");
+    }
     import_handle_copy(handle, out)
 }
 
@@ -442,6 +463,10 @@ unsafe fn import_handle_copy(handle: *const NativeHandle, out: *mut *const Nativ
         if dup < 0 {
             for j in 0..i {
                 libc::close(copy.data[j]);
+            }
+            if std::env::var_os("PENGUDROID_TRACE_AHB").is_some() {
+                eprintln!("[ahb] import handle copy failed: dup({}) errno={}", src.data[i],
+                    *libc::__errno_location());
             }
             return -12;
         }
@@ -1152,6 +1177,24 @@ unsafe fn as_buf<'a>(p: *mut FakeHardwareBuffer) -> Option<&'a FakeHardwareBuffe
     (b.magic == AHB_MAGIC).then_some(b)
 }
 
+/// Resolve the next definition of an `AHardwareBuffer_*` symbol.
+///
+/// `GraphicBuffer::toAHardwareBuffer()` returns a framework `AHardwareBuffer`
+/// object, not this shim's `FakeHardwareBuffer`. Those objects must be handled
+/// by the real libandroid implementation; answering them from the fake-struct
+/// path produced a null native handle and an all-zero descriptor, which made
+/// `requestBuffer`'s HBuffer conversion fail (`C2BqBuffer: get generationNumber
+/// failed`).
+unsafe fn real_ahb<T: Copy>(name: &[u8]) -> Option<T> {
+    let p = libc::dlsym(libc::RTLD_NEXT, name.as_ptr() as *const libc::c_char);
+    if p.is_null() {
+        None
+    } else {
+        debug_assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<*const c_void>());
+        Some(std::mem::transmute_copy(&p))
+    }
+}
+
 /// `AHardwareBuffer_describe(buffer, desc)`.
 #[no_mangle]
 pub unsafe extern "C" fn AHardwareBuffer_describe(
@@ -1163,7 +1206,13 @@ pub unsafe extern "C" fn AHardwareBuffer_describe(
     }
     match as_buf(buffer) {
         Some(b) => *desc = b.desc,
-        None => *desc = HardwareBufferDesc::default(),
+        None => {
+            type Real = unsafe extern "C" fn(*mut c_void, *mut HardwareBufferDesc);
+            match real_ahb::<Real>(b"AHardwareBuffer_describe\0") {
+                Some(real) => real(buffer as *mut c_void, desc),
+                None => *desc = HardwareBufferDesc::default(),
+            }
+        }
     }
 }
 
@@ -1172,6 +1221,8 @@ pub unsafe extern "C" fn AHardwareBuffer_describe(
 pub unsafe extern "C" fn AHardwareBuffer_acquire(buffer: *mut FakeHardwareBuffer) {
     if let Some(b) = as_buf(buffer) {
         b.refs.fetch_add(1, Ordering::Relaxed);
+    } else if let Some(real) = real_ahb::<unsafe extern "C" fn(*mut c_void)>(b"AHardwareBuffer_acquire\0") {
+        real(buffer as *mut c_void);
     }
 }
 
@@ -1183,6 +1234,9 @@ pub unsafe extern "C" fn AHardwareBuffer_release(buffer: *mut FakeHardwareBuffer
     }
     let b = &*buffer;
     if b.magic != AHB_MAGIC {
+        if let Some(real) = real_ahb::<unsafe extern "C" fn(*mut c_void)>(b"AHardwareBuffer_release\0") {
+            real(buffer as *mut c_void);
+        }
         return;
     }
     if b.refs.fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -1262,6 +1316,13 @@ pub unsafe extern "C" fn AHardwareBuffer_lockPlanes(
     if out_planes.is_null() {
         return -22;
     }
+    if as_buf(buffer).is_none() {
+        type Real = unsafe extern "C" fn(*mut c_void, u64, i32, *const c_void, *mut c_void) -> i32;
+        return match real_ahb::<Real>(b"AHardwareBuffer_lockPlanes\0") {
+            Some(real) => real(buffer as *mut c_void, usage, fence, rect, out_planes),
+            None => -22,
+        };
+    }
     let mut addr: *mut c_void = std::ptr::null_mut();
     let rc = AHardwareBuffer_lock(buffer, usage, fence, rect, &mut addr);
     if rc != 0 {
@@ -1301,7 +1362,13 @@ pub unsafe extern "C" fn AHardwareBuffer_getNativeHandle(
 ) -> *const NativeHandle {
     match as_buf(buffer) {
         Some(b) => &b.handle,
-        None => std::ptr::null(),
+        None => {
+            type Real = unsafe extern "C" fn(*mut c_void) -> *const NativeHandle;
+            match real_ahb::<Real>(b"AHardwareBuffer_getNativeHandle\0") {
+                Some(real) => real(buffer as *mut c_void),
+                None => std::ptr::null(),
+            }
+        }
     }
 }
 
@@ -1362,7 +1429,11 @@ pub unsafe extern "C" fn AHardwareBuffer_lock(
     out_addr: *mut *mut c_void,
 ) -> i32 {
     let Some(b) = as_buf(buffer) else {
-        return -22;
+        type Real = unsafe extern "C" fn(*mut c_void, u64, i32, *const c_void, *mut *mut c_void) -> i32;
+        return match real_ahb::<Real>(b"AHardwareBuffer_lock\0") {
+            Some(real) => real(buffer as *mut c_void, _usage, _fence, _rect, out_addr),
+            None => -22,
+        };
     };
     if out_addr.is_null() {
         return -22;
@@ -1382,7 +1453,11 @@ pub unsafe extern "C" fn AHardwareBuffer_unlock(
     _fence: *mut i32,
 ) -> i32 {
     let Some(b) = as_buf(buffer) else {
-        return -22;
+        type Real = unsafe extern "C" fn(*mut c_void, *mut i32) -> i32;
+        return match real_ahb::<Real>(b"AHardwareBuffer_unlock\0") {
+            Some(real) => real(buffer as *mut c_void, _fence),
+            None => -22,
+        };
     };
     unmap_cpu(&b.handle as *const NativeHandle as usize);
     if !_fence.is_null() { *_fence = -1; }
@@ -1402,7 +1477,11 @@ pub unsafe extern "C" fn AHardwareBuffer_to_ANativeWindowBuffer(
     }
     let b = &mut *buffer;
     if b.magic != AHB_MAGIC {
-        return std::ptr::null_mut();
+        type Real = unsafe extern "C" fn(*mut c_void) -> *mut NativeWindowBuffer;
+        return match real_ahb::<Real>(b"AHardwareBuffer_to_ANativeWindowBuffer\0") {
+            Some(real) => real(buffer as *mut c_void),
+            None => std::ptr::null_mut(),
+        };
     }
     &mut b.window_buffer
 }

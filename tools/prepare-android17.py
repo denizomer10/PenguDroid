@@ -52,6 +52,9 @@ REQUIRED = (
     "system/lib64/libc.so",
     "system/lib64/libandroid.so",
     "system/lib64/libdl_android.so",
+    # Link input for the native bridge's libbase dependency; the bridge build
+    # does not recompile system/core's liblog from the incomplete source slice.
+    "system/lib64/liblog.so",
 )
 
 

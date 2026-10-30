@@ -358,7 +358,10 @@ fn serve(daemon: Arc<Daemon>, conn: Connection) -> io::Result<()> {
     let (_role, pid) = match hello {
         Message::Hello { version, role, pid } => {
             if version != PROTO_VERSION {
-                crate::warn!("client protocol v{version} != daemon v{PROTO_VERSION}");
+                let message = format!("client protocol v{version} != daemon v{PROTO_VERSION}; rebuild/restart matching peers");
+                crate::warn!("{message}");
+                let _ = conn.send_message(&Message::Error { code: -libc::EPROTO, message }, &[]);
+                return Ok(());
             }
             crate::debug!("client connected: role={role:?} pid={pid}");
             let _ = conn.send_message(
@@ -417,11 +420,11 @@ fn serve(daemon: Arc<Daemon>, conn: Connection) -> io::Result<()> {
         };
         let (msg, raw_fds) = received;
         let (reply, out_fds, close) = match msg {
-            Message::PresentShm { surface_id, width, height, stride, format } => {
+            Message::PresentShm { surface_id, width, height, stride, format, crop } => {
                 let owned: Vec<OwnedFd> = raw_fds.into_iter().map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }).collect();
                 let mut fds = owned.into_iter();
                 let result = match (fds.next(), daemon.graphics.lock().unwrap().as_mut()) {
-                    (Some(fd), Some(gfx)) => gfx.present_shm(surface_id, fd, width, height, stride, format),
+                    (Some(fd), Some(gfx)) => gfx.present_shm(surface_id, fd, width, height, stride, format, crop),
                     (None, _) => Err("PresentShm: no fd attached".into()),
                     (_, None) => Err("graphics unavailable".into()),
                 };
@@ -1077,6 +1080,24 @@ mod tests {
     fn call(daemon: &Arc<Daemon>, peer: &Peer, m: Message) -> (Option<Message>, Vec<OwnedFd>, bool) {
         let (tx, _rx) = std::sync::mpsc::channel();
         handle(daemon, peer, &tx, m)
+    }
+
+    #[test]
+    fn software_crop_protocol_rejects_mismatched_handshakes() {
+        let daemon = test_daemon();
+        for version in [PROTO_VERSION - 1, PROTO_VERSION + 1] {
+            let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+            let daemon = daemon.clone();
+            let thread = std::thread::spawn(move || serve(daemon, Connection::from_stream(server)));
+            let conn = Connection::from_stream(client);
+            conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            conn.send_message(&Message::Hello { version, role: pengudroid_proto::Role::Guest,
+                pid: std::process::id() as i32 }, &[]).unwrap();
+            assert!(matches!(conn.recv_message().unwrap().0,
+                Message::Error { code, message } if code == -libc::EPROTO && message.contains("protocol")));
+            thread.join().unwrap().unwrap();
+            assert!(conn.recv_message().is_err(), "a mismatched peer must not enter request dispatch");
+        }
     }
 
     #[test]

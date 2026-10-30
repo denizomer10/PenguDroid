@@ -582,6 +582,93 @@ pub extern "C" fn __pengudroid_binder_set_application_transactions(
     true
 }
 
+/// `startActivity` on the task/activity manager, then `finishActivity` on the
+/// activity manager/client controller. Installed from the loaded API-37 Stubs.
+static ACTIVITY_LIFECYCLE_CODES: Mutex<[u32; 4]> = Mutex::new([u32::MAX; 4]);
+static ACTIVITY_START_RESULTS: Mutex<Option<[i32; 4]>> = Mutex::new(None);
+
+/// The four `ActivityManager.START_*` constants: success, unresolved intent,
+/// class not found, and canceled. Never choose framework result codes by guess.
+///
+/// # Safety
+/// `codes` must reference four readable i32s when `len == 4`.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_activity_start_results(codes: *const i32, len: usize) -> bool {
+    if codes.is_null() || len != 4 { return false; }
+    let Ok(values) = <[i32; 4]>::try_from(std::slice::from_raw_parts(codes, len)) else { return false; };
+    if values[0] != 0 || values[1..].iter().any(|v| *v >= 0) { return false; }
+    *ACTIVITY_START_RESULTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(values);
+    true
+}
+
+/// Install the four lifecycle transaction codes.
+#[no_mangle]
+pub extern "C" fn __pengudroid_binder_set_activity_lifecycle_transactions(
+    start_task: u32,
+    start_activity: u32,
+    finish: u32,
+    finish_client: u32,
+) -> bool {
+    let codes = [start_task, start_activity, finish, finish_client];
+    if codes.iter().any(|&code| code == 0 || code >= 0x00ff_fffe) { return false; }
+    *ACTIVITY_LIFECYCLE_CODES.lock().unwrap_or_else(|e| e.into_inner()) = codes;
+    true
+}
+
+/// The hosted application's package, set before `handleBindApplication`.
+///
+/// Only an activity whose `Intent` names a component in this package can be
+/// launched by the host; resolving another package would need a real package
+/// manager. The shim checks the component before admitting a request, so an
+/// unhostable start fails in the caller instead of being acknowledged.
+static HOSTED_PACKAGE: Mutex<Option<String>> = Mutex::new(None);
+static HOSTED_ACTIVITIES: Mutex<std::collections::BTreeSet<String>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// Install the NUL-separated UTF-8 class names from the hosted manifest.
+///
+/// # Safety
+/// `ptr` must reference `len` readable bytes; no pointer is retained.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_hosted_activities(ptr: *const u8, len: usize) -> bool {
+    if ptr.is_null() || len > 1024 * 1024 { return false; }
+    let Ok(text) = std::str::from_utf8(std::slice::from_raw_parts(ptr, len)) else { return false; };
+    let mut names = std::collections::BTreeSet::new();
+    for name in text.split('\0').filter(|name| !name.is_empty()) {
+        if name.len() > 1024 { return false; }
+        names.insert(name.to_owned());
+    }
+    *HOSTED_ACTIVITIES.lock().unwrap_or_else(|e| e.into_inner()) = names;
+    true
+}
+
+const ACTIVITY_HOST_DESCRIPTOR: &str = "org.pengudroid.IHostedActivity";
+// Native Binder identities are registered through a private in-process Binder
+// transaction. No Java handle addresses or guessed JavaBBinder layout is used.
+static ACTIVITY_TOKENS: Mutex<std::collections::BTreeMap<(u64, u64), u64>> =
+    Mutex::new(std::collections::BTreeMap::new());
+static ACTIVITY_WAKEUP: AtomicBool = AtomicBool::new(false);
+
+#[no_mangle]
+pub extern "C" fn __pengudroid_binder_take_activity_wakeup() -> bool {
+    ACTIVITY_WAKEUP.swap(false, Ordering::AcqRel)
+}
+
+#[no_mangle]
+pub extern "C" fn __pengudroid_binder_forget_activity_token(id: u64) {
+    ACTIVITY_TOKENS.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, value| *value != id);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_hosted_package(ptr: *const u8, len: usize) -> bool {
+    if ptr.is_null() || len == 0 {
+        return false;
+    }
+    let bytes = std::slice::from_raw_parts(ptr, len);
+    let Ok(package) = std::str::from_utf8(bytes) else { return false; };
+    *HOSTED_PACKAGE.lock().unwrap_or_else(|e| e.into_inner()) = Some(package.to_string());
+    true
+}
+
 
 /// ISessionManager.createSession, ISession.getController/getBinderForSetQueue,
 /// IMediaMetricsManager.getPlaybackSessionId, installed from the API-37 Stubs.
@@ -1933,9 +2020,15 @@ fn string8_start_ending_at(data: &[u8], end: usize) -> Option<usize> {
         return None;
     }
     let word = u32::from_ne_bytes([data[end - 4], data[end - 3], data[end - 2], data[end - 1]]);
-    if word == u32::MAX || word == 0 {
+    // `-1` is a null String8, never a valid length word.
+    if word == u32::MAX {
         return Some(end - 4);
     }
+    // A trailing zero word is either a null Uri (a bare `0` int) or the
+    // terminator/padding of a non-null String8 whose length is a multiple of
+    // four. Try the real length scan first, and fall back to the null field
+    // only when no payload fits.
+    let trailing_zero = word == 0;
     let lowest = end.saturating_sub(4 + 1024 + 8);
     let mut start = (end - 4) & !3;
     loop {
@@ -1946,17 +2039,156 @@ fn string8_start_ending_at(data: &[u8], end: usize) -> Option<usize> {
                 data[start + 2],
                 data[start + 3],
             ]) as usize;
+            // `Parcel::writeString8` writes the length, the bytes, one NUL, and
+            // then pads the whole payload to four bytes. The terminator is part
+            // of the padded region, so the next field starts at
+            // `start + 4 + align4(len + 1)` (not align4(len) + 5).
             if (1..=1024).contains(&len) && start + 4 + len <= data.len() {
-                if (start + 4 + len + 3) & !3 == end {
+                if start + 4 + ((len + 1 + 3) & !3) == end {
                     return Some(start);
                 }
             }
         }
-        if start < lowest || start < 4 {
-            return None;
+        if start < 4 || start < lowest {
+            break;
         }
         start -= 4;
     }
+    trailing_zero.then(|| end - 4)
+}
+
+fn u32_at(data: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_ne_bytes(data.get(at..at + 4)?.try_into().ok()?))
+}
+
+/// Read one `Parcel.writeString16` field.
+///
+/// Returns the decoded string (`None` for a null) and the offset of the next
+/// field. This is the forward counterpart of `string16_start_ending_at` and is
+/// used to validate a candidate `Intent` instead of trusting a backward walk.
+fn read_string16(data: &[u8], at: usize) -> Option<(Option<String>, usize)> {
+    let len = u32_at(data, at)?;
+    if len == u32::MAX {
+        return Some((None, at + 4));
+    }
+    let len = usize::try_from(len).ok()?;
+    if len > 4096 {
+        return None;
+    }
+    let payload = data.get(at + 4..at + 4 + len * 2)?;
+    let next = at + 4 + ((len * 2 + 2 + 3) & !3);
+    if next > data.len() {
+        return None;
+    }
+    Some((Some(decode_utf16le(payload)), next))
+}
+
+/// Read one `Parcel.writeString8` field.
+fn read_string8(data: &[u8], at: usize) -> Option<(Option<String>, usize)> {
+    let len = u32_at(data, at)?;
+    if len == u32::MAX {
+        return Some((None, at + 4));
+    }
+    let len = usize::try_from(len).ok()?;
+    if len > 4096 {
+        return None;
+    }
+    let payload = data.get(at + 4..at + 4 + len)?;
+    let next = at + 4 + ((len + 1 + 3) & !3);
+    if next > data.len() {
+        return None;
+    }
+    Some((Some(String::from_utf8_lossy(payload).into_owned()), next))
+}
+
+/// Walk one `Intent.mData` field: either a null type id or `[type id][String8]`.
+fn intent_uri_end(data: &[u8], at: usize) -> Option<usize> {
+    match u32_at(data, at)? {
+        0 | u32::MAX => Some(at + 4),
+        1..=3 => read_string8(data, at + 4).map(|(_, next)| next),
+        _ => None,
+    }
+}
+
+/// Parse the API-37 `Intent` prefix at `at` and return its component.
+///
+/// `Intent.writeToParcel` order is action, data, type, identifier, flags,
+/// extendedFlags, package, then `ComponentName` as two String16 fields. A
+/// missing component returns `None`; no other Intent layout is accepted.
+fn intent_component_at(data: &[u8], at: usize) -> Option<(String, String, usize)> {
+    let (_, mut next) = read_string8(data, at)?;
+    next = intent_uri_end(data, next)?;
+    let (_, after_type) = read_string8(data, next)?;
+    let (_, after_identifier) = read_string8(data, after_type)?;
+    let after_flags = after_identifier.checked_add(4)?;
+    let after_extended_flags = after_flags.checked_add(4)?;
+    // The `mPackage` String8 sits after both int flags fields.
+    let (_, component) = read_string8(data, after_extended_flags)?;
+    let (package_name, after_package) = read_string16(data, component)?;
+    let package_name = package_name?;
+    let (class_name, _) = read_string16(data, after_package)?;
+    let class_name = class_name?;
+    if package_name.is_empty() || class_name.is_empty() {
+        return None;
+    }
+    Some((package_name, class_name, component))
+}
+
+/// Locate the `Intent` argument of an API-37 activity-manager transaction.
+///
+/// The API-37 interface token follows `[strictMode][workSourceUid]["TSYS"]`.
+/// `startActivity` then carries the caller binder, the calling package, an
+/// optional feature id (task-manager variant only), and a typed `Intent`.
+/// Parsing forward keeps `callingPackage` from being mistaken for the
+/// component package. Only the loaded platform's wire format is accepted.
+fn activity_intent(data: &[u8]) -> Option<(usize, String, String)> {
+    if data.get(8..12)? != b"TSYS" { return None; }
+    let (descriptor, mut at) = read_string16(data, 12)?;
+    let descriptor = descriptor?;
+    let task_manager = match descriptor.as_str() {
+        "android.app.IActivityTaskManager" => true,
+        "android.app.IActivityManager" => false,
+        _ => return None,
+    };
+    let ty = u32_at(data, at)?;
+    if ty != BINDER_TYPE_BINDER && ty != BINDER_TYPE_HANDLE {
+        return None;
+    }
+    // `flat_binder_object` is type/flags/binder-or-handle/cookie (24 bytes) and
+    // then the stability word libbinder writes in `finishFlattenBinder`.
+    at = at.checked_add(24)?;
+    if !matches!(u32_at(data, at)?, 3 | 0xc | 0x3f) {
+        return None;
+    }
+    at += 4;
+    let (_, next) = read_string16(data, at)?;
+    at = next;
+    if task_manager {
+        let (_, next) = read_string16(data, at)?;
+        at = next;
+    }
+    // AIDL's writeTypedObject adds a presence word before Intent.writeToParcel.
+    // Skipping it is mandatory: treating `1` as an action string length can
+    // make a hand-written fixture pass while every real start is rejected.
+    if u32_at(data, at)? != 1 { return None; }
+    at += 4;
+    let (package, class, _) = intent_component_at(data, at)?;
+    Some((at, package, class))
+}
+
+/// Decode only finishes for a registered local token, without result Intent or
+/// task-wide removal. Unsupported finishes return false instead of closing an
+/// unrelated top activity.
+fn activity_finish_token(data: &[u8], descriptor: &str) -> Option<(u64, i32)> {
+    if first_string16(data).as_deref() != Some(descriptor) { return None; }
+    let (_, at) = read_string16(data, 12)?;
+    let (weak, cookie, offset) = find_local_binder(data)?;
+    if offset != at || u32_at(data, at + 32)? != 0 || u32_at(data, at + 36)? != 0 {
+        return None;
+    }
+    let result = u32_at(data, at + 28)? as i32;
+    let token = *ACTIVITY_TOKENS.lock().unwrap_or_else(|e| e.into_inner()).get(&(weak, cookie))?;
+    Some((token, result))
 }
 
 /// Offset of the `Intent` that contains the component package at
@@ -2113,6 +2345,31 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             _ => return Reply::unknown_transaction(tr, "unimplemented API-37 ISurfaceComposer method"),
         }
         return Reply { parcel, objects, flags: 0 };
+    }
+    if name_for_handle(tr.target_handle).as_deref() == Some("pengudroid.activity_host") {
+        let data = if tr.data_size != 0 && tr.data_ptr != 0 {
+            std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize)
+        } else { &[] };
+        if tr.code != 1 || first_string16(data).as_deref() != Some(ACTIVITY_HOST_DESCRIPTOR) {
+            return Reply::unknown_transaction(tr, "unsupported hosted-activity registration");
+        }
+        let Some((_, at)) = read_string16(data, 12) else {
+            return Reply::unknown_transaction(tr, "missing hosted-activity interface token");
+        };
+        let Some((weak, cookie, offset)) = find_local_binder(data).filter(|(_, _, offset)| *offset == at) else {
+            return Reply::unknown_transaction(tr, "activity token must be a non-null local Binder");
+        };
+        let Some(bytes) = data.get(offset + 28..offset + 36) else {
+            return Reply::unknown_transaction(tr, "missing activity token id");
+        };
+        let id = u64::from_ne_bytes(bytes.try_into().unwrap());
+        let mut tokens = ACTIVITY_TOKENS.lock().unwrap_or_else(|e| e.into_inner());
+        if id == 0 || tokens.len() >= 64 || tokens.contains_key(&(weak, cookie))
+            || tokens.values().any(|value| *value == id) {
+            return Reply::unknown_transaction(tr, "activity token registration refused");
+        }
+        tokens.insert((weak, cookie), id);
+        return Reply { parcel: vec![0; 4], objects: Vec::new(), flags: 0 };
     }
     if trace_enabled() {
         let name = name_for_handle(tr.target_handle).unwrap_or_else(|| "?".to_string());
@@ -2306,6 +2563,81 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                 intent_offset,
             );
         }
+    }
+    let lifecycle = *ACTIVITY_LIFECYCLE_CODES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let start_activity = (tr.target_handle == handle_for("activity_task") && tr.code == lifecycle[0])
+        || (tr.target_handle == handle_for("activity") && tr.code == lifecycle[1]);
+    if start_activity {
+        let Some(results) = *ACTIVITY_START_RESULTS.lock().unwrap_or_else(|e| e.into_inner()) else {
+            return Reply::unknown_transaction(tr, "framework activity-start result codes not installed");
+        };
+        let data = if tr.data_size > 0 && tr.data_ptr != 0 {
+            std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize)
+        } else {
+            &[][..]
+        };
+        match activity_intent(data) {
+            Some((intent_offset, pkg, cls))
+                if note_activity_start(&pkg, &cls, data, intent_offset) =>
+            {
+                // `ActivityManager.START_SUCCESS`. The request is now owned by
+                // the main-thread host, which is the only place an Activity can
+                // be created; the reply is not a claim that it has finished
+                // launching.
+                parcel.extend_from_slice(&results[0].to_ne_bytes());
+                if trace_enabled() {
+                    diag(&format!(
+                        "[binder]   -> startActivity admitted {pkg}/{cls} intent_offset={intent_offset}\n"
+                    ));
+                }
+            }
+            other => {
+                let reason = match other {
+                    Some((_, ref pkg, ref cls)) => format!(
+                        "startActivity for {pkg}/{cls} was not admitted (manifest, package, queue or size limit)"
+                    ),
+                    None => "startActivity Intent could not be parsed with the API-37 layout".to_string(),
+                };
+                if trace_enabled() {
+                    let mut hex = String::new();
+                    for byte in data.iter().take(512) {
+                        hex.push_str(&format!("{byte:02x}"));
+                    }
+                    diag(&format!(
+                        "[binder] startActivity parse failed: {} bytes, hex={hex}\n",
+                        data.len()
+                    ));
+                }
+                diag(&format!("[binder] {reason}\n"));
+                // A recognized but rejected start must return a fatal framework
+                // result. UNKNOWN_TRANSACTION alone is insufficient: some
+                // generated proxies read a zero default after transact(false),
+                // accidentally treating rejection as START_SUCCESS.
+                let result = match other {
+                    None => results[1],
+                    Some((_, ref package, ref class)) if
+                        HOSTED_PACKAGE.lock().unwrap_or_else(|e| e.into_inner()).as_deref() != Some(package.as_str())
+                        || !HOSTED_ACTIVITIES.lock().unwrap_or_else(|e| e.into_inner()).contains(class) => results[2],
+                    Some(_) => results[3],
+                };
+                parcel.extend_from_slice(&result.to_ne_bytes());
+            }
+        }
+    }
+    let finish_descriptor = if tr.target_handle == handle_for("activity") && tr.code == lifecycle[2] {
+        Some("android.app.IActivityManager")
+    } else if tr.target_handle == handle_for("activity_client_controller") && tr.code == lifecycle[3] {
+        Some("android.app.IActivityClientController")
+    } else { None };
+    if let Some(descriptor) = finish_descriptor {
+        let data = if tr.data_size != 0 && tr.data_ptr != 0 {
+            std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize)
+        } else { &[] };
+        let admitted = activity_finish_token(data, descriptor)
+            .is_some_and(|(token, result)| note_activity_finish(token, result));
+        parcel.extend_from_slice(&i32::from(admitted).to_ne_bytes());
     }
     if tr.target_handle == handle_for("activity") && tr.code == APPLICATION_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner())[1] {
         let info = PROVIDER_INFO.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -3601,6 +3933,148 @@ pub unsafe extern "C" fn __pengudroid_binder_take_service_request(
     0
 }
 
+/// One hosted activity transition recorded by the broker.
+///
+/// The activity itself must be created on the main Looper thread, so the
+/// broker never calls into the framework: it records the transaction and lets
+/// `apphost` replay it as `ActivityThread.handleLaunchActivity` /
+/// `handlePauseActivity` / `handleDestroyActivity`.
+#[derive(Clone)]
+pub struct ActivityRequest {
+    /// `0` = start, `1` = finish.
+    pub op: u8,
+    /// `finishActivity`'s result code (start requests use 0).
+    pub result: i32,
+    pub token: u64,
+    pub package: String,
+    pub class: String,
+    /// The transaction buffer, verbatim.
+    pub parcel: Vec<u8>,
+    /// Offset of the `Intent` inside `parcel`, or 0 when it was not located.
+    pub intent_offset: usize,
+}
+
+/// Binder transactions can carry a whole `PlayQueue` intent. 512 KiB leaves
+/// room for that while keeping the bounded queue's worst case predictable.
+pub const ACTIVITY_REQUEST_CAP: usize = 512 * 1024;
+/// Requests are only generated by user actions; eight pending transitions is
+/// already more than the host can meaningfully present.
+const ACTIVITY_REQUEST_QUEUE_CAP: usize = 8;
+
+static ACTIVITY_REQUESTS: Mutex<Vec<ActivityRequest>> = Mutex::new(Vec::new());
+
+/// Record an activity start. Returns `false` when the request cannot be hosted
+/// (unknown package, oversized buffer, or a full queue); the caller must not
+/// report success in that case.
+fn note_activity_start(package: &str, class: &str, data: &[u8], intent_offset: usize) -> bool {
+    if data.len() > ACTIVITY_REQUEST_CAP || package.len() > 1024 || class.len() > 1024
+        || intent_offset == 0 || intent_offset >= data.len() {
+        unsafe {
+            diag(&format!(
+                "[binder] startActivity rejected: {package}/{class} needs {} bytes (cap {ACTIVITY_REQUEST_CAP})\n",
+                data.len()
+            ));
+        }
+        return false;
+    }
+    let hosted = HOSTED_PACKAGE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if hosted.as_deref() != Some(package) {
+        unsafe {
+            diag(&format!(
+                "[binder] startActivity rejected: {package}/{class} is outside the hosted package {:?}\n",
+                hosted
+            ));
+        }
+        return false;
+    }
+    if !HOSTED_ACTIVITIES.lock().unwrap_or_else(|e| e.into_inner()).contains(class) { return false; }
+    let mut queue = ACTIVITY_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+    if queue.len() >= ACTIVITY_REQUEST_QUEUE_CAP {
+        unsafe { diag("[binder] startActivity rejected: activity request queue is full\n"); }
+        return false;
+    }
+    queue.push(ActivityRequest {
+        op: 0,
+        result: 0,
+        token: 0,
+        package: package.to_string(),
+        class: class.to_string(),
+        parcel: data.to_vec(),
+        intent_offset,
+    });
+    ACTIVITY_WAKEUP.store(true, Ordering::Release);
+    unsafe { diag(&format!("[binder] activity request: start {package}/{class}\n")); }
+    true
+}
+
+fn note_activity_finish(token: u64, result: i32) -> bool {
+    let mut queue = ACTIVITY_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+    if queue.len() >= ACTIVITY_REQUEST_QUEUE_CAP {
+        unsafe { diag("[binder] finishActivity rejected: activity request queue is full\n"); }
+        return false;
+    }
+    queue.push(ActivityRequest {
+        op: 1,
+        result,
+        token,
+        package: String::new(),
+        class: String::new(),
+        parcel: Vec::new(),
+        intent_offset: 0,
+    });
+    ACTIVITY_WAKEUP.store(true, Ordering::Release);
+    unsafe { diag(&format!("[binder] activity request: finish token={token}\n")); }
+    true
+}
+
+/// Pop the oldest recorded activity transition.
+///
+/// Record layout (all integers little-endian):
+/// ```text
+/// [u32 op][i32 result][u64 token][u32 pkg_len][u32 cls_len][u32 intent_offset][u32 parcel_len]
+/// [pkg bytes][class bytes][parcel bytes]
+/// ```
+/// Returns `0` on success and `-1` when the queue is empty or the record does
+/// not fit `cap`.
+///
+/// # Safety
+/// `out` must point at `cap` writable bytes and `out_len` at a writable
+/// `usize`.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_take_activity_request(
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if out.is_null() || out_len.is_null() {
+        return -1;
+    }
+    let request = {
+        let mut queue = ACTIVITY_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(first) = queue.first() else { return -1; };
+        let total = 32 + first.package.len() + first.class.len() + first.parcel.len();
+        if total > cap { return -1; }
+        queue.remove(0)
+    };
+    let pkg = request.package.as_bytes();
+    let cls = request.class.as_bytes();
+    let total = 32 + pkg.len() + cls.len() + request.parcel.len();
+    let mut record = Vec::with_capacity(total);
+    record.extend_from_slice(&(request.op as u32).to_ne_bytes());
+    record.extend_from_slice(&request.result.to_ne_bytes());
+    record.extend_from_slice(&request.token.to_ne_bytes());
+    record.extend_from_slice(&(pkg.len() as u32).to_ne_bytes());
+    record.extend_from_slice(&(cls.len() as u32).to_ne_bytes());
+    record.extend_from_slice(&(request.intent_offset as u32).to_ne_bytes());
+    record.extend_from_slice(&(request.parcel.len() as u32).to_ne_bytes());
+    record.extend_from_slice(pkg);
+    record.extend_from_slice(cls);
+    record.extend_from_slice(&request.parcel);
+    std::ptr::copy_nonoverlapping(record.as_ptr(), out, record.len());
+    *out_len = record.len();
+    0
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn __pengudroid_binder_set_activity_info(ptr: *const u8, len: usize) {
     if ptr.is_null() || len == 0 {
@@ -4120,6 +4594,180 @@ mod tests {
         data.extend_from_slice(&18u32.to_ne_bytes());
         data.resize(data.len() + 38, 0);
         assert_eq!(intent_start(&data, component_package), Some(0));
+    }
+
+    fn write_string16(out: &mut Vec<u8>, value: Option<&str>) {
+        match value {
+            None => out.extend_from_slice(&u32::MAX.to_ne_bytes()),
+            Some(value) => {
+                out.extend_from_slice(&(value.len() as u32).to_ne_bytes());
+                for unit in value.encode_utf16() {
+                    out.extend_from_slice(&unit.to_ne_bytes());
+                }
+                out.extend_from_slice(&[0, 0]);
+                while out.len() % 4 != 0 {
+                    out.push(0);
+                }
+            }
+        }
+    }
+
+    fn write_string8(out: &mut Vec<u8>, value: Option<&str>) {
+        match value {
+            None => out.extend_from_slice(&u32::MAX.to_ne_bytes()),
+            Some(value) => {
+                out.extend_from_slice(&(value.len() as u32).to_ne_bytes());
+                out.extend_from_slice(value.as_bytes());
+                out.push(0);
+                while out.len() % 4 != 0 {
+                    out.push(0);
+                }
+            }
+        }
+    }
+
+    fn api37_intent(action: Option<&str>, package: &str, class: &str) -> Vec<u8> {
+        let mut intent = Vec::new();
+        write_string8(&mut intent, action);
+        intent.extend_from_slice(&0u32.to_ne_bytes()); // null Uri type id
+        write_string8(&mut intent, None); // type
+        write_string8(&mut intent, None); // identifier
+        intent.extend_from_slice(&0u32.to_ne_bytes()); // flags
+        intent.extend_from_slice(&0u32.to_ne_bytes()); // extended flags
+        write_string8(&mut intent, None); // package
+        write_string16(&mut intent, Some(package));
+        write_string16(&mut intent, Some(class));
+        intent
+    }
+
+    fn api37_start_activity(package: &str, class: &str) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x8000_0000u32.to_ne_bytes()); // strict mode
+        data.extend_from_slice(&u32::MAX.to_ne_bytes()); // work source uid
+        data.extend_from_slice(b"TSYS");
+        write_string16(&mut data, Some("android.app.IActivityTaskManager"));
+        // `IApplicationThread caller`: flat_binder_object + stability.
+        data.extend_from_slice(&BINDER_TYPE_BINDER.to_ne_bytes());
+        data.extend_from_slice(&0x7fu32.to_ne_bytes());
+        data.extend_from_slice(&0x1234u64.to_ne_bytes());
+        data.extend_from_slice(&0x5678u64.to_ne_bytes());
+        data.extend_from_slice(&0xcu32.to_ne_bytes());
+        write_string16(&mut data, Some("org.schabi.newpipe")); // callingPackage
+        write_string16(&mut data, None); // callingFeatureId
+        data.extend_from_slice(&1u32.to_ne_bytes()); // typed Intent present
+        data.extend_from_slice(&api37_intent(None, package, class));
+        data
+    }
+
+    #[test]
+    fn api37_activity_intent_is_located_after_the_calling_package() {
+        let data = api37_start_activity("org.schabi.newpipe", "org.schabi.newpipe.PlayerActivity");
+        let (offset, package, class) = activity_intent(&data).expect("activity Intent not located");
+        assert_eq!(package, "org.schabi.newpipe");
+        assert_eq!(class, "org.schabi.newpipe.PlayerActivity");
+        assert_eq!(
+            intent_component_at(&data, offset),
+            Some((
+                "org.schabi.newpipe".to_string(),
+                "org.schabi.newpipe.PlayerActivity".to_string(),
+                offset + 28,
+            ))
+        );
+    }
+
+    #[test]
+    fn api37_activity_intent_requires_header_and_typed_object_presence() {
+        let data = api37_start_activity("org.schabi.newpipe", "org.schabi.newpipe.PlayerActivity");
+        let (intent, _, _) = activity_intent(&data).expect("API-37 activity Intent");
+        let mut missing_magic = data.clone();
+        missing_magic.drain(8..12);
+        assert!(activity_intent(&missing_magic).is_none());
+        for presence in [0u32, 2, u32::MAX] {
+            let mut invalid = data.clone();
+            invalid[intent - 4..intent].copy_from_slice(&presence.to_ne_bytes());
+            assert!(activity_intent(&invalid).is_none(), "presence={presence}");
+        }
+    }
+
+    #[test]
+    fn string8_length_divisible_by_four_keeps_the_backward_walk_aligned() {
+        // Eight-byte action: `writeString8` advances by the padded length of
+        // `len + 1`, which the old `align(len)` rule got wrong by four bytes.
+        let intent = api37_intent(Some("abcdefgh"), "org.schabi.newpipe", "org.schabi.newpipe.MainActivity");
+        let component = intent_component_at(&intent, 0).expect("component");
+        assert_eq!(component.0, "org.schabi.newpipe");
+        assert_eq!(component.2, 40);
+        assert_eq!(intent_start(&intent, component.2), Some(0));
+    }
+
+    #[test]
+    fn start_activity_is_admitted_only_for_the_hosted_package() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _queue = reset_table(&ACTIVITY_REQUESTS, Vec::new());
+        let _codes = reset_table(&ACTIVITY_LIFECYCLE_CODES, [1, 2, 3, 4]);
+        let _results = reset_table(&ACTIVITY_START_RESULTS, Some([0, -101, -102, -103]));
+        let _package = reset_table(&HOSTED_PACKAGE, Some("org.schabi.newpipe".to_string()));
+        let _activities = reset_table(&HOSTED_ACTIVITIES, ["org.schabi.newpipe.PlayerActivity".to_string()].into_iter().collect());
+        let target = handle_for("activity_task");
+
+        let accepted = api37_start_activity(
+            "org.schabi.newpipe",
+            "org.schabi.newpipe.PlayerActivity",
+        );
+        let reply = unsafe { make_reply(&transaction(target, 1, &accepted), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(&reply.parcel[..8], &[0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(ACTIVITY_REQUESTS.lock().unwrap().len(), 1);
+
+        let rejected = api37_start_activity("com.example.other", "com.example.other.Activity");
+        let reply = unsafe { make_reply(&transaction(target, 1, &rejected), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(&reply.parcel[4..8], &(-102i32).to_ne_bytes());
+        let undeclared = api37_start_activity("org.schabi.newpipe", "org.schabi.newpipe.Missing");
+        let reply = unsafe { make_reply(&transaction(target, 1, &undeclared), 1) };
+        assert_eq!(&reply.parcel[4..8], &(-102i32).to_ne_bytes());
+        assert_eq!(ACTIVITY_REQUESTS.lock().unwrap().len(), 1);
+        let reply = unsafe { make_reply(&transaction(target, 1, &[]), 1) };
+        assert_eq!(&reply.parcel[4..8], &(-101i32).to_ne_bytes());
+
+        for _ in 1..ACTIVITY_REQUEST_QUEUE_CAP {
+            assert!(note_activity_start("org.schabi.newpipe", "org.schabi.newpipe.PlayerActivity", &accepted, 4));
+        }
+        let reply = unsafe { make_reply(&transaction(target, 1, &accepted), 1) };
+        assert_eq!(&reply.parcel[4..8], &(-103i32).to_ne_bytes());
+        assert!(__pengudroid_binder_take_activity_wakeup());
+        assert!(!__pengudroid_binder_take_activity_wakeup());
+        let mut out = [0u8; 1];
+        let mut len = 0;
+        assert_eq!(unsafe { __pengudroid_binder_take_activity_request(out.as_mut_ptr(), out.len(), &mut len) }, -1);
+        assert_eq!(ACTIVITY_REQUESTS.lock().unwrap().len(), ACTIVITY_REQUEST_QUEUE_CAP);
+    }
+
+    #[test]
+    fn activity_finish_resolves_the_requested_token_not_the_top_activity() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _tokens = reset_table(&ACTIVITY_TOKENS, [((0x1234, 0x5678), 1), ((0x2345, 0x6789), 2)].into_iter().collect());
+        let _queue = reset_table(&ACTIVITY_REQUESTS, Vec::new());
+        let descriptor = "android.app.IActivityClientController";
+        let data = |weak: u64, cookie: u64| {
+            let mut out = service_request(descriptor, "");
+            out.truncate(out.len() - 8); // omit service_request's extra empty String16
+            out.extend_from_slice(&BINDER_TYPE_BINDER.to_ne_bytes());
+            out.extend_from_slice(&0x7fu32.to_ne_bytes());
+            out.extend_from_slice(&weak.to_ne_bytes());
+            out.extend_from_slice(&cookie.to_ne_bytes());
+            out.extend_from_slice(&0xcu32.to_ne_bytes());
+            out.extend_from_slice(&0i32.to_ne_bytes()); // result code
+            out.extend_from_slice(&0i32.to_ne_bytes()); // null typed Intent
+            out.extend_from_slice(&0i32.to_ne_bytes()); // no task-wide finish
+            out
+        };
+        assert_eq!(activity_finish_token(&data(0x1234, 0x5678), descriptor), Some((1, 0)));
+        assert_eq!(activity_finish_token(&data(0x2345, 0x6789), descriptor), Some((2, 0)));
+        assert_eq!(activity_finish_token(&data(0x1234, 0x6789), descriptor), None);
+        __pengudroid_binder_forget_activity_token(1);
+        assert_eq!(activity_finish_token(&data(0x1234, 0x5678), descriptor), None);
+        assert_eq!(ACTIVITY_TOKENS.lock().unwrap().len(), 1);
     }
 
     #[test]
