@@ -126,6 +126,61 @@ What the driver had to add to get there, all measured against the pinned
 5. The build needs 6 GiB of virtual address space and up to 300 s per command
    for `heavy_optimizer/arm64/frontend.cc` (measured 3.75 GiB RSS, 77.5 s).
 
+## Reproducing the guest build (2026-10-31)
+
+The guest linker/libc build is reproducible again from the repository, without
+root and without hand-assembled trees:
+
+```sh
+# 1. Pinned AOSP source closure (bionic + external projects)
+python3 -B tools/fetch-guest-sources.py
+
+# 2. Compiler and sysroot (both outside the repo's Git scope)
+#    LLVM 22 from distro packages, unpacked into .toolchain/llvm-22-root
+#    NDK r30 platform sysroot at .toolchain/ndk-refs_tags_ndk-r30-platform-sysroot
+/usr/bin/env PENGUDROID_LLVM_DIR=$PWD/.toolchain/llvm-bin \\
+  python3 -B tools/build-guest-linker.py
+```
+
+`tools/fetch-guest-sources.py` reads `BIONIC_PIN`/`EXT_PINS` straight out of
+`build-guest-linker.py`, so a pin is bumped in exactly one place. Two layout
+facts it encodes, both learned by measurement:
+
+* `EXT_PINS` is keyed by **AOSP path** (`system/core/libcutils`) while an
+  archive is a **project** snapshot (`platform/system/core`); each input is
+  therefore `(project, subpath)`, and only the pinned subpath is materialised.
+* The driver indexes Rust crates as `<dest>/<crate>/Android.bp`, so
+  `external/rust/android-crates-io` must land as its `crates/` subtree.
+
+Both drivers accept `PENGUDROID_LLVM_DIR` (default `/usr/lib/llvm-22/bin`) so a
+relocated compiler tree works without editing the pins.
+
+### Measured state of the guest build
+
+`build-guest-linker.py` now resolves the whole Blueprint closure and compiles
+**85 translation units**, including the Rust `icu4x` crates and the
+`arm-optimized-routines` assembly. Two driver defects fixed on the way:
+
+* With `--sysroot=<NDK>`, clang injects the NDK libc++ *after* the module's own
+  include directories, so libc++'s `<string.h>` wrapper never won over
+  `bionic/libc/include` (`<cstring>` failed). libc++ is now declared explicitly
+  and first, so its wrappers `#include_next` into bionic as in AOSP.
+* `libutils`/`libsystem`/`libpropertyinfoparser` are the same project revision
+  as `libcutils`, and `libdl` is bionic's own subtree; all are materialised from
+the pinned archives rather than hand-copied.
+
+The build currently stops at `libc_bionic: android_crash_detail.cpp` with
+`_NOEXCEPT` unresolved inside `__atomic/atomic.h:465`. That is a **libc++
+version mismatch**, not a logic error: bionic at this pin is built against the
+`clang-prebuilt` platform libc++ whose archives the driver links from
+`sources/ext/clang-prebuilt` (`libc++_static_noexcept.a`, `libc++abi_noexcept.a`,
+`libc++demangle_noexcept.a`, `libunwind.a`, `libunwind-exported.a`,
+`libclang_rt.builtins-aarch64-android.a`). That prebuilt tree is a
+multi-gigabyte `prebuilts/clang/host/linux-x86` snapshot and is deliberately not
+fetched by the tool; `sources/GUEST_SOURCES.md` lists what is missing. Supplying
+those archives (or building the matching `_noexcept` libc++ from the pinned
+sources) is the next concrete task, and nothing ARM64 runs until then.
+
 ## ARM64 guest runtime
 
 The translator starts `/system/bin/arm64/app_process64` and needs the guest

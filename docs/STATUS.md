@@ -2,7 +2,71 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
-## Current handoff — BBR2 target: ARM64 chain must be rebuilt; two render-path contracts fixed (2026-10-31)
+## Current handoff — guest build reproducible again; stops at the missing libc++ prebuilts (2026-10-31)
+
+**Android 17 / API 37 / x86_64 only on the host.** Focus is Beach Buggy Racing 2
+(`com.vectorunit.cobalt.googleplay`, SDL + FMOD, **arm64-v8a only**). Its Java
+side boots on ART and the only blocker is the ARM64 natives, so this pass
+rebuilt the ARM64 build inputs that had been deleted from `.toolchain`.
+
+### What now exists again (no root used)
+
+| Input | State |
+| --- | --- |
+| ARM64 GSI `aosp_arm64-exp-CP2A.260605.012-15430684-8e545e1e.zip` | downloaded, SHA-256 `8e545e1e…48f75` verified |
+| LLVM 22.1.2 (the pinned compiler) | unpacked from distro `.deb`s into `.toolchain/llvm-22-root`, wrappers in `.toolchain/llvm-bin` |
+| NDK r30 platform sysroot | extracted to `.toolchain/ndk-r30/sysroot`, linked as `.toolchain/ndk-refs_tags_ndk-r30-platform-sysroot` |
+| `rustup` target `aarch64-linux-android` | installed (was missing; E0463 `can't find crate for core`) |
+| AOSP source closure (bionic + 13 external trees) | **new** `tools/fetch-guest-sources.py`, pins read from the driver |
+
+`tools/fetch-guest-sources.py` is the tool that was missing: `nativebridge-deps.py`
+fetches header *slices* by design, so the full trees the guest build compiles had
+been assembled by hand and were unreproducible. The new tool fetches
+`<project>/+archive/<revision>.tar.gz` at the driver's own pins, hashes every
+archive, bounds extraction, and materialises the exact destinations the driver
+hard-codes. Two layout facts it encodes (both measured): `EXT_PINS` is keyed by
+AOSP **path** but archives are **project** snapshots, so each input carries a
+subpath; and the driver indexes crates as `<dest>/<crate>/Android.bp`, so
+`android-crates-io` must land as its `crates/` subtree.
+
+### Measured build state
+
+`build-guest-linker.py` resolves the whole Blueprint closure and compiles **85
+translation units** (Rust `icu4x` crates and `arm-optimized-routines` assembly
+included). Two driver defects fixed to get there:
+
+* clang injects the NDK libc++ *after* module includes when `--sysroot=<NDK>`, so
+  libc++'s `<string.h>` wrapper lost to `bionic/libc/include` and `<cstring>`
+  failed. libc++ is now declared explicitly and first, as AOSP does.
+* `libdl`, `libutils`, `libsystem` and `libpropertyinfoparser` are now
+  materialised from the pinned archives instead of hand-copied.
+
+It stops at `libc_bionic: android_crash_detail.cpp` with `_NOEXCEPT` unresolved
+in `__atomic/atomic.h:465` — a libc++ **version** mismatch, because the driver
+links the platform libc++ archives from `sources/ext/clang-prebuilt`
+(`libc++_static_noexcept.a` and friends). That tree is a multi-gigabyte
+`prebuilts/clang/host/linux-x86` snapshot and is deliberately not fetched;
+`sources/GUEST_SOURCES.md` lists exactly which six archives are missing.
+
+**Next concrete task:** supply those six archives (fetch the pinned
+`prebuilts/clang/host/linux-x86` closure, or build the matching `_noexcept`
+libc++ from the pinned sources), then rerun the linker/libc build, then
+`--module app_process --bundle`, then BBR2 with `PENGUDROID_NATIVE_BRIDGE_LIB`
+and `PENGUDROID_ARM64_GUEST_ROOT`. Nothing ARM64 is executed yet and no BBR2
+compatibility is claimed.
+
+### Render-path contracts fixed last pass (unchanged, still verified)
+
+`INTERFACE_TRANSACTION` now answers with the descriptor of every hosted
+interface (measured `code=1598968902` refusals 1 → 0), and the API-37 C++
+`android.ui.ISurfaceComposer` sharing the SurfaceFlinger handle accepts
+`BOOT_FINISHED`/`SET_TRANSACTION_STATE` (tag 8, from the pinned
+`ISurfaceComposer.h`) with an empty body (measured `code=8` refusals 9 → 0).
+
+Validation: `cargo test --workspace --offline` **373 passed / 0 failed**;
+`tools` unittest **214 passed**; `git diff --check` clean.
+
+## Previous handoff — BBR2 target: ARM64 chain must be rebuilt (2026-10-31)
 
 **Android 17 / API 37 / x86_64 only on the host.** The focus is now Beach Buggy
 Racing 2 (`com.vectorunit.cobalt.googleplay`, SDL + FMOD, **arm64-v8a only**).

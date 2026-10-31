@@ -51,8 +51,18 @@ PREBUILT = EXT / "clang-prebuilt"
 LIBDL_SRC = EXT / "bionic-libdl"
 SCUDO_SRC = EXT / "scudo"
 GWP_ASAN_SRC = EXT / "gwp_asan"
-LIBCXX = DEPS / "toolchain/libcxx/android/x86_64/include/c++/v1"
-LIBCXX_COMMON = DEPS / "toolchain/libcxx/include/c++/v1"
+# libc++ must be a single matching version: the NDK tree next to the sysroot is
+# self-consistent (it also ships the `<string.h>`/`<wchar.h>` overlays), while
+# mixing the platform slice with a different common header tree produced
+# conflicting `__atomic` builtins. The slice remains the fallback for a sysroot
+# without an NDK.
+_NDK_LIBCXX = NDK / "usr/include/c++/v1"
+if _NDK_LIBCXX.is_dir():
+    LIBCXX = _NDK_LIBCXX
+    LIBCXX_COMMON = _NDK_LIBCXX
+else:
+    LIBCXX = DEPS / "toolchain/libcxx/android/x86_64/include/c++/v1"
+    LIBCXX_COMMON = DEPS / "toolchain/libcxx/include/c++/v1"
 LINKER_ARTIFACT = ROOT / "out" / "native_bridge_guest_linker.native_bridge"
 VDSO_FILE = REPO / ".toolchain/sysroot-android17/system/lib64/arm64/libnative_bridge_vdso.so"
 LIBC_ARTIFACT = ROOT / "out" / "libnative_bridge_guest_libc.native_bridge"
@@ -730,13 +740,18 @@ class GuestBuild:
                 "-fPIC", "-O0", "-g0", "-fno-lto", "-fstack-protector-strong",
                 "-funwind-tables", *DEVICE_CFLAGS]
         stl = props.get("stl")
-        use_libcxx = cpp and (stl not in ("none",) or name in (
-            "native_bridge_guest_linker", "liblinker_main", "liblinker_malloc",
-            "liblinker_debuggerd_stub"))
-        if use_libcxx:
-            argv += ["-nostdinc++", "-I", str(LIBCXX), "-I", str(LIBCXX_COMMON)]
+        if cpp:
+            # Always drive libc++ explicitly. `--sysroot` points at the NDK, so
+            # clang would otherwise inject that libc++ *after* the module's own
+            # includes, which breaks libc++'s `<string.h>` overlay against
+            # `bionic/libc/include`. Declaring it here puts libc++ first, so its
+            # wrappers `#include_next` into bionic's headers, as in AOSP.
+            argv += ["-nostdinc++", "-I", str(LIBCXX)]
+            if LIBCXX_COMMON != LIBCXX:
+                argv += ["-I", str(LIBCXX_COMMON)]
             if "noexcept" in self.linkage_hint(name):
                 argv += ["-D_LIBCPP_HAS_NO_EXCEPTIONS"]
+        del stl
         for directory in self.include_flags(name, props):
             argv += ["-I", directory]
         cflags = expand_flags(props.get("cflags", []))
