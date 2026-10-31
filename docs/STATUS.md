@@ -12,6 +12,34 @@ compositor. The ARM64 translator still cannot execute guest code: the guest
 runtime quartet is missing and the loader is now **fail-closed** about it. It
 does **not** claim Beach Buggy Racing 2 runs.
 
+### Beach Buggy Racing 2: measured debug chain (2026-10-31)
+
+`tools/smoke_bundle.py <bundle>` (new, reusable) runs one bundle against a
+private daemon. Measured on `Beach+Buggy+Racing+2_2026.10.05_APKPure.xapk`
+(`com.vectorunit.cobalt.googleplay`, `com.vectorunit.cobalt.MainActivity`):
+
+1. The XAPK materialises (5 members, 4 splits + assets) and the **Java side
+   boots on ART**: `SDLActivity.onCreate` (this build is **SDL + FMOD**, not
+   Unity), `handleLaunchActivity` returns the Activity, WindowInsets 720x1280,
+   the WorkManager DB is created.
+2. First hard blocker: `nativeloader: Load libfmod.so ... cannot open shared
+   object file` → `MainActivity: Failed to load FMOD libs`. The bundle is
+   arm64-v8a-only (`apphost: no x86_64 native libraries ...`), so the FMOD/SDL
+   natives need the translator.
+3. With `PENGUDROID_NATIVE_BRIDGE_LIB=<de-bionic'd libberberis_arm64.so>` the
+   chain reaches the fail-closed gate in 4 s, **before** `JNI_CreateJavaVM`:
+   `art: ARM64 guest ... is staged-only ... stock GSI linker64/libc are not
+   native-bridge variants`. No fake linker exports, no patched game.
+4. Java-side gaps to fix alongside the bridge work: the
+   `IAudioPolicyService.listAudioPorts` failure loop (audio port cache spam),
+   `IAudioService` code 171 unimplemented, the graphics-stats `requestBuffer`
+   NPE, and the `ParceledListSlice` NPE.
+
+Guest bootstrap artifact built and verified:
+`target/arm64-guest-bootstrap/app_process64` — the real tiny
+`native_bridge_post_init()` executable (AArch64 PIE, interpreter
+`/system/bin/arm64/linker64`, `DT_NEEDED linux-vdso.so.1`).
+
 ### NewPipe: click → detail → decoded video frames
 
 Two implementation pieces landed:
@@ -97,12 +125,19 @@ measurement).
   identical to its basename before `LoadNativeBridge`, and
   `NativeBridgeGetSignalHandler`'s callback is chained over ART's handler
   instead of being misread as a `struct sigaction`.
-* Next concrete task: build the four `.native_bridge` modules from a matching
-  Android-17 Soong product (`native_bridge_guest_linker`,
-  `libnative_bridge_guest_libc`, `native_bridge_guest_app_process`,
-  `libnative_bridge_vdso`). The cached Bionic tree is header slices only, so
-  this is not a small extension of `tools/build-nativebridge.py`; until it
-  lands, BBR2 is **not** runnable here.
+* Next concrete task: build `native_bridge_guest_linker.native_bridge`. The
+  closure is now mapped (`REPORT.md` in
+  `.toolchain/nativebridge-deps/sources/bionic-expansion/`, where the pinned
+  Bionic tree was fetched: 2,601 files): 32 TUs (`linker_bin_template` 25 + 3
+  arm64 + 4 native-bridge add-ons), `linker.generic.map` is load-bearing
+  (Digitalis binds 2 TLS hooks plus 9 `__loader_*` callbacks from `dlfcn.cpp`),
+  `objcopy --prefix-symbols=__dl_` renames only `.symtab` and it must be kept.
+  Still to fetch at the same pins: `arm-optimized-routines`, `llvm-libc`,
+  `system/librustutils/no_std`, ICU4X crates, scudo/gwp_asan, and the aarch64
+  clang prebuilt slices (`libc++_static_noexcept`, `libunwind`, `builtins`).
+  Exercising the linker then also needs the guest `libc.so`
+  (`libnative_bridge_guest_libc`); the cached Bionic slice alone cannot build
+  it. Until then BBR2 stops at `libfmod.so` (measured above).
 
 See [NATIVE_BRIDGE.md](NATIVE_BRIDGE.md) for the build flags, source pins, and
 the exact driver changes.
