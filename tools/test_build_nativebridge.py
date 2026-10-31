@@ -408,6 +408,41 @@ class BuildTests(unittest.TestCase):
         self.assertEqual({name for name, _ in calls}, {a.name for a in build.EXTRAS})
         self.assertFalse((self.root / "extras-manifest.tmp").exists())
 
+    def test_pinned_bionic_header_is_reused_offline_without_modifying_source(self):
+        root, deps = self.root / "build", self.root / "deps"
+        root.mkdir()
+        original = deps / "sources/bionic-expansion/bionic/libc/bionic/private.h"
+        original.parent.mkdir(parents=True)
+        data = b"// original pinned Bionic header\n"
+        original.write_bytes(data)
+        artifact = build.BOOT.Artifact("private", "bionic", "a" * 40,
+            "extra/headers/bionic/private.h", blob=build.BOOT.git_hash(b"blob", data).hex(),
+            subtree="libc/bionic/private.h", limit=1024)
+        with mock.patch.multiple(build, ROOT=root, DEPS=deps, EXTRAS=(artifact,)):
+            records, received = build.fetch_extras(offline=True)
+            self.assertEqual(received, 0)
+            self.assertEqual((root / artifact.destination).read_bytes(), data)
+            self.assertEqual(original.read_bytes(), data)
+            self.assertEqual(records["private"]["content_sha256"], build.BOOT.sha256_file(original))
+            (root / artifact.destination).write_bytes(b"modified imported header")
+            with self.assertRaisesRegex(build.BOOT.BootstrapError, "modified dependency; not replacing"):
+                build.fetch_extras(offline=True)
+        self.assertEqual(original.read_bytes(), data)
+
+    def test_mismatched_cached_bionic_header_is_not_seeded_or_replaced(self):
+        root, deps = self.root / "build", self.root / "deps"
+        root.mkdir()
+        original = deps / "sources/bionic-expansion/bionic/libc/bionic/private.h"
+        original.parent.mkdir(parents=True)
+        original.write_bytes(b"wrong input")
+        artifact = build.BOOT.Artifact("private", "bionic", "a" * 40,
+            "extra/private.h", blob="b" * 40, subtree="libc/bionic/private.h", limit=1024)
+        with (mock.patch.multiple(build, ROOT=root, DEPS=deps, EXTRAS=(artifact,)),
+              self.assertRaisesRegex(build.BuildError, "cached Bionic blob does not match pin")):
+            build.fetch_extras(offline=True)
+        self.assertFalse((root / "downloads/private.b64").exists())
+        self.assertEqual(original.read_bytes(), b"wrong input")
+
     def test_elf_validation_rejects_other_architectures_classes_and_types(self):
         elf = bytearray(20)
         elf[:6] = b"\x7fELF\x02\x01"
@@ -700,6 +735,13 @@ class BuildTests(unittest.TestCase):
             build.NativeBuild(model, runner, self.root).build("entry")
         runner.run.assert_not_called()
 
+    def test_wrap_flag_cannot_smuggle_additional_linker_options(self):
+        model = self.model('cc_library_shared {name:"entry",ldflags:["-Wl,--wrap=free,--allow-shlib-undefined"]}')
+        runner = mock.Mock(root=self.root)
+        with self.assertRaisesRegex(build.BuildError, "no flags discarded"):
+            build.NativeBuild(model, runner, self.root).build("entry")
+        runner.run.assert_not_called()
+
     def test_genrule_defaults_keep_declared_outputs_tools_and_input_order(self):
         model = self.model('''
             genrule_defaults {name:"common",out:["one.h","two.h"],tools:["generator"],
@@ -720,6 +762,197 @@ class BuildTests(unittest.TestCase):
         for name in ("bad_gen", "bad_cc"):
             with self.subTest(name=name), self.assertRaisesRegex(build.BuildError, "unsupported defaults module"):
                 model.props(name)
+
+    PROXY_CONFIG = '''
+        soong_config_module_type {name:"berberis_cc_defaults",module_type:"cc_defaults",
+            config_namespace:"berberis",variables:["translation_arch"],
+            properties:["defaults","generated_headers","header_libs","shared_libs"]}
+        soong_config_string_variable {name:"translation_arch",values:["arm64_to_x86_64","riscv64_to_x86_64"]}
+        cc_defaults {name:"arm64",cflags:["-DNATIVE_BRIDGE_GUEST_ARCH_ARM64"]}
+        cc_defaults {name:"riscv64",cflags:["-DNATIVE_BRIDGE_GUEST_ARCH_RISCV64"]}
+        berberis_cc_defaults {name:"proxy_defaults",defaults:["riscv64"],shared_libs:["liblog"],
+            soong_config_variables:{translation_arch:{
+                arm64_to_x86_64:{defaults:["arm64"],shared_libs:["libberberis_arm64"]},
+                riscv64_to_x86_64:{defaults:["riscv64"],shared_libs:["libberberis_riscv64"]},
+                conditions_default:{defaults:["riscv64"]}}}}
+        cc_library_shared {name:"proxy",defaults:["proxy_defaults"]}
+    '''
+
+    def test_soong_proxy_config_requires_explicit_guest_and_keeps_upstream_flags(self):
+        model = self.model(self.PROXY_CONFIG)
+        with self.assertRaisesRegex(build.BuildError, "explicit supported Soong translation_arch"):
+            model.props("proxy")
+        model = build.Blueprints(model.roots, translation_arch="arm64_to_x86_64")
+        props = model.props("proxy")
+        self.assertEqual(props["shared_libs"], ["liblog", "libberberis_arm64"])
+        # Upstream still inherits riscv64_defaults. Do not secretly rewrite its
+        # flags; the actual source and ARM64 include roots select the ARM64 ABI.
+        self.assertEqual(props["cflags"], ["-DNATIVE_BRIDGE_GUEST_ARCH_RISCV64", "-DNATIVE_BRIDGE_GUEST_ARCH_ARM64"])
+        self.assertEqual(model.config_selections["proxy_defaults"]["translation_arch"], "arm64_to_x86_64")
+
+    def test_soong_proxy_config_rejects_unknown_branches_and_compilation_properties(self):
+        for original, replacement, message in (
+            ("arm64_to_x86_64:{defaults:", "unknown:{defaults:", "unsupported Soong translation_arch branch"),
+            ('shared_libs:["libberberis_arm64"]', 'cflags:["-DUNDECLARED"]', "undeclared properties"),
+            ('translation_arch:{', 'unknown_variable:{', "unsupported Soong variables"),
+        ):
+            with self.subTest(replacement=replacement):
+                root = self.root / str(len(list(self.root.iterdir())))
+                root.mkdir()
+                (root / "Android.bp").write_text(self.PROXY_CONFIG.replace(original, replacement))
+                model = build.Blueprints({"fixture": root}, translation_arch="arm64_to_x86_64")
+                with self.assertRaisesRegex(build.BuildError, message):
+                    model.props("proxy")
+
+    def test_soong_proxy_custom_contract_is_not_an_arbitrary_defaults_alias(self):
+        model = self.model(self.PROXY_CONFIG.replace('config_namespace:"berberis"', 'config_namespace:"other"'))
+        model.translation_arch = "arm64_to_x86_64"
+        with self.assertRaisesRegex(build.BuildError, "expected cc_defaults"):
+            model.props("proxy")
+
+    def test_namespaced_filegroups_resolve_within_nested_aosp_scope(self):
+        model = self.model('cc_library_static {name:"consumer",srcs:["//fixture/api/libc:files"]}')
+        directory = self.root / "source/api/libc"
+        directory.mkdir(parents=True)
+        (directory / "a.cc").write_text("// real filegroup input\n")
+        blueprint = directory / "Android.bp"
+        blueprint.write_text('filegroup {name:"files",srcs:["a.cc"]}')
+        model.index_file(blueprint)
+        self.assertEqual(model.files(model.props("consumer")["srcs"]), [str(directory / "a.cc")])
+        with self.assertRaisesRegex(build.BuildError, "outside declared namespace"):
+            model.canonical("//fixture/api/libc:consumer")
+        for name in ("//fixture/api/../libc:files", "//fixture//api:files", "//missing/api:files"):
+            with self.subTest(name=name), self.assertRaisesRegex(build.BuildError, "unresolved Blueprint namespace"):
+                model.canonical(name)
+
+    def reuse_fixture(self):
+        model = self.model('cc_library_shared {name:"bridge"}')
+        props = model.props("bridge", linkage="shared")
+        prior = self.root / "prior"
+        (prior / "lib").mkdir(parents=True)
+        output = prior / "lib/bridge.so"
+        elf = bytearray(20)
+        elf[:6] = b"\x7fELF\x02\x01"
+        elf[16:18], elf[18:20] = (3).to_bytes(2, "little"), (62).to_bytes(2, "little")
+        output.write_bytes(elf)
+        artifact = {"module":"bridge", "kind":"cc_library_shared", "output":str(output),
+                    "bytes":len(elf), "sha256":build.BOOT.sha256_file(output), "objects":[]}
+        report = {**build.OWNER, "run":str(prior), "requested_goals_passed":True,
+                  "dependencies_manifest_sha256":"a" * 64,
+                  "artifacts":[artifact], "modules":model.used}
+        path = prior / "report.json"
+        path.write_text(json.dumps(report))
+        log = self.root / "dynamic.log"
+        log.write_text("0x0 (SONAME) Library soname: [bridge.so]\n"
+                       "0x0 (NEEDED) Shared library: [libc.so]\n")
+        runner = mock.Mock(root=self.root, report={"commands":[]})
+        runner.run.return_value = {"log":str(log)}
+        self.assertEqual(props, model.used["bridge"]["selected_properties"])
+        return path, model, runner, report
+
+    def test_explicit_shared_reuse_never_rebuilds_translator_and_rechecks_input(self):
+        path, model, runner, report = self.reuse_fixture()
+        with mock.patch.object(build, "ROOT", self.root):
+            reuse = build.SharedReuse(path, model, runner, "a" * 64)
+            native = build.NativeBuild(model, runner, self.root, shared_reuse=reuse)
+            with mock.patch.object(native, "_build") as compile_library:
+                result = native.build("bridge")
+                compile_library.assert_not_called()
+            self.assertEqual(result["sha256"], report["artifacts"][0]["sha256"])
+            self.assertEqual(result["dynamic"]["needed"], ["libc.so"])
+            self.assertFalse(result["runtime_tested"])
+            Path(result["output"]).write_bytes(b"changed")
+            with self.assertRaisesRegex(build.BuildError, "reused shared artifact changed"):
+                native.build("bridge")
+
+    def test_reuse_report_missing_translator_never_triggers_a_heavy_rebuild(self):
+        model = self.model('cc_library_shared {name:"libberberis_arm64"}')
+        runner = mock.Mock(root=self.root)
+        native = build.NativeBuild(model, runner, self.root, shared_reuse=mock.Mock(artifacts={}))
+        with self.assertRaisesRegex(build.BuildError, "refusing an implicit full translator rebuild"):
+            native.build("libberberis_arm64")
+        runner.run.assert_not_called()
+        self.assertFalse(native.building)
+
+    def test_shared_reuse_rejects_malformed_provenance_without_tool_execution(self):
+        path, model, runner, report = self.reuse_fixture()
+        with mock.patch.object(build, "ROOT", self.root):
+            for malformed in ([], {**report, "run":None}, {**report, "artifacts":{}},
+                              {**report, "artifacts":[{"kind":"cc_library_shared"}]}):
+                with self.subTest(value=malformed):
+                    path.write_text(json.dumps(malformed))
+                    with self.assertRaises(build.BuildError):
+                        build.SharedReuse(path, model, runner, "a" * 64)
+        runner.run.assert_not_called()
+
+    def test_shared_reuse_rejects_failed_or_different_dependency_build(self):
+        path, model, runner, report = self.reuse_fixture()
+        with mock.patch.object(build, "ROOT", self.root):
+            with self.assertRaisesRegex(build.BuildError, "current verified dependencies"):
+                build.SharedReuse(path, model, runner, "b" * 64)
+            report["requested_goals_passed"] = False
+            path.write_text(json.dumps(report))
+            with self.assertRaisesRegex(build.BuildError, "successful build"):
+                build.SharedReuse(path, model, runner, "a" * 64)
+        runner.run.assert_not_called()
+
+    def test_shared_reuse_rejects_path_escape_duplicate_module_and_changed_properties(self):
+        path, model, runner, report = self.reuse_fixture()
+        with mock.patch.object(build, "ROOT", self.root):
+            reuse = build.SharedReuse(path, model, runner, "a" * 64)
+            reuse.artifacts["bridge"]["output"] = str(self.root / "outside.so")
+            with self.assertRaisesRegex(build.BuildError, "path mismatch/escape"):
+                reuse.inspect("bridge")
+            report["dependency_artifacts"] = report["artifacts"]
+            path.write_text(json.dumps(report))
+            with self.assertRaisesRegex(build.BuildError, "duplicate shared artifact"):
+                build.SharedReuse(path, model, runner, "a" * 64)
+            report.pop("dependency_artifacts")
+            report["modules"]["bridge"]["selected_properties"]["cflags"] = ["-DSTALE"]
+            path.write_text(json.dumps(report))
+            # Reparse to avoid changing the model through the fixture's shared dict.
+            current = build.Blueprints(model.roots)
+            reuse = build.SharedReuse(path, current, runner, "a" * 64)
+            with self.assertRaisesRegex(build.BuildError, "Blueprint/properties changed"):
+                reuse.inspect("bridge")
+        runner.run.assert_not_called()
+
+    def test_private_platform_libc_requires_pinned_allocator_exports(self):
+        with mock.patch.dict(build.PLATFORM_SHARED, build.PLATFORM_PRIVATE):
+            root, _record, runner = self.platform_fixture()
+            imports = build.PlatformImports(root, runner, {})
+            self.assertEqual(imports.inspect("libc"), (root / "system/lib64/libc.so").resolve())
+            self.assertEqual(imports.records["libc"]["checked_exports"],
+                             ["malloc_disable", "malloc_enable", "malloc_iterate"])
+            runner.run.side_effect = None
+            runner.run.return_value = {"log":str(self.root / "missing-allocator.log")}
+            Path(runner.run.return_value["log"]).write_text("0x0 (SONAME) Library soname: [libc.so]\n")
+            with self.assertRaisesRegex(build.BuildError, "missing defined exports"):
+                imports.inspect("libc")
+
+    def test_dynamic_proxy_entry_must_be_a_defined_global_function(self):
+        _path, _model, runner, report = self.reuse_fixture()
+        output = report["artifacts"][0]["output"]
+        log = Path(runner.run.return_value["log"])
+        for type_, binding, visibility, index, expected in (
+            ("FUNC", "GLOBAL", "DEFAULT", "10", True),
+            ("FUNC", "GLOBAL", "DEFAULT", "UND", False),
+            ("OBJECT", "GLOBAL", "DEFAULT", "10", False),
+            ("FUNC", "WEAK", "DEFAULT", "10", False),
+            ("FUNC", "GLOBAL", "HIDDEN", "10", False),
+        ):
+            with self.subTest(type=type_, binding=binding, index=index):
+                log.write_text(f"1: 0000000000001000 16 {type_} {binding} {visibility} {index} InitProxyLibrary\n")
+                self.assertEqual(build.dynamic_evidence(runner, output, "entry")["init_proxy_library"], expected)
+
+    def test_debionic_staging_refuses_unverified_entries_and_missing_tool(self):
+        runner = mock.Mock(root=self.root)
+        with self.assertRaisesRegex(build.BuildError, "verified native-bridge proxies"):
+            build.stage_debionic_proxy({}, runner, Path(sys.executable))
+        artifact = {"output":str(self.root / "proxy.so"), "init_proxy_library_dynamic_export":True}
+        with self.assertRaisesRegex(build.BuildError, "no cargo build attempted"):
+            build.stage_debionic_proxy(artifact, runner, self.root / "absent")
+        runner.run.assert_not_called()
 
     def test_resource_and_goal_policy(self):
         self.assertGreaterEqual(build.MEMORY, 6_000_000_000)
@@ -963,6 +1196,91 @@ extern "C" void probe(ANativeActivity* activity) {
         self.assertEqual(dl["kind"], "bionic_cc_library")
         self.assertEqual(dl["properties"]["shared_libs"], ["ld-android"])
         self.assertTrue(dl["properties"]["nocrt"])
+
+    def test_pinned_proxy_sources_use_arm64_tables_without_rewriting_cached_sources(self):
+        digitalis = build.DEPS / "sources/digitalis"
+        support = build.DEPS / "sources/native_bridge_support"
+        roots = self.platform_header_roots()
+        roots.update({"frameworks/libs/binary_translation":digitalis,
+                      "frameworks/libs/native_bridge_support":support,
+                      "system/logging":build.DEPS / "sources/logging"})
+        model = build.Blueprints(roots, translation_arch="arm64_to_x86_64")
+        props = model.props("libberberis_proxy_libc")
+        sources = model.files(props["srcs"])
+        self.assertEqual([Path(p).name for p in sources], [
+            "cxa_trampolines.cc", "libc_translation.cc", "malloc_translation.cc",
+            "pthread_translation.cc", "setjmp_thunks.cc", "system_properties_trampolines.cc",
+            "unistd_thunks.cc", "free_quarantine.cc"])
+        self.assertEqual(props["ldflags"], ["-Wl,--wrap=free"])
+        self.assertIn("libberberis_arm64", props["shared_libs"])
+        self.assertNotIn("libberberis_riscv64", props["shared_libs"])
+        self.assertIn("libberberis_guest_abi_arm64_headers", props["header_libs"])
+        self.assertEqual(props["cflags"][-1], "-DNATIVE_BRIDGE_GUEST_ARCH_ARM64")
+        libc_source = Path(sources[1]).read_text()
+        self.assertIn('"trampolines_arm64_to_x86_64-inl.h"', libc_source)
+        table = support / "android_api/libc/proxy/trampolines_arm64_to_x86_64-inl.h"
+        self.assertIn('"native_bridge_malloc_disable"', table.read_text())
+        self.assertIn('DEFINE_INIT_PROXY_LIBRARY("libc.so")', libc_source)
+        self.assertIn('kProxyPrefix = "libberberis_proxy_"',
+                      (digitalis / "guest_loader/arm64/guest_loader_arch.cc").read_text())
+        libm = model.props("libberberis_proxy_libm")
+        self.assertEqual([Path(p).name for p in model.files(libm["srcs"])], ["libm_trampolines.cc"])
+        # There is no pinned liblog proxy contract to substitute with a fake.
+        self.assertNotIn("libberberis_proxy_liblog", model.modules)
+        evidence = build.proxy_support_evidence(model)
+        self.assertEqual(evidence["proxy_prefix"], "libberberis_proxy_")
+        self.assertFalse(evidence["liblog"]["native_proxy_module_present"])
+        self.assertFalse(evidence["liblog"]["guest_stub_module_present"])
+        self.assertTrue(evidence["liblog"]["native_bridge_supported"])
+
+    def test_real_proxy_private_allocator_link_wrap_and_debionic_metadata(self):
+        if not (build.PLATFORM_ROOT / build.RUNTIME_MANIFEST).is_file():
+            self.skipTest("requires the completed verified API37 runtime")
+        source = self.root / "source"
+        # A synthetic link-only fixture, not a substitute for any production
+        # proxy. No entry point in this fixture is executed.
+        (source / "Android.bp").write_text('''cc_library_shared {
+            name:"libberberis_proxy_allocator_probe",srcs:["probe.cc"],ldflags:["-Wl,--wrap=free"]}''')
+        (source / "probe.cc").write_text('''#include <malloc.h>
+#include <stdint.h>
+#include <stdlib.h>
+extern "C" int malloc_iterate(uintptr_t, size_t, void (*)(uintptr_t, size_t, void*), void*);
+extern "C" void malloc_disable();
+extern "C" void malloc_enable();
+extern "C" void __real_free(void*);
+extern "C" void __wrap_free(void* p) { __real_free(p); }
+extern "C" void InitProxyLibrary(void* p) {
+  malloc_disable();
+  malloc_enable();
+  malloc_iterate(reinterpret_cast<uintptr_t>(p), 0, nullptr, nullptr);
+  free(p);
+}
+''')
+        bootstrap = json.loads((build.DEPS / "manifest.json").read_text())
+        report, records = {"commands":[]}, {}
+        runner = build.Runner(self.root, report, 30)
+        imports = build.PlatformImports(build.PLATFORM_ROOT, runner, records)
+        native = build.NativeBuild(build.Blueprints({"fixture":source}), runner,
+                                   Path(bootstrap["preflight"]["sysroot"]), imports)
+        artifact = native.build("libberberis_proxy_allocator_probe")
+        self.assertTrue(artifact["init_proxy_library_dynamic_export"])
+        self.assertEqual(artifact["platform_libc"], records["libc"]["path"])
+        for symbol in ("malloc_disable", "malloc_enable", "malloc_iterate"):
+            self.assertIn(symbol + "@LIBC_Q", artifact["dynamic"]["undefined"])
+        self.assertFalse(any("__real_free" in symbol for symbol in artifact["dynamic"]["undefined"]))
+        link = next(c["argv"] for c in report["commands"] if c["label"] == "link " + artifact["module"])
+        self.assertIn("--wrap=free", link)
+        self.assertIn("--no-undefined", link)
+        self.assertIn(records["libc"]["path"], link)
+        self.assertNotIn("-lc", link)
+        tool = build.REPO / "target/debug/pengudroid"
+        if tool.is_file():
+            staged = build.stage_debionic_proxy(artifact, runner, tool)
+            self.assertTrue(staged["dynamic"]["init_proxy_library"])
+            self.assertFalse(staged["runtime_tested"])
+            self.assertFalse(staged["glibc_abi_compatible"])
+            self.assertFalse(any("@LIBC" in symbol for symbol in staged["dynamic"]["undefined"]))
+            self.assertEqual(build.BOOT.sha256_file(Path(artifact["output"])), artifact["sha256"])
 
     def test_pinned_digitalis_guest_flags_and_bridge_source_selection(self):
         manifest = json.loads((build.DEPS / "manifest.json").read_text())

@@ -1,6 +1,6 @@
 //! Build script for the Bionic shim.
 //!
-//! Two jobs:
+//! Three jobs:
 //!
 //! 1. Compile a small generated C file (see `src/vlog.rs`) into
 //!    `libpengudroid_vlog.a`, which the shim links in. Rust cannot define
@@ -9,6 +9,8 @@
 //!    forward to Rust, where the format string is expanded with `vsnprintf`.
 //! 2. Link the shim against a tiny version script that gives it the
 //!    Android-style version nodes `LIBC`, `LIBM` and `LD`.
+//! 3. Compile the x86_64 jump and read-only syscall boundaries (`src/jump.rs`,
+//!    `src/syscall_paths.rs`) into the cdylib only, retaining their exports.
 //!
 //! Why the version nodes: a real Android `.so` carries a `VERNEED` demanding that
 //! its `libc.so` provide version `LIBC` (and `libm.so` provide `LIBM`, `libdl.so`
@@ -17,8 +19,9 @@
 //! shipping a separate stub library. The shim's other symbols stay global and
 //! unversioned.
 //!
-//! If no C compiler is available the build still succeeds, but the two variadic
-//! entry points are omitted (the shim reports this with a cargo warning).
+//! The variadic entry points are optional without a C compiler (with a cargo
+//! warning). The x86_64 GNU/Linux jump boundary requires an assembler driver;
+//! silently omitting it or substituting glibc's saves would be unsafe.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -27,16 +30,99 @@ use std::process::Command;
 mod vlog;
 #[path = "src/pathshim.rs"]
 mod pathshim;
+#[path = "src/jump.rs"]
+mod jump;
+#[path = "src/syscall_paths.rs"]
+mod syscall_paths;
 
 fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     compile_c_shims(&out_dir);
+    compile_jump_shim(&out_dir);
+    compile_syscall_paths(&out_dir);
     write_version_script(&out_dir);
 
     println!("cargo:rustc-check-cfg=cfg(has_variadic_log)");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/vlog.rs");
     println!("cargo:rerun-if-changed=src/pathshim.rs");
+    println!("cargo:rerun-if-changed=src/jump.rs");
+    println!("cargo:rerun-if-changed=src/syscall_paths.rs");
+}
+
+fn jump_symbols() -> &'static [&'static str] {
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64")
+        && std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu")
+        && std::env::var("CARGO_CFG_TARGET_POINTER_WIDTH").as_deref() == Ok("64")
+    {
+        jump::SYMBOLS
+    } else {
+        &[]
+    }
+}
+
+/// Keep assembly exports out of the rlib: host Rust executables must not gain
+/// an unversioned jump dispatcher that could bind its host fallback to itself.
+fn compile_jump_shim(out_dir: &PathBuf) {
+    if jump_symbols().is_empty() {
+        return;
+    }
+    let source = out_dir.join("jump.S");
+    let object = out_dir.join("jump.o");
+    std::fs::write(&source, jump::ASSEMBLY).expect("write jump assembly");
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let status = Command::new(cc)
+        .args(["-c", "-fPIC", "-x", "assembler-with-cpp"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&object)
+        .status()
+        .expect("a working assembler is required for the Bionic jump boundary");
+    assert!(status.success(), "failed to assemble the Bionic jump boundary");
+    println!("cargo:rustc-cdylib-link-arg={}", object.display());
+    for sym in jump_symbols() {
+        println!("cargo:rustc-cdylib-link-arg=-Wl,--undefined={sym}");
+    }
+}
+
+fn syscall_path_symbols() -> &'static [&'static str] {
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64")
+        && std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu")
+        && std::env::var("CARGO_CFG_TARGET_POINTER_WIDTH").as_deref() == Ok("64")
+    {
+        syscall_paths::SYMBOLS
+    } else {
+        &[]
+    }
+}
+
+fn compile_syscall_paths(out_dir: &PathBuf) {
+    if syscall_path_symbols().is_empty() {
+        return;
+    }
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    for (name, language, source) in [
+        ("syscall_paths_c", "c", syscall_paths::source()),
+        ("syscall_paths_asm", "assembler-with-cpp", syscall_paths::assembly()),
+    ] {
+        let source_path = out_dir.join(format!("{name}.src"));
+        let object = out_dir.join(format!("{name}.o"));
+        std::fs::write(&source_path, source).expect("write syscall path source");
+        let status = Command::new(&cc)
+            .args(["-c", "-O2", "-fPIC", "-fvisibility=hidden", "-x", language])
+            .arg(&source_path)
+            .arg("-o")
+            .arg(&object)
+            .status()
+            .expect("a C compiler is required for the syscall path boundary");
+        assert!(status.success(), "failed to compile {name}");
+        println!("cargo:rustc-cdylib-link-arg={}", object.display());
+    }
+    for symbol in syscall_path_symbols() {
+        println!("cargo:rustc-cdylib-link-arg=-Wl,--undefined={symbol}");
+    }
 }
 
 /// Compile the hand-written C translation units and bundle them into
@@ -106,13 +192,18 @@ fn compile_c_shims(out_dir: &PathBuf) {
 /// Assign the three anchor symbols to `LIBC`/`LIBM`/`LD`; everything else stays
 /// global, so the shim can serve as the provider of the Bionic sonames.
 ///
-/// The C-implemented entry points are listed in the `LIBC` node as well: rustc
+/// The C/assembly entry points are listed in the `LIBC` node as well: rustc
 /// emits its own export list for a cdylib, and a symbol that appears in *no*
 /// version node is hidden by it. Naming them here is what makes them visible.
 fn write_version_script(out_dir: &PathBuf) {
     let map = out_dir.join("pengudroid-versions.map");
     let mut libc_globals = String::from("__pengudroid_ver_libc");
-    for sym in vlog::C_SYMBOLS.iter().chain(pathshim::C_SYMBOLS.iter()) {
+    for sym in vlog::C_SYMBOLS
+        .iter()
+        .chain(pathshim::C_SYMBOLS.iter())
+        .chain(jump_symbols().iter())
+        .chain(syscall_path_symbols().iter())
+    {
         libc_globals.push_str("; ");
         libc_globals.push_str(sym);
     }

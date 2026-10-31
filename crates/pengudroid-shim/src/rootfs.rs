@@ -17,6 +17,10 @@
 //! Only *guest* mount points are rewritten.  Host paths (`/proc`, `/dev`,
 //! `/etc`, the sysroot's own location, ...) are left untouched, so the same
 //! process can still use the host normally.
+//!
+//! Optional `PENGUDROID_ARM64_GUEST_ROOT` overlays only native-bridge runtime
+//! paths. The host ART/framework stays in `PENGUDROID_ROOT`; guest linker/libc
+//! must never replace the host's x86_64 libraries.
 
 use std::ffi::{CStr, CString};
 use std::sync::OnceLock;
@@ -56,6 +60,29 @@ fn root() -> Option<&'static [u8]> {
     .as_deref()
 }
 
+fn arm64_root() -> Option<&'static [u8]> {
+    static ROOT: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let value = std::env::var_os("PENGUDROID_ARM64_GUEST_ROOT")?;
+        let bytes = std::os::unix::ffi::OsStrExt::as_bytes(value.as_os_str());
+        (bytes.starts_with(b"/") && bytes != b"/").then(|| bytes.to_vec())
+    }).as_deref()
+}
+
+fn under(path: &[u8], prefix: &[u8]) -> bool {
+    path == prefix || path.starts_with(prefix) && path.get(prefix.len()) == Some(&b'/')
+}
+
+/// Deliberately a narrow overlay, not a second whole `/system` tree. Redirect
+/// the optional Berberis directories too, so a stale host overlay cannot win
+/// Digitalis's alternative-location probe over the selected guest runtime.
+fn arm64_runtime_path(path: &[u8]) -> bool {
+    path == b"/system/etc/ld.config.arm64.txt" || [
+        b"/system/bin/arm64".as_slice(), b"/system/lib64/arm64",
+        b"/system/bin/berberis", b"/system/lib64/berberis",
+    ].iter().any(|prefix| under(path, prefix))
+}
+
 /// Whether `path` names something inside the virtual Android root.
 fn guest_path(path: &[u8]) -> bool {
     if !path.starts_with(b"/") {
@@ -81,9 +108,20 @@ pub fn map_with_root(root: &[u8], path: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Map `path` into the virtual root, or return `None` when no rewrite applies.
+fn map_with_roots(host: Option<&[u8]>, arm64: Option<&[u8]>, path: &[u8]) -> Option<Vec<u8>> {
+    if arm64_runtime_path(path) {
+        if let Some(arm64) = arm64 {
+            // No existence-based fallback: a missing guest dependency is an
+            // error, not permission to load the stock GSI's incompatible libc.
+            return map_with_root(arm64, path);
+        }
+    }
+    map_with_root(host?, path)
+}
+
+/// Map `path` into the selected runtime root, or leave host paths untouched.
 pub fn map_bytes(path: &[u8]) -> Option<Vec<u8>> {
-    map_with_root(root()?, path)
+    map_with_roots(root(), arm64_root(), path)
 }
 
 /// `char *__pengudroid_map_path(const char *path)`
@@ -340,6 +378,39 @@ pub unsafe extern "C" fn faccessat(
     }
 }
 
+fn virtual_arm64_path<'a>(root: &[u8], path: &'a [u8]) -> Option<&'a [u8]> {
+    let path = path.strip_prefix(root)?;
+    arm64_runtime_path(path).then_some(path)
+}
+
+fn virtual_runtime_path(path: &[u8]) -> Option<&[u8]> {
+    let arm64 = arm64_root()?;
+    if let Some(path) = virtual_arm64_path(arm64, path) { return Some(path); }
+    // The config reader canonicalizes dir.system=/system as well as the
+    // executable. Both must remain in the same virtual coordinate space.
+    let path = path.strip_prefix(root()?)?;
+    guest_path(path).then_some(path)
+}
+
+/// Linker config sections are selected by executable realpath. Returning the
+/// host bundle prefix here makes `/system` fail to match `dir.system`, which
+/// otherwise silently selects the host x86_64 library fallback.
+unsafe fn with_link_output(
+    buf: *mut c_char, size: usize, mut read: impl FnMut(*mut c_char, usize) -> isize,
+) -> isize {
+    if arm64_root().is_none() { return read(buf, size); }
+    if buf.is_null() || size == 0 { return read(buf, size); }
+    let mut link = [0u8; 4096 + 64];
+    let len = read(link.as_mut_ptr().cast(), link.len());
+    if len < 0 { return len; }
+    if len as usize == link.len() { return read(buf, size); }
+    let path = &link[..len as usize];
+    let path = virtual_runtime_path(path).unwrap_or(path);
+    let count = size.min(path.len());
+    std::ptr::copy_nonoverlapping(path.as_ptr(), buf.cast(), count);
+    count as isize
+}
+
 /// `readlink(path, buf, size)`.
 #[no_mangle]
 pub unsafe extern "C" fn readlink(
@@ -348,7 +419,7 @@ pub unsafe extern "C" fn readlink(
     size: usize,
 ) -> isize {
     match next::<ReadlinkFn>(b"readlink\0") {
-        Some(f) => with_path(path, |p| f(p, buf, size)),
+        Some(f) => with_path(path, |p| with_link_output(buf, size, |out, size| f(p, out, size))),
         None => -1,
     }
 }
@@ -362,7 +433,7 @@ pub unsafe extern "C" fn readlinkat(
     size: usize,
 ) -> isize {
     match next::<ReadlinkAtFn>(b"readlinkat\0") {
-        Some(f) => with_path(path, |p| f(dirfd, p, buf, size)),
+        Some(f) => with_path(path, |p| with_link_output(buf, size, |out, size| f(dirfd, p, out, size))),
         None => -1,
     }
 }
@@ -452,7 +523,20 @@ pub unsafe extern "C" fn freopen(
 #[no_mangle]
 pub unsafe extern "C" fn realpath(path: *const c_char, resolved: *mut c_char) -> *mut c_char {
     match next::<RealpathFn>(b"realpath\0") {
-        Some(f) => with_path(path, |p| f(p, resolved)),
+        Some(f) => with_path(path, |p| {
+            let out = f(p, resolved);
+            if !out.is_null() {
+                {
+                    let host = CStr::from_ptr(out).to_bytes();
+                    if let Some(virtual_path) = virtual_runtime_path(host) {
+                        let len = virtual_path.len();
+                        std::ptr::copy(virtual_path.as_ptr(), out.cast(), len);
+                        *out.add(len) = 0;
+                    }
+                }
+            }
+            out
+        }),
         None => std::ptr::null_mut(),
     }
 }
@@ -536,6 +620,45 @@ mod tests {
             map_with_root(ROOT, b"/system_ext/lib64/x.so").unwrap(),
             b"/opt/android/system_ext/lib64/x.so"
         );
+    }
+
+    #[test]
+    fn arm64_overlay_does_not_replace_host_framework_or_libc() {
+        for path in [
+            b"/system/bin/arm64/linker64".as_slice(),
+            b"/system/lib64/arm64/libc.so", b"/system/lib64/arm64/bootstrap/libdl.so",
+            b"/system/etc/ld.config.arm64.txt", b"/system/bin/berberis",
+            b"/system/lib64/berberis/arm64/libc.so",
+        ] {
+            let expected = [b"/opt/guest".as_slice(), path].concat();
+            assert_eq!(map_with_roots(Some(ROOT), Some(b"/opt/guest"), path), Some(expected));
+        }
+        for path in [
+            b"/system/lib64/libc.so".as_slice(), b"/system/bin/linker64",
+            b"/system/framework/framework.jar", b"/apex/com.android.art/lib64/libart.so",
+            b"/system/bin/arm64-other", b"/system/lib64/arm640/libc.so",
+            b"/system/etc/ld.config.arm64.txt.bak",
+        ] {
+            assert_eq!(map_with_roots(Some(ROOT), Some(b"/opt/guest"), path), map_with_root(ROOT, path));
+        }
+        assert!(map_with_roots(Some(ROOT), Some(b"/opt/guest"), b"/opt/guest/system/lib64/arm64/libc.so").is_none());
+    }
+
+    #[test]
+    fn only_arm64_bundle_realpaths_become_virtual_again() {
+        assert_eq!(virtual_arm64_path(b"/opt/guest", b"/opt/guest/system/bin/arm64/app_process64"), Some(b"/system/bin/arm64/app_process64".as_slice()));
+        assert_eq!(virtual_arm64_path(b"/opt/guest", b"/opt/guest/system/lib64/arm64/libc.so"), Some(b"/system/lib64/arm64/libc.so".as_slice()));
+        for path in [b"/opt/guest/system/lib64/libc.so".as_slice(), b"/opt/guest-other/system/bin/arm64/linker64", b"/usr/bin/bash", b"/opt/guest"] {
+            assert!(virtual_arm64_path(b"/opt/guest", path).is_none());
+        }
+    }
+
+    #[test]
+    fn arm64_overlay_is_optional_and_never_falls_back_for_missing_files() {
+        let path = b"/system/lib64/arm64/does-not-exist.so";
+        assert_eq!(map_with_roots(Some(ROOT), None, path), map_with_root(ROOT, path));
+        assert_eq!(map_with_roots(None, Some(b"/opt/guest"), path), Some(b"/opt/guest/system/lib64/arm64/does-not-exist.so".to_vec()));
+        assert!(map_with_roots(None, Some(b"/opt/guest"), b"/system/lib64/libart.so").is_none());
     }
 
     #[test]

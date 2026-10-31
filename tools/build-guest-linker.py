@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
-"""Build the ARM64 native-bridge guest linker (ld-android.so) from pinned AOSP sources.
+"""Build the ARM64 native-bridge guest linker and bootstrap from pinned AOSP sources.
 
 Run: python3 -B tools/build-guest-linker.py [--seconds N] [--stage all|compile|rust|link|verify]
+     python3 -B tools/build-guest-linker.py --module libm
+     python3 -B tools/build-guest-linker.py --module app_process --bundle
+
+The bootstrap uses NBS's tiny native_bridge_guest_app_process, NOT the framework
+app_process. New module builds reuse the already-built guest linker/libc/libdl;
+--stage verify checks existing artifacts without running compilers or generators.
 
 The 32 translation units, static closure, flags, version script and post-link
 `llvm-objcopy --prefix-symbols=__dl_` come from
@@ -47,7 +53,12 @@ LIBCXX = DEPS / "toolchain/libcxx/android/x86_64/include/c++/v1"
 LIBCXX_COMMON = DEPS / "toolchain/libcxx/include/c++/v1"
 LINKER_ARTIFACT = ROOT / "out" / "native_bridge_guest_linker.native_bridge"
 VDSO_FILE = REPO / ".toolchain/sysroot-android17/system/lib64/arm64/libnative_bridge_vdso.so"
-APP_PROCESS = REPO / "target/arm64-guest-bootstrap/app_process64"
+LIBC_ARTIFACT = ROOT / "out" / "libnative_bridge_guest_libc.native_bridge"
+APP_PROCESS = ROOT / "out" / "native_bridge_guest_app_process.native_bridge"
+# Soong cc/binary.go uses the canonical device interpreter. Digitalis's
+# kernel_api/open_emulation.cc redirects guest opens to /system/bin/arm64/linker64.
+GUEST_INTERPRETER = "/system/bin/linker64"
+CRT = NDK / "usr/lib/aarch64-linux-android/37"
 # Digitalis installs this as system/etc/ld.config.arm64.txt; the guest linker
 # reads it from kLdConfigArchFilePath and it is what makes the exported guest
 # "default" namespace search /system/lib64/arm64/bootstrap:/system/lib64/arm64.
@@ -108,6 +119,7 @@ BP_FILES = (
     BIONIC / "linker/Android.bp",
     NBS / "android_api/linker/Android.bp",
     NBS / "android_api/libc/Android.bp",
+    NBS / "android_api/app_process/Android.bp",
     DEPS / "sources/libbase/Android.bp",
     DEPS / "sources/fmtlib/Android.bp",
     DEPS / "sources/logging/liblog/Android.bp",
@@ -650,6 +662,7 @@ class GuestBuild:
              ("__libc_add_main_thread", "__libc_init_scudo",
               "__libc_set_target_sdk_version")),
             ("libdl.arm64.map", LIBDL_SRC / "libdl.map.txt", ()),
+            ("libm.arm64.map", BIONIC / "libm/libm.map.txt", ()),
         )
         for name, source, extra in plans:
             output = self.root / "gen" / name / name
@@ -802,7 +815,11 @@ class GuestBuild:
             raise BuildError(f"header/defaults module cannot be built: {name}")
         if props.get("sdk_version") not in (None, ""):
             raise BuildError(f"SDK/NDK variant is not the platform guest variant: {name}")
+        if name == "native_bridge_guest_app_process":
+            return self._build_app_process(name, props)
         if linkage == "shared":
+            if name == "libm":
+                return self._build_libm_shared(props)
             return self._build_shared(name, props)
         return self._build_archive(name, props)
 
@@ -973,6 +990,153 @@ class GuestBuild:
                 "shared_requirements": [str(path) for path in shared],
                 "rust_inputs": list(dict.fromkeys(rust_inputs)),
                 "bytes": output.stat().st_size, "sha256": sha256(output)}
+
+    def bootstrap_shared_inputs(self, props):
+        # Soong defaults system_shared_libs to libc/libm/libdl; libm explicitly
+        # narrows that to libc. Never substitute the NDK's stub DSOs or build
+        # ordinary bionic libc instead of the NBS guest replacement.
+        dependencies = props.get("shared_libs", []) + props.get(
+            "system_shared_libs", ["libc", "libm", "libdl"])
+        paths = {"libc": LIBC_ARTIFACT, "libdl": self.root / "lib/libdl.so",
+                 "libm": self.root / "lib/libm.so", "ld-android": LINKER_ARTIFACT,
+                 "libnative_bridge_vdso": VDSO_FILE}
+        result = []
+        for dependency in dict.fromkeys(dependencies):
+            if dependency not in paths:
+                raise BuildError(f"unsupported bootstrap shared dependency: {dependency}")
+            path = paths[dependency]
+            if dependency == "libm" and not path.exists():
+                path = Path(self.build("libm", "shared")["output"])
+            if not path.is_file():
+                raise BuildError(f"missing built guest {dependency}: {path}; "
+                                 "build the guest linker/libc first")
+            verify_elf_arm64(path, 3)
+            result.append(str(path))
+        return result
+
+    @staticmethod
+    def bootstrap_crt(begin, end):
+        paths = [CRT / (name + ".o") for name in (begin, end)]
+        for path in paths:
+            if not path.is_file():
+                raise BuildError(f"missing ARM64 API-37 CRT: {path}")
+            verify_elf_arm64(path, 1)
+        return paths
+
+    def link_bootstrap(self, name, argv, output, objects, shared, required_exports=()):
+        check_output_path(output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=output.name + ".", dir=output.parent)
+        os.close(fd)
+        temporary = Path(temporary)
+        try:
+            self.runner.run([*map(str, argv), "-o", str(temporary)], "link " + name)
+            artifact = inspect_runtime(temporary)
+            validate_runtime_module("app_process" if name == "app_process64" else "libm", artifact)
+            missing = set(required_exports) - set(artifact["exports"])
+            if missing:
+                raise BuildError(f"{name} is missing version-script exports: {sorted(missing)}")
+            temporary.chmod(0o755 if name == "app_process64" else 0o644)
+            temporary.replace(output)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return {"output": str(output), "objects": list(map(str, objects)),
+                "shared_requirements": shared, "bytes": output.stat().st_size,
+                "sha256": sha256(output)}
+
+    def _build_app_process(self, name, props):
+        if self.model.kind(name) != "cc_binary" or not props.get("enabled"):
+            raise BuildError("NBS app_process must be the enabled native-bridge cc_binary")
+        sources = self._sources(name, props, None)
+        if sources != [NBS / "android_api/app_process/app_process.cc"]:
+            raise BuildError(f"unexpected NBS app_process sources: {sources}")
+        objects = [self.object_for(name, props, number, source,
+                                   self.root / "obj" / name)
+                   for number, source in enumerate(sources)]
+        begin, end = self.bootstrap_crt("crtbegin_dynamic", "crtend_android")
+        shared = self.bootstrap_shared_inputs(props)
+        # With exceptions/RTTI disabled, this main has no C++ runtime references.
+        # --as-needed drops the unused implicit libm/libdl (and no libc++ is
+        # required); CRT's __libc_init and main's vDSO call retain their providers.
+        argv = [LLVM / "ld.lld", "-m", "aarch64linux", "--threads=1", "-pie",
+                "--entry=_start", "--dynamic-linker=" + GUEST_INTERPRETER,
+                "--no-undefined", "--fatal-warnings", "--build-id=md5",
+                "-z", "noexecstack", "-z", "relro", "-z", "now",
+                "-z", "max-page-size=16384", "--gc-sections", "--hash-style=both",
+                *expand_linker_flags(props.get("ldflags", [])), begin, *objects,
+                "--as-needed", *shared,
+                PREBUILT_ARCHIVES["libclang_rt.builtins-aarch64-android"], end]
+        result = self.link_bootstrap("app_process64", argv, APP_PROCESS, objects, shared)
+        return {"module": name, "kind": "binary", **result}
+
+    def bootstrap_static_inputs(self, name, props):
+        sources = self._sources(name, props, "static")
+        objects = [self.object_for(name, props, number, source, self.root / "obj" / name)
+                   for number, source in enumerate(sources)]
+        if props.get("static_libs") or props.get("rustlibs"):
+            raise BuildError(f"unsupported extra bootstrap static dependencies in {name}")
+        archive = self.root / "lib" / (name + ".a")
+        reused = False
+        # Earlier flattened archives can contain duplicate or stale members.
+        # Reuse only an exact byte-for-byte packing of the verified objects;
+        # otherwise pass those objects directly, as Soong's shared variant does.
+        if archive.is_file() and archive.stat().st_size <= FILE_LIMIT:
+            members = subprocess.run([str(LLVM / "llvm-ar"), "t", str(archive)],
+                                     capture_output=True, text=True, check=True, timeout=30).stdout.splitlines()
+            if members == [path.name for path in objects]:
+                packed = subprocess.run([str(LLVM / "llvm-ar"), "p", str(archive)],
+                                        capture_output=True, check=True, timeout=30).stdout
+                digest = hashlib.sha256()
+                for path in objects:
+                    with path.open("rb") as stream:
+                        for block in iter(lambda: stream.read(1024 * 1024), b""):
+                            digest.update(block)
+                reused = hashlib.sha256(packed).digest() == digest.digest()
+        self.runner.report.setdefault("bootstrap_archive_reuse", {})[name] = {
+            "archive": str(archive), "reused": reused, "objects": len(objects),
+            "reason": "exact verified object contents" if reused else "using verified objects; archive absent or not exact"}
+        inputs = [archive] if reused else objects
+        for dependency in dict.fromkeys(props.get("whole_static_libs", [])):
+            dependency = self.model.canonical(dependency)
+            inputs += self.bootstrap_static_inputs(dependency, self.model.props(dependency, "static"))
+        return inputs
+
+    def _build_libm_shared(self, props):
+        static_props = self.model.props("libm", "static")
+        sources = self._sources("libm", props, "shared")
+        if sources != self._sources("libm", static_props, "static"):
+            raise BuildError("cannot reuse static libm: shared sources differ")
+        for source in sources:
+            output = self.root / "obj/libm" / (source.stem + ".o")
+            if (self.compile_command("libm", props, source, output)
+                    != self.compile_command("libm", static_props, source, output)):
+                raise BuildError(f"cannot reuse static libm: shared compile flags differ: {source}")
+        # Both variants use -fPIC and identical source/compile rules. Validate
+        # their cached source/command digests without rewriting old archives.
+        inputs = self.bootstrap_static_inputs("libm", static_props)
+        begin, end = self.bootstrap_crt("crtbegin_so", "crtend_so")
+        shared = self.bootstrap_shared_inputs(props)
+        version_script = VERSION_SCRIPTS.get(self.model.canonical(props.get("version_script", "")))
+        if version_script is None:
+            raise BuildError("missing generated libm.arm64.map")
+        inputs = list(dict.fromkeys(inputs))
+        argv = [LLVM / "ld.lld", "-m", "aarch64linux", "--threads=1", "-shared",
+                "--no-undefined", "--fatal-warnings", "--no-undefined-version",
+                "--soname=libm.so", "--build-id=md5", "--hash-style=both",
+                "-z", "noexecstack", "-z", "relro", "-z", "now",
+                "-z", "max-page-size=16384", "--gc-sections",
+                "--version-script=" + str(version_script),
+                *expand_linker_flags(props.get("ldflags", [])), begin]
+        for symbol in version_script_symbols(version_script):
+            argv += ["-u", symbol]
+        argv += ["--whole-archive", *inputs, "--no-whole-archive",
+                 "--start-group",
+                 PREBUILT_ARCHIVES["libclang_rt.builtins-aarch64-android"], "--end-group",
+                 "--as-needed", *shared, end]
+        result = self.link_bootstrap("libm.so", argv, self.root / "lib/libm.so", [], shared,
+                                     required_exports=version_script_symbols(version_script))
+        return {"module": "libm", "kind": "shared", "soname": "libm.so",
+                "reused_static_variant": True, "static_inputs": list(map(str, inputs)), **result}
 
     def stage_proc_macro(self, name, crate_root):
         """rustc 1.99 no longer puts `proc_macro` in the extern prelude for
@@ -1374,60 +1538,202 @@ def inspect_libc(path, required):
             "required_missing": sorted(set(required) - defined), "checks": checks}
 
 
-def assemble_bundle(libc_result, libdl_result):
-    """Manifest-free native-bridge guest bundle in Digitalis's path layout."""
-    required = {
-        "linker": LINKER_ARTIFACT,
-        "app_process64": APP_PROCESS,
-        "vdso": VDSO_FILE,
-        "ld_config": LD_CONFIG,
-        "libc": Path(libc_result["output"]),
-        "libdl": Path(libdl_result["output"]),
-    }
-    for label, path in required.items():
-        if not path.is_file():
+BOOTSTRAP_PATHS = {
+    "linker": "system/bin/arm64/linker64",
+    "app_process64": "system/bin/arm64/app_process64",
+    "libc": "system/lib64/arm64/libc.so",
+    "libdl": "system/lib64/arm64/libdl.so",
+    "libm": "system/lib64/arm64/libm.so",
+    "vdso": "system/lib64/arm64/libnative_bridge_vdso.so",
+}
+REQUIRED_LIBM_EXPORTS = ("cos", "sin", "pow", "sqrt", "exp", "log", "fesetround")
+
+
+def inspect_runtime(path):
+    """ELF evidence shared by module acceptance and bootstrap closure checks."""
+    path = Path(path)
+    verify_elf_arm64(path, 3)
+    text = subprocess.run(
+        [str(LLVM / "llvm-readelf"), "--wide", "--file-header", "--program-headers",
+         "--dynamic", "--dyn-syms", str(path)],
+        capture_output=True, text=True, check=True, timeout=30).stdout
+    exports, imports = set(), set()
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) >= 8 and fields[0].rstrip(":").isdigit() and fields[0].endswith(":"):
+            name = fields[7].split("@", 1)[0]
+            if fields[6] != "UND":
+                exports.add(name)
+            elif fields[4] != "WEAK":
+                imports.add(name)
+    entry = re.search(r"Entry point address:\s*(0x[0-9a-fA-F]+)", text)
+    return {"path": str(path), "bytes": path.stat().st_size, "sha256": sha256(path),
+            "soname": re.findall(r"\(SONAME\).*?\[([^\]]+)\]", text),
+            "needed": re.findall(r"\(NEEDED\).*?\[([^\]]+)\]", text),
+            "interpreter": re.findall(r"\[Requesting program interpreter: ([^\]]+)\]", text),
+            "entry": int(entry[1], 16) if entry else 0,
+            "pie": bool(re.search(r"\(FLAGS_1\).*\bPIE\b", text)),
+            "exports": sorted(exports), "imports": sorted(imports), "required_missing": []}
+
+
+def validate_runtime_module(module, artifact):
+    if module == "app_process":
+        if (artifact["soname"] or artifact["interpreter"] != [GUEST_INTERPRETER]
+                or not artifact["entry"] or not artifact["pie"]):
+            raise BuildError("guest app_process must be an ARM64 PIE with PT_INTERP " + GUEST_INTERPRETER)
+        if set(artifact["needed"]) != {"libc.so", "linux-vdso.so.1"}:
+            raise BuildError(f"unexpected app_process DT_NEEDED (unused runtime libraries?): {artifact['needed']}")
+        missing = {"native_bridge_post_init", "__libc_init"} - set(artifact["imports"])
+        if missing:
+            raise BuildError(f"guest app_process is missing bootstrap imports: {sorted(missing)}")
+    elif module == "libm":
+        if artifact["soname"] != ["libm.so"] or artifact["interpreter"]:
+            raise BuildError("guest libm must have SONAME libm.so and no PT_INTERP")
+        missing = set(REQUIRED_LIBM_EXPORTS) - set(artifact["exports"])
+        if missing:
+            raise BuildError(f"guest libm is missing required exports: {sorted(missing)}")
+        if artifact["needed"] != ["libc.so"]:
+            raise BuildError(f"unexpected libm DT_NEEDED: {artifact['needed']}")
+    else:
+        raise BuildError(f"unsupported bootstrap module: {module}")
+
+
+def bootstrap_artifacts(libc_result=None, libdl_result=None, libm_result=None, app_result=None):
+    return {"linker": LINKER_ARTIFACT, "vdso": VDSO_FILE,
+            "app_process64": Path(app_result["output"]) if app_result else APP_PROCESS,
+            "libc": Path(libc_result["output"]) if libc_result else LIBC_ARTIFACT,
+            "libdl": Path(libdl_result["output"]) if libdl_result else ROOT / "lib/libdl.so",
+            "libm": Path(libm_result["output"]) if libm_result else ROOT / "lib/libm.so"}
+
+
+def validate_bootstrap_closure(artifacts):
+    expected = {"linker": ("ld-android.so", REQUIRED_EXPORTS),
+                "vdso": ("linux-vdso.so.1", ("native_bridge_post_init",)),
+                "libc": ("libc.so", REQUIRED_LIBC_EXPORTS),
+                "libdl": ("libdl.so", ("dlopen", "dlsym")),
+                "libm": ("libm.so", REQUIRED_LIBM_EXPORTS)}
+    evidence, providers = {}, {}
+    for label in BOOTSTRAP_PATHS:
+        path = artifacts.get(label)
+        if path is None or not Path(path).is_file():
             raise BuildError(f"cannot assemble guest bundle; missing {label}: {path}")
-    bin_dir = BUNDLE / "system/bin/arm64"
-    lib_dir = BUNDLE / "system/lib64/arm64"
-    etc_dir = BUNDLE / "system/etc"
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    lib_dir.mkdir(parents=True, exist_ok=True)
-    etc_dir.mkdir(parents=True, exist_ok=True)
-    copies = {
-        bin_dir / "linker64": LINKER_ARTIFACT,
-        bin_dir / "app_process64": APP_PROCESS,
-        lib_dir / "libc.so": Path(libc_result["output"]),
-        lib_dir / "libdl.so": Path(libdl_result["output"]),
-        lib_dir / "libnative_bridge_vdso.so": VDSO_FILE,
-        etc_dir / "ld.config.arm64.txt": LD_CONFIG,
-    }
-    # libc.so NEEDs ld-android.so; that SONAME is the already-running linker
-    # (solinker is in the guest default namespace), so bionic resolves it
-    # without a file on disk. AOSP's dist list installs only the tiny
-    # ld_android.cpp stub, not the linker; do not copy the full linker here.
+        artifact = inspect_runtime(path)
+        evidence[label] = artifact
+        if label == "app_process64":
+            validate_runtime_module("app_process", artifact)
+            continue
+        soname, required = expected[label]
+        if artifact["soname"] != [soname] or artifact["interpreter"]:
+            raise BuildError(f"unexpected {label} SONAME/PT_INTERP: {artifact['soname']}, {artifact['interpreter']}")
+        missing = set(required) - set(artifact["exports"])
+        if missing:
+            raise BuildError(f"{label} is missing required exports: {sorted(missing)}")
+        providers[soname] = label
+    if evidence["linker"]["needed"] or evidence["vdso"]["needed"]:
+        raise BuildError("guest linker and preloaded vDSO must not have DT_NEEDED")
+    validate_runtime_module("libm", evidence["libm"])
+    resolutions = {}
+    for label, artifact in evidence.items():
+        resolutions[label] = {}
+        for needed in artifact["needed"]:
+            if needed not in providers:
+                raise BuildError(f"bootstrap closure missing DT_NEEDED {needed} required by {label}")
+            resolutions[label][needed] = BOOTSTRAP_PATHS[providers[needed]]
+        # Include the two objects Digitalis preloads, then the transitive
+        # dependency group. Do not let unrelated bundled DSOs mask an import.
+        reachable, pending = set(), [label, "linker", "vdso"]
+        while pending:
+            current = pending.pop()
+            if current in reachable:
+                continue
+            reachable.add(current)
+            for needed in evidence[current]["needed"]:
+                if needed not in providers:
+                    raise BuildError(f"bootstrap closure missing DT_NEEDED {needed} required by {current}")
+                pending.append(providers[needed])
+        exports = set().union(*(set(evidence[item]["exports"]) for item in reachable))
+        missing = set(artifact["imports"]) - exports
+        if missing:
+            raise BuildError(f"unresolved bootstrap imports in {label}: {sorted(missing)}")
+    return {"validated": True, "interpreter": GUEST_INTERPRETER,
+            "resident_sonames": {name: BOOTSTRAP_PATHS[providers[name]]
+                                 for name in ("ld-android.so", "linux-vdso.so.1")},
+            "needed_resolution": resolutions,
+            "artifacts": {label: {key: value for key, value in artifact.items() if key != "exports"}
+                          for label, artifact in evidence.items()}}
+
+
+def check_output_path(path):
+    path = Path(path)
+    if ".." in path.parts or not path.is_relative_to(ROOT) or path == ROOT:
+        raise BuildError(f"output must be inside the owned build root: {path}")
+    for candidate in (ROOT, *(ROOT / parent for parent in reversed(path.relative_to(ROOT).parents))):
+        if candidate.is_symlink() or (candidate.exists() and not candidate.is_dir()):
+            raise BuildError(f"unsafe output directory refused: {candidate}")
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise BuildError(f"unsafe output file refused: {path}")
+
+
+def assemble_bundle(libc_result=None, libdl_result=None, libm_result=None, app_result=None):
+    """Validate before updating only known files in the owned, manifest-free bundle."""
+    artifacts = bootstrap_artifacts(libc_result, libdl_result, libm_result, app_result)
+    closure = validate_bootstrap_closure(artifacts)
+    if not LD_CONFIG.is_file():
+        raise BuildError(f"cannot assemble guest bundle; missing ld_config: {LD_CONFIG}")
+    if BUNDLE != ROOT / "bundle":
+        raise BuildError("bundle must be the owned build root's bundle directory")
+    copies = {BUNDLE / BOOTSTRAP_PATHS[label]: source for label, source in artifacts.items()}
+    copies[BUNDLE / "system/etc/ld.config.arm64.txt"] = LD_CONFIG
+    for path in copies:
+        check_output_path(path)
+    allowed_dirs = {parent for path in copies for parent in path.parents if parent.is_relative_to(BUNDLE)}
+    if BUNDLE.exists():
+        for path in BUNDLE.rglob("*"):
+            if path.is_symlink() or (path not in copies and path not in allowed_dirs):
+                raise BuildError(f"unknown/symlink bundle entry refused (not removed): {path}")
     for destination, source in copies.items():
-        if not (destination.is_file() and sha256(destination) == sha256(source)):
-            shutil.copyfile(source, destination)
-    for path in BUNDLE.rglob("*"):
-        if path.is_file() and path not in copies:
-            path.unlink()
-    return {"root": str(BUNDLE), "manifest_free": True,
+        mode = 0o755 if destination.parent == BUNDLE / "system/bin/arm64" else 0o644
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".bundle-", dir=destination.parent)
+        temporary = Path(temporary)
+        try:
+            with os.fdopen(fd, "wb") as output, Path(source).open("rb") as stream:
+                shutil.copyfileobj(stream, output)
+            temporary.chmod(mode)
+            temporary.replace(destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+    # ld-android.so is the running linker; linux-vdso.so.1 is supplied via
+    # AT_SYSINFO_EHDR. Neither SONAME needs a duplicate file in the library dir.
+    return {"root": str(BUNDLE), "manifest_free": True, "closure": closure,
             "default_namespace": "/system/lib64/arm64/bootstrap:/system/lib64/arm64",
             "alternate_lookup": ["system/bin/berberis/arm64/<name>",
                                  "system/lib64/berberis/arm64/<name>"],
             "alternate_lookup_note": "preferred per GetSystemPath if the berberis dir exists",
             "files": {str(path.relative_to(BUNDLE)): {
-                "bytes": path.stat().st_size, "sha256": sha256(path)}
-                for path in sorted(BUNDLE.rglob("*")) if path.is_file()}}
+                "bytes": path.stat().st_size, "sha256": sha256(path),
+                "mode": format(path.stat().st_mode & 0o777, "04o")}
+                for path in sorted(copies)}}
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seconds", type=int, default=14400, choices=range(60, 86401), metavar="60..86400")
     parser.add_argument("--stage", choices=("all", "compile", "rust", "link", "verify"), default="all")
-    parser.add_argument("--module", choices=("libnative_bridge_guest_libc",),
+    parser.add_argument("--module", choices=("libnative_bridge_guest_libc", "app_process", "libm"),
                         help="build a guest runtime module instead of the linker")
-    args = parser.parse_args()
+    parser.add_argument("--bundle", action="store_true",
+                        help="validate and package the complete bootstrap (automatic for libc)")
+    args = parser.parse_args(argv)
+    if args.bundle and not args.module:
+        parser.error("--bundle requires --module")
+    if args.module in ("app_process", "libm") and args.stage not in ("all", "verify"):
+        parser.error("app_process/libm support --stage all or verify")
+    return args
+
+
+def main():
+    args = parse_args()
     prepare_root()
     with (ROOT / ".lock").open("a") as lock:
         import fcntl
@@ -1451,8 +1757,24 @@ def main():
             runner = Runner(run, report, args.seconds)
             build = GuestBuild(model, runner)
             linker = LinkerBuild(model, build, runner)
-            report["stages"]["generated"] = build.generate()
-            if args.module == "libnative_bridge_guest_libc":
+            if args.module not in ("app_process", "libm") or args.stage != "verify":
+                report["stages"]["generated"] = build.generate()
+            if args.module in ("app_process", "libm"):
+                output = APP_PROCESS if args.module == "app_process" else ROOT / "lib/libm.so"
+                if args.stage != "verify":
+                    name = "native_bridge_guest_app_process" if args.module == "app_process" else "libm"
+                    linked = build.build(name, "shared" if args.module == "libm" else None)
+                    report["stages"]["link"] = linked
+                report["artifact"] = inspect_runtime(output)
+                validate_runtime_module(args.module, report["artifact"])
+                if args.module == "libm" and args.stage != "verify":
+                    missing = set(version_script_symbols(VERSION_SCRIPTS["libm.arm64.map"])) - set(
+                        report["artifact"]["exports"])
+                    if missing:
+                        raise BuildError(f"guest libm version-script exports missing: {sorted(missing)}")
+                if args.bundle:
+                    report["bundle"] = assemble_bundle()
+            elif args.module == "libnative_bridge_guest_libc":
                 if not LINKER_ARTIFACT.is_file():
                     raise BuildError(f"guest linker artifact is missing: {LINKER_ARTIFACT}; "
                                      "run the linker build first")
@@ -1470,7 +1792,10 @@ def main():
                 if failed:
                     raise BuildError(f"guest libc acceptance check failed: {failed}: "
                                      f"{report['artifact']['checks']}")
-                report["bundle"] = assemble_bundle(libc, libdl)
+                libm = build.build("libm", "shared")
+                app = build.build("native_bridge_guest_app_process")
+                report["stages"]["bootstrap"] = {"libm": libm, "app_process": app}
+                report["bundle"] = assemble_bundle(libc, libdl, libm, app)
             else:
                 if args.stage in ("all", "compile"):
                     units = linker.compile_translation_units()
@@ -1499,12 +1824,13 @@ def main():
                     output = ROOT / "out" / "native_bridge_guest_linker.native_bridge"
                     report["artifact"] = inspect_artifact(output, REQUIRED_EXPORTS)
             report["verified"] = bool(report["artifact"]) and not report["artifact"]["required_missing"]
-        except (BuildError, OSError, ValueError, subprocess.SubprocessError) as error:
+        except (BuildError, DRIVER.BuildError, OSError, ValueError, subprocess.SubprocessError) as error:
             report["blocker"] = str(error)
             print(str(error), file=sys.stderr)
         finally:
             report["reused_objects"] = report.get("reused_objects", 0)
             report["retry"] = [sys.executable, "-B", str(Path(__file__).resolve())] + sys.argv[1:]
+            atomic_json(run / "report.json", report)
             atomic_json(ROOT / "report.json", report)
             print(f"Report: {ROOT / 'report.json'}", flush=True)
         return 0 if report.get("verified") else 1

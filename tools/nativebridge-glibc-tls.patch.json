@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "description": "Opt-in GNU x86_64 host / ARM64 Bionic guest bootstrap TLS. Apply only to driver-owned staged copies, after exact base-source hash validation. No pthread_self interposition or host TCB writes.",
+  "sources": [
+    {
+      "path": "guest_loader/guest_loader.cc",
+      "base_sha256": "9dd4be7951535de55188a009720ca28532e0dcd67affa252d576a1c678699f34",
+      "replacements": [
+        {
+          "old": "#include \"native_bridge_support/linker/static_tls_config.h\"",
+          "new": "#include \"native_bridge_support/linker/static_tls_config.h\"\n#include \"pengudroid_bridge_tls.h\""
+        },
+        {
+          "old": "  auto&& [ret] = GuestReturnReference<decltype(pthread_self)>(state);\n  ret = pthread_self();",
+          "new": "  auto&& [ret] = GuestReturnReference<decltype(pthread_self)>(state);\n  if (IsConfigFlagSet(kGlibcHostThreadIdHandoff)) {\n    ret = reinterpret_cast<pthread_t>(GetPengudroidBridgeTls().guest_pthread);\n  } else {\n    ret = pthread_self();\n  }"
+        }
+      ]
+    },
+    {
+      "path": "guest_os_primitives/guest_thread.cc",
+      "base_sha256": "11c137f2ceac288381a41340b8fda5a3f9737cdf9eda7d26e4a1d7526f74754c",
+      "replacements": [
+        {
+          "old": "#include \"native_bridge_support/linker/static_tls_config.h\"",
+          "new": "#include \"native_bridge_support/linker/static_tls_config.h\"\n#include \"pengudroid_bridge_tls.h\""
+        },
+        {
+          "old": "  memcpy(static_tls_, g_static_tls_config.init_img, g_static_tls_config.size);",
+          "new": "  if (IsConfigFlagSet(kGlibcHostThreadIdHandoff)) {\n    // The probed ARM64 TCB spans TP[-3..7]. Reject mismatched guest layouts\n    // before copying or writing slots; none of these pointers are host TLS.\n    CHECK_EQ(g_static_tls_config.tls_slot_thread_id, 1);\n    CHECK_EQ(g_static_tls_config.tls_slot_bionic_tls, -1);\n    CHECK_GE(g_static_tls_config.tpoff, size_t{24});\n    CHECK_LE(g_static_tls_config.tpoff, g_static_tls_config.size);\n    CHECK_GE(g_static_tls_config.size - g_static_tls_config.tpoff, size_t{64});\n    CHECK_EQ(g_static_tls_config.tpoff % alignof(void*), size_t{0});\n    CHECK_NE(g_static_tls_config.init_img, nullptr);\n  }\n  memcpy(static_tls_, g_static_tls_config.init_img, g_static_tls_config.size);"
+        },
+        {
+          "old": "  // region digitalis\n  // On a glibc host running the translator under a bionic compatibility layer,\n  // TLS_SLOT_THREAD_ID (%fs+0x08) is glibc's DTV pointer rather than a\n  // pthread_internal_t*. Such a host seeds a synthetic bionic pthread record in\n  // TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE; take the thread id from there and let\n  // the store below replace it with the live GuestThread pointer.\n  const size_t host_thread_id_slot = IsConfigFlagSet(kGlibcHostThreadIdHandoff)\n                                         ? TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE\n                                         : TLS_SLOT_THREAD_ID;\n  tls[g_static_tls_config.tls_slot_thread_id] = GetTls()[host_thread_id_slot];\n  // endregion\n  tls[g_static_tls_config.tls_slot_bionic_tls] = GetTls()[TLS_SLOT_BIONIC_TLS];\n  GetTls()[TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE] = GetThreadStateStorage(*state_);",
+          "new": "  if (IsConfigFlagSet(kGlibcHostThreadIdHandoff)) {\n    const auto bridge = GetPengudroidBridgeTls(tls, GetThreadStateStorage(*state_));\n    tls[g_static_tls_config.tls_slot_thread_id] = bridge.guest_pthread;\n    tls[g_static_tls_config.tls_slot_bionic_tls] = bridge.bionic_tls;\n  } else {\n    // Native Bionic only. GNU hosts must never seed/read guest slots in FS.\n    tls[g_static_tls_config.tls_slot_thread_id] = GetTls()[TLS_SLOT_THREAD_ID];\n    tls[g_static_tls_config.tls_slot_bionic_tls] = GetTls()[TLS_SLOT_BIONIC_TLS];\n    GetTls()[TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE] = GetThreadStateStorage(*state_);\n  }"
+        }
+      ]
+    }
+  ],
+  "added_files": {
+    "pengudroid_bridge_tls.h": "// Driver-owned adapter contract. Not an upstream Bionic or Digitalis header.\n#ifndef PENGUDROID_BRIDGE_TLS_ADAPTER_H_\n#define PENGUDROID_BRIDGE_TLS_ADAPTER_H_\n#include <cstddef>\n#include <cstdint>\n#include <dlfcn.h>\n#include <pthread.h>\n#include \"berberis/base/checks.h\"\nnamespace berberis {\nstruct PengudroidBridgeTlsView {\n  void* guest_pthread;\n  void* bionic_tls;\n  uintptr_t host_pthread;\n  int32_t tid;\n  int32_t pid;\n  void* guest_state;\n};\nstatic_assert(sizeof(PengudroidBridgeTlsView) == 40);\ninline PengudroidBridgeTlsView GetPengudroidBridgeTls(void* guest_tp = nullptr,\n                                                     void* guest_state = nullptr) {\n  using Helper = int (*)(uint64_t, size_t, void*, void*, PengudroidBridgeTlsView*);\n  static const auto helper = reinterpret_cast<Helper>(\n      dlsym(RTLD_DEFAULT, \"pengudroid_bridge_tls_v1\"));\n  CHECK(helper != nullptr);\n  PengudroidBridgeTlsView view{};\n  // The helper also requires PENGUDROID_BRIDGE_TLS=1. Missing/disabled or\n  // mismatched helpers fail closed instead of exposing a glibc pthread as Bionic.\n  CHECK_EQ(helper(UINT64_C(0xf953e6ea42974914), sizeof(view), guest_tp, guest_state, &view), 0);\n  CHECK(view.guest_pthread != nullptr);\n  CHECK(view.bionic_tls != nullptr);\n  CHECK_EQ(view.host_pthread, static_cast<uintptr_t>(pthread_self()));\n  return view;\n}\n}  // namespace berberis\n#endif\n"
+  }
+}

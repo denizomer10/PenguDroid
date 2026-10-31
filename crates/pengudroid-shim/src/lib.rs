@@ -60,9 +60,24 @@ mod audiofocus;
 mod virtual_input;
 mod blast;
 mod codec2;
+#[cfg(all(
+    target_os = "linux",
+    target_env = "gnu",
+    target_arch = "x86_64",
+    target_pointer_width = "64"
+))]
+mod bridge_exec;
+#[cfg(all(
+    target_os = "linux",
+    target_env = "gnu",
+    target_arch = "x86_64",
+    target_pointer_width = "64"
+))]
+mod bridge_tls;
 mod netdb;
 mod pathshim;
 mod rootfs;
+mod syscall_paths;
 mod vlog;
 mod zip;
 
@@ -3593,25 +3608,9 @@ pub unsafe extern "C" fn sigaddset(set: *mut BionicSigset, signum: c_int) -> c_i
     0
 }
 
-/// `sigsetjmp` — Bionic exports this as a real function, while glibc only has
-/// the `__sigsetjmp` it is a macro for.
-///
-/// The forwarding has to be a *tail jump*: `__sigsetjmp` saves its caller's
-/// return address, so an ordinary wrapper function would make `longjmp` return
-/// into a frame that no longer exists. A `jmp` keeps the original return
-/// address on the stack and passes `rdi`/`rsi` through untouched.
-///
-/// NOTE: this inherits glibc's `sigjmp_buf` layout, which is larger than
-/// Bionic's. Callers must allocate the glibc-sized buffer; the ARM translator's
-/// own uses are internal and never cross the boundary.
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    ".globl sigsetjmp",
-    ".type sigsetjmp,@function",
-    "sigsetjmp:",
-    "jmp __sigsetjmp@PLT",
-    ".size sigsetjmp, .-sigsetjmp",
-);
+// The x86_64 Bionic sigsetjmp/jump pair is assembled by build.rs from
+// src/jump.rs, into the cdylib only. Never forward an 88-byte Bionic jump
+// buffer to glibc's __sigsetjmp; host __sigsetjmp itself stays uninterposed.
 
 /// `sigdelset(set, signum)`.
 #[no_mangle]

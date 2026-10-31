@@ -529,6 +529,21 @@ const GUEST_VDSO_HOOKS: &[&str] = &[
     "native_bridge_call_guest",
 ];
 
+/// Use a distinct native-bridge runtime without replacing host ART libraries.
+/// The shim uses this same root for only `/system/{bin,lib64}/arm64` and the
+/// guest linker configuration. No missing-file fallback to a stock GSI exists.
+fn bridge_guest_root(host: &Path, configured: Option<&std::ffi::OsStr>) -> Result<PathBuf, String> {
+    let Some(configured) = configured else { return Ok(host.to_path_buf()); };
+    let path = Path::new(configured);
+    if !path.is_absolute() || path == Path::new("/") {
+        return Err("PENGUDROID_ARM64_GUEST_ROOT must name an absolute native-bridge bundle directory, not /".into());
+    }
+    let path = std::fs::canonicalize(path)
+        .map_err(|error| format!("cannot resolve ARM64 guest root {}: {error}", path.display()))?;
+    if !path.is_dir() { return Err(format!("ARM64 guest root {} is not a directory", path.display())); }
+    Ok(path)
+}
+
 /// Tool schema 1 contains stock guest binaries; schema 2 is explicitly staged-only.
 /// Neither schema defines an executable/compatible state. Refuse any such marker
 /// (including malformed ones), rather than inventing a JSON-compatible status.
@@ -761,6 +776,19 @@ pub fn art_test(args: &[String]) -> i32 {
             return 1;
         }
     };
+    let configured_guest = std::env::var_os("PENGUDROID_ARM64_GUEST_ROOT");
+    let guest_requested = passthrough.iter().any(|arg| matches!(arg.as_str(), "--init-bridge" | "--bridge-selftest"));
+    let guest_root = if guest_requested {
+        let selected = match bridge_guest_root(&layout.root, configured_guest.as_deref()) {
+            Ok(root) => root,
+            Err(error) => { eprintln!("pengudroid: {error}"); return 1; }
+        };
+        if let Err(error) = validate_bridge_guest(&selected) {
+            eprintln!("pengudroid: {error}");
+            return 1;
+        }
+        Some(selected)
+    } else { None };
     let Some(shim) = find_shim() else {
         eprintln!("pengudroid: libpengudroid_shim.so not found (set PENGUDROID_SHIM)");
         return 1;
@@ -812,6 +840,13 @@ pub fn art_test(args: &[String]) -> i32 {
         .arg("--libs")
         .arg(&art_libs);
     cmd.args(&passthrough);
+    if configured_guest.is_some() {
+        if let Some(root) = &guest_root {
+            cmd.env("PENGUDROID_ARM64_GUEST_ROOT", root);
+        } else {
+            cmd.env_remove("PENGUDROID_ARM64_GUEST_ROOT");
+        }
+    }
     let mut ld_path = format!(
         "{}:{}:{}",
         art_libs.display(),
@@ -1081,10 +1116,24 @@ pub fn art_main(args: &[String]) -> i32 {
         }
     };
     if bridge_isa.is_some() {
-        if let Err(error) = validate_bridge_guest(&layout.root) {
+        let configured = std::env::var_os("PENGUDROID_ARM64_GUEST_ROOT");
+        let guest_root = match bridge_guest_root(&layout.root, configured.as_deref()) {
+            Ok(root) => root,
+            Err(error) => { diag(&format!("art: {error}")); return 1; }
+        };
+        if let Err(error) = validate_bridge_guest(&guest_root) {
             diag(&format!("art: {error}"));
             return 1;
         }
+        diag(&format!("art: native-bridge guest root = {}", guest_root.display()));
+        // glibc consumed its loader environment at exec time. Keep that cached
+        // host search path, but do not hand its x86_64 directories/preloads to
+        // the guest linker, which parses environ afresh in linker_main.cpp.
+        // Do this before loading ART/starting VM threads, not during bootstrap.
+        std::env::set_var("LD_LIBRARY_PATH", "/system/lib64/arm64/bootstrap:/system/lib64/arm64");
+        std::env::remove_var("LD_PRELOAD");
+        std::env::remove_var("LD_AUDIT");
+        diag("art: guest loader environment uses ARM64 paths (host glibc search cache unchanged)");
     }
     let lib = libs
         .as_ref()
@@ -1194,6 +1243,8 @@ pub fn art_main(args: &[String]) -> i32 {
             // A requested bridge must be ready before JNI_OnLoad or any app
             // work can run. Direct self-tests still perform the guest bootstrap.
             if let Some(setup) = &bridge_setup {
+                diag(&format!("art: guest bootstrap LD_LIBRARY_PATH = {:?}; LD_PRELOAD = {:?}",
+                    std::env::var_os("LD_LIBRARY_PATH"), std::env::var_os("LD_PRELOAD")));
                 let result = if let Some(spec) = bridge_selftest.as_deref() {
                     require_bridge_success("selftest", run_bridge_selftest(setup, &env, spec))
                 } else {
@@ -2723,6 +2774,28 @@ mod tests {
         assert_eq!(app_target_sdk(None), 37);
         for target in [1, 23, 33, 35, 36, 37, 38, 10_000] {
             assert_eq!(app_target_sdk(Some(target)), target as i32);
+        }
+    }
+
+    #[test]
+    fn native_bridge_guest_root_is_separate_explicit_and_absolute() {
+        let host = Fixture::android17();
+        let guest = Fixture::empty();
+        assert_eq!(bridge_guest_root(&host.0, None).unwrap(), host.0);
+        assert_eq!(bridge_guest_root(&host.0, Some(guest.0.as_os_str())).unwrap(), std::fs::canonicalize(&guest.0).unwrap());
+        for path in ["", "/", "relative/guest", "/pengudroid-nonexistent-guest-root"] {
+            assert!(bridge_guest_root(&host.0, Some(std::ffi::OsStr::new(path))).is_err(), "{path}");
+        }
+        guest.write("not-a-directory", b"file");
+        assert!(bridge_guest_root(&host.0, Some(guest.0.join("not-a-directory").as_os_str())).is_err());
+    }
+
+    #[test]
+    fn legacy_and_staged_only_guest_roots_remain_refused() {
+        let guest = Fixture::empty();
+        for body in [b"{\"schema\":1}".as_slice(), b"{\"schema\":2,\"bridge_compatibility\":{\"state\":\"staged-only\"}}", b"not valid JSON"] {
+            guest.write(GUEST_STAGING_MANIFEST, body);
+            assert!(validate_bridge_guest(&guest.0).unwrap_err().contains("staged-only"));
         }
     }
 

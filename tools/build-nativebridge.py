@@ -3,9 +3,13 @@
 
 Run: python3 -B tools/build-nativebridge.py [--offline] [--towards-bridge] [--module NAME ...]
      python3 -B tools/build-nativebridge.py --offline --check-platform [--platform-root PATH]
+     python3 -B tools/build-nativebridge.py --offline --module libberberis_proxy_libc \
+         --reuse-report .toolchain/nativebridge-build/RUN/report.json \
+         [--de-bionic-tool target/debug/pengudroid]
 This is an early native build driver, NOT a complete Soong implementation. It
 supports literal Blueprint values/list variables, defaults, x86_64 Android
-variants, exported headers, filegroups, and simple Python genrules. Unsupported
+variants, exported headers, filegroups, simple Python genrules, and the pinned
+berberis.translation_arch=arm64_to_x86_64 proxy-defaults contract. Unsupported
 rules fail closed. The default steps attempt exec_region, assembler, base, then
 the Android ARM64 NativeBridge entry archive, not the broad berberis_all target.
 
@@ -15,12 +19,17 @@ command, selected module, source pin and first blocker is retained in report.jso
 A separately checksummed last-successful-early.json survives failed probes. Platform
 imports require the completed extractor manifest to pin each imported file;
 shared-link inputs are rechecked immediately before use. Never inspect or repair an extraction stage.
+--reuse-report checks shared artifacts without rebuilding their translator closure.
+--de-bionic-tool uses an already-built CLI, never cargo; loader-compatible copies
+are NOT glibc ABI implementations, and unsafe interfaces are recorded explicitly.
 """
 
 import argparse
+import base64
 import copy
 import fcntl
 import glob
+import hashlib
 import importlib.util
 import json
 import os
@@ -28,6 +37,7 @@ import re
 import resource
 import shlex
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -56,6 +66,12 @@ PLATFORM_SHARED = {
     "liblog": {"artifact": "", "relative": "system/lib64/liblog.so",
                "required_exports": ["__android_log_print", "__android_log_assert",
                                     "__android_log_write", "__android_log_vprint"]},
+}
+# Proxies use private platform libc APIs absent from the NDK link declarations.
+# Import on demand rather than silently accepting an unresolved allocator API.
+PLATFORM_PRIVATE = {
+    "libc": {"relative": "system/lib64/libc.so",
+             "required_exports": ["malloc_disable", "malloc_enable", "malloc_iterate"]},
 }
 OWNER = {"tool": "PenguDroid nativebridge-build", "schema": 1}
 # Goals, not source/flag lists: all module contents come from Android.bp.
@@ -188,6 +204,9 @@ EXTRAS = (
     # patching the upstream file whose `art_defaults` live outside this slice.
     BOOT.Artifact("art_openjdkjvmti", "art", "b753cf97923c3695338d21466fa14c57b480a59a",
                   "extra/art-openjdkjvmti", subtree="openjdkjvmti", limit=2_000_000),
+    BOOT.Artifact("bionic_pthread_internal", "bionic", "06356e41c5ed7b12220b24c05ba4fdb873b126a7",
+                  "extra/platform-headers/bionic/pthread_internal.h", blob="b3133a92dfa7a26f9c3f5d6ec58ec2d1ea412f58",
+                  subtree="libc/bionic/pthread_internal.h", limit=20_000),
 )
 
 
@@ -210,12 +229,96 @@ def ensure_art_header_module():
         path.write_text(ART_HEADER_BLUEPRINT)
 
 
-def verify_elf(path, elf_type):
+def verify_elf(path, elf_type, machine=62):
     with Path(path).open("rb") as stream:
         header = stream.read(20)
     if (header[:6] != b"\x7fELF\x02\x01" or int.from_bytes(header[16:18], "little") != elf_type
-            or int.from_bytes(header[18:20], "little") != 62):
-        raise BuildError(f"not the required little-endian ELF64 x86_64 type {elf_type}: {path}")
+            or int.from_bytes(header[18:20], "little") != machine):
+        arch = "x86_64" if machine == 62 else str(machine)
+        raise BuildError(f"not the required little-endian ELF64 {arch} type {elf_type}: {path}")
+
+
+# The public header tree is the pinned Bionic libc/include slice already
+# cached by the guest-linker build. Only read it; do not modify that tree.
+BIONIC_INCLUDE_TREE = "bd088cdc87a48ec511e2d5b105be674a3d6b35b3"
+BRIDGE_TLS_COOKIE = 0xf953e6ea42974914
+BRIDGE_TLS_PATCH = REPO / "tools/nativebridge-glibc-tls.patch.json"
+BRIDGE_TLS_MODULES = {
+    "guest_loader/guest_loader.cc": "libberberis_guest_loader_arm64",
+    "guest_os_primitives/guest_thread.cc": "libberberis_guest_os_primitives_arm64",
+}
+BRIDGE_TLS_LAYOUT = {
+    "pthread_size": "sizeof(pthread_internal_t)",
+    "pthread_align": "alignof(pthread_internal_t)",
+    **{f"pthread_{field}": f"offsetof(pthread_internal_t, {field})" for field in (
+        "tid", "attr", "join_state", "cleanup_stack", "start_routine", "stack_top", "stack_bottom",
+        "current_dlerror", "dlerror_buffer", "bionic_tls", "errno_value", "bionic_tcb")},
+    "attr_size": "sizeof(pthread_attr_t)",
+    **{f"attr_{field}": f"offsetof(pthread_attr_t, {field})" for field in (
+        "flags", "stack_base", "stack_size", "guard_size", "sched_policy", "sched_priority")},
+    "bionic_tls_size": "sizeof(bionic_tls)",
+    "bionic_tls_align": "alignof(bionic_tls)",
+    **{f"tls_{field}": f"offsetof(bionic_tls, {field})" for field in (
+        "key_data", "locale", "libgen_buffers_ptr", "fdtrack_disabled", "bionic_systrace_enabled")},
+    "libgen_size": "sizeof(libgen_buffers)",
+    "tcb_size": "sizeof(bionic_tcb)",
+    "min_tls_slot": "MIN_TLS_SLOT", "max_tls_slot": "MAX_TLS_SLOT",
+    "thread_id_slot": "TLS_SLOT_THREAD_ID", "bionic_tls_slot": "TLS_SLOT_BIONIC_TLS",
+}
+
+
+def probe_bridge_tls(runner, sysroot):
+    public = DEPS / "sources/bionic-expansion/bionic/libc/include"
+    if not public.is_dir() or BOOT.tree_digest(public) != BIONIC_INCLUDE_TREE:
+        raise BuildError("bridge TLS ABI probe requires the unmodified pinned Bionic public headers")
+    directory = runner.root / "tls-probes"
+    directory.mkdir()
+    source = directory / "layout.cc"
+    source.write_text('#include <stddef.h>\n#include <stdint.h>\n#include "bionic/pthread_internal.h"\n'
+                      'extern "C" __attribute__((used, section(".pengudroid_tls_abi")))\n'
+                      'const int64_t pengudroid_tls_layout[] = {\n' +
+                      ",\n".join(BRIDGE_TLS_LAYOUT.values()) + '\n};\n')
+    result = {}
+    for arch, triple, machine in (("x86_64", "x86_64-linux-android", 62),
+                                   ("arm64", "aarch64-linux-android", 183)):
+        obj, payload = directory / (arch + ".o"), directory / (arch + ".bin")
+        argv = [str(LLVM / "clang++"), "--no-default-config", "--target=" + triple + "37",
+                "--sysroot=" + str(sysroot), "-nostdinc++", "-isystem",
+                str(DEPS / "toolchain/libcxx/android/x86_64/include/c++/v1"), "-isystem",
+                str(DEPS / "toolchain/libcxx/include/c++/v1"), "-isystem", str(public), "-isystem",
+                str(sysroot / "usr/include" / triple), "-I", str(ROOT / "extra/platform-headers"),
+                "-I", str(DEPS / "sources/bionic/libc"), "-std=gnu++23", "-Wno-invalid-constexpr",
+                "-Wno-invalid-offset-of", "-Xclang", "-fdump-record-layouts", "-c", str(source), "-o", str(obj)]
+        record = runner.run(argv, "probe Bionic TLS layout " + arch)
+        verify_elf(obj, 1, machine)
+        runner.run([str(LLVM / "llvm-objcopy"), "--dump-section=.pengudroid_tls_abi=" + str(payload), str(obj)],
+                   "extract Bionic TLS layout " + arch)
+        data = payload.read_bytes()
+        if len(data) != len(BRIDGE_TLS_LAYOUT) * 8:
+            raise BuildError("Bionic TLS layout probe emitted an unexpected payload size")
+        layout = dict(zip(BRIDGE_TLS_LAYOUT, struct.unpack("<" + "q" * len(BRIDGE_TLS_LAYOUT), data)))
+        bitfield = re.findall(r"(?m)^\s*(\d+):(\d+)-(\d+)\s*\|\s*uint32_t cached_pid_\s*$",
+                              Path(record["log"]).read_text())
+        if len(bitfield) != 1:
+            raise BuildError("Bionic cached_pid bitfield was not proven by the compiler record layout")
+        layout.update(zip(("pthread_cached_pid", "cached_pid_bit_first", "cached_pid_bit_last"),
+                          map(int, bitfield[0])))
+        result[arch] = {"layout": layout, "object": str(obj), "sha256": BOOT.sha256_file(obj),
+                        "record_layout_log": record["log"]}
+    common = set(BRIDGE_TLS_LAYOUT) - {"min_tls_slot", "max_tls_slot", "bionic_tls_slot"}
+    if any(result["x86_64"]["layout"][k] != result["arm64"]["layout"][k] for k in common):
+        raise BuildError("Bionic pthread/bionic_tls layouts differ between host and guest")
+    digest = hashlib.sha256(json.dumps(result["arm64"]["layout"], sort_keys=True, separators=(",", ":")).encode()).digest()
+    cookie = int.from_bytes(digest[:8], "little")
+    if cookie != BRIDGE_TLS_COOKIE:
+        raise BuildError("compiled Bionic TLS layout does not match the tracked bridge TLS ABI cookie")
+    host = result["x86_64"]["layout"]
+    if (host["min_tls_slot"], host["max_tls_slot"], host["bionic_tls_slot"]) != (0, 10, 9):
+        raise BuildError("unexpected native x86_64 Bionic TCB slot layout")
+    result["layout_cookie"] = hex(cookie)
+    result["public_headers_git_tree"] = BIONIC_INCLUDE_TREE
+    runner.report["bridge_tls_abi"] = result
+    return result
 
 
 def merge(left, right):
@@ -298,9 +401,11 @@ def tokenize(text):
 
 
 class Blueprints:
-    def __init__(self, roots, source_dirs=None):
+    def __init__(self, roots, source_dirs=None, translation_arch=None):
         self.modules, self.resolved, self.used, self.inherited = {}, {}, {}, {}
         self.roots, self.source_dirs = roots, source_dirs or {}
+        self.translation_arch = translation_arch
+        self.config_selections = {}
         for root in roots.values():
             for path in sorted(root.rglob("Android.bp")):
                 self.index_file(path)
@@ -347,9 +452,13 @@ class Blueprints:
     def canonical(self, name):
         if name.startswith("//"):
             namespace, separator, module = name[2:].partition(":")
-            if not separator or namespace not in self.roots:
+            if not separator or any(p in ("", ".", "..") for p in namespace.split("/")):
                 raise BuildError(f"unresolved Blueprint namespace: {name}")
-            if module in self.modules and not self.modules[module][1].is_relative_to(self.roots[namespace]):
+            try:
+                scope = self.aosp_path(namespace)
+            except BuildError as error:
+                raise BuildError(f"unresolved Blueprint namespace: {name}") from error
+            if module in self.modules and not self.modules[module][1].resolve().is_relative_to(scope.resolve()):
                 raise BuildError(f"module outside declared namespace: {name}")
             name = module
         else:
@@ -357,6 +466,51 @@ class Blueprints:
         if not re.fullmatch(r"[A-Za-z0-9_.+-]+", name):
             raise BuildError(f"unsafe/unsupported Blueprint module name: {name}")
         return name
+
+    def rule_kind(self, kind):
+        declaration = self.modules.get(kind)
+        if declaration is None or declaration[0] != "soong_config_module_type":
+            return kind
+        descriptor = Values(declaration[2], declaration[3]).value()
+        if not isinstance(descriptor, dict):
+            raise BuildError(f"invalid custom rule descriptor: {kind}")
+        # This is the sole compilation-changing Soong config contract needed
+        # by the proxies. Do not project arbitrary custom rules to cc_defaults.
+        if (descriptor.get("module_type") == "cc_defaults"
+                and descriptor.get("config_namespace") == "berberis"
+                and descriptor.get("variables") == ["translation_arch"]
+                and set(descriptor.get("properties", [])) == {
+                    "defaults", "generated_headers", "header_libs", "shared_libs"}
+                and set(descriptor) == {"name", "module_type", "config_namespace", "variables", "properties"}):
+            return "cc_defaults"
+        return kind
+
+    def select_config(self, name, kind, raw):
+        if self.rule_kind(kind) == kind:
+            return raw
+        variable = self.modules.get("translation_arch")
+        if variable is None or variable[0] != "soong_config_string_variable":
+            raise BuildError("missing Soong translation_arch string variable declaration")
+        variable_props = Values(variable[2], variable[3]).value()
+        if not isinstance(variable_props, dict):
+            raise BuildError("invalid Soong translation_arch variable declaration")
+        values = variable_props.get("values", [])
+        if not isinstance(values, list) or any(not isinstance(v, str) for v in values):
+            raise BuildError("invalid Soong translation_arch values")
+        if self.translation_arch not in values:
+            raise BuildError(f"explicit supported Soong translation_arch required for {name}: {values}")
+        config = raw.get("soong_config_variables", {})
+        if not isinstance(config, dict) or set(config) != {"translation_arch"}:
+            raise BuildError(f"unsupported Soong variables in {name}")
+        branches = config["translation_arch"]
+        if not isinstance(branches, dict) or set(branches) - set(values) - {"conditions_default"}:
+            raise BuildError(f"unsupported Soong translation_arch branch in {name}")
+        allowed = {"defaults", "generated_headers", "header_libs", "shared_libs"}
+        if any(not isinstance(branch, dict) or set(branch) - allowed for branch in branches.values()):
+            raise BuildError(f"Soong config changes undeclared properties in {name}")
+        selected = branches.get(self.translation_arch, branches.get("conditions_default", {}))
+        self.config_selections[name] = {"translation_arch": self.translation_arch, "properties": selected}
+        return merge({k: v for k, v in raw.items() if k != "soong_config_variables"}, selected)
 
     def raw_props(self, name, stack=()):
         name = self.canonical(name)
@@ -371,6 +525,7 @@ class Blueprints:
             raw = Values(tokens, variables).value()
             if not isinstance(raw, dict):
                 raise BuildError("Blueprint module body must be a property map")
+            raw = self.select_config(name, _kind, raw)
             for selector, allowed in (("arch", KNOWN_ARCHES), ("target", KNOWN_TARGETS), ("multilib", {"lib32", "lib64"})):
                 variants = raw.get(selector, {})
                 if not isinstance(variants, dict) or any(not isinstance(v, dict) for v in variants.values()):
@@ -385,7 +540,7 @@ class Blueprints:
                 if isinstance(value, dict):
                     paths(value)
                 elif key in PATH_FIELDS:
-                    properties[key] = [str(source_dir / p) if not p.startswith(":") else p for p in value]
+                    properties[key] = [p if p.startswith((":", "//")) else str(source_dir / p) for p in value]
                 elif key == "main":
                     properties[key] = str(source_dir / value)
 
@@ -394,7 +549,7 @@ class Blueprints:
         for default in raw.get("defaults", []):
             default = self.canonical(default)
             expected_default = "genrule_defaults" if _kind in ("genrule", "genrule_defaults") else "cc_defaults"
-            if default in self.modules and self.modules[default][0] != expected_default:
+            if default in self.modules and self.rule_kind(self.modules[default][0]) != expected_default:
                 raise BuildError(f"unsupported defaults module {default} for {name}; expected {expected_default}")
             result = merge(result, self.raw_props(default, stack + (name,)))
         result = merge(result, raw)
@@ -450,11 +605,13 @@ class Blueprints:
             selected = merge(selected, raw.get(linkage, {}))
         # Product/Soong config, nested arch-feature selectors, and unknown
         # properties are intentionally NOT ignored or guessed.
-        rule_kind = self.packaging_only_header_kind(kind) if headers_only else kind
+        rule_kind = self.rule_kind(kind)
+        if headers_only and rule_kind == kind:
+            rule_kind = self.packaging_only_header_kind(kind)
         if rule_kind not in RULE_FIELDS:
             raise BuildError(f"unsupported Blueprint rule {name} ({kind})")
         unsupported = set(selected) - METADATA - RULE_FIELDS[rule_kind]
-        if headers_only and rule_kind != kind:
+        if headers_only and rule_kind != kind and self.rule_kind(kind) == kind:
             descriptor = Values(self.modules[kind][2], self.modules[kind][3]).value()
             if not isinstance(descriptor, dict):
                 raise BuildError(f"invalid custom rule descriptor: {kind}")
@@ -479,7 +636,7 @@ class Blueprints:
                 unsupported.discard("product_variables")
         if unsupported:
             raise BuildError(f"unsupported properties in {name}: {', '.join(sorted(unsupported))}")
-        if kind not in ("cc_defaults", "genrule_defaults"):
+        if rule_kind not in ("cc_defaults", "genrule_defaults"):
             if not host and (selected.get("enabled") is False or selected.get("device_supported") is False):
                 raise BuildError(f"Android x86_64 variant disabled: {name}")
             if host and selected.get("host_supported") is not True and kind not in ("cc_library_headers", "filegroup", "genrule"):
@@ -506,7 +663,7 @@ class Blueprints:
     def files(self, entries, seen=()):
         result = []
         for value in entries:
-            if value.startswith(":"):
+            if value.startswith((":", "//")):
                 name = self.canonical(value)
                 if name not in self.modules or self.modules[name][0] != "filegroup":
                     raise BuildError(f"unsupported source reference: {value}")
@@ -648,7 +805,8 @@ class PlatformImports:
         return resolved
 
     def inspect(self, name):
-        if name not in PLATFORM_SHARED:
+        specifications = {**PLATFORM_SHARED, **PLATFORM_PRIVATE}
+        if name not in specifications:
             raise BuildError(f"unsupported platform import: {name}")
         if self.root.is_symlink():
             raise BuildError("symlink platform root refused")
@@ -680,7 +838,7 @@ class PlatformImports:
                 props[key] = value
         if props != {"ro.build.id": GSI_BUILD, "ro.build.version.sdk": "37", "ro.build.version.release": "17"}:
             raise BuildError("platform build.prop does not match the pinned API37 GSI")
-        specification = PLATFORM_SHARED[name]
+        specification = specifications[name]
         relative = specification["relative"]
         path = self.checked_file(relative, files)
         verify_elf(path, 3)
@@ -721,10 +879,114 @@ class PlatformImports:
         return all(r["status"] == "verified link input only" for r in self.records.values())
 
 
+def proxy_support_evidence(model):
+    source = model.aosp_path("frameworks/libs/binary_translation/guest_loader/arm64/guest_loader_arch.cc")
+    prefix = re.search(r'\bkProxyPrefix\s*=\s*"([^"]+)"', source.read_text())
+    if prefix is None or prefix.group(1) != "libberberis_proxy_":
+        raise BuildError("pinned ARM64 loader has an unexpected proxy prefix")
+    defaults = model.modules["liblog.defaults"]
+    log_props = Values(defaults[2], defaults[3]).value()
+    if not isinstance(log_props, dict) or log_props.get("native_bridge_supported") is not True:
+        raise BuildError("pinned liblog no longer declares ordinary native-bridge support")
+    return {"proxy_prefix": prefix.group(1), "prefix_source": str(source),
+            "prefix_source_sha256": BOOT.sha256_file(source),
+            "liblog": {
+                "guest_stub_module_present": "libnative_bridge_guest_liblog" in model.modules,
+                "native_proxy_module_present": "libberberis_proxy_liblog" in model.modules,
+                "blueprint": str(defaults[1]), "blueprint_sha256": BOOT.sha256_file(defaults[1]),
+                "native_bridge_supported": True,
+                "note": "Pinned liblog is an ordinary guest library. No stub/proxy is invented; build/stage its guest closure separately.",
+            }}
+
+
+def dynamic_evidence(runner, path, label):
+    verify_elf(path, 3)
+    record = runner.run([str(LLVM / "llvm-readelf"), "--wide", "--dynamic", "--dyn-syms", str(path)], label)
+    text = Path(record["log"]).read_text()
+    symbols = []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) >= 8 and re.fullmatch(r"\d+:", fields[0]):
+            symbols.append({"name": fields[7], "type": fields[3], "binding": fields[4],
+                            "visibility": fields[5], "defined": fields[6] != "UND"})
+    return {"soname": re.findall(r"\(SONAME\).*?\[([^\]]+)\]", text),
+            "needed": re.findall(r"\(NEEDED\).*?\[([^\]]+)\]", text),
+            "undefined": [s["name"] for s in symbols if not s["defined"] and s["name"]],
+            "init_proxy_library": any(s["name"] == "InitProxyLibrary" and s["defined"]
+                                      and s["type"] == "FUNC" and s["binding"] == "GLOBAL"
+                                      and s["visibility"] == "DEFAULT" for s in symbols),
+            "log": record["log"]}
+
+
+class SharedReuse:
+    """Explicit, hash-checked shared inputs from a successful owned build.
+
+    Never import archives/objects implicitly or fall back to rebuilding the
+    translator if an explicitly requested reuse report is invalid.
+    """
+    def __init__(self, path, model, runner, manifest_sha256):
+        self.path, self.model, self.runner = Path(path), model, runner
+        if self.path.is_symlink() or not self.path.resolve().is_relative_to(ROOT.resolve()):
+            raise BuildError("reuse report must be inside the owned nativebridge build root")
+        self.path = self.path.resolve()
+        self.report_sha256 = BOOT.sha256_file(self.path)
+        self.report = json.loads(self.path.read_text())
+        if (not isinstance(self.report, dict) or any(self.report.get(k) != v for k, v in OWNER.items())
+                or self.report.get("requested_goals_passed") is not True
+                or self.report.get("dependencies_manifest_sha256") != manifest_sha256):
+            raise BuildError("reuse report must attest a successful build with the current verified dependencies")
+        if not isinstance(self.report.get("run"), str) or not isinstance(self.report.get("modules"), dict):
+            raise BuildError("reuse report is missing run/module provenance")
+        self.run = Path(self.report["run"])
+        if (self.path != self.run / "report.json"
+                or not self.run.resolve().is_relative_to(ROOT.resolve())):
+            raise BuildError("reuse report run/path mismatch")
+        self.artifacts = {}
+        artifacts, dependencies = self.report.get("artifacts", []), self.report.get("dependency_artifacts", [])
+        if not isinstance(artifacts, list) or not isinstance(dependencies, list):
+            raise BuildError("reuse report artifacts must be lists")
+        for artifact in artifacts + dependencies:
+            if not isinstance(artifact, dict):
+                raise BuildError("reuse artifact must be an object")
+            if artifact.get("kind") != "cc_library_shared" or artifact.get("host"):
+                continue
+            if (not isinstance(artifact.get("module"), str) or not isinstance(artifact.get("output"), str)
+                    or not isinstance(artifact.get("bytes"), int) or not 0 < artifact["bytes"] <= FILE_LIMIT
+                    or not isinstance(artifact.get("sha256"), str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", artifact["sha256"])):
+                raise BuildError("reuse shared artifact is missing file/hash provenance")
+            name = model.canonical(artifact["module"])
+            if name in self.artifacts:
+                raise BuildError(f"duplicate shared artifact in reuse report: {name}")
+            self.artifacts[name] = artifact
+
+    def inspect(self, name):
+        artifact = copy.deepcopy(self.artifacts[name])
+        output = Path(artifact["output"])
+        if (output != self.run / "lib" / (name + ".so")
+                or not output.resolve().is_relative_to(self.run.resolve())):
+            raise BuildError(f"reused shared artifact path mismatch/escape: {name}")
+        module = self.report.get("modules", {}).get(name, {})
+        current = self.model.props(name, linkage="shared")
+        blueprint = self.model.modules[name][1]
+        if (not isinstance(module, dict) or module.get("blueprint_sha256") != BOOT.sha256_file(blueprint)
+                or module.get("selected_properties") != current):
+            raise BuildError(f"reused module Blueprint/properties changed: {name}")
+        if output.stat().st_size != artifact["bytes"] or BOOT.sha256_file(output) != artifact["sha256"]:
+            raise BuildError(f"reused shared artifact changed: {output}")
+        evidence = dynamic_evidence(self.runner, output, "verify reused shared " + name)
+        if evidence["soname"] != [output.name] or BOOT.sha256_file(self.path) != self.report_sha256:
+            raise BuildError(f"reused shared SONAME/report changed: {name}")
+        artifact.update(reused_from_report=str(self.path), reuse_report_sha256=self.report_sha256,
+                        dynamic=evidence, needed_closure_verified=False, runtime_tested=False)
+        self.runner.report.setdefault("reused_shared", {})[name] = artifact
+        return artifact
+
+
 class NativeBuild:
-    def __init__(self, model, runner, sysroot, platform_imports=None):
+    def __init__(self, model, runner, sysroot, platform_imports=None, shared_reuse=None):
         self.model, self.runner, self.root, self.sysroot = model, runner, runner.root, sysroot
-        self.platform_imports = platform_imports
+        self.platform_imports, self.shared_reuse = platform_imports, shared_reuse
         self.generated, self.built, self.building = {}, {}, []
 
     def python_tool(self, name, seen=()):
@@ -882,6 +1144,11 @@ class NativeBuild:
         if linkage not in ("static", "shared"):
             raise BuildError(f"explicit static/shared build variant required: {name} ({declared})")
         key = (name, linkage)
+        if linkage == "shared" and self.shared_reuse is not None:
+            if name in self.shared_reuse.artifacts:
+                return self.shared_reuse.inspect(name)
+            if name == "libberberis_arm64":
+                raise BuildError("reuse report lacks libberberis_arm64; refusing an implicit full translator rebuild")
         if key in self.built:
             return self.built[key]
         if key in self.building:
@@ -1062,8 +1329,11 @@ class NativeBuild:
             self.runner.run([str(LLVM / "llvm-ar"), operation, str(output), *map(str, objects),
                              *(archive["output"] for archive in whole)], "archive " + name)
         else:
-            if props.get("ldflags"):
-                raise BuildError(f"unsupported shared linker flags in {name}: {props['ldflags']}; no flags discarded")
+            ldflags = []
+            for flag in props.get("ldflags", []):
+                if not re.fullmatch(r"-Wl,--wrap=[A-Za-z_][A-Za-z0-9_]*", flag):
+                    raise BuildError(f"unsupported shared linker flags in {name}: {props['ldflags']}; no flags discarded")
+                ldflags.append(flag.removeprefix("-Wl,"))
             static, linked, visiting = [], set(), set()
             shared_names = list(result["shared_link_requirements"])
             def collect_static(dep):
@@ -1094,14 +1364,20 @@ class NativeBuild:
             result["static_archives"] = [{k: archive[k] for k in ("module", "output", "sha256")} for archive in static]
             result["shared_inputs"] = shared
             libdir = self.sysroot / "usr/lib/x86_64-linux-android/37"
+            system_libc = "-lc"
+            if name.startswith("libberberis_proxy_"):
+                if self.platform_imports is None:
+                    raise BuildError(f"verified platform libc required for {name}; private APIs cannot use NDK stubs")
+                system_libc = str(self.platform_imports.inspect("libc"))
+                result["platform_libc"] = system_libc
             argv = [str(LLVM / "ld.lld"), "--threads=1", "-m", "elf_x86_64", "-shared", "--no-undefined",
-                    "-z", "max-page-size=16384", "--soname=" + output.name]
+                    "-z", "max-page-size=16384", "--soname=" + output.name, *ldflags]
             for script in props.get("linker_scripts", []):
                 argv += ["-T", script]
             argv += [str(libdir / "crtbegin_so.o"), *map(str, objects), "--start-group", "--whole-archive",
                      *(archive["output"] for archive in whole), "--no-whole-archive",
                      *(archive["output"] for archive in static), "--end-group", *shared, "--as-needed",
-                     str(platform / "lib/libc++.so"), f"-L{libdir}", "-lc", "-lm", "-ldl",
+                     str(platform / "lib/libc++.so"), f"-L{libdir}", system_libc, "-lm", "-ldl",
                      str(DEPS / "toolchain/libclang_rt.builtins-x86_64-android.a"),
                      str(libdir / "crtend_so.o"), "-o", str(output)]
             self.runner.run(argv, "link " + name)
@@ -1118,12 +1394,220 @@ class NativeBuild:
                        and f[7].split("@", 1)[0] == "NativeBridgeItf" for f in entries):
                 raise BuildError("translator shared library is missing its global dynamic NativeBridgeItf export")
             result["native_bridge_itf_dynamic_export"] = True
+        if name.startswith("libberberis_proxy_") and linkage == "shared":
+            result["dynamic"] = dynamic_evidence(self.runner, output, "verify proxy entry " + name)
+            if not result["dynamic"]["init_proxy_library"]:
+                raise BuildError(f"proxy is missing its global dynamic InitProxyLibrary function: {name}")
+            result["init_proxy_library_dynamic_export"] = True
         if name == "libberberis_native_bridge_arm64":
             record = self.runner.run([str(LLVM / "llvm-nm"), "--defined-only", str(output)], "verify bridge entry archive")
             if not re.search(r"(?m)^\S+ [BD] NativeBridgeItf$", Path(record["log"]).read_text()):
                 raise BuildError("NativeBridgeItf global definition missing from the bridge entry archive")
             result["native_bridge_itf_archive_definition"] = True
         return result
+
+
+def stage_bridge_tls_adapter(source_root, destination, patch_path=BRIDGE_TLS_PATCH):
+    patch = json.loads(Path(patch_path).read_text())
+    if (patch.get("schema") != 1 or len(patch.get("sources", [])) != 2
+            or {s.get("path") for s in patch["sources"]} != set(BRIDGE_TLS_MODULES)
+            or set(patch.get("added_files", {})) != {"pengudroid_bridge_tls.h"}):
+        raise BuildError("unsupported bridge TLS adapter patch contract")
+    staged, records = {}, []
+    for specification in patch["sources"]:
+        relative = specification["path"]
+        original = Path(source_root) / relative
+        digest = BOOT.sha256_file(original)
+        if digest != specification["base_sha256"]:
+            raise BuildError(f"bridge TLS adapter base source hash mismatch: {relative}")
+        text = original.read_text()
+        for replacement in specification["replacements"]:
+            if not replacement["old"] or text.count(replacement["old"]) != 1:
+                raise BuildError(f"bridge TLS adapter context is not unique: {relative}")
+            text = text.replace(replacement["old"], replacement["new"], 1)
+        staged[relative] = text
+        records.append({"source": str(original), "source_sha256": digest,
+                        "staged": str(Path(destination) / relative),
+                        "staged_sha256": hashlib.sha256(text.encode()).hexdigest()})
+    header = patch["added_files"]["pengudroid_bridge_tls.h"]
+    rust = (REPO / "crates/pengudroid-shim/src/bridge_tls.rs").read_text()
+    cookie = f"0x{BRIDGE_TLS_COOKIE:x}"
+    if cookie not in header or f"pub const LAYOUT_COOKIE: u64 = {cookie};" not in rust:
+        raise BuildError("tracked C++/Rust bridge TLS ABI cookies differ")
+    staged.update(patch["added_files"])
+    # Validate every input before creating any output. No cached file is written.
+    Path(destination).mkdir()
+    for relative, content in staged.items():
+        output = Path(destination) / relative
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(content)
+    return {"patch": str(patch_path), "patch_sha256": BOOT.sha256_file(Path(patch_path)),
+            "sources": records, "header_sha256": hashlib.sha256(header.encode()).hexdigest(),
+            "layout_cookie": cookie, "cached_sources_modified": False}
+
+
+def relink_bridge_tls(model, runner, sysroot, reuse, manifest, imports):
+    if reuse is None or "libberberis_arm64" not in reuse.artifacts:
+        raise BuildError("TLS adapter requires a successful reuse report containing libberberis_arm64")
+    translator = reuse.inspect("libberberis_arm64")
+    report = reuse.report
+    source_root = model.roots["frameworks/libs/binary_translation"]
+    stage = runner.root / "bridge-tls-source"
+    adapter = stage_bridge_tls_adapter(source_root, stage)
+    runner.report["bridge_tls_adapter"] = adapter
+    artifacts = {}
+    for artifact in report.get("artifacts", []) + report.get("dependency_artifacts", []):
+        if artifact.get("host"):
+            continue
+        key = (artifact["module"], artifact["kind"])
+        if key in artifacts:
+            raise BuildError(f"duplicate reuse archive/module: {key}")
+        artifacts[key] = artifact
+    link_commands = [c for c in report["commands"] if c["label"] == "link libberberis_arm64"]
+    if len(link_commands) != 1:
+        raise BuildError("TLS relink requires exactly one recorded translator link command")
+    link = list(link_commands[0]["argv"])
+    if (link[0] != str(LLVM / "ld.lld") or link[-2:] != ["-o", translator["output"]]
+            or "--no-undefined" not in link or "--threads=1" not in link):
+        raise BuildError("unrecognized recorded translator link command")
+    # Check every archive/shared/CRT/builtins input against its original report
+    # or bootstrap attestation before passing it to the linker. No guessed .a
+    # and no rebuild fallback, especially for the heavy optimizer/frontend.
+    known = dict(manifest["preflight"]["inputs"])
+    for artifact in artifacts.values():
+        output = Path(artifact["output"])
+        if (not output.resolve().is_relative_to(reuse.run.resolve())
+                or output.stat().st_size != artifact["bytes"]):
+            raise BuildError(f"reused archive/shared artifact path/size mismatch: {output}")
+        known[str(output)] = artifact["sha256"]
+    for name in PLATFORM_SHARED:
+        path = imports.inspect(name)
+        known[str(path)] = imports.records[name]["sha256"]
+    inputs = []
+    for argument in link[1:-2]:
+        path = Path(argument)
+        if path.is_absolute() and path.suffix in (".a", ".so", ".o"):
+            if str(path) not in known or BOOT.sha256_file(path) != known[str(path)]:
+                raise BuildError(f"translator relink input is not attested or changed: {path}")
+            inputs.append({"path": str(path), "sha256": known[str(path)]})
+    adapter["reused_link_inputs"] = inputs
+    replacements = {}
+    generators = NativeBuild(model, runner, sysroot)
+    for relative, name in BRIDGE_TLS_MODULES.items():
+        original = source_root / relative
+        archive = artifacts.get((name, "cc_library_static"))
+        if archive is None or archive.get("whole_static_archives"):
+            raise BuildError(f"unsupported/missing small TLS adapter archive: {name}")
+        if model.props(name, linkage="static") != report["modules"][name]["selected_properties"]:
+            raise BuildError(f"small TLS module properties changed: {name}")
+        old_archive = Path(archive["output"])
+        if BOOT.sha256_file(old_archive) != archive["sha256"]:
+            raise BuildError(f"small TLS archive changed: {name}")
+        commands = [c for c in report["commands"] if c["label"] == f"compile {name}: {original.name}"]
+        if len(commands) != 1:
+            raise BuildError(f"TLS source compile command is missing/ambiguous: {relative}")
+        argv = list(commands[0]["argv"])
+        if (argv[0] != str(LLVM / "clang++") or argv[-4:-2] != ["-c", str(original)]
+                or argv[-2] != "-o" or argv[-1] not in archive["objects"]
+                or "--target=x86_64-linux-android37" not in argv):
+            raise BuildError(f"unrecognized TLS compile command: {relative}")
+        object_dir = runner.root / "obj" / name
+        object_dir.mkdir()
+        members = runner.run([str(LLVM / "llvm-ar"), "t", str(old_archive)], "check TLS archive members " + name)
+        names = Path(members["log"]).read_text().splitlines()
+        if (names != [Path(p).name for p in archive["objects"]] or len(set(names)) != len(names)
+                or any(Path(n).name != n or n in ("", ".", "..") for n in names)):
+            raise BuildError(f"TLS archive object list mismatch: {name}")
+        runner.run([str(LLVM / "llvm-ar"), "x", "--output=" + str(object_dir), str(old_archive)],
+                   "extract verified small TLS archive " + name)
+        # Regenerate only Python-generated public headers in fresh output dirs.
+        # Never use mutable old generated headers as unstated compile inputs.
+        for i, argument in enumerate(argv):
+            old_gen = reuse.run / "gen"
+            if argument.startswith(str(old_gen) + "/"):
+                generator = Path(argument).relative_to(old_gen).parts[0]
+                props = model.props(generator)
+                if any(model.modules[model.canonical(t)][0] != "python_binary_host" for t in props.get("tools", [])):
+                    raise BuildError("TLS incremental build refuses native/heavy host codegen")
+                argv[i] = argument.replace(str(old_gen / generator), str(generators.generate(generator)), 1)
+        new_object = object_dir / Path(argv[-1]).name
+        argv[-4:-2] = ["-c", str(stage / relative)]
+        argv[-1] = str(new_object)
+        argv[1:1] = ["-I", str(stage)]
+        runner.run(argv, "compile TLS adapter " + relative)
+        verify_elf(new_object, 1)
+        output = runner.root / "lib" / old_archive.name
+        objects = [object_dir / n for n in names]
+        for obj in objects:
+            verify_elf(obj, 1)
+        runner.run([str(LLVM / "llvm-ar"), "rcsD", str(output), *map(str, objects)], "archive TLS adapter " + name)
+        replacements[str(old_archive)] = str(output)
+        runner.report.setdefault("dependency_artifacts", []).append({
+            **archive, "output": str(output), "objects": list(map(str, objects)),
+            "bytes": output.stat().st_size, "sha256": BOOT.sha256_file(output),
+            "adapter_source": relative, "reused_archive_sha256": archive["sha256"],
+        })
+    if len(replacements) != 2 or any(link.count(old) != 1 for old in replacements):
+        raise BuildError("TLS adapter archives are not exactly once in the translator link closure")
+    link = [replacements.get(arg, arg) for arg in link]
+    output = runner.root / "lib/libberberis_arm64.so"
+    link[-1] = str(output)
+    runner.run(link, "relink translator with TLS adapter")
+    evidence = dynamic_evidence(runner, output, "inspect TLS-adapted translator")
+    log = Path(evidence["log"]).read_text()
+    if not re.search(r"(?m)^\s*\d+:\s+\S+\s+\d+\s+OBJECT\s+GLOBAL\s+DEFAULT\s+(?!UND)\S+\s+NativeBridgeItf\s*$", log):
+        raise BuildError("TLS-adapted translator is missing its NativeBridgeItf dynamic entry")
+    # Recheck immutable originals after compile/link as well.
+    for record in adapter["sources"]:
+        if BOOT.sha256_file(Path(record["source"])) != record["source_sha256"]:
+            raise BuildError("cached Digitalis source changed during TLS adapter build")
+    for record in inputs:
+        if BOOT.sha256_file(Path(record["path"])) != record["sha256"]:
+            raise BuildError("reused translator closure changed during TLS adapter link")
+    adapter["compiled_translation_units"] = list(BRIDGE_TLS_MODULES)
+    adapter["required_runtime_opt_in"] = ["PENGUDROID_BRIDGE_TLS=1", "BERBERIS_FLAGS=glibc-host-thread-id-handoff"]
+    adapter["limitations"] = ["guest pthread handles require separate proxy translation before glibc pthread calls",
+                              "guest thread registry, key destructors, MTE and host debuggerd TLS slots are not implemented",
+                              "synthetic storage is retained for process lifetime; guest TCB binds at ConfigStaticTls"]
+    return {"module": "libberberis_arm64", "kind": "cc_library_shared", "output": str(output),
+            "objects": [], "bytes": output.stat().st_size, "sha256": BOOT.sha256_file(output),
+            "elf_machine": "x86_64", "native_bridge_itf_dynamic_export": True,
+            "dynamic": evidence, "runtime_tested": False, "relinked_from_report": str(reuse.path)}
+
+
+def stage_debionic_proxy(artifact, runner, tool):
+    """Make a separate loader-compatible copy, NOT an assertion of glibc ABI safety."""
+    translator = artifact.get("native_bridge_itf_dynamic_export") is True
+    if not artifact.get("init_proxy_library_dynamic_export") and not translator:
+        raise BuildError("de-bionic staging is restricted to verified native-bridge proxies/translators")
+    source, tool = Path(artifact["output"]), Path(tool).resolve()
+    if not tool.is_file() or not os.access(tool, os.X_OK):
+        raise BuildError(f"missing executable de-bionic tool: {tool}; no cargo build attempted")
+    if BOOT.sha256_file(source) != artifact["sha256"]:
+        raise BuildError(f"proxy changed before de-bionic staging: {source}")
+    tool_digest = BOOT.sha256_file(tool)
+    output = runner.root / "glibc" / source.name
+    output.parent.mkdir(exist_ok=True)
+    runner.run([str(tool), "de-bionic", str(source), str(output)], "de-bionic " + artifact["module"])
+    evidence = dynamic_evidence(runner, output, "inspect de-bionic " + artifact["module"])
+    entry = ("NativeBridgeItf" in Path(evidence["log"]).read_text()) if translator else evidence["init_proxy_library"]
+    if not entry or evidence["soname"] != [source.name]:
+        raise BuildError("de-bionic staging lost proxy entry/SONAME")
+    if BOOT.sha256_file(source) != artifact["sha256"] or BOOT.sha256_file(tool) != tool_digest:
+        raise BuildError("proxy/de-bionic executable changed during staging")
+    return {"output": str(output), "bytes": output.stat().st_size, "sha256": BOOT.sha256_file(output),
+            "tool": str(tool), "tool_sha256": tool_digest, "dynamic": evidence,
+            "runtime_tested": False, "glibc_abi_compatible": False,
+            "warning": "Only ELF loader metadata was transformed. Bionic ABI adaptation is still required.",
+            "unverified_interfaces": ([
+                "pthread_attr_t/internal thread and cleanup layouts; raw pthread passthrough in the table",
+                "Bionic mallinfo structure return ABI vs glibc mallinfo",
+                "malloc_disable/malloc_enable/malloc_iterate allocator semantics (glibc has no equivalents)",
+                "system-property callback APIs and opaque prop_info objects",
+                "Bionic host sigjmp_buf used by the translator vs glibc siglongjmp",
+            ] if artifact["module"] == "libberberis_proxy_libc" else [
+                "ProxyLibraryBuilder and translator/C++ runtime closure must use the same ABI",
+            ])}
 
 
 def prepare_root():
@@ -1153,6 +1637,20 @@ def fetch_extras(offline=False):
         previous["libnativehelper"] = json.loads(legacy.read_text())
     downloader, records = BOOT.Downloader(offline=offline), dict(previous)
     for extra in EXTRAS:
+        # Reuse only exact pinned blobs from the guest-linker agent's read-only
+        # Bionic cache. Never repoint the project root at an unverified tree.
+        cache = ROOT / "downloads" / (extra.name + ".b64")
+        local = DEPS / "sources/bionic-expansion/bionic" / extra.subtree
+        if extra.project == "bionic" and extra.blob and not cache.exists() and local.is_file():
+            data = local.read_bytes()
+            if BOOT.git_hash(b"blob", data).hex() != extra.blob:
+                raise BuildError(f"cached Bionic blob does not match pin: {local}")
+            encoded = base64.b64encode(data)
+            if len(encoded) > extra.limit:
+                raise BuildError(f"cached Bionic blob exceeds download limit: {extra.name}")
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            with cache.open("xb") as stream:
+                stream.write(encoded)
         records[extra.name] = BOOT.fetch_artifact(ROOT, extra, downloader, previous.get(extra.name))
         temporary = destination.with_suffix(".tmp")
         temporary.write_text(json.dumps(records, indent=2) + "\n")
@@ -1244,9 +1742,17 @@ def main():
     parser.add_argument("--towards-bridge", action="store_true", help="after early goals, attempt libberberis_arm64")
     parser.add_argument("--platform-root", type=Path, default=PLATFORM_ROOT, help="read-only completed API37 GSI extraction")
     parser.add_argument("--check-platform", action="store_true", help="only verify platform shared imports; do not compile")
+    parser.add_argument("--reuse-report", type=Path, help="reuse checked shared libraries from a successful owned run/report.json")
+    parser.add_argument("--de-bionic-tool", type=Path, help="existing pengudroid executable; stage separate glibc-loader copies of built proxies")
+    parser.add_argument("--probe-bridge-tls", action="store_true", help="only compile pinned x86_64/ARM64 Bionic TLS ABI probes")
+    parser.add_argument("--bridge-tls-adapter", action="store_true", help="probe ABI, stage tracked TLS adapter, rebuild two small TUs, relink reused translator")
     args = parser.parse_args()
-    if args.check_platform and (args.module or args.towards_bridge):
+    if args.check_platform and (args.module or args.towards_bridge or args.reuse_report or args.de_bionic_tool):
         parser.error("--check-platform cannot be combined with build goals")
+    if args.bridge_tls_adapter and (not args.reuse_report or args.module or args.towards_bridge or args.check_platform):
+        parser.error("--bridge-tls-adapter requires --reuse-report and cannot be combined with other goals")
+    if args.probe_bridge_tls and (args.module or args.towards_bridge or args.check_platform or args.reuse_report or args.de_bionic_tool or args.bridge_tls_adapter):
+        parser.error("--probe-bridge-tls is an independent, compile-only ABI check")
     prepare_root()
     with (ROOT / ".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1262,10 +1768,14 @@ def main():
                       "optimization": "-O0 -g0 -fno-lto", "default_cpp_std": "gnu++23",
                       "platform_flags": PLATFORM_FLAGS, "os_selectors": OS_AXES, "arch_selectors": ARCH_AXES,
                       "platform_libcxx_abi": "std::__1 (not NDK std::__ndk1)",
-                      "offline": args.offline, "no_source_patches": True,
+                      "offline": args.offline, "no_source_patches": not args.bridge_tls_adapter,
+                      "cached_sources_modified": False, "staged_bridge_tls_adapter": args.bridge_tls_adapter,
                       "platform_root": str(args.platform_root), "platform_root_access": "read-only; completed manifest only",
                       "platform_linking_implemented": True,
-                      "shared_link_scope": "explicit static/whole/shared dependencies; nonempty ldflags remain unsupported",
+                      "shared_link_scope": "explicit static/whole/shared dependencies; only literal --wrap linker flags supported",
+                      "translation_arch": "arm64_to_x86_64", "private_libc": "proxies require verified platform libc, not NDK stubs",
+                      "reuse_report": str(args.reuse_report) if args.reuse_report else None,
+                      "de_bionic_tool": str(args.de_bionic_tool) if args.de_bionic_tool else None,
                       "whole_static_merging": "llvm-ar qcsDL; deterministic non-thin flattened archives",
                       "scope": "early native compilation, not complete Soong platform defaults/ABI/sanitizer variants"}}
         model = None
@@ -1306,19 +1816,37 @@ def main():
             ensure_art_header_module()
             roots["art-headers"] = ROOT / "extra/art-headers"
             source_dirs = {ROOT / "extra/bionic-libc/Android.bp": DEPS / "sources/bionic/libc"}
-            model = Blueprints(roots, source_dirs)
+            model = Blueprints(roots, source_dirs, translation_arch="arm64_to_x86_64")
             report["platform_sources"] = describe_platform_sources(model)
             # Keep proof that the Android root retains its real bridge entry dependency.
             report["bridge_goal"] = model.props("libberberis_arm64")
             if "libberberis_native_bridge_arm64" not in report["bridge_goal"].get("whole_static_libs", []):
                 raise BuildError("Android bridge goal lost its real native-bridge entry dependency")
             runner = Runner(run, report, args.seconds)
-            build = NativeBuild(model, runner, Path(manifest["preflight"]["sysroot"]))
+            reuse = (SharedReuse(args.reuse_report, model, runner, report["dependencies_manifest_sha256"])
+                     if args.reuse_report else None)
+            build = NativeBuild(model, runner, Path(manifest["preflight"]["sysroot"]), shared_reuse=reuse)
             version = runner.run([str(LLVM / "clang++"), "--no-default-config", "--version"], "compiler version")
             report["compiler_version"] = Path(version["log"]).read_text()
+            if args.probe_bridge_tls:
+                report["goals"] = ["compile pinned Bionic TLS ABI probes"]
+                probe_bridge_tls(runner, Path(manifest["preflight"]["sysroot"]))
+                report["requested_goals_passed"] = True
+                report["blocker"] = "ABI probes only; no runtime execution attempted."
+                return 0
             imports = PlatformImports(args.platform_root, runner, report["platform_imports"])
             platform_ready = imports.probe()
             build.platform_imports = imports
+            if args.bridge_tls_adapter:
+                report["goals"] = ["incremental TLS-adapted libberberis_arm64"]
+                probe_bridge_tls(runner, Path(manifest["preflight"]["sysroot"]))
+                artifact = relink_bridge_tls(model, runner, Path(manifest["preflight"]["sysroot"]), reuse, manifest, imports)
+                report["artifacts"].append(artifact)
+                if args.de_bionic_tool:
+                    artifact["de_bionic"] = stage_debionic_proxy(artifact, runner, args.de_bionic_tool)
+                report["requested_goals_passed"] = True
+                report["blocker"] = "Only bootstrap TLS contracts are adapted; guest runtime and pthread proxies remain unvalidated."
+                return 0
             if args.check_platform:
                 report["goals"] = ["verify platform shared imports"]
                 if not platform_ready:
@@ -1331,9 +1859,14 @@ def main():
             if args.towards_bridge and "libberberis_arm64" not in goals:
                 goals.append("libberberis_arm64")
             report["goals"] = goals
+            if any(goal.startswith("libberberis_proxy_") for goal in goals):
+                report["proxy_support"] = proxy_support_evidence(model)
             for goal in goals:
                 report["attempting"] = goal
-                report["artifacts"].append(build.build(goal))
+                artifact = build.build(goal)
+                report["artifacts"].append(artifact)
+                if args.de_bionic_tool and artifact.get("init_proxy_library_dynamic_export"):
+                    artifact["de_bionic"] = stage_debionic_proxy(artifact, runner, args.de_bionic_tool)
                 built = {a["module"] for a in report["artifacts"]}
                 report["early_steps_passed"] = set(EARLY_GOALS) <= built
             report["requested_goals_passed"] = True
@@ -1344,6 +1877,7 @@ def main():
         finally:
             if model is not None:
                 report["modules"] = model.used
+                report["soong_config_selections"] = model.config_selections
             report["retry"] = [sys.executable, "-B", str(Path(__file__).resolve())] + sys.argv[1:]
             translator_built = any(a.get("native_bridge_itf_dynamic_export") for a in report["artifacts"])
             report["translator_shared_built"] = translator_built
