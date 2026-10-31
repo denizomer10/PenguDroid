@@ -9,7 +9,8 @@ hosted Activity lifecycle on a real NewPipe run (Main → Settings → finish �
 resume), routes input to the focused visible window only, and fixes the decoded
 video's padding by propagating the per-frame BufferQueue crop all the way to the
 compositor. The ARM64 translator still cannot execute guest code: the guest
-runtime quartet is missing and the loader is now **fail-closed** about it. It
+runtime. The ARM64 translator and the guest linker/libc now build, but guest
+execution has not been wired or run. It
 does **not** claim Beach Buggy Racing 2 runs.
 
 ### Beach Buggy Racing 2: measured debug chain (2026-10-31)
@@ -125,19 +126,32 @@ measurement).
   identical to its basename before `LoadNativeBridge`, and
   `NativeBridgeGetSignalHandler`'s callback is chained over ART's handler
   instead of being misread as a `struct sigaction`.
-* Next concrete task: build `native_bridge_guest_linker.native_bridge`. The
-  closure is now mapped (`REPORT.md` in
-  `.toolchain/nativebridge-deps/sources/bionic-expansion/`, where the pinned
-  Bionic tree was fetched: 2,601 files): 32 TUs (`linker_bin_template` 25 + 3
-  arm64 + 4 native-bridge add-ons), `linker.generic.map` is load-bearing
-  (Digitalis binds 2 TLS hooks plus 9 `__loader_*` callbacks from `dlfcn.cpp`),
-  `objcopy --prefix-symbols=__dl_` renames only `.symtab` and it must be kept.
-  Still to fetch at the same pins: `arm-optimized-routines`, `llvm-libc`,
-  `system/librustutils/no_std`, ICU4X crates, scudo/gwp_asan, and the aarch64
-  clang prebuilt slices (`libc++_static_noexcept`, `libunwind`, `builtins`).
-  Exercising the linker then also needs the guest `libc.so`
-  (`libnative_bridge_guest_libc`); the cached Bionic slice alone cannot build
-  it. Until then BBR2 stops at `libfmod.so` (measured above).
+* **Guest runtime artifacts now build.** `tools/build-guest-linker.py` produces,
+  from the pinned sources plus the fetched external closure:
+  * `native_bridge_guest_linker.native_bridge` (6,906,368 B, SHA-256
+    `2fd29a0c…f6304d`): ELF64 AArch64 DYN, SONAME `ld-android.so`, no
+    `DT_NEEDED`, all 12 required `.dynsym` exports (`__loader_*` from
+    `dlfcn.cpp`, `__native_bridge_config_static_tls`,
+    `__native_bridge_get_host_pthread`), `.symtab` retained with `__dl_`
+    prefixes, `ANDROID_RELR`.
+  * `libnative_bridge_guest_libc.native_bridge` (3,605,768 B, SHA-256
+    `9b403bce…77bf05`): SONAME `libc.so`, version nodes `LIBC`…`LIBC_37`,
+    `DT_NEEDED` = `linux-vdso.so.1`, `ld-android.so`, `libdl.so`; exports the
+    native-bridge replacements and **imports `native_bridge_intercept_symbol`**
+    (`stubs_arm64.cpp`), satisfying the runtime gate.
+  * `bundle/` assembles `system/bin/arm64/{linker64,app_process64}`,
+    `system/lib64/arm64/{libc.so,libdl.so,libnative_bridge_vdso.so}` and
+    `system/etc/ld.config.arm64.txt` (needed for the guest `default` namespace).
+* **Next blocker is wiring, not building:** Digitalis resolves guest runtime
+  paths as **absolute host paths** (`GetSystemPath`: `/system/bin/arm64/...`,
+  preferring `/system/bin/berberis/...` when that directory exists;
+  `kernel_api/open_emulation.cc` special-cases `/system/bin/arm64/linker64`).
+  PenguDroid has no host-side `/system` redirection yet, so the next step is to
+  interpose `open`/`openat`/`stat`/`access` (and the exec path) in the shim and
+  rewrite `/system/...` to a configured root (e.g. the built `bundle/` or the
+  sysroot), then rerun BBR2 and capture the next real failure. After that:
+  guest `libm.so`/`libc++.so` and real ARM64 `app_process64`/framework
+  libraries as the failures demand; nothing is runtime-tested yet.
 
 See [NATIVE_BRIDGE.md](NATIVE_BRIDGE.md) for the build flags, source pins, and
 the exact driver changes.
