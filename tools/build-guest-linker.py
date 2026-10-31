@@ -40,7 +40,9 @@ sys.dont_write_bytecode = True
 REPO = Path(__file__).resolve().parent.parent
 ROOT = REPO / ".toolchain/nativebridge-guest-linker-build"
 DEPS = REPO / ".toolchain/nativebridge-deps"
-LLVM = Path("/usr/lib/llvm-22/bin")
+# See tools/build-nativebridge.py: the pinned compiler is LLVM 22, and a
+# relocated package tree can be selected instead of the distro path.
+LLVM = Path(os.environ.get("PENGUDROID_LLVM_DIR", "/usr/lib/llvm-22/bin"))
 NDK = REPO / ".toolchain/ndk-refs_tags_ndk-r30-platform-sysroot"
 BIONIC = DEPS / "sources/bionic-expansion/bionic"
 NBS = DEPS / "sources/native_bridge_support"

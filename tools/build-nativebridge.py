@@ -48,7 +48,11 @@ sys.dont_write_bytecode = True
 REPO = Path(__file__).resolve().parent.parent
 ROOT = REPO / ".toolchain/nativebridge-build"
 DEPS = REPO / ".toolchain/nativebridge-deps"
-LLVM = Path("/usr/lib/llvm-22/bin")
+# The pinned driver is LLVM 22. `PENGUDROID_LLVM_DIR` selects a bin directory
+# that is not at the distro path (for example an unpacked package tree); the
+# tools there must be loadable, which for a relocated tree means its shared
+# libraries are on the loader path.
+LLVM = Path(os.environ.get("PENGUDROID_LLVM_DIR", "/usr/lib/llvm-22/bin"))
 HOST_LIBCXX = REPO / ".toolchain/host-libcxx/usr"
 PLATFORM_ROOT = REPO / ".toolchain/sysroot-android17"
 RUNTIME_MANIFEST = "pengudroid-runtime.json"

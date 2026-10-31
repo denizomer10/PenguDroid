@@ -770,6 +770,24 @@ const ISC_GET_MAX_ACQUIRED_BUFFER_COUNT: u32 = 69;
 /// API-37 android.gui.ISurfaceComposerClient.createSurface (generated AIDL).
 const ISCC_CREATE_SURFACE: u32 = 1;
 
+/// Tags of the **API-37 C++** `ISurfaceComposer` interface.
+///
+/// `libgui.so` still ships both interfaces on the same SurfaceFlinger handle:
+/// the generated AIDL one above (`android.gui.ISurfaceComposer`) and the C++ one
+/// whose descriptor is `android.ui.ISurfaceComposer`. The numbers are the
+/// `ISurfaceComposerTag` enum in the pinned API-37
+/// `libs/gui/include/gui/ISurfaceComposer.h`, starting at
+/// `IBinder::FIRST_CALL_TRANSACTION`. They are this platform's own tags, not an
+/// older release's: `SET_TRANSACTION_STATE` is `8`, measured on a live run
+/// (`ISurfaceComposer code=8 token mismatch: first16=Some("android.ui.ISurfaceComposer")`).
+const ISC_CPP_BOOT_FINISHED: u32 = 1;
+const ISC_CPP_SET_TRANSACTION_STATE: u32 = 8;
+
+/// Accepted C++ `ISurfaceComposer` transactions. The host owns no layers, so the
+/// count is what proves a caller reached this broker and was not refused, not a
+/// claim that a frame was composed.
+static CPP_TRANSACTION_STATES: AtomicU64 = AtomicU64::new(0);
+
 /// `IDisplayEventConnection` transaction code for `stealReceiveChannel`.
 ///
 /// This one *is* AIDL, so the reply starts with a `Status` int32 and then the
@@ -1921,6 +1939,23 @@ fn is_surface_flinger(handle: u32) -> bool {
     )
 }
 
+/// The AIDL descriptor of a hosted interface, for the transport's
+/// `INTERFACE_TRANSACTION`.
+///
+/// Only interfaces this broker actually implements are listed: answering with a
+/// descriptor for a service that is not hosted would invite a caller to speak a
+/// protocol nothing answers. Every string here is already the descriptor this
+/// file validates incoming parcels against, so it is measured, not invented.
+fn hosted_interface_descriptor(handle: u32) -> Option<&'static str> {
+    match name_for_handle(handle)?.as_str() {
+        "SurfaceFlinger" | "SurfaceFlingerAIDL" => Some("android.gui.ISurfaceComposer"),
+        "surface_composer_client" => Some("android.gui.ISurfaceComposerClient"),
+        "display_event_connection" => Some("android.gui.IDisplayEventConnection"),
+        "pengudroid.activity_host" => Some(ACTIVITY_HOST_DESCRIPTOR),
+        _ => None,
+    }
+}
+
 /// Every plausible `string16` in a parcel, as `(offset, text)`.
 ///
 /// A request parcel is not a flat list of strings: `bindService`/`startService`
@@ -2303,6 +2338,18 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
     if tr.code == 0 {
         return Reply::unknown_transaction(tr, "zero is not a Binder transaction code");
     }
+    // Every hosted interface answers the transport's interface-descriptor
+    // transaction with its own descriptor and no status word: `Binder.onTransact`
+    // and `BpBinder::getInterfaceDescriptor` both read/write it that way. Without
+    // this branch a caller that probes an interface (measured: `code=1598968902`
+    // against `SurfaceFlingerAIDL` in the BBR2 run) is told the transaction is
+    // unsupported instead of being told which interface it reached.
+    if tr.code == IBINDER_INTERFACE_TRANSACTION {
+        if let Some(descriptor) = hosted_interface_descriptor(tr.target_handle) {
+            let parcel = string16(descriptor);
+            return Reply { parcel, objects: Vec::new(), flags: 0 };
+        }
+    }
     let mut parcel = Vec::new();
     let mut objects = Vec::new();
     if is_hidl_request(tr) && (tr.target_handle == 0
@@ -2320,7 +2367,48 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         let data = if tr.data_size > 0 && tr.data_ptr != 0 {
             std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize)
         } else { &[] };
+        if first_string16(data).as_deref() == Some("android.ui.ISurfaceComposer") {
+            // The C++ interface writes no AIDL status word and no payload for the
+            // tags it accepts, so the reply body stays empty; libbinder carries the
+            // `status_t` in the reply header.
+            //
+            // `SET_TRANSACTION_STATE` is a layer transaction for a compositor this
+            // host does not have: it owns no layers, so "applied" is the honest
+            // result and every update stays unobserved. It is counted and traced
+            // instead of being silently swallowed.
+            return match tr.code {
+                ISC_CPP_BOOT_FINISHED | ISC_CPP_SET_TRANSACTION_STATE => {
+                    let seen = CPP_TRANSACTION_STATES.fetch_add(1, Ordering::Relaxed) + 1;
+                    if trace_enabled() {
+                        diag(&format!(
+                            "[binder]   -> C++ ISurfaceComposer tag={} accepted ({seen} transaction(s) dropped: no hosted layers)\n",
+                            tr.code
+                        ));
+                    }
+                    Reply { parcel: Vec::new(), objects: Vec::new(), flags: 0 }
+                }
+                _ => Reply::unknown_transaction(
+                    tr,
+                    "unimplemented API-37 android.ui.ISurfaceComposer tag",
+                ),
+            };
+        }
         if first_string16(data).as_deref() != Some("android.gui.ISurfaceComposer") {
+            // The rejection is only useful with the bytes that caused it: this
+            // handle is reached by more than one interface, and a silent mismatch
+            // cannot tell "wrong token" from "different method encoding".
+            if trace_enabled() {
+                let mut hex = String::new();
+                for byte in data.iter().take(192) {
+                    hex.push_str(&format!("{byte:02x}"));
+                }
+                diag(&format!(
+                    "[binder] ISurfaceComposer code={} token mismatch: {} byte(s), first16={:?}, hex={hex}\n",
+                    tr.code,
+                    data.len(),
+                    first_string16(data)
+                ));
+            }
             return Reply::unknown_transaction(tr, "API-37 android.gui.ISurfaceComposer token required");
         }
         parcel.extend_from_slice(&0u32.to_ne_bytes()); // AIDL Status
@@ -4521,13 +4609,14 @@ mod tests {
 
     #[test]
     fn surface_composer_rejects_legacy_tokens_and_unknown_contracts() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let aidl = service_request("android.gui.ISurfaceComposer", "");
-        let legacy = service_request("android.ui.ISurfaceComposer", "android.gui.ISurfaceComposer");
+        let cpp = service_request("android.ui.ISurfaceComposer", "");
         let headerless = string16("android.gui.ISurfaceComposer");
         for alias in ["SurfaceFlinger", "SurfaceFlingerAIDL"] {
             let target = handle_for(alias);
-            for code in [0, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 27, 34, 54, 55, 69] {
-                assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &legacy), 1) });
+            for code in [0, 2, 3, 4, 5, 6, 7, 9, 12, 13, 27, 34, 54, 55, 69] {
+                assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &cpp), 1) });
             }
             for code in [0, 4, 5, 8, 9, 27, 54, 55, 9999] {
                 assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &aidl), 1) });
@@ -4538,6 +4627,24 @@ mod tests {
         }
         for name in ["surface_composer_client", "display_event_connection"] {
             assert_unknown_transaction(unsafe { make_reply(&transaction(handle_for(name), 9999, &[]), 1) });
+        }
+    }
+
+    /// The API-37 C++ `ISurfaceComposer` descriptor shares the SurfaceFlinger
+    /// handle with the AIDL one. Its accepted tags answer with an empty body (the
+    /// `status_t` travels in the reply header, not in a body status word), which
+    /// is what a measured `libgui` caller expects for `SET_TRANSACTION_STATE`.
+    #[test]
+    fn cpp_surface_composer_accepts_its_own_tags_without_a_body_status() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cpp = service_request("android.ui.ISurfaceComposer", "");
+        for alias in ["SurfaceFlinger", "SurfaceFlingerAIDL"] {
+            for code in [ISC_CPP_BOOT_FINISHED, ISC_CPP_SET_TRANSACTION_STATE] {
+                let reply = unsafe { make_reply(&transaction(handle_for(alias), code, &cpp), 1) };
+                assert_eq!(reply.flags, 0, "{alias} code={code}");
+                assert!(reply.parcel.is_empty(), "{alias} code={code}");
+                assert!(reply.objects.is_empty(), "{alias} code={code}");
+            }
         }
     }
 
@@ -4833,6 +4940,31 @@ mod tests {
         let b = handle_for("activity");
         assert_eq!(a, b);
         assert!(a >= 1);
+    }
+
+    /// `Binder.onTransact` answers the interface-descriptor transaction before
+    /// any method dispatch. A caller that probes a hosted interface must get the
+    /// descriptor, not a transport rejection (measured as
+    /// `UNKNOWN_TRANSACTION ... code=1598968902` against `SurfaceFlingerAIDL`).
+    #[test]
+    fn interface_descriptor_transaction_names_each_hosted_interface() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (name, descriptor) in [
+            ("SurfaceFlinger", "android.gui.ISurfaceComposer"),
+            ("SurfaceFlingerAIDL", "android.gui.ISurfaceComposer"),
+            ("surface_composer_client", "android.gui.ISurfaceComposerClient"),
+            ("display_event_connection", "android.gui.IDisplayEventConnection"),
+        ] {
+            let reply = unsafe {
+                make_reply(&transaction(handle_for(name), IBINDER_INTERFACE_TRANSACTION, &[]), 1)
+            };
+            assert_eq!(reply.flags, 0, "{name}");
+            assert!(reply.objects.is_empty(), "{name}");
+            // No status word: the descriptor is the whole reply.
+            assert_eq!(reply.parcel, string16(descriptor), "{name}");
+        }
+        // A handle this broker does not host is not given an invented identity.
+        assert_eq!(hosted_interface_descriptor(handle_for("netstats")), None);
     }
 
     #[test]

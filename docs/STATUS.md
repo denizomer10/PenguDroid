@@ -2,7 +2,99 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
-## Current handoff — activity roundtrip and video crop verified; ARM64 guest runtime still blocked (2026-10-31)
+## Current handoff — BBR2 target: ARM64 chain must be rebuilt; two render-path contracts fixed (2026-10-31)
+
+**Android 17 / API 37 / x86_64 only on the host.** The focus is now Beach Buggy
+Racing 2 (`com.vectorunit.cobalt.googleplay`, SDL + FMOD, **arm64-v8a only**).
+
+### BBR2: re-measured on this checkout
+
+A bounded 30 s run (`target/bbr2-1031-remeasure/`) reproduces the documented
+state exactly: the XAPK materialises (35 splits incl. `split_config.arm64_v8a`),
+ART boots the Java side, `handleLaunchActivity` returns the Activity, and the
+only hard blocker is the ARM64 natives:
+
+```
+nativeloader: Load libSDL3.so ... cannot open shared object file
+nativeloader: Load libfmod.so ... cannot open shared object file
+ERROR MainActivity: Failed to load FMOD libs
+apphost: no x86_64 native libraries in /tmp/pengudroid-libs/...
+```
+
+**No ARM64 execution work is wired right now.** The translator
+(`libberberis_arm64.so`), the guest linker/libc artifacts, the NDK sysroot and
+the guest source expansion had all been removed from `.toolchain` since the last
+checkpoint. This pass rebuilt the *inputs* and measured what is still missing:
+
+| Input | State now |
+| --- | --- |
+| ARM64 GSI `aosp_arm64-exp-CP2A.260605.012-15430684-8e545e1e.zip` | downloaded, SHA-256 verified `8e545e1e…48f75` (`.toolchain/downloads/aosp_arm64-gsi.zip`) |
+| LLVM 22 (pinned driver) | installed **without root** from Ubuntu `.deb`s into `.toolchain/llvm-22-root`, wrapped by `.toolchain/llvm-bin` |
+| NDK r30 platform sysroot | extracted to `.toolchain/ndk-r30/sysroot`, linked as `.toolchain/ndk-refs_tags_ndk-r30-platform-sysroot` (`usr/include/jni.h`, `usr/lib/aarch64-linux-android/37`) |
+| `tools/nativebridge-deps.py` inputs | fetched (28.7 MB, manifest written; preflight still `NOT RUN`) |
+| `sources/bionic-expansion/bionic` + `sources/ext/*` | **still missing — see below** |
+
+Both build drivers now honour `PENGUDROID_LLVM_DIR` (default
+`/usr/lib/llvm-22/bin`), so a relocated compiler tree can be used without
+patching the pins.
+
+**The chain is not reproducible from this repository yet.**
+`tools/build-guest-linker.py` compiles from
+`sources/bionic-expansion/bionic` (full pinned Bionic tree) and ~15
+`sources/ext/*` trees (`arm-optimized-routines`, `google-highway`, `llvm-libc`,
+`android-crates-io`, `librustutils`, `libcutils`, `libpropertyinfoparser`,
+`soong`, `clang-prebuilt`, `bionic-libdl`, `scudo`, `gwp_asan`).
+`tools/nativebridge-deps.py` deliberately fetches only header **slices**
+(its own manifest says so), so those trees were created by hand in the previous
+session and are gone. The next concrete task is a pinned fetcher for that
+closure (googlesource `+archive/<revision>.tar.gz` per project, same
+budget/lock/manifest style as `nativebridge-deps.py`), then:
+
+```sh
+PENGUDROID_LLVM_DIR=$PWD/.toolchain/llvm-bin python3 -B tools/build-nativebridge.py --towards-bridge
+python3 -B tools/prepare-arm64-guest.py --archive .toolchain/downloads/aosp_arm64-gsi.zip   # staging only
+PENGUDROID_LLVM_DIR=$PWD/.toolchain/llvm-bin python3 -B tools/build-guest-linker.py --module app_process --bundle
+```
+
+and finally BBR2 with `PENGUDROID_NATIVE_BRIDGE_LIB` +
+`PENGUDROID_ARM64_GUEST_ROOT=<bundle>`. `bundle/` must be manifest-free: the
+host gate in `sysroot.rs` rejects staged trees by contract.
+
+### Two render-path contracts fixed (measured, not guessed)
+
+BBR2's Java UI reaches `ThreadedRenderer.create`, and both failures below were
+in that path. Both are **API-37 contracts**, not older-release fallbacks:
+
+1. **`INTERFACE_TRANSACTION` is answered everywhere.** A caller that probes a
+   hosted interface must receive its descriptor; the broker rejected it
+   (`UNKNOWN_TRANSACTION target=26 (SurfaceFlingerAIDL) code=1598968902`).
+   `hosted_interface_descriptor()` now names the interfaces this broker really
+   implements (SurfaceComposer, SurfaceComposerClient, DisplayEventConnection,
+   the hosted activity host) and the descriptor is the whole reply, with no
+   status word — the same shape `Binder.onTransact` uses.
+2. **The C++ `android.ui.ISurfaceComposer` shares the SurfaceFlinger handle.**
+   Nine `code=8` calls were refused with "token required". The interface token
+   was measured from the parcel (`first16=Some("android.ui.ISurfaceComposer")`,
+   UTF-16 stored in API-37 `libgui.so`), and code 8 is
+   `ISurfaceComposerTag::SET_TRANSACTION_STATE` in the pinned API-37
+   `libs/gui/include/gui/ISurfaceComposer.h`. `BOOT_FINISHED` (1) and
+   `SET_TRANSACTION_STATE` (8) are now accepted with an empty body (the
+   `status_t` travels in the reply header), counted and traced; every other tag
+   is still refused loudly. The host owns no layers, so this is "applied, nothing
+   to compose", not a claim that a frame was composed.
+
+Measured effect on BBR2 (`target/bbr2-1031-cppsf/`): `code=8` refusals **9 → 0**
+and `code=1598968902` refusals **1 → 0**.
+
+Validation on this checkout: `cargo test --workspace --offline` **373 passed, 0
+failed**; `tools` unittest **214 passed**; `git diff --check` clean.
+
+Still open and unchanged: the `HardwareRenderer` graphics-stats buffer
+(`requestBuffer` returns no `ParcelFileDescriptor`: the unhosted `graphicsstats`
+service falls through to an empty success reply), the `ParceledListSlice` NPE on
+shortcuts, `IAudioService` code 171, and the `listAudioPorts` loop.
+
+## Previous handoff — activity roundtrip and video crop verified; ARM64 guest runtime still blocked (2026-10-31)
 
 **Android 17 / API 37 / x86_64 only on the host.** This checkpoint verifies the
 hosted Activity lifecycle on a real NewPipe run (Main → Settings → finish →
