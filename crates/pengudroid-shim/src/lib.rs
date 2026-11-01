@@ -50,6 +50,38 @@ use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 
 use libc::{c_char, c_int, c_void};
+
+#[repr(C)]
+struct BionicCleanup {
+    prev: *mut BionicCleanup,
+    routine: Option<unsafe extern "C" fn(*mut c_void)>,
+    arg: *mut c_void,
+}
+
+/// Bionic's cleanup ABI is not exported by glibc. The proxy uses the explicit
+/// push/pop entry points around guest calls; preserve the frame and execute it
+/// on pop when requested.
+#[no_mangle]
+pub unsafe extern "C" fn __pthread_cleanup_push(
+    cleanup: *mut BionicCleanup,
+    routine: Option<unsafe extern "C" fn(*mut c_void)>,
+    arg: *mut c_void,
+) {
+    if !cleanup.is_null() {
+        (*cleanup).prev = std::ptr::null_mut();
+        (*cleanup).routine = routine;
+        (*cleanup).arg = arg;
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __pthread_cleanup_pop(cleanup: *mut BionicCleanup, execute: c_int) {
+    if execute != 0 {
+        if let Some(routine) = cleanup.as_ref().and_then(|frame| frame.routine) {
+            routine(cleanup.as_ref().map_or(std::ptr::null_mut(), |frame| frame.arg));
+        }
+    }
+}
 use pengudroid_proto::abi::{validate_platform_property_override, ANDROID_API_LEVEL, ANDROID_RELEASE};
 
 mod ahardwarebuffer;

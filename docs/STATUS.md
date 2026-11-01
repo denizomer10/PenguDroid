@@ -2,7 +2,7 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
-## Current handoff — guest build reproducible again; stops at the missing libc++ prebuilts (2026-10-31)
+## Current handoff — TLS fault fixed; libc proxy still blocks BBR2 (2026-11-01)
 
 **Android 17 / API 37 / x86_64 only on the host.** Focus is Beach Buggy Racing 2
 (`com.vectorunit.cobalt.googleplay`, SDL + FMOD, **arm64-v8a only**). Its Java
@@ -31,6 +31,45 @@ subpath; and the driver indexes crates as `<dest>/<crate>/Android.bp`, so
 
 ### Measured build state
 
+The guest linker/libc bundle and translator are built and wired into the real
+BBR2 launch path. The smoke run reaches `JNI_CreateJavaVM`,
+`LoadNativeBridge=true`, Berberis initialization, and ARM64 guest execution.
+This proves that the staged-only guest gate, linker bundle, bridge loading, and
+basic ARM64 execution path are all crossed.
+
+The first optimizer crash was caused by uninitialized `postloop_edge` and
+`loop_edge` locals in the pinned Digitalis `read_flags_optimizer.cc`. The
+nativebridge build driver now applies and records a narrow compatibility overlay
+for those locals and keeps the gear-switch threshold at `UINT32_MAX` while the
+heavy optimizer remains unvalidated. Rebuilding succeeds, but the first BBR2 blocker was a repeatable low-address
+fault at `si_addr=0xfa9` in guest bootstrap code. The faulting instruction was
+`ldrb w8, [x8, #0xfa9]` in the guest linker's `bionic_trace_begin`; `x8` came
+from Bionic `__get_tls()`. The original translator did not bind a synthetic
+Bionic TLS object to the guest thread, so the linker read an invalid TLS base.
+
+The bridge TLS adapter now allocates and binds the required guest pthread,
+Bionic TLS object, and guest TCB. With the actual TLS-adapted artifact
+(`run-74nov5bs`) and `PENGUDROID_BRIDGE_TLS=1`, the `0xfa9` fault is gone.
+This was independently reproduced in interpreter-only mode with
+`BERBERIS_FLAGS=glibc-host-thread-id-handoff`.
+
+The next blocker is native libc proxy loading. `libberberis_proxy_libc.so` now
+exports Bionic's missing `__pthread_cleanup_push`/`__pthread_cleanup_pop`
+compatibility ABI from `crates/pengudroid-shim`, but the translator's proxy
+loader still needs to be rebuilt with the compatibility overlay changing
+`dlopen(library_name, RTLD_GLOBAL)` to
+`dlopen(library_name, RTLD_NOW | RTLD_GLOBAL)`. The latest smoke log reached
+`ProxyLibraryBuilder::Build()` and then failed with glibc's
+`dlopen failed: libc.so: invalid mode for dlopen(): Invalid argument`.
+
+The required next build must be a fresh translator build so the proxy-loader
+overlay and TLS adapter are present in the same artifact. Rebuild the proxy
+against that report, stage `libberberis_arm64.so` and
+`libberberis_proxy_libc.so` together, then rerun the short `/tmp` BBR2 smoke
+with `BERBERIS_MODE=interpret-only`, `PENGUDROID_BRIDGE_TLS=1`, and
+`BERBERIS_FLAGS=glibc-host-thread-id-handoff`. BBR2 has not yet loaded
+`libSDL3.so`/`libfmod.so` or reached the game Activity.
+
 `build-guest-linker.py` resolves the whole Blueprint closure and compiles **85
 translation units** (Rust `icu4x` crates and `arm-optimized-routines` assembly
 included). Two driver defects fixed to get there:
@@ -41,19 +80,19 @@ included). Two driver defects fixed to get there:
 * `libdl`, `libutils`, `libsystem` and `libpropertyinfoparser` are now
   materialised from the pinned archives instead of hand-copied.
 
-It stops at `libc_bionic: android_crash_detail.cpp` with `_NOEXCEPT` unresolved
-in `__atomic/atomic.h:465` — a libc++ **version** mismatch, because the driver
-links the platform libc++ archives from `sources/ext/clang-prebuilt`
-(`libc++_static_noexcept.a` and friends). That tree is a multi-gigabyte
-`prebuilts/clang/host/linux-x86` snapshot and is deliberately not fetched;
-`sources/GUEST_SOURCES.md` lists exactly which six archives are missing.
+The six pinned clang archives are now fetched reproducibly by
+`tools/fetch-guest-sources.py`, with manifest hashes and a report in
+`sources/GUEST_SOURCES.md`. The guest linker/libc build now completes with
+`PENGUDROID_LLVM_DIR=/usr/lib/llvm-22/bin`; the report and
+`.toolchain/nativebridge-guest-linker-build/out/ld-android.so` are present.
+The build driver generates compatibility headers for the pinned libc++/Bionic
+atomic boundary and the API-37 `std::nothrow_t` initialization mismatch.
 
-**Next concrete task:** supply those six archives (fetch the pinned
-`prebuilts/clang/host/linux-x86` closure, or build the matching `_noexcept`
-libc++ from the pinned sources), then rerun the linker/libc build, then
-`--module app_process --bundle`, then BBR2 with `PENGUDROID_NATIVE_BRIDGE_LIB`
-and `PENGUDROID_ARM64_GUEST_ROOT`. Nothing ARM64 is executed yet and no BBR2
-compatibility is claimed.
+The guest bundle includes `system/bin/arm64/{linker64,app_process64}`,
+`system/lib64/arm64/{libc.so,libdl.so,libm.so,libnative_bridge_vdso.so}`, and
+`system/etc/ld.config.arm64.txt`. BBR2 is not open yet: the current run reaches
+native libc proxy construction but stops before `libSDL3.so` or `libfmod.so` is
+loaded.
 
 ### Render-path contracts fixed last pass (unchanged, still verified)
 

@@ -48,21 +48,23 @@ BIONIC = DEPS / "sources/bionic-expansion/bionic"
 NBS = DEPS / "sources/native_bridge_support"
 EXT = DEPS / "sources/ext"
 PREBUILT = EXT / "clang-prebuilt"
+CXX_COMPAT = ROOT / "gen" / "cxx-compat"
 LIBDL_SRC = EXT / "bionic-libdl"
 SCUDO_SRC = EXT / "scudo"
 GWP_ASAN_SRC = EXT / "gwp_asan"
-# libc++ must be a single matching version: the NDK tree next to the sysroot is
-# self-consistent (it also ships the `<string.h>`/`<wchar.h>` overlays), while
-# mixing the platform slice with a different common header tree produced
-# conflicting `__atomic` builtins. The slice remains the fallback for a sysroot
-# without an NDK.
+# libc++ must be a single matching version. The pinned API-37 header tree from
+# nativebridge-deps is the primary set because it is the one paired with the
+# platform libc++ archives; the NDK headers are only a fallback for a bootstrap
+# cache that does not contain that tree.
 _NDK_LIBCXX = NDK / "usr/include/c++/v1"
-if _NDK_LIBCXX.is_dir():
+_PINNED_LIBCXX = DEPS / "toolchain/libcxx/android/x86_64/include/c++/v1"
+_PINNED_LIBCXX_COMMON = DEPS / "toolchain/libcxx/include/c++/v1"
+if _PINNED_LIBCXX.is_dir() and _PINNED_LIBCXX_COMMON.is_dir():
+    LIBCXX = _PINNED_LIBCXX
+    LIBCXX_COMMON = _PINNED_LIBCXX_COMMON
+else:
     LIBCXX = _NDK_LIBCXX
     LIBCXX_COMMON = _NDK_LIBCXX
-else:
-    LIBCXX = DEPS / "toolchain/libcxx/android/x86_64/include/c++/v1"
-    LIBCXX_COMMON = DEPS / "toolchain/libcxx/include/c++/v1"
 LINKER_ARTIFACT = ROOT / "out" / "native_bridge_guest_linker.native_bridge"
 VDSO_FILE = REPO / ".toolchain/sysroot-android17/system/lib64/arm64/libnative_bridge_vdso.so"
 LIBC_ARTIFACT = ROOT / "out" / "libnative_bridge_guest_libc.native_bridge"
@@ -101,7 +103,7 @@ OWNER = {"tool": "PenguDroid guest-linker build", "schema": 1}
 MEMORY = 6_000_000_000
 FILE_LIMIT = 512 * 1024 * 1024
 PLATFORM_FLAGS = ("-DANDROID", "-DNDEBUG", "-UDEBUG", "-D__compiler_offsetof=__builtin_offsetof",
-                  "-D__ANDROID_NATIVE_BRIDGE__=1")
+                  "-D__ANDROID_NATIVE_BRIDGE__=1", "-D__BIONIC__=1")
 # Diagnostics added by clang 22 relative to the pinned clang-r584948. They do
 # not change code generation and would otherwise be promoted by -Werror.
 TRAILING_FLAGS = ("-Wno-error", "-Wno-nullability-completeness",
@@ -746,11 +748,11 @@ class GuestBuild:
             # includes, which breaks libc++'s `<string.h>` overlay against
             # `bionic/libc/include`. Declaring it here puts libc++ first, so its
             # wrappers `#include_next` into bionic's headers, as in AOSP.
-            argv += ["-nostdinc++", "-I", str(LIBCXX)]
+            argv += ["-nostdinc++", "-I", str(CXX_COMPAT), "-I", str(LIBCXX)]
             if LIBCXX_COMMON != LIBCXX:
                 argv += ["-I", str(LIBCXX_COMMON)]
             if "noexcept" in self.linkage_hint(name):
-                argv += ["-D_LIBCPP_HAS_NO_EXCEPTIONS"]
+                argv += ["-D_LIBCPP_HAS_NO_EXCEPTIONS", "-D_LIBCPP_HAS_NO_C_ATOMIC_IMP"]
         del stl
         for directory in self.include_flags(name, props):
             argv += ["-I", directory]
@@ -1494,6 +1496,66 @@ def prepare_root():
         if path.is_symlink():
             raise BuildError(f"symlink output refused: {path}")
         path.mkdir(exist_ok=True)
+    CXX_COMPAT.mkdir(exist_ok=True)
+    (CXX_COMPAT / "bits").mkdir(exist_ok=True)
+    (CXX_COMPAT / "__new").mkdir(exist_ok=True)
+    (CXX_COMPAT / "__config").write_text(
+        "#pragma once\n"
+        "#include_next <__config>\n"
+        "#undef _LIBCPP_HAS_C_ATOMIC_IMP\n"
+        "#define _LIBCPP_HAS_C_ATOMIC_IMP 0\n"
+        "#undef _LIBCPP_HAS_GCC_ATOMIC_IMP\n"
+        "#define _LIBCPP_HAS_GCC_ATOMIC_IMP 1\n"
+    )
+    atomic_macro_undefs = (
+        "#undef atomic_compare_exchange_strong\n"
+        "#undef atomic_compare_exchange_strong_explicit\n"
+        "#undef atomic_compare_exchange_weak\n"
+        "#undef atomic_compare_exchange_weak_explicit\n"
+        "#undef atomic_exchange\n"
+        "#undef atomic_exchange_explicit\n"
+        "#undef atomic_fetch_add\n"
+        "#undef atomic_fetch_add_explicit\n"
+        "#undef atomic_fetch_and\n"
+        "#undef atomic_fetch_and_explicit\n"
+        "#undef atomic_fetch_or\n"
+        "#undef atomic_fetch_or_explicit\n"
+        "#undef atomic_fetch_sub\n"
+        "#undef atomic_fetch_sub_explicit\n"
+        "#undef atomic_fetch_xor\n"
+        "#undef atomic_fetch_xor_explicit\n"
+        "#undef atomic_init\n"
+        "#undef atomic_is_lock_free\n"
+        "#undef atomic_load\n"
+        "#undef atomic_load_explicit\n"
+        "#undef atomic_store\n"
+        "#undef atomic_store_explicit\n"
+        "#undef atomic_thread_fence\n"
+        "#undef atomic_signal_fence\n"
+        "#undef kill_dependency\n"
+    )
+    (CXX_COMPAT / "stdatomic.h").write_text(
+        "#pragma once\n"
+        + atomic_macro_undefs
+        + "#include <atomic>\n"
+        + "#ifdef _Atomic\n"
+        + "#undef _Atomic\n"
+        + "#endif\n"
+        + "#include <bits/stdatomic.h>\n"
+    )
+    (CXX_COMPAT / "bits" / "stdatomic.h").write_text(
+        "#include_next <bits/stdatomic.h>\n"
+    )
+    (CXX_COMPAT / "__new" / "nothrow_t.h").write_text(
+        "#pragma once\n"
+        "#include <__config>\n"
+        "_LIBCPP_BEGIN_UNVERSIONED_NAMESPACE_STD\n"
+        "struct _LIBCPP_EXPORTED_FROM_ABI nothrow_t {\n"
+        "  nothrow_t() = default;\n"
+        "};\n"
+        "extern _LIBCPP_EXPORTED_FROM_ABI const nothrow_t nothrow;\n"
+        "_LIBCPP_END_UNVERSIONED_NAMESPACE_STD\n"
+    )
 
 
 def atomic_json(path, data):

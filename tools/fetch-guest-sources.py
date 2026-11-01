@@ -25,6 +25,7 @@ An already-verified archive is reused, so a rerun is offline-cheap.
 
 import argparse
 import ast
+import base64
 import fcntl
 import gzip
 import hashlib
@@ -90,6 +91,21 @@ PREBUILT_ARCHIVES = (
     "libc++_static_noexcept.a", "libc++abi_noexcept.a", "libc++demangle_noexcept.a",
     "libunwind.a", "libunwind-exported.a", "libclang_rt.builtins-aarch64-android.a",
 )
+PREBUILT_PATHS = {
+    "libc++_static_noexcept.a":
+        "clang-r584948/android_libc++/platform_noexcept/aarch64/lib/libc++_static_noexcept.a",
+    "libc++abi_noexcept.a":
+        "clang-r584948/android_libc++/platform_noexcept/aarch64/lib/libc++abi_noexcept.a",
+    "libc++demangle_noexcept.a":
+        "clang-r584948/android_libc++/platform_noexcept/aarch64/lib/libc++demangle_noexcept.a",
+    "libunwind.a": "clang-r584948/lib/clang/22/lib/linux/aarch64/libunwind.a",
+    "libunwind-exported.a":
+        "clang-r584948/lib/clang/22/lib/linux/aarch64/libunwind-exported.a",
+    "libclang_rt.builtins-aarch64-android.a":
+        "clang-r584948/lib/clang/22/lib/linux/libclang_rt.builtins-aarch64-android.a",
+}
+PREBUILT_PROJECT = "prebuilts/clang/host/linux-x86"
+MAX_BLOB = 512 * 1024 * 1024
 
 
 class FetchError(RuntimeError):
@@ -188,6 +204,43 @@ def verify_gzip(path, name):
                 pass
     except OSError as error:
         raise FetchError(f"{name}: corrupt gzip stream: {error}") from error
+
+
+def download_prebuilt(revision, name, destination):
+    """Fetch one pinned Gitiles blob without downloading the clang snapshot."""
+    relative = PREBUILT_PATHS[name]
+    url = (f"{HOST}/platform/{PREBUILT_PROJECT}/+/{revision}/{relative}"
+           "?format=TEXT")
+    temporary = destination.with_suffix(".part")
+    request = urllib.request.Request(url, headers={"User-Agent": OWNER["tool"]})
+    encoded = bytearray()
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            while True:
+                block = response.read(1 << 20)
+                if not block:
+                    break
+                encoded.extend(block)
+                if len(encoded) > (MAX_BLOB * 4 // 3 + 4):
+                    raise FetchError(f"{name}: blob exceeds the {MAX_BLOB} byte budget")
+        try:
+            payload = base64.b64decode(encoded, validate=True)
+        except ValueError as error:
+            raise FetchError(f"{name}: Gitiles returned invalid base64") from error
+        if not payload:
+            raise FetchError(f"{name}: empty blob from {url}")
+        if len(payload) > MAX_BLOB:
+            raise FetchError(f"{name}: blob exceeds the {MAX_BLOB} byte budget")
+        temporary.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_bytes(payload)
+        os.replace(temporary, destination)
+    except urllib.error.HTTPError as error:
+        temporary.unlink(missing_ok=True)
+        raise FetchError(f"{name}: {error.code} {error.reason} for {url}") from error
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return len(payload), url
 
 
 def escapes(member):
@@ -343,12 +396,39 @@ def main():
                       + f" @ `{record['revision']}`, archive SHA-256 `{record['sha256'][:16]}…`, "
                       f"{record['extracted_bytes']:,} bytes, {record['members']:,} entries")
     prebuilt = SOURCES / "ext/clang-prebuilt"
+    prebuilt_records = manifest.setdefault("prebuilt_archives", {})
+    prebuilt_revision = driver_pins().get(PREBUILT_PROJECT)
+    if prebuilt_revision is None:
+        raise FetchError(f"no pin for {PREBUILT_PROJECT}")
+    for name in PREBUILT_ARCHIVES:
+        destination = prebuilt / name
+        record = prebuilt_records.get(name)
+        if (destination.is_file() and record
+                and record.get("revision") == prebuilt_revision
+                and record.get("path") == PREBUILT_PATHS[name]
+                and sha256(destination) == record.get("sha256")):
+            continue
+        if args.offline:
+            raise FetchError(f"{name}: no verified cache and --offline was requested")
+        downloaded, url = download_prebuilt(prebuilt_revision, name, destination)
+        prebuilt_records[name] = {
+            "project": PREBUILT_PROJECT, "revision": prebuilt_revision,
+            "path": PREBUILT_PATHS[name], "url": url,
+            "bytes": downloaded, "sha256": sha256(destination),
+        }
+        path.write_text(json.dumps(manifest, indent=2) + "\n")
+        print(f"fetched  {name} ({downloaded:,} bytes, {prebuilt_revision[:12]})", flush=True)
     missing = [name for name in PREBUILT_ARCHIVES if not (prebuilt / name).is_file()]
-    report += ["", "## Not fetched", "",
-               "`sources/ext/clang-prebuilt` is a multi-gigabyte `prebuilts/clang/host/linux-x86` "
-               "snapshot and is not downloaded here. The driver links these archives from it, "
-               "so the guest link step cannot run until they are supplied:", ""]
-    report += [f"- `{name}`" for name in missing] or ["- (all present)"]
+    report += ["", "## Prebuilt archives", "",
+               "Only the six archives required by the guest linker are fetched from "
+               "`prebuilts/clang/host/linux-x86`; the full multi-gigabyte snapshot is "
+               "not downloaded.", ""]
+    report += [f"- `{name}`: `{prebuilt_records[name]['path']}`, "
+               f"{prebuilt_records[name]['bytes']:,} bytes, "
+               f"SHA-256 `{prebuilt_records[name]['sha256'][:16]}…`"
+               for name in PREBUILT_ARCHIVES if name in prebuilt_records]
+    if missing:
+        report += ["", "Missing:", *[f"- `{name}`" for name in missing]]
     (SOURCES / "GUEST_SOURCES.md").write_text("\n".join(report) + "\n")
     print(f"\nManifest: {path}")
     if missing:
