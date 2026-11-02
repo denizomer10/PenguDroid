@@ -184,16 +184,106 @@ fn unregister_handle(handle: *const NativeHandle) {
     owned_handles().lock().unwrap_or_else(|e| e.into_inner()).remove(&(handle as usize));
 }
 
-fn bytes_for(desc: &HardwareBufferDesc) -> usize {
-    let stride = desc.stride.max(desc.width);
-    let bpp = match desc.format {
-        // AHardwareBuffer_Format: RGBA_8888 = 1, RGBX_8888 = 2, RGB_565 = 4,
-        // RGBA_F16 = 0x16.
-        0x16 => 8,
-        4 => 2,
+// `AHardwareBuffer_Format` values (android/hardware_buffer.h) and the legacy
+// `HAL_PIXEL_FORMAT_*` spellings used by gralloc. The plane geometry below
+// follows the same model as a gralloc handle (minigbm's `cros_gralloc_handle`):
+// one allocation, with each plane described by an offset, a row stride and a
+// pixel stride.
+const FORMAT_RGBA_8888: u32 = 0x01;
+const FORMAT_RGBX_8888: u32 = 0x02;
+const FORMAT_RGB_565: u32 = 0x04;
+const FORMAT_RGBA_F16: u32 = 0x16;
+const FORMAT_YCRCB_420_SP: u32 = 0x21; // NV21
+const FORMAT_YCBCR_420_888: u32 = 0x23; // NV12
+const FORMAT_YV12: u32 = 0x3231_5659;
+
+#[derive(Clone, Copy, Default)]
+struct PlaneLayout {
+    offset: usize,
+    row_stride: usize,
+    pixel_stride: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct BufferLayout {
+    planes: [PlaneLayout; 4],
+    count: u32,
+    total: usize,
+}
+
+fn pixel_size(format: u32) -> u32 {
+    match format {
+        FORMAT_RGBA_F16 => 8,
+        FORMAT_RGB_565 => 2,
+        FORMAT_YCRCB_420_SP | FORMAT_YCBCR_420_888 | FORMAT_YV12 => 1,
         _ => 4,
-    };
-    (stride as usize) * (desc.height.max(1) as usize) * (desc.layers.max(1) as usize) * bpp
+    }
+}
+
+/// Derive gralloc-style plane geometry from an `AHardwareBuffer_Desc`.
+///
+/// RGB formats are a single packed plane. The 4:2:0 formats are one memfd split
+/// into three planes, exactly as `lockYCbCr` hands them to `android_ycbcr`:
+///
+/// * NV12/NV21 keep the two chroma samples interleaved, so both chroma planes
+///   point into the same rows with `pixel_stride = 2` and the chroma row stride
+///   is the luma stride in bytes.
+/// * YV12 keeps chroma planar, so each chroma plane has half the luma row
+///   stride and `pixel_stride = 1`; `Cb` (U) follows `Cr` (V), matching the
+///   format's name.
+fn plane_layout(desc: &HardwareBufferDesc) -> BufferLayout {
+    let stride = desc.stride.max(desc.width).max(1) as usize;
+    let height = desc.height.max(1) as usize;
+    let layers = desc.layers.max(1) as usize;
+    let mut layout = BufferLayout::default();
+    match desc.format {
+        FORMAT_YCBCR_420_888 | FORMAT_YCRCB_420_SP => {
+            let luma = stride * height;
+            let chroma = stride * (height / 2);
+            // NV21 is Cr-first, NV12 is Cb-first. `android_ycbcr` still calls
+            // the second plane Cb and the third Cr, so the offsets swap.
+            let (cb, cr) = if desc.format == FORMAT_YCRCB_420_SP {
+                (luma + 1, luma)
+            } else {
+                (luma, luma + 1)
+            };
+            layout.planes[0] = PlaneLayout { offset: 0, row_stride: stride, pixel_stride: 1 };
+            layout.planes[1] = PlaneLayout { offset: cb, row_stride: stride, pixel_stride: 2 };
+            layout.planes[2] = PlaneLayout { offset: cr, row_stride: stride, pixel_stride: 2 };
+            layout.count = 3;
+            layout.total = (luma + chroma) * layers;
+        }
+        FORMAT_YV12 => {
+            let luma = stride * height;
+            let cstride = (stride / 2).max(1);
+            let chroma = cstride * (height / 2);
+            layout.planes[0] = PlaneLayout { offset: 0, row_stride: stride, pixel_stride: 1 };
+            layout.planes[1] = PlaneLayout {
+                offset: luma + chroma,
+                row_stride: cstride,
+                pixel_stride: 1,
+            };
+            layout.planes[2] = PlaneLayout { offset: luma, row_stride: cstride, pixel_stride: 1 };
+            layout.count = 3;
+            layout.total = (luma + 2 * chroma) * layers;
+        }
+        format => {
+            let bpp = pixel_size(format) as usize;
+            let row_stride = stride * bpp;
+            layout.planes[0] = PlaneLayout {
+                offset: 0,
+                row_stride,
+                pixel_stride: bpp as u32,
+            };
+            layout.count = 1;
+            layout.total = row_stride * height * layers;
+        }
+    }
+    layout
+}
+
+fn bytes_for(desc: &HardwareBufferDesc) -> usize {
+    plane_layout(desc).total
 }
 
 /// `android::GraphicBufferMapper::GraphicBufferMapper()`.
@@ -331,12 +421,15 @@ unsafe fn allocate_buffer(
         return -22;
     }
     let stride = width.max(1);
-    let bpp: usize = match format {
-        0x16 => 8, // RGBA_F16
-        4 => 2,    // RGB_565
-        _ => 4,
-    };
-    let size = (stride as usize) * (height.max(1) as usize) * (layer_count.max(1) as usize) * bpp;
+    let layout = plane_layout(&HardwareBufferDesc {
+        width,
+        height,
+        layers: layer_count,
+        format: format as u32,
+        stride,
+        ..Default::default()
+    });
+    let size = layout.total;
     let fd = libc::memfd_create(c"pengudroid-gbuf".as_ptr(), libc::MFD_CLOEXEC);
     if fd < 0 {
         return -12;
@@ -540,8 +633,9 @@ unsafe fn lock_body(
         Ok(p) => p, Err(error) => return error,
     };
     *addr = p;
+    let format = if h.num_ints >= 3 { h.data[2] as u32 } else { 0 };
     if !bytes_per_pixel.is_null() {
-        *bytes_per_pixel = 4;
+        *bytes_per_pixel = pixel_size(format) as i32;
     }
     if !stride.is_null() {
         // `data[1]` is the stride we recorded at allocation time.
@@ -853,29 +947,50 @@ pub unsafe extern "C" fn _ZN7android19GraphicBufferMapper9lockYCbCrEPK13native_h
     };
     let base = p as *mut u8;
     let stride = h.data[1].max(0) as usize;
+    let width = if h.num_ints >= 4 { h.data[3].max(0) as usize } else { stride };
     let height = h.data[4].max(0) as usize;
     let format = h.data[2] as u32;
-    let y = base;
-    // Half the chroma planes: `stride/2` per row, `height/2` rows each.
+    let layout = plane_layout(&HardwareBufferDesc {
+        width: width as u32,
+        height: height as u32,
+        layers: 1,
+        format,
+        stride: stride as u32,
+        ..Default::default()
+    });
+    if layout.count == 3 {
+        *out = AndroidYcbcr {
+            y: base.add(layout.planes[0].offset) as *mut c_void,
+            cb: base.add(layout.planes[1].offset) as *mut c_void,
+            cr: base.add(layout.planes[2].offset) as *mut c_void,
+            ystride: layout.planes[0].row_stride,
+            cstride: layout.planes[1].row_stride,
+            chroma_step: layout.planes[1].pixel_stride as usize,
+        };
+        if std::env::var_os("PENGUDROID_TRACE_AHB").is_some() {
+            eprintln!(
+                "[ahb] lockYCbCr fmt={format:#x} stride={} cstride={} step={}",
+                layout.planes[0].row_stride,
+                layout.planes[1].row_stride,
+                layout.planes[1].pixel_stride
+            );
+        }
+        return 0;
+    }
+    // Not a YUV format: preserve the historical single-plane interpretation
+    // (YV12-style V/U) instead of inventing chroma pointers.
     let cstride = stride / 2;
-    let chroma_base = y.add(stride * height);
-    // HAL_PIXEL_FORMAT_YCbCr_420_888 (0x23) and _YCrCb_420_SP (0x21) interleave
-    // the chroma samples; YV12 (0x32315659) keeps them planar in V,U order.
-    let (cb, cr, chroma_step) = match format {
-        0x23 => (chroma_base, chroma_base.add(1), 2), // NV12: Cb first
-        0x21 => (chroma_base.add(1), chroma_base, 2), // NV21: Cr first
-        _ => (chroma_base.add(cstride * (height / 2)), chroma_base, 1), // YV12: V then U
-    };
+    let chroma_base = base.add(stride * height);
     *out = AndroidYcbcr {
-        y: y as *mut c_void,
-        cb: cb as *mut c_void,
-        cr: cr as *mut c_void,
+        y: base as *mut c_void,
+        cb: chroma_base.add(cstride * (height / 2)) as *mut c_void,
+        cr: chroma_base as *mut c_void,
         ystride: stride,
         cstride,
-        chroma_step,
+        chroma_step: 1,
     };
     if std::env::var_os("PENGUDROID_TRACE_AHB").is_some() {
-        eprintln!("[ahb] lockYCbCr fmt={format:#x} stride={stride} cstride={cstride} step={chroma_step}");
+        eprintln!("[ahb] lockYCbCr fmt={format:#x} stride={stride} cstride={cstride} step=1 (non-YUV)");
     }
     0
 }
@@ -1335,20 +1450,46 @@ pub unsafe extern "C" fn AHardwareBuffer_lockPlanes(
     // (`void*` + three `u32` + padding).
     let out = out_planes as *mut u8;
     std::ptr::write_bytes(out, 0, 8 + 4 * 24);
-    *(out as *mut u32) = 1;
-    let plane = out.add(8);
-    *(plane as *mut *mut c_void) = addr;
-    *(plane.add(8) as *mut u32) = b.desc.stride * 4;
-    *(plane.add(12) as *mut u32) = b.desc.stride * 4;
-    *(plane.add(16) as *mut u32) = 4;
+    let layout = plane_layout(&b.desc);
+    *(out as *mut u32) = layout.count;
+    for (index, plane) in layout.planes.iter().take(layout.count as usize).enumerate() {
+        let entry = out.add(8 + index * 24);
+        *(entry as *mut *mut c_void) =
+            (addr as *mut u8).add(plane.offset) as *mut c_void;
+        *(entry.add(8) as *mut u32) = plane.row_stride as u32;
+        *(entry.add(12) as *mut u32) = plane.row_stride as u32;
+        *(entry.add(16) as *mut u32) = plane.pixel_stride;
+    }
     0
 }
 
-/// `AHardwareBuffer_isSupported(desc)` — every format we back with a memfd is
-/// supported, so this always answers 1.
+/// Whether [`plane_layout`] models `format` rather than falling back to 4 bytes
+/// per pixel.
+fn supported_format(format: u32) -> bool {
+    matches!(
+        format,
+        FORMAT_RGBA_8888
+            | FORMAT_RGBX_8888
+            | FORMAT_RGB_565
+            | FORMAT_RGBA_F16
+            | FORMAT_YCRCB_420_SP
+            | FORMAT_YCBCR_420_888
+            | FORMAT_YV12
+    )
+}
+
+/// `AHardwareBuffer_isSupported(desc)`.
+///
+/// Only the formats with real plane geometry are reported as supported. The
+/// implementation is still permissive in `AHardwareBuffer_allocate` (an unknown
+/// format gets a packed 4-byte plane), but advertising that as *supported* made
+/// callers skip their fallback and then read a buffer with the wrong stride.
 #[no_mangle]
-pub unsafe extern "C" fn AHardwareBuffer_isSupported(_desc: *const HardwareBufferDesc) -> i32 {
-    1
+pub unsafe extern "C" fn AHardwareBuffer_isSupported(desc: *const HardwareBufferDesc) -> i32 {
+    if desc.is_null() {
+        return 0;
+    }
+    i32::from(supported_format((*desc).format))
 }
 
 /// `AHardwareBuffer_getNativeHandle(buffer)`.
@@ -1609,6 +1750,110 @@ mod tests {
         unsafe {
             assert_eq!(_ZN7android19GraphicBufferMapper10freeBufferEPK13native_handle(
                 std::ptr::null_mut(), out), 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod plane_layout_tests {
+    use super::*;
+
+    fn desc(width: u32, height: u32, format: u32, stride: u32) -> HardwareBufferDesc {
+        HardwareBufferDesc { width, height, layers: 1, format, stride, ..Default::default() }
+    }
+
+    #[test]
+    fn packed_rgb_is_one_plane_with_its_pixel_size() {
+        let rgba = plane_layout(&desc(4, 2, FORMAT_RGBA_8888, 5));
+        assert_eq!((rgba.count, rgba.total), (1, 40));
+        assert_eq!((rgba.planes[0].row_stride, rgba.planes[0].pixel_stride), (20, 4));
+
+        let rgb565 = plane_layout(&desc(4, 2, FORMAT_RGB_565, 4));
+        assert_eq!((rgb565.total, rgb565.planes[0].pixel_stride), (16, 2));
+
+        let f16 = plane_layout(&desc(4, 2, FORMAT_RGBA_F16, 4));
+        assert_eq!((f16.total, f16.planes[0].pixel_stride), (64, 8));
+    }
+
+    #[test]
+    fn layers_multiply_the_allocation_size() {
+        let mut layered = desc(4, 4, FORMAT_RGBA_8888, 4);
+        layered.layers = 3;
+        assert_eq!(plane_layout(&layered).total, 4 * 4 * 4 * 3);
+    }
+
+    #[test]
+    fn nv12_and_nv21_share_chroma_rows_but_swap_the_planes() {
+        let nv12 = plane_layout(&desc(4, 4, FORMAT_YCBCR_420_888, 4));
+        assert_eq!(nv12.count, 3);
+        assert_eq!(nv12.total, 24, "4:2:0 needs 1.5 bytes per pixel");
+        assert_eq!(
+            (nv12.planes[0].offset, nv12.planes[1].offset, nv12.planes[2].offset),
+            (0, 16, 17)
+        );
+        for plane in &nv12.planes[1..3] {
+            assert_eq!((plane.row_stride, plane.pixel_stride), (4, 2));
+        }
+
+        let nv21 = plane_layout(&desc(4, 4, FORMAT_YCRCB_420_SP, 4));
+        assert_eq!(
+            (nv21.planes[1].offset, nv21.planes[2].offset),
+            (17, 16),
+            "NV21 is Cr-first"
+        );
+        assert_eq!(nv21.total, nv12.total);
+    }
+
+    #[test]
+    fn yv12_has_planar_chroma_with_u_after_v() {
+        let yv12 = plane_layout(&desc(4, 4, FORMAT_YV12, 4));
+        assert_eq!(yv12.count, 3);
+        assert_eq!(yv12.total, 24);
+        assert_eq!(
+            (yv12.planes[1].offset, yv12.planes[2].offset),
+            (20, 16),
+            "Cb (U) follows Cr (V)"
+        );
+        assert_eq!(yv12.planes[1].row_stride, 2, "half the luma stride");
+        assert_eq!(yv12.planes[1].pixel_stride, 1);
+    }
+
+    #[test]
+    fn only_modelled_formats_are_advertised_as_supported() {
+        for format in [FORMAT_RGBA_8888, FORMAT_RGBX_8888, FORMAT_RGB_565, FORMAT_RGBA_F16,
+                       FORMAT_YCRCB_420_SP, FORMAT_YCBCR_420_888, FORMAT_YV12] {
+            assert_eq!(
+                unsafe { AHardwareBuffer_isSupported(&desc(8, 5, format, 8)) },
+                1,
+                "format {format:#x} has a real plane layout"
+            );
+        }
+        assert_eq!(unsafe { AHardwareBuffer_isSupported(&desc(8, 5, 0x2b, 8)) }, 0);
+        assert_eq!(unsafe { AHardwareBuffer_isSupported(std::ptr::null()) }, 0);
+    }
+
+    #[test]
+    fn allocation_size_covers_every_plane() {
+        for format in [
+            FORMAT_RGBA_8888,
+            FORMAT_RGBX_8888,
+            FORMAT_RGB_565,
+            FORMAT_RGBA_F16,
+            FORMAT_YCBCR_420_888,
+            FORMAT_YCRCB_420_SP,
+            FORMAT_YV12,
+        ] {
+            let layout = plane_layout(&desc(8, 5, format, 8));
+            for plane in layout.planes.iter().take(layout.count as usize) {
+                let rows = if layout.count == 3 { 5 / 2 } else { 5 };
+                let last = plane.offset + plane.row_stride * (rows - 1) + plane.pixel_stride as usize;
+                assert!(
+                    last <= layout.total,
+                    "format {format:#x} plane ends at {last}, allocation is {}",
+                    layout.total
+                );
+            }
+            assert_eq!(bytes_for(&desc(8, 5, format, 8)), layout.total);
         }
     }
 }

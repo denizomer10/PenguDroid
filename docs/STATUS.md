@@ -2,6 +2,48 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
+## Current handoff — Intel BSP compatibility pass (2026-11-02)
+
+The [Intel Edge AOSP BSP](https://github.com/edge-aosp-bsp) was analysed against
+this runtime across its Binder/HAL, Mesa, Vulkan, EGL, gralloc and memory
+components. The full report, reuse matrix and roadmap are in
+[INTEL_BSP_COMPATIBILITY.md](INTEL_BSP_COMPATIBILITY.md).
+
+Short version: the BSP is a bare-metal Android 16 product, while PenguDroid is a
+Linux-hosted, unprivileged Android 17/API 37 runtime with no general HAL service
+manager. Its gralloc/HWC/media/boot implementations are not portable; the
+reusable part is the contract layer. Measured API-37 facts used in the report:
+
+* the sysroot still ships HIDL gralloc mapper 2.0/3.0/4.0 **and** the AIDL
+  `allocator-V2-ndk` / `graphics.common-V7` libraries, so HIDL is deprecated but
+  not removed;
+* memtrack and power clients are AIDL (`memtrack-V1-ndk`, `power-V7-ndk`), while
+  the BSP's MemTrack is a legacy `hw_module` and Intel's power AIDL is frozen at
+  v5;
+* API-37 `libui` probes Gralloc5, then Gralloc4, and only falls back to
+  Gralloc3/2 when `android_get_device_api_level() <= 35`;
+* ANGLE (`libEGL_angle.so`) is present, so GLES routing must not assume Mesa.
+
+**Implemented and tested from that analysis:** `pengudroid-shim` now derives a
+gralloc-style plane layout for `AHardwareBuffer` (RGBA/RGBX/RGB565/F16 plus
+NV12/NV21/YV12), so allocation size, `lockPlanes`, `lockYCbCr` and
+`bytesPerPixel` agree on plane offsets and row/pixel strides; the old code
+always reported one plane at `stride * 4`. `AHardwareBuffer_isSupported` now
+advertises only the formats with real geometry.
+
+Validation: `cargo test -p pengudroid-shim --offline --lib` **148 passed**;
+`cargo test -p pengudroid-cli --offline` **94 passed** (80 + 7 + 2 + 3 + 2).
+
+### BBR2 native loading (same branch)
+
+The merged TLS/proxy work plus this branch's changes now get past "library not
+found": `libfmod.so` and `libfmodstudio.so` load through
+`NativeBridgeLoadLibraryExt`, and `libSDL3.so` enters the guest linker and runs
+its constructors. The remaining gap is speed, not discovery: in
+`BERBERIS_MODE=interpret-only` the SDL3 load did not return within 45 s, so no
+game frame has been observed. `docs/STATUS.md`'s older "libc proxy still blocks"
+heading below is historical; the proxy and TLS blockers are fixed.
+
 ## Current handoff — TLS fault fixed; libc proxy still blocks BBR2 (2026-11-01)
 
 **Android 17 / API 37 / x86_64 only on the host.** Focus is Beach Buggy Racing 2
