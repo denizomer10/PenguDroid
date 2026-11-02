@@ -68,6 +68,21 @@ Gralloc3/2 when `android_get_device_api_level() <= 35` (`docs/STATUS.md`,
 
 ## 3. What the BSP actually contains
 
+### 3.0 Binder and HAL plumbing
+
+Binder is not an Intel component: the BSP uses AOSP's kernel binder driver and
+`libbinder`. What Intel adds is a set of HAL services plus their interface
+definitions (`vendor-hardware-interfaces`: power v1-v5, thermal v1-v2, sensors,
+health, lights, USB, boot, EVS). Those services are started by `init`,
+registered with `hwservicemanager`/`servicemanager`, and require kernel binder.
+
+PenguDroid has neither kernel binder (on desktops without
+`CONFIG_ANDROID_BINDER_IPC`) nor a HAL service manager; it runs a userspace
+binder broker with hand-written replies (`crates/pengudroid-daemon/src/services.rs`,
+`stubs.rs`). A BSP HAL `.so` therefore cannot be dropped in and started. The
+reusable artifact is the **interface version**, not the service.
+
+
 ### 3.1 gralloc: minigbm
 
 * `cros_gralloc/cros_gralloc_handle.h` defines the allocation as one packed
@@ -225,12 +240,26 @@ order, allocation coverage for every plane, and the `isSupported` filtering.
 
 ## 8. Digitalis / Berberis (ARM64 → x86-64)
 
-The bridge work is tracked separately in `docs/NATIVE_BRIDGE.md` and
-`docs/STATUS.md`. The BSP does not carry a different translator: Digitalis is
-the upstream project PenguDroid builds (`libberberis_arm64.so`,
-`libberberis_proxy_libc.so`). The BSP's contribution here is none; the relevant
-compatibility facts are the same guest linker config, TLS adapter and proxy
-loader documented in `STATUS.md`. No BSP change is required for the ARM64 path.
+The bridge work is tracked in `docs/NATIVE_BRIDGE.md` and `docs/STATUS.md`. The
+BSP does not carry a translator of its own: Digitalis is the upstream project
+PenguDroid builds (`libberberis_arm64.so`, `libberberis_proxy_libc.so`), so
+there is nothing to import from Intel here.
+
+Measured state on this checkout:
+
+* the translator loads through ART's `NativeBridgeItf`, and guest execution
+  works only with the TLS adapter (`PENGUDROID_BRIDGE_TLS=1`,
+  `BERBERIS_FLAGS=glibc-host-thread-id-handoff`), which removes the Bionic
+  `__get_tls()` fault at `si_addr=0xfa9`;
+* the de-Bionic libc proxy needs its `dlopen` patched to
+  `RTLD_NOW | RTLD_GLOBAL` because glibc rejects `RTLD_GLOBAL` alone;
+* BBR2 now reaches `SDLActivity`; `libfmod.so` and `libfmodstudio.so` load
+  through `NativeBridgeLoadLibraryExt`, and `libSDL3.so` enters the guest
+  linker. In interpret-only mode that load is still too slow to finish inside a
+  45 s smoke run, so no game frame has been observed.
+
+None of this depends on the Intel BSP; the BSP analysis and the bridge work are
+independent tracks.
 
 ## 9. Open questions
 
