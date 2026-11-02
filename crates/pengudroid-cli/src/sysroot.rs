@@ -853,6 +853,7 @@ pub fn art_test(args: &[String]) -> i32 {
         compat.display(),
         layout.ld_library_path()
     );
+    let mut native_lib_dirs = Vec::new();
     // `System.loadLibrary` ends up in `dlopen`, and glibc does not know about
     // the class loader's native library directories (that is an Android linker
     // feature), so the app's own `lib/<abi>/*.so` have to be on
@@ -864,10 +865,17 @@ pub fn art_test(args: &[String]) -> i32 {
         } else {
             info.package.clone()
         };
-        let dir = std::env::temp_dir().join(format!("pengudroid-libs/{package}"));
+        let native_abi = if std::env::var_os("PENGUDROID_NATIVE_BRIDGE_LIB").is_some() {
+            "arm64-v8a"
+        } else {
+            "x86_64"
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "pengudroid-libs/{package}/lib/{native_abi}"
+        ));
         let _ = std::fs::create_dir_all(&dir);
         if let Ok(libs) = crate::apk::native_libs(&apk) {
-            for lib in libs.iter().filter(|l| l.abi == "x86_64") {
+            for lib in libs.iter().filter(|l| l.abi == native_abi) {
                 let dest = dir.join(&lib.file);
                 if dest.exists() {
                     continue;
@@ -882,6 +890,7 @@ pub fn art_test(args: &[String]) -> i32 {
             }
         }
         ld_path = format!("{}:{ld_path}", dir.display());
+        native_lib_dirs.push(dir);
     }
     if let Some(dir) = &bridge_lib {
         // The translator is a normal x86-64 `.so` but carries Bionic VERNEED
@@ -956,6 +965,12 @@ pub fn art_test(args: &[String]) -> i32 {
         // them, and the host lays the window frame out against the same numbers.
         .env("PENGUDROID_SURFACE_W", "720")
         .env("PENGUDROID_SURFACE_H", "1280");
+    if !native_lib_dirs.is_empty() {
+        let dirs = std::env::join_paths(&native_lib_dirs)
+            .map_err(|e| format!("cannot encode native library directories: {e}"))
+            .unwrap_or_default();
+        cmd.env("PENGUDROID_NATIVE_LIB_DIRS", dirs);
+    }
     if let Some(bridge) = &native_bridge {
         // Enabling the bridge is pure property configuration, exactly as on a
         // device: ART's libnativebridge dlopens the named library and reads its
@@ -1014,6 +1029,28 @@ type CreateJavaVM =
 const JNI_VERSION_1_6: c_int = 0x0001_0006;
 const JNI_OK: c_int = 0;
 const JNI_ERR: c_int = -1;
+
+/// The VM's `java.library.path`: the sysroot's public libraries plus the app's
+/// own extracted `lib/<abi>` directories.
+///
+/// `LoadedApk` puts `java.library.path` into the class loader's library search
+/// path, and `libnativeloader` decides whether a class loader namespace is
+/// bridged by looking for `/lib/arm64` in that path (`NativeBridgeIsPathSupported`).
+/// Without the app directory there, the namespace is created as a *host*
+/// namespace and `System.loadLibrary` reaches glibc, which cannot load an
+/// ARM64 guest library.
+fn java_library_path(layout: &Layout) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(dirs) = std::env::var_os("PENGUDROID_NATIVE_LIB_DIRS") {
+        parts.extend(
+            std::env::split_paths(&dirs)
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.display().to_string()),
+        );
+    }
+    parts.push(layout.ld_library_path());
+    parts.join(":")
+}
 
 /// `pengudroid __art --sysroot <dir>` — load libart and try to start a VM.
 pub fn art_main(args: &[String]) -> i32 {
@@ -1176,7 +1213,7 @@ pub fn art_main(args: &[String]) -> i32 {
         // `framework/x86_64/x86_64/boot.art` and miss.
         CString::new(format!("-Ximage:{}", layout.framework.join("boot.art").display()))
             .unwrap_or_default(),
-        CString::new(format!("-Djava.library.path={}", layout.ld_library_path())).unwrap_or_default(),
+        CString::new(format!("-Djava.library.path={}", java_library_path(&layout))).unwrap_or_default(),
         CString::new(format!("-Xmx{xmx}")).unwrap_or_default(),
     ];
     for opt in &vm_extra {
@@ -2101,9 +2138,16 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) -> bool 
     } else {
         info.package.clone()
     };
+    let native_abi = if std::env::var_os("PENGUDROID_NATIVE_BRIDGE_LIB").is_some() {
+        "arm64-v8a"
+    } else {
+        "x86_64"
+    };
     let apk_path = std::path::PathBuf::from(&apk);
     let data_dir = std::env::temp_dir().join(format!("pengudroid-data/{package}"));
-    let lib_dir = std::env::temp_dir().join(format!("pengudroid-libs/{package}"));
+    let lib_dir = std::env::temp_dir().join(format!(
+        "pengudroid-libs/{package}/lib/{native_abi}"
+    ));
     // `handleBindApplication` creates `code_cache` under the data directory and
     // logs "Data directory doesn't exist" (plus a stack trace) when the parent
     // is missing, so lay the tree out the way the framework expects.
@@ -2160,14 +2204,14 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) -> bool 
         }
     }
     if extracted > 0 {
-        println!("apphost: extracted {extracted} x86_64 native libraries");
+        println!("apphost: extracted {extracted} {native_abi} native libraries");
     } else if std::fs::read_dir(&lib_dir).map(|d| d.count()).unwrap_or(0) == 0 {
         // Only when the directory really ends up empty: this runs more than once
         // per launch, and on the second call every file already exists, which is
         // not a problem. An empty `lib/` is, because `System.loadLibrary` then
         // fails silently and every `native*` method is an UnsatisfiedLinkError.
         eprintln!(
-            "apphost: no x86_64 native libraries in {} (classpath: {})",
+            "apphost: no {native_abi} native libraries in {} (classpath: {})",
             lib_dir.display(),
             classpath.join(":")
         );
@@ -2204,6 +2248,7 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) -> bool 
         splits: &splits,
         data_dir: &data_dir,
         native_lib_dir: &lib_dir,
+        native_abi,
         target_sdk: app_target_sdk(info.target_sdk),
         min_sdk: info.min_sdk.map(|v| v as i32).unwrap_or(23),
         app_class: info.application_class.as_deref(),

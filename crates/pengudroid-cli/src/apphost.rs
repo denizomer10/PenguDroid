@@ -66,6 +66,9 @@ pub struct AppSpec<'a> {
     pub splits: &'a [std::path::PathBuf],
     pub data_dir: &'a Path,
     pub native_lib_dir: &'a Path,
+    /// ABI whose native libraries were selected for this launch. An ARM64
+    /// guest uses the native bridge instead of the host's x86_64 ABI.
+    pub native_abi: &'a str,
     pub target_sdk: i32,
     pub min_sdk: i32,
     /// `android:name` of the `<application>` element, if the manifest has one.
@@ -172,7 +175,7 @@ fn build_app_info(env: &JniEnv, spec: &AppSpec<'_>) -> Option<JObject> {
         &spec.data_dir.display().to_string(),
     );
     set_str("nativeLibraryDir", &spec.native_lib_dir.display().to_string());
-    set_str("primaryCpuAbi", "x86_64");
+    set_str("primaryCpuAbi", spec.native_abi);
     set_int("targetSdkVersion", spec.target_sdk);
     set_int("minSdkVersion", spec.min_sdk);
     set_int("uid", spec.uid);
@@ -6192,7 +6195,6 @@ fn install_class_loader_on(env: &JniEnv, loaded_apk: JObject, apk: &Path, native
         eprintln!("apphost: PathClassLoader construction threw");
         return false;
     };
-
     let mut installed = false;
     for field in ["mClassLoader", "mDefaultClassLoader"] {
         if let Some(id) = env.field_id(apk_class, field, "Ljava/lang/ClassLoader;") {
@@ -6201,6 +6203,17 @@ fn install_class_loader_on(env: &JniEnv, loaded_apk: JObject, apk: &Path, native
         }
     }
     if installed {
+        // LoadedApk computes the class-loader namespace from mLibDir during
+        // application binding. The hosted framework created this object before
+        // we install the APK's PathClassLoader, so keep its native-library
+        // directory in sync or isolated `System.loadLibrary` cannot see the
+        // extracted guest libraries.
+        if let Some(id) = env.field_id(apk_class, "mLibDir", "Ljava/lang/String;") {
+            let lib_dir = env.new_string(&native_lib_dir.display().to_string());
+            env.set_object_field(loaded_apk, id, lib_dir);
+        } else {
+            eprintln!("apphost: LoadedApk.mLibDir not found");
+        }
         println!("apphost: installed a PathClassLoader for {}", apk.display());
     }
     installed
@@ -6340,6 +6353,16 @@ fn probe_app_class(env: &JniEnv, data: JObject, name: &str) {
     if loader.is_null() {
         eprintln!("apphost: LoadedApk.getClassLoader returned null");
         return;
+    }
+    if let Some(base) = env.find_class("dalvik/system/BaseDexClassLoader") {
+        if let Some(get_ld) = env.method_id(base, "getLdLibraryPath", "()Ljava/lang/String;") {
+            if let Some(ld) = env
+                .call_object(loader, get_ld, &[])
+                .and_then(|s| env.get_string(s))
+            {
+                println!("apphost: app class loader getLdLibraryPath = {ld}");
+            }
+        }
     }
     let Some(loader_class) = env.find_class("java/lang/ClassLoader") else {
         return;
