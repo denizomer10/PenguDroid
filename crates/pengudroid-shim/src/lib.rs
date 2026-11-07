@@ -805,6 +805,7 @@ pub unsafe extern "C" fn android_dlopen_ext(
     extinfo: *const AndroidDlextinfo,
 ) -> *mut c_void {
     let mut path = cstr_lossy(filename);
+    path = resolve_app_library_path(path);
     if !extinfo.is_null() {
         let info = &*extinfo;
         if info.flags & ANDROID_DLEXT_USE_LIBRARY_FD != 0 {
@@ -1212,7 +1213,27 @@ pub unsafe extern "C" fn __loader_android_update_LD_LIBRARY_PATH(ld_library_path
 /// `__loader_dlopen(filename, flags)` — see `dlopen(3)`.
 #[no_mangle]
 pub unsafe extern "C" fn __loader_dlopen(filename: *const c_char, flags: c_int) -> *mut c_void {
-    libc::dlopen(filename, flags)
+    let path = resolve_app_library_path(cstr_lossy(filename));
+    let Ok(path) = CString::new(path) else {
+        return std::ptr::null_mut();
+    };
+    libc::dlopen(path.as_ptr(), flags)
+}
+
+fn resolve_app_library_path(name: String) -> String {
+    if name.is_empty() || name.contains('/') {
+        return name;
+    }
+    let Some(dirs) = std::env::var_os("PENGUDROID_NATIVE_LIB_DIRS") else {
+        return name;
+    };
+    for dir in std::env::split_paths(&dirs) {
+        let candidate = dir.join(&name);
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    name
 }
 
 /// `__loader_dlsym(handle, symbol)` — see `dlsym(3)`.
