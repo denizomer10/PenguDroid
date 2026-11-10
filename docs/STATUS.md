@@ -2,7 +2,76 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
-## Current handoff — `pthread_attr_t` ABI mismatch fixed; BBR2 now runs `SDL_main` (2026-11-04)
+## Current handoff — Beach Buggy Racing 2 boots into gameplay (2026-11-05)
+
+**Beach Buggy Racing 2 runs.** The splash, the loading path and live gameplay all
+render: a 120 s run presents 22,911 dma-bufs and the captured frames walk through
+the Vector Unit logo, the profile/update screens, the title screen and then a
+race in progress (car, track, HUD, lap counters).
+
+The blocker that had been recorded for weeks — "no GL at all" — **was a
+measurement error, not a rendering failure.** The game had been presenting
+frames the whole time. See "Why 'no GL at all' was wrong" below.
+
+### The actual last blocker: a hardcoded `versionName`
+
+`install_package_manager_replies` (`crates/pengudroid-cli/src/apphost.rs`)
+answered every `PackageInfo` with `versionName="1.0"`, `versionCode=1`. BBR2
+asks its update server for a minimum version and compares:
+
+    Important Update
+    Please update to the latest version of Beach Buggy Racing 2.
+    The minimum version is 2026.10.05. Your current version: 1.0.
+                        [ Update! Now ]
+
+Nothing is broken in the graphics stack — the game renders an ordinary dialog
+and then, correctly, refuses to continue. The manifest already carried the real
+values (`ApkInfo::version_name` / `version_code`); they were parsed and thrown
+away. `AppSpec` now carries them through to `PackageInfo`.
+
+Measured before/after on the same APK, from BBR2's own telemetry line:
+
+| build | `HttpConnection: Tenjin::connect params` | outcome |
+|-------|------------------------------------------|---------|
+| before | `app_version=1.0` | stuck on the update dialog for 110 s |
+| after | `app_version=2026.10.05, app_version_code=500` | straight into gameplay |
+
+The update dialog still flashes for ~0.5 s (the server reply arrives after the
+first frame), then dismisses itself.
+
+### Why "no GL at all" was wrong
+
+Two independent masking bugs made a working renderer look dead:
+
+1. **Success is silent.** gleshim logs *failures* (`log_once`) and traces only
+   when `PENGUDROID_TRACE_GLESHIM` is set. The old harness exported
+   `PENGUDROID_GL_TRACE`, which **does not exist in the Rust code** — so no GL
+   line ever appeared, no matter how well GL worked.
+2. **The daemon's success path is `debug!`.** `handle_present_dmabuf` logs
+   `presented dmabuf on surface N (WxH)` at debug level, which requires
+   `pengudroid-daemon -v`. `tools/smoke_bundle.py` spawned the daemon with a
+   hardcoded path and no arguments, so `-v` could not be passed at all.
+
+`smoke_bundle.py` now honours `PENGUDROID_DAEMON` and `PENGUDROID_DAEMON_ARGS`.
+With `PENGUDROID_DAEMON_ARGS=-v` the same 110 s run logged **83,736** successful
+presents.
+
+The `pixel format wanted SDL_PIXELFORMAT_UNKNOWN (0), got SDL_PIXELFORMAT_RGB565 (4)`
+line is also not an error: `Android_SetFormat()` is called *from*
+`SDL_EGL_CreateWindowSurface()` (`src/video/SDL_egl.c`) **after**
+`eglCreateWindowSurface()` has already succeeded; it only records what the
+window is backing. `format_wanted == 0` means the GL config's surface format was
+not recorded.
+
+### Looking at frames
+
+`PENGUDROID_DUMP_FRAME=<path>` (with `_AT`, `_EVERY`, `_NOFLIP`) writes
+`<path>.s<surface>frame<n>.ppm` from `glReadPixels` straight off the app's FBO.
+`frame 20` is legitimately black (pre-splash); frames from ~300 on show real
+content. This is the cheapest way to answer "does the game actually draw?"
+without guessing from logs.
+
+## Previous handoff — `pthread_attr_t` ABI mismatch fixed; BBR2 runs `SDL_main` (2026-11-04)
 
 Beach Buggy Racing 2 used to die ~13 s after launch inside berberis'
 `ScopedVirtualGuestCallFrame` constructor with `cpu->sp == 0x1001`. That was not

@@ -1,59 +1,134 @@
 # PenguDroid
 
-<img src="logo.png" alt="PenguDroid logo" width="180">
+<img src="logo.png" alt="PenguDroid logo" width="150" align="right">
 
 **A no-KVM, no-container, no-VM Android compatibility layer for Linux — in Rust.**
 
 PenguDroid runs Android applications as ordinary Linux processes. There is no
 virtual machine, no LXC/Waydroid-style container, no namespace sandbox, and no
 booted `system.img`. Like Wine/Proton translate Windows to POSIX, PenguDroid
-translates Android's user-space interfaces — binder, Bionic libc, the surface
-stack, audio — directly onto Linux primitives and onto the user's own session
-(Wayland, PipeWire, the host's Vulkan/GL drivers).
+translates Android's user-space interfaces — binder, Bionic libc, ART, the
+surface stack, audio — directly onto Linux primitives and onto the user's own
+session (Wayland, PipeWire, the host's Vulkan/GL drivers).
 
 A small always-on daemon (`pengudroid-daemon`, analogous to Proton's
 `wineserver`) brokers shared resources and stays resident; apps come and go as
 normal processes that you can see in `ps aux`.
 
-**Runtime target: Android 17 / API 37, x86_64 only.** Older runtime images are
+**Runtime target: Android 17 / API 37, x86_64 host.** Older runtime images are
 rejected, not used as fallback. APK minSdk/targetSdk remain application metadata.
-See [the current migration boundaries](docs/ANDROID17.md) and
-[status](docs/STATUS.md) before interpreting historical app screenshots/results.
-
-```
-$ pengudroid run app.apk
-package:      com.example.app
-targetSdk:    37
-main activity:com.example.app/.MainActivity
-started guest: pid 26829 (com.example.app)
-the window is live; press Ctrl-C to stop the guest
-
-$ pengudroid ps
-PID      PACKAGE                      SURFACE  COMPONENT
-26829    com.example.app              1        com.example.app/.MainActivity
-
-$ ps -eo pid,comm,args | grep pengudroid
-26822 pengudroid-daem  pengudroid-daemon --daemonize
-26829 pengudroid       pengudroid __guest --package com.example.app ...
-```
+See [the migration boundaries](docs/ANDROID17.md) and
+[status](docs/STATUS.md) before interpreting historical results.
 
 ---
 
-> **Where we are right now:** `docs/STATUS.md` is the up-to-date handoff note
-> (what runs, what does not, and the exact failure point of each attempt).
-> **Current target: API 37 only.** Earlier API-37 runs reached NewPipe UI and
-> PlayerService binding, but stable playback and hardware decoding are not yet
-> established. The API-37 runtime is absent from this checkout, so the latest
-> changes have host/source tests, not a new live NewPipe result. The included
-> Beach Buggy Racing 2 package has only ARM64 native libraries and needs a working
-> ARM64 execution path. Screenshots below record earlier milestones, not proof
-> that the current API-37 end-to-end goals are complete.
->
-> ![NewPipe running under PenguDroid](docs/screenshots/newpipe.png)
->
-> Two windows at once — NewPipe's own `AlertDialog` over the dimmed activity:
->
-> ![NewPipe dialog under PenguDroid](docs/screenshots/newpipe-dialog.png)
+## Two real apps, end to end
+
+Both of these are unmodified store builds running on a stock Linux desktop with
+no emulator, no container and no root.
+
+| Beach Buggy Racing 2 `2026.10.05` | NewPipe `v0.29.1` |
+|---|---|
+| ![Beach Buggy Racing 2 gameplay under PenguDroid](docs/screenshots/bbr2-race.png) | ![NewPipe live feed under PenguDroid](docs/screenshots/newpipe-live.png) |
+| A native ARM64 game: splash → update check → title → **a race in progress**. 22,911 dma-bufs presented in a 120 s run | A Java/ExoPlayer app: subclassed `Activity`, ViewPager, fragment pages, thumbnails fetched over the network |
+
+The frames above are not mock-ups or a static screenshot of a dead window: they
+were read back with `glReadPixels` from the app's own framebuffer while it ran,
+and are the same buffers the Wayland compositor received.
+
+Boot sequence of the game, one row at a time (Vector Unit logo → profile/update
+screens → title → race):
+
+![Beach Buggy Racing 2 boot sequence](docs/screenshots/bbr2-boot-sequence.png)
+
+```
+$ pengudroid run com.vectorunit.cobalt.googleplay.apkm
+package:       com.vectorunit.cobalt.googleplay
+version:       2026.10.05 (500)
+main activity: com.vectorunit.cobalt/.CobaltActivity
+started guest: pid 27241 (com.vectorunit.cobalt.googleplay)
+the window is live; press Ctrl-C to stop the guest
+```
+
+> **A note on the last millimetre.** The graphics stack was never the problem.
+> The game had been rendering for weeks; two logging bugs hid it (success is
+> silent in both the GL shim and the daemon), and the *actual* blocker was that
+> `PackageInfo.versionName` was hardcoded to `"1.0"`, so the game's update check
+> showed an "Important Update" dialog forever. Both are fixed and documented in
+> [STATUS.md](docs/STATUS.md) — a reminder that "no output" is a statement about
+> the instrumentation first, and the system second.
+
+## How it fits together
+
+```mermaid
+flowchart LR
+    subgraph guest["app process (ordinary Linux process)"]
+        apk["APK dex + lib/&lt;abi&gt;/*.so"]
+        art["ART (libart.so)"]
+        shim["libpengudroid_shim.so<br/>Bionic → glibc"]
+        gl["libEGL / libGLESv2 shim"]
+    end
+    subgraph daemon["pengudroid-daemon (resident)"]
+        broker["binder broker<br/>service table"]
+        wl["Wayland broker<br/>xdg-shell + linux-dmabuf"]
+        audio["PipeWire ring"]
+        props["property store"]
+    end
+    host["host GPU (Mesa/NVIDIA)<br/>Wayland compositor<br/>pw-cat"]
+
+    apk --> art --> shim
+    gl -- dma-buf --- wl
+    shim -- transactions --> broker
+    shim -- getprop/setprop --> props
+    shim -- PCM --> audio
+    wl --> host
+    audio --> host
+```
+
+Java code runs on a real ART, loaded in-process as a host library. Native code
+runs either directly (x86_64 APKs) or through Intel's NDK translation
+(aarch64 APKs). Everything the framework expects from `system_server` — binder
+services, package info, activity lifecycle, window relayout, audio — is answered
+by the daemon and by the CLI's `apphost`.
+
+## Quick start
+
+```sh
+# 1. Build
+cargo build --release          # pengudroid, pengudroid-daemon, libpengudroid_shim.so
+
+# 2. Check an APK without running it
+./target/release/pengudroid info app.apk
+./target/release/pengudroid doctor app.apk
+
+# 3. Run it. The daemon starts on demand.
+./target/release/pengudroid run app.apk
+
+# 4. See what is running
+./target/release/pengudroid ps
+./target/release/pengudroid stop
+```
+
+The runtime needs an extracted Android 17 system tree (ART, framework jars, the
+codec2 services) and an ARM64 guest sysroot for aarch64 apps; both are prepared
+by the scripts in `tools/` and described in
+[ANDROID17.md](docs/ANDROID17.md). `pengudroid launch` keeps one prefix per
+package, like Proton.
+
+## Where we are right now
+
+`docs/STATUS.md` is the up-to-date handoff note: exactly what runs, what does
+not, and the failure point of each attempt.
+
+* **Working:** daemon/lifecycle, binder broker, property store, ART in-process,
+  activity lifecycle driven from the host, hwui drawing, dma-buf presentation,
+  pointer/keyboard input, MediaCodec (ByteBuffer + Surface), AudioTrack,
+  OpenSL ES, PipeWire audio, app services, Play bundles (`.apkm`/`.xapk`).
+* **In progress:** hardware video decode integration, full window/layer
+  association, host IME composition.
+* **Not there yet:** `AHardwareBuffer`/gralloc allocation, camera, stable aarch64
+  translation for every game engine. The honest list is in
+  [LIMITATIONS.md](docs/LIMITATIONS.md).
 
 ## Status: what actually works vs. what is stubbed
 
@@ -206,7 +281,7 @@ pengudroid audio-test --tone
 pengudroid ps
 pengudroid services
 pengudroid getprop                           # every property
-pengudroid getprop ro.build.version.sdk      # -> 36
+pengudroid getprop ro.build.version.sdk      # -> 37
 pengudroid setprop debug.pengudroid 1
 pengudroid status
 pengudroid stop
@@ -409,8 +484,19 @@ docs/
 ## Testing
 
 ```sh
+# Rust: protocol, ELF, shim, daemon, CLI and the end-to-end native path.
 cargo test --workspace
+
+# Python: the build/tooling pipeline (linkers, stubs, native bridge, AppImage).
+cd tools
+PENGUDROID_LLVM_DIR=$PWD/../.toolchain/llvm-bin \
+LD_LIBRARY_PATH=$PWD/../.toolchain/llvm-22-root/usr/lib \
+    python3 -m unittest discover -s .
 ```
+
+Both suites are green: 388 Rust tests and 242 Python tests. The Python tests
+compile real ARM64 guests and link the native bridge, so they need the pinned
+LLVM 22 toolchain in `.toolchain/`; without it they skip rather than fail.
 
 Unit tests cover the wire protocol round-trips, `SCM_RIGHTS` fd passing, socket
 timeouts, ashmem sealing, binder ioctl-number correctness, the property store,

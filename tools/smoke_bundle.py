@@ -25,7 +25,11 @@ extra = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv[2:] else []
 duration = int(os.environ.get("SMOKE_SECONDS", "45"))
 socket = work / "daemon.sock"
 env = dict(os.environ)
-env.setdefault("PENGUDROID_SOCKET", str(socket))
+# The run owns a private daemon on this socket, so an inherited
+# `PENGUDROID_SOCKET` must not win: pointing the guest at a socket nobody
+# listens on makes the blast surface path log "daemon unavailable; frames will
+# be dropped" and the run looks like a rendering failure.
+env["PENGUDROID_SOCKET"] = str(socket)
 processes = []
 result = {"bundle": str(bundle), "runtime": "Android 17 / API 37 x86_64", "samples": []}
 
