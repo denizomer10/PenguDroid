@@ -299,7 +299,7 @@ pub fn assess(facts: &Facts) -> Vec<Requirement> {
         out.push(requirement(
             "Keyboard and mouse controls",
             Status::Partial,
-            "a built-in keymap exists (WASD joystick, multi-touch); print it with \
+            "a built-in keymap exists (WASD joystick, mouse-look, multi-touch); print it with \
              `pengudroid keymap-preset`. Positions are approximate until checked in the game",
         ));
     }

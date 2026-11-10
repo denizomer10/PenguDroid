@@ -745,6 +745,30 @@ fn handle(
             }
         }
 
+        Message::SetPointerLock { surface_id, locked } => {
+            let mut graphics = daemon.graphics.lock().unwrap();
+            // `0` means "my window that has the focus": an app can own several
+            // surfaces (video layers, dialogs) and only the focused one can
+            // hold an active lock.
+            let surface_id = if surface_id != 0 {
+                surface_id
+            } else if locked {
+                graphics.as_ref().and_then(|gfx| gfx.focused_surface()).unwrap_or(0)
+            } else {
+                // Releasing must work after the focus moved elsewhere.
+                graphics.as_ref().and_then(|gfx| gfx.pointer_lock_surface()).unwrap_or(0)
+            };
+            if !locked && surface_id == 0 {
+                // Nothing is locked: the release is already true.
+                return (Some(Message::Ack), vec![], false);
+            }
+            let owned = daemon.surface_owner.lock().unwrap().get(&surface_id).copied() == Some(peer.pid);
+            let ok = owned && graphics.as_mut().is_some_and(|gfx| gfx.set_pointer_lock(surface_id, locked));
+            if ok { (Some(Message::Ack), vec![], false) } else {
+                (Some(Message::Error { code: -95, message: "the pointer cannot be locked: the surface is not this process's, or the compositor lacks pointer-constraints/relative-pointer".into() }), vec![], false)
+            }
+        }
+
         Message::SetSubsurfacePosition { surface_id, x, y } => {
             let mut guard = daemon.graphics.lock().unwrap();
             let ok = match guard.as_mut() {

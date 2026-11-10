@@ -4811,6 +4811,22 @@ fn spawn_input_pump(env: &JniEnv) {
                 env.call_void(root, dispatch, &[JValue { l: event }]);
             }
         };
+        // Mouse-look needs the compositor to lock the pointer; the gleshim
+        // owns the daemon connection, so the request goes through it.
+        let pointer_lock: Option<unsafe extern "C" fn(i32) -> i32> = {
+            let sym = unsafe {
+                libc::dlsym(
+                    libc::RTLD_DEFAULT,
+                    b"pengudroid_pointer_lock\0".as_ptr() as *const libc::c_char,
+                )
+            };
+            (!sym.is_null()).then(|| unsafe { std::mem::transmute(sym) })
+        };
+        // Whether the pointer is locked right now, as far as this side knows.
+        let mut pointer_locked = false;
+        let mut last_look_motion = std::time::Instant::now();
+        // How long the mouse must rest before the camera finger is lifted.
+        const LOOK_IDLE: std::time::Duration = std::time::Duration::from_millis(150);
         // Run a mapped binding for a key or mouse-button edge.
         let run_binding = |action: &pengudroid_input::keymap::Action,
                            code: u16,
@@ -4866,6 +4882,11 @@ fn spawn_input_pump(env: &JniEnv) {
                 trace_surface_views(&env);
             }
             if unsafe { poll(buf.as_mut_ptr()) } == 0 {
+                if mapped_held.look_finger_down() && last_look_motion.elapsed() >= LOOK_IDLE {
+                    for step in mapped_held.look_idle() {
+                        send_touch(step.event);
+                    }
+                }
                 std::thread::sleep(std::time::Duration::from_millis(8));
                 continue;
             }
@@ -4895,6 +4916,38 @@ fn spawn_input_pump(env: &JniEnv) {
                 if let Some(map) = &keymap {
                     if let Some(action) = map.action_for(a as u16) {
                         run_binding(action, a as u16, b != 0.0, &mut mapped_held);
+                        // A `look` binding toggles mouse-look; keep the
+                        // compositor's pointer lock in step with it.
+                        if mapped_held.look_active() != pointer_locked {
+                            let want = mapped_held.look_active();
+                            let ok = pointer_lock
+                                .is_some_and(|lock| unsafe { lock(i32::from(want)) } != 0);
+                            if want && !ok {
+                                // No lock means no relative motion: leaving
+                                // the mode on would only swallow the mouse.
+                                for step in mapped_held.look_cancel() {
+                                    send_touch(step.event);
+                                }
+                                eprintln!(
+                                    "input: mouse-look is unavailable (the compositor did not \
+                                     lock the pointer)"
+                                );
+                            } else {
+                                pointer_locked = want;
+                                println!("input: mouse-look {}", if want { "on" } else { "off" });
+                                if want && pressed {
+                                    // The left button was mid-drag as a touch;
+                                    // its release now belongs to mouse-look, so
+                                    // lift that finger here.
+                                    pressed = false;
+                                    send_touch(crate::keymap_gesture::Event::Up {
+                                        id: crate::keymap_gesture::MOUSE_POINTER,
+                                        x: last.0,
+                                        y: last.1,
+                                    });
+                                }
+                            }
+                        }
                         continue;
                     }
                 }
@@ -4931,9 +4984,23 @@ fn spawn_input_pump(env: &JniEnv) {
                 }
                 continue;
             }
+            // Relative motion only arrives while the pointer is locked.
+            if tag == 7 {
+                last_look_motion = std::time::Instant::now();
+                for step in mapped_held.look_motion(a, b) {
+                    send_touch(step.event);
+                }
+                continue;
+            }
             // A mouse button other than the left one can carry a binding
-            // (`MOUSE_RIGHT = tap ...`); unbound, it is ignored as before.
-            if tag == 4 && a as u32 != 0x110 {
+            // (`MOUSE_RIGHT = tap ...`); unbound, it is ignored as before. The
+            // left button is the touch itself — except in mouse-look, where
+            // there is no cursor to touch with and its binding applies.
+            // (A left-button binding pressed in mouse-look is also released
+            // through here if the mode was switched off while it was held.)
+            if tag == 4
+                && (a as u32 != 0x110 || mapped_held.look_active() || mapped_held.is_down(0x110))
+            {
                 if let Some(action) = keymap.as_ref().and_then(|m| m.action_for(a as u16)) {
                     run_binding(action, a as u16, b != 0.0, &mut mapped_held);
                 }

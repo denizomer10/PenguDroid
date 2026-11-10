@@ -42,6 +42,18 @@ pub enum Action {
         y1: f32,
         steps: u32,
     },
+    /// Toggle mouse-look: the pointer is locked and its motion drags a finger
+    /// around `(cx, cy)`, which is how a touch game turns its camera.
+    ///
+    /// The finger is lifted and put back on the centre whenever it strays more
+    /// than `radius` away, so the camera can turn forever inside a small area.
+    /// `sensitivity` is guest pixels per unit of mouse motion.
+    Look {
+        cx: f32,
+        cy: f32,
+        radius: f32,
+        sensitivity: f32,
+    },
     /// One direction of a virtual joystick centred on `(cx, cy)`.
     ///
     /// Keys that share a centre and radius drive the same finger.
@@ -146,6 +158,9 @@ impl Keymap {
                 Action::Stick { cx, cy, radius, dir } => {
                     format!("stick {cx} {cy} {radius} {}", dir.name())
                 }
+                Action::Look { cx, cy, radius, sensitivity } => {
+                    format!("look {cx} {cy} {radius} {sensitivity}")
+                }
             };
             out.push_str(&format!("{key} = {action}\n"));
         }
@@ -206,6 +221,22 @@ fn parse_action(text: &str) -> Result<Action, String> {
                 _ => Err("swipe needs x0 y0 x1 y1 [steps]; steps must be an integer from 1 to 240".into()),
             }
         }
+        "look" => {
+            const USAGE: &str = "look needs cx cy radius [sensitivity]";
+            let n = nums()?;
+            let (cx, cy, radius, sensitivity) = match n.as_slice() {
+                [cx, cy, radius] => (*cx, *cy, *radius, 1.0),
+                [cx, cy, radius, sensitivity] => (*cx, *cy, *radius, *sensitivity),
+                _ => return Err(USAGE.into()),
+            };
+            if radius < 1.0 {
+                return Err("look radius must be at least 1".into());
+            }
+            if !(0.01..=100.0).contains(&sensitivity) {
+                return Err("look sensitivity must be between 0.01 and 100".into());
+            }
+            Ok(Action::Look { cx, cy, radius, sensitivity })
+        }
         "stick" => {
             const USAGE: &str = "stick needs cx cy radius up|down|left|right";
             let [cx, cy, radius, dir] = words.as_slice() else {
@@ -231,7 +262,8 @@ fn parse_action(text: &str) -> Result<Action, String> {
     }
 }
 
-/// `BTN_LEFT`: the primary button. It is the touch pointer, so it cannot be bound.
+/// `BTN_LEFT`: the primary button. It is the touch pointer; a binding for it
+/// takes effect only while mouse-look is on.
 pub const BTN_LEFT: u16 = 0x110;
 pub const BTN_RIGHT: u16 = 0x111;
 pub const BTN_MIDDLE: u16 = 0x112;
@@ -327,6 +359,10 @@ pub fn keycode(name: &str) -> Option<u16> {
         // Mouse buttons other than the left one, which is the touch itself.
         // They share the keycode space (`BTN_RIGHT`, `BTN_MIDDLE`, ...), so a
         // binding can put attack on the right button the way a PC game does.
+        // The left button is the touch pointer, so its binding only applies
+        // while mouse-look has the pointer locked and there is no cursor to
+        // click with.
+        "MOUSE_LEFT" | "BTN_LEFT" => BTN_LEFT,
         "MOUSE_RIGHT" | "BTN_RIGHT" => BTN_RIGHT,
         "MOUSE_MIDDLE" | "BTN_MIDDLE" => BTN_MIDDLE,
         "MOUSE_SIDE" | "BTN_SIDE" => BTN_SIDE,
@@ -420,6 +456,7 @@ pub fn keyname(code: u16) -> String {
         (58, "CAPSLOCK"),
         (97, "RIGHTCTRL"),
         (100, "RIGHTALT"),
+        (BTN_LEFT, "MOUSE_LEFT"),
         (BTN_RIGHT, "MOUSE_RIGHT"),
         (BTN_MIDDLE, "MOUSE_MIDDLE"),
         (BTN_SIDE, "MOUSE_SIDE"),
@@ -528,6 +565,10 @@ SHIFT = swipe 400 800 700 800 12
         assert!(Keymap::parse("W = stick 1 2 3 north").is_err());
         assert!(Keymap::parse("W = stick 1 2 0 up").is_err());
         assert!(Keymap::parse("W = stick 1 2 3 up extra").is_err());
+        assert!(Keymap::parse("W = look 1 2").is_err());
+        assert!(Keymap::parse("W = look 1 2 0").is_err());
+        assert!(Keymap::parse("W = look 1 2 3 0").is_err());
+        assert!(Keymap::parse("W = look 1 2 3 4 5").is_err());
     }
 
     #[test]
@@ -540,6 +581,19 @@ SHIFT = swipe 400 800 700 800 12
         );
         assert_eq!(map.action_for(BTN_RIGHT), Some(&Action::Tap { x: 1110.0, y: 590.0 }));
         assert_eq!(map.render(), text);
+    }
+
+    #[test]
+    fn look_parses_with_a_default_sensitivity_and_round_trips() {
+        let map = Keymap::parse("LEFTALT = look 900 300 200\nMOUSE_LEFT = hold 1 2\n").expect("parse");
+        assert_eq!(
+            map.action_for(56),
+            Some(&Action::Look { cx: 900.0, cy: 300.0, radius: 200.0, sensitivity: 1.0 })
+        );
+        assert_eq!(map.action_for(BTN_LEFT), Some(&Action::Hold { x: 1.0, y: 2.0 }));
+        let rendered = map.render();
+        assert_eq!(rendered, "LEFTALT = look 900 300 200 1\nMOUSE_LEFT = hold 1 2\n");
+        assert_eq!(Keymap::parse(&rendered).expect("reparse").bindings, map.bindings);
     }
 
     /// A name `render` cannot write back would make the GUI editor silently

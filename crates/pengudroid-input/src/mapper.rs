@@ -95,6 +95,9 @@ impl KeyMapper {
                                 let _ = panel.swipe(x0, y0, x1, y1, steps);
                             }
                         }
+                        // Mouse-look needs a pointer lock from the compositor,
+                        // which only the app host's input path has.
+                        Action::Look { .. } => {}
                         // This panel has one slot, so a stick direction is a
                         // finger dragged from the centre to the rim; combining
                         // directions needs the multitouch path in the app host.

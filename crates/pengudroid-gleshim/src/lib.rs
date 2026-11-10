@@ -888,6 +888,7 @@ static INPUT_QUEUE: Mutex<Vec<(u32, pengudroid_proto::InputKind)>> = Mutex::new(
 /// desynchronise it; a dedicated connection keeps the two streams apart. The
 /// reader thread only ever appends to [`INPUT_QUEUE`].
 fn subscribe_input(surface_id: u32) {
+    HAS_WINDOW.store(true, std::sync::atomic::Ordering::Relaxed);
     std::thread::spawn(move || {
         let conn = match Connection::connect_endpoint(&default_socket_path()) {
             Ok(c) => c,
@@ -941,6 +942,54 @@ fn subscribe_input(surface_id: u32) {
     });
 }
 
+/// Whether any window exists yet; before that there is nothing to lock to.
+static HAS_WINDOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Lock (`locked != 0`) or release the pointer on the app's window.
+///
+/// While locked the compositor hides the cursor and motion arrives through
+/// [`pengudroid_input_poll`] as kind 7 (`a` = dx, `b` = dy). Returns 1 when the
+/// daemon accepted the request, 0 otherwise — no window yet, no daemon, or a
+/// compositor without `pointer-constraints`/`relative-pointer`.
+///
+/// It uses a connection of its own: the present connection is strictly
+/// request/reply and may be mid-swap on another thread.
+#[no_mangle]
+pub extern "C" fn pengudroid_pointer_lock(locked: i32) -> i32 {
+    if !HAS_WINDOW.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
+    // 0: whichever of this process's surfaces has the focus.
+    let surface_id = 0;
+    let request = || -> Result<bool, String> {
+        let conn = Connection::connect_endpoint(&default_socket_path()).map_err(|e| e.to_string())?;
+        let hello = Message::Hello {
+            version: PROTO_VERSION,
+            role: Role::Guest,
+            pid: std::process::id() as i32,
+        };
+        conn.send_message(&hello, &[]).map_err(|e| e.to_string())?;
+        let (_, fds) = conn.recv_message().map_err(|e| e.to_string())?;
+        close_fds(&fds);
+        conn.send_message(&Message::SetPointerLock { surface_id, locked: locked != 0 }, &[])
+            .map_err(|e| e.to_string())?;
+        let (reply, fds) = conn.recv_message().map_err(|e| e.to_string())?;
+        close_fds(&fds);
+        match reply {
+            Message::Ack => Ok(true),
+            Message::Error { message, .. } => Err(message),
+            other => Err(format!("unexpected {:?}", other.kind())),
+        }
+    };
+    match request() {
+        Ok(ok) => i32::from(ok),
+        Err(e) => {
+            eprintln!("[pengudroid-gleshim] pointer lock: {e}");
+            0
+        }
+    }
+}
+
 /// Pop one queued input event into `out`.
 ///
 /// Layout (all little-endian, 16 bytes): `[u32 surface_id][u32 kind]
@@ -975,6 +1024,7 @@ pub unsafe extern "C" fn pengudroid_input_poll(out: *mut u8) -> i32 {
         pengudroid_proto::InputKind::Key { keycode, pressed } => {
             (6, keycode as f32, if pressed { 1.0 } else { 0.0 })
         }
+        pengudroid_proto::InputKind::PointerRelative { dx, dy } => (7, dx, dy),
     };
     let buf = std::slice::from_raw_parts_mut(out, 16);
     buf[0..4].copy_from_slice(&surface_id.to_le_bytes());

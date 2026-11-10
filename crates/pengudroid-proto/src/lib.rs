@@ -101,6 +101,7 @@ pub enum MsgKind {
 
     SubscribeInput = 87,
     InputEvent = 88,
+    SetPointerLock = 89,
 
     Ack = 80,
 
@@ -162,6 +163,7 @@ impl MsgKind {
             86 => AudioWrite,
             87 => SubscribeInput,
             88 => InputEvent,
+            89 => SetPointerLock,
             80 => Ack,
             90 => Shutdown,
             91 => Goodbye,
@@ -228,6 +230,9 @@ pub enum InputKind {
     PointerAxis { axis: u8, value: f32 },
     /// `keycode` is a Linux input keycode (`KEY_*`).
     Key { keycode: u32, pressed: bool },
+    /// Relative pointer motion while the pointer is locked to the surface
+    /// (mouse-look). There is no position: the cursor does not move.
+    PointerRelative { dx: f32, dy: f32 },
 }
 
 impl InputKind {
@@ -239,6 +244,7 @@ impl InputKind {
             InputKind::PointerButton { .. } => 4,
             InputKind::PointerAxis { .. } => 5,
             InputKind::Key { .. } => 6,
+            InputKind::PointerRelative { .. } => 7,
         }
     }
 }
@@ -384,6 +390,11 @@ pub enum Message {
     SubscribeInput { surface_id: u32 },
     /// Pointer/keyboard input for a surface the receiver subscribed to.
     InputEvent { surface_id: u32, event: InputKind },
+    /// Lock (or release) the pointer to a surface the sender owns;
+    /// `surface_id == 0` means the sender's surface that has the focus. While
+    /// locked the cursor is hidden and motion arrives as `PointerRelative`.
+    /// Replied to with `Ack`, or `Error` when the compositor cannot lock.
+    SetPointerLock { surface_id: u32, locked: bool },
 
     /// Generic acknowledgement for fire-and-forget requests.
     Ack,
@@ -446,6 +457,7 @@ impl Message {
             AudioWrite { .. } => MsgKind::AudioWrite,
             SubscribeInput { .. } => MsgKind::SubscribeInput,
             InputEvent { .. } => MsgKind::InputEvent,
+            SetPointerLock { .. } => MsgKind::SetPointerLock,
             Ack => MsgKind::Ack,
             Shutdown => MsgKind::Shutdown,
             Goodbye => MsgKind::Goodbye,
@@ -651,6 +663,7 @@ impl Message {
                 e.u32(*len);
             }
             SubscribeInput { surface_id } => e.u32(*surface_id),
+            SetPointerLock { surface_id, locked } => { e.u32(*surface_id); e.u8(u8::from(*locked)); }
             InputEvent { surface_id, event } => {
                 e.u32(*surface_id);
                 e.u8(event.tag());
@@ -672,6 +685,10 @@ impl Message {
                     InputKind::Key { keycode, pressed } => {
                         e.u32(*keycode);
                         e.u8(if *pressed { 1 } else { 0 });
+                    }
+                    InputKind::PointerRelative { dx, dy } => {
+                        e.f32(*dx);
+                        e.f32(*dy);
                     }
                 }
             }
@@ -838,6 +855,7 @@ impl Message {
             },
             K::AudioWrite => AudioWrite { offset: d.u32()?, len: d.u32()? },
             K::SubscribeInput => SubscribeInput { surface_id: d.u32()? },
+            K::SetPointerLock => SetPointerLock { surface_id: d.u32()?, locked: d.u8()? != 0 },
             K::InputEvent => {
                 let surface_id = d.u32()?;
                 let event = match d.u8()? {
@@ -847,6 +865,7 @@ impl Message {
                     4 => InputKind::PointerButton { button: d.u32()?, pressed: d.u8()? != 0 },
                     5 => InputKind::PointerAxis { axis: d.u8()?, value: d.f32()? },
                     6 => InputKind::Key { keycode: d.u32()?, pressed: d.u8()? != 0 },
+                    7 => InputKind::PointerRelative { dx: d.f32()?, dy: d.f32()? },
                     other => return Err(ProtoError::BadKind(other)),
                 };
                 InputEvent { surface_id, event }
@@ -1215,6 +1234,12 @@ mod tests {
             crop: BufferCrop::full(426, 240) });
         roundtrip(Message::SetSurfaceOptions { surface_id: 4, fps_meter: true });
         roundtrip(Message::SetSurfaceOptions { surface_id: 4, fps_meter: false });
+        roundtrip(Message::SetPointerLock { surface_id: 4, locked: true });
+        roundtrip(Message::SetPointerLock { surface_id: 4, locked: false });
+        roundtrip(Message::InputEvent {
+            surface_id: 4,
+            event: InputKind::PointerRelative { dx: -3.5, dy: 12.25 },
+        });
         roundtrip(Message::RunApk {
             path: "/tmp/app.apk".into(),
             component: Some("com.x/.Main".into()),

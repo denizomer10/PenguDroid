@@ -3,8 +3,8 @@
 //! The keymap itself lives in [`pengudroid_input::keymap`] and is authored in
 //! the guest's pixel coordinates. [`crate::apphost`] feeds each physical key
 //! event through [`steps`] and injects the result as `MotionEvent`s, so a bound
-//! key never reaches the app as a key press: it becomes the tap, hold, swipe or
-//! joystick drag the binding describes. Games that only understand a
+//! key never reaches the app as a key press: it becomes the tap, hold, swipe,
+//! joystick drag or camera drag the binding describes. Games that only understand a
 //! touchscreen can then be played from the keyboard without a second input
 //! device.
 //!
@@ -90,6 +90,17 @@ struct StickState {
     at: (f32, f32),
 }
 
+/// Mouse-look while it is switched on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LookState {
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    sensitivity: f32,
+    /// The camera finger and where it is, while it is on the screen.
+    finger: Option<(i32, (f32, f32))>,
+}
+
 /// State of every mapped key that is currently held.
 ///
 /// A `Hold` binding must lift the point it pressed, a joystick must know which
@@ -99,6 +110,8 @@ struct StickState {
 pub struct HeldPoints {
     keys: BTreeMap<u16, Held>,
     sticks: BTreeMap<StickKey, StickState>,
+    /// `Some` while mouse-look is on (it is a toggle, not a held key).
+    look: Option<LookState>,
 }
 
 impl HeldPoints {
@@ -110,6 +123,7 @@ impl HeldPoints {
     fn free_id(&self) -> Option<i32> {
         (1..=MAX_MAPPED_POINTERS).find(|id| {
             !self.sticks.values().any(|s| s.id == *id)
+                && self.look.and_then(|l| l.finger).map(|(held, _)| held) != Some(*id)
                 && !self
                     .keys
                     .values()
@@ -145,6 +159,87 @@ impl HeldPoints {
             .any(|h| matches!(h, Held::Stick { stick: s, .. } if *s == stick))
     }
 
+    /// Whether mouse-look is on. The caller keeps the pointer lock in step
+    /// with this.
+    pub fn look_active(&self) -> bool {
+        self.look.is_some()
+    }
+
+    /// Whether the camera finger is currently on the screen.
+    pub fn look_finger_down(&self) -> bool {
+        self.look.is_some_and(|l| l.finger.is_some())
+    }
+
+    /// Relative mouse motion while mouse-look is on: drag the camera finger.
+    ///
+    /// The finger lands on the centre, follows the mouse, and when it would
+    /// leave the allowed circle it is lifted and put back on the centre first.
+    /// A touch game turns the camera by how far a finger *moves*, so the
+    /// re-centring is invisible to it apart from a new touch beginning.
+    pub fn look_motion(&mut self, dx: f32, dy: f32) -> Vec<Step> {
+        let Some(mut look) = self.look else {
+            return Vec::new();
+        };
+        if !(dx.is_finite() && dy.is_finite()) || (dx == 0.0 && dy == 0.0) {
+            return Vec::new();
+        }
+        let centre = (look.cx, look.cy);
+        // A single motion larger than the circle still has to end inside it.
+        let limit = |x: f32, y: f32| {
+            let (ox, oy) = (x - centre.0, y - centre.1);
+            let len = (ox * ox + oy * oy).sqrt();
+            if len > look.radius {
+                (centre.0 + ox / len * look.radius, centre.1 + oy / len * look.radius)
+            } else {
+                (x, y)
+            }
+        };
+        let (mx, my) = (dx * look.sensitivity, dy * look.sensitivity);
+        let mut out = Vec::new();
+        let (id, mut at) = match look.finger {
+            Some(finger) => finger,
+            None => {
+                let Some(id) = self.free_id() else { return Vec::new() };
+                out.push(Step::new(Event::Down { id, x: centre.0, y: centre.1 }, 0));
+                (id, centre)
+            }
+        };
+        let (tx, ty) = (at.0 + mx, at.1 + my);
+        let outside = {
+            let (ox, oy) = (tx - centre.0, ty - centre.1);
+            (ox * ox + oy * oy).sqrt() > look.radius
+        };
+        if outside && at != centre {
+            out.push(Step::new(Event::Up { id, x: at.0, y: at.1 }, 0));
+            out.push(Step::new(Event::Down { id, x: centre.0, y: centre.1 }, 0));
+            at = centre;
+        }
+        let target = limit(at.0 + mx, at.1 + my);
+        out.push(Step::new(Event::Move { id, x: target.0, y: target.1 }, 0));
+        look.finger = Some((id, target));
+        self.look = Some(look);
+        out
+    }
+
+    /// The mouse stopped: lift the camera finger so the next motion starts
+    /// from the centre again.
+    pub fn look_idle(&mut self) -> Vec<Step> {
+        let Some(look) = self.look.as_mut() else {
+            return Vec::new();
+        };
+        match look.finger.take() {
+            Some((id, (x, y))) => vec![Step::new(Event::Up { id, x, y }, 0)],
+            None => Vec::new(),
+        }
+    }
+
+    /// Switch mouse-look off (the pointer could not be locked, for example).
+    pub fn look_cancel(&mut self) -> Vec<Step> {
+        let out = self.look_idle();
+        self.look = None;
+        out
+    }
+
     /// Lift every finger a mapped key still owns.
     ///
     /// The daemon already synthesises key releases when the window loses
@@ -163,6 +258,7 @@ impl HeldPoints {
         }
         self.keys.clear();
         self.sticks.clear();
+        out.extend(self.look_cancel());
         out
     }
 }
@@ -214,6 +310,21 @@ pub fn steps(action: &Action, code: u16, pressed: bool, held: &mut HeldPoints) -
             }
             out.push(Step::new(Event::Up { id, x: *x1, y: *y1 }, SWIPE_STEP_MS));
             out
+        }
+        Action::Look { cx, cy, radius, sensitivity } => {
+            // A toggle: the press flips it, the release does nothing.
+            held.keys.insert(code, Held::Done);
+            if held.look.is_some() {
+                return held.look_cancel();
+            }
+            held.look = Some(LookState {
+                cx: *cx,
+                cy: *cy,
+                radius: *radius,
+                sensitivity: *sensitivity,
+                finger: None,
+            });
+            Vec::new()
         }
         Action::Stick { cx, cy, radius, dir } => {
             let stick = stick_key(*cx, *cy, *radius);
@@ -551,6 +662,117 @@ mod tests {
         assert!(out.contains(&Step::new(Event::Up { id: 1, x: 200.0, y: 400.0 }, 0)));
         assert!(!held.is_down(17) && !held.is_down(42));
         assert!(held.release_all().is_empty());
+    }
+
+    fn look() -> Action {
+        Action::Look { cx: 800.0, cy: 300.0, radius: 100.0, sensitivity: 2.0 }
+    }
+
+    #[test]
+    fn look_is_a_toggle_and_moves_nothing_until_the_mouse_does() {
+        let mut held = HeldPoints::default();
+        assert!(held.look_motion(5.0, 5.0).is_empty(), "off: motion is ignored");
+        assert!(steps(&look(), 56, true, &mut held).is_empty());
+        assert!(held.look_active() && !held.look_finger_down());
+        // Auto-repeat and the release must not flip it back.
+        assert!(steps(&look(), 56, true, &mut held).is_empty());
+        assert!(steps(&look(), 56, false, &mut held).is_empty());
+        assert!(held.look_active());
+        // The second press switches it off.
+        steps(&look(), 56, true, &mut held);
+        assert!(!held.look_active());
+    }
+
+    #[test]
+    fn look_drags_from_the_centre_scaled_by_sensitivity() {
+        let mut held = HeldPoints::default();
+        steps(&look(), 56, true, &mut held);
+        assert_eq!(
+            held.look_motion(10.0, -5.0),
+            vec![
+                Step::new(Event::Down { id: 1, x: 800.0, y: 300.0 }, 0),
+                Step::new(Event::Move { id: 1, x: 820.0, y: 290.0 }, 0),
+            ]
+        );
+        assert_eq!(
+            held.look_motion(10.0, 0.0),
+            vec![Step::new(Event::Move { id: 1, x: 840.0, y: 290.0 }, 0)]
+        );
+        assert!(held.look_motion(0.0, 0.0).is_empty());
+        assert!(held.look_motion(f32::NAN, 1.0).is_empty());
+        // Idle lifts the finger where it is; the next motion starts over.
+        assert_eq!(
+            held.look_idle(),
+            vec![Step::new(Event::Up { id: 1, x: 840.0, y: 290.0 }, 0)]
+        );
+        assert!(held.look_idle().is_empty());
+        assert_eq!(held.look_motion(1.0, 0.0)[0].event, Event::Down { id: 1, x: 800.0, y: 300.0 });
+    }
+
+    #[test]
+    fn look_recentres_instead_of_leaving_its_circle() {
+        let mut held = HeldPoints::default();
+        steps(&look(), 56, true, &mut held);
+        held.look_motion(40.0, 0.0); // finger at 880
+        // Another 40 would reach 960, outside the 100 px circle: lift, land on
+        // the centre, and continue the same motion from there.
+        assert_eq!(
+            held.look_motion(40.0, 0.0),
+            vec![
+                Step::new(Event::Up { id: 1, x: 880.0, y: 300.0 }, 0),
+                Step::new(Event::Down { id: 1, x: 800.0, y: 300.0 }, 0),
+                Step::new(Event::Move { id: 1, x: 880.0, y: 300.0 }, 0),
+            ]
+        );
+        // A flick far larger than the circle is clamped to its rim.
+        held.look_idle();
+        let out = held.look_motion(0.0, 1000.0);
+        assert_eq!(out.last().unwrap().event, Event::Move { id: 1, x: 800.0, y: 400.0 });
+    }
+
+    #[test]
+    fn look_finger_coexists_with_the_stick_and_cancel_lifts_it() {
+        let mut held = HeldPoints::default();
+        steps(&stick(Dir::Up), 17, true, &mut held);
+        steps(&look(), 56, true, &mut held);
+        let out = held.look_motion(1.0, 1.0);
+        assert_eq!(out[0].event, Event::Down { id: 2, x: 800.0, y: 300.0 });
+        // A hold pressed now must not reuse the camera finger.
+        let hold = steps(&Action::Hold { x: 1.0, y: 1.0 }, 42, true, &mut held);
+        assert_eq!(hold[0].event, Event::Down { id: 3, x: 1.0, y: 1.0 });
+        assert_eq!(
+            held.look_cancel(),
+            vec![Step::new(Event::Up { id: 2, x: 802.0, y: 302.0 }, 0)]
+        );
+        assert!(!held.look_active());
+    }
+
+    /// Mouse-look mixed with keys still yields a legal Android stream.
+    #[test]
+    fn look_and_keys_form_a_legal_stream() {
+        let mut held = HeldPoints::default();
+        let mut touch = TouchState::default();
+        let mut apply = |events: Vec<Step>, touch: &mut TouchState| {
+            for step in events {
+                touch.apply(step.event).expect("legal transition");
+            }
+        };
+        apply(steps(&look(), 56, true, &mut held), &mut touch);
+        let mut seed = 0x9e37_79b9u32;
+        for round in 0..3000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let dx = (seed % 61) as f32 - 30.0;
+            let dy = ((seed >> 8) % 61) as f32 - 30.0;
+            match seed % 5 {
+                0 => apply(steps(&stick(Dir::Left), 30, round % 2 == 0, &mut held), &mut touch),
+                1 => apply(held.look_idle(), &mut touch),
+                _ => apply(held.look_motion(dx, dy), &mut touch),
+            }
+        }
+        apply(held.release_all(), &mut touch);
+        assert!(touch.is_idle());
     }
 
     fn p(id: i32, x: f32, y: f32) -> Pointer {

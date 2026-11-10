@@ -43,7 +43,7 @@ predict whether a gap is fatal; only a run can show that.
 | 7 | `libOpenSLES.so` for ARM64 guests | missing | no stub in `tools/build-guest-stubs.py` |
 | 8 | Vulkan for ARM64 guests | missing | no stub, no `vkCreateAndroidSurfaceKHR`; the game must use GLES |
 | 9 | WebView provider | missing | measured blocker for Roblox, see `STATUS.md` |
-| 10 | Mouse-look (pointer lock) | missing | the daemon has no relative-pointer/pointer-constraints path |
+| 10 | Mouse-look (pointer lock) | **implemented, not yet run** | fourth change, below |
 | 11 | Performance of `libil2cpp.so` under translation | unknown | |
 | 12 | Tamper/emulator detection | unknown | never patch the game to get past it |
 
@@ -51,7 +51,7 @@ predict whether a gap is fatal; only a run can show that.
 it has not been exercised against a live Android runtime, because the
 environment it was written in had no Android 17 system tree, no native bridge
 build and no GPU. Treat rows 4–6 as unverified until the checks at the end of
-this document pass on a real desktop.
+this document pass on a real desktop. Row 10 is in the same state.
 
 ## What changed for this target
 
@@ -95,12 +95,13 @@ W = stick 198 536 101 up
 A = stick 198 536 101 left
 S = stick 198 536 101 down
 D = stick 198 536 101 right
-MOUSE_RIGHT = hold 1107 587
+MOUSE_RIGHT = hold 1197 630
 ```
 
 Mouse buttons other than the left one (`MOUSE_RIGHT`, `MOUSE_MIDDLE`,
 `MOUSE_SIDE`, `MOUSE_EXTRA`) can be bound like keys. The left button stays the
-touch itself: dragging with it turns the camera while WASD walks.
+touch itself: dragging with it turns the camera while WASD walks. A
+`MOUSE_LEFT` binding applies only while mouse-look (below) is on.
 
 The multi-pointer path is used only when a keymap is active. Without one, the
 single-pointer path NewPipe was verified on is untouched;
@@ -114,8 +115,9 @@ randomised test that the stream handed to Android is always legal),
 
 When the user has no profile for `com.miHoYo.GenshinImpact` (or the `Yuanshen`
 / `ys.bilibili` packages), the runtime uses a built-in one scaled to the
-display: WASD movement pad, right mouse button attack, `E` skill, `Q` burst,
-`Space` jump, `Shift` sprint, `F` interact, `1`–`4` party, `M` map.
+display: WASD movement pad, `Left Alt` mouse-look toggle, left mouse button
+attack (in mouse-look), right mouse button or `Shift` sprint, `E` skill, `Q`
+burst, `Space` jump, `F` interact, `1`–`4` party, `M` map.
 
 ```sh
 pengudroid keymap-preset com.miHoYo.GenshinImpact 1920x1080 \
@@ -125,6 +127,27 @@ pengudroid keymap-preset com.miHoYo.GenshinImpact 1920x1080 \
 The positions come from the stock control layout as fractions of the screen;
 they were **not** measured in a running game here, and the game lets players
 move its buttons. Expect to adjust them.
+
+### 4. Mouse-look
+
+A `look` binding is a toggle. Switching it on asks the compositor to lock the
+pointer (`zwp_pointer_constraints_v1`, persistent lifetime) and subscribes to
+`zwp_relative_pointer_v1`; mouse motion then drags a "camera finger" around
+the given centre. When the finger would leave its circle it is lifted and put
+back on the centre, so the camera can keep turning; it is also lifted after
+150 ms without motion.
+
+```text
+LEFTALT    = look 794 259 158 1     # centre x y, radius, sensitivity
+MOUSE_LEFT = hold 1107 587          # only while mouse-look is on
+```
+
+Switch it off (same key) to get the cursor back for menus. If the compositor
+has neither protocol, the log says `mouse-look is unavailable` and the mode
+stays off. Wire protocol: `SetPointerLock` and `InputKind::PointerRelative` in
+`pengudroid-proto`; `set_pointer_lock` in the daemon's Wayland broker;
+`pengudroid_pointer_lock` in the gleshim; `look_motion` in
+`keymap_gesture.rs`.
 
 ## What to do next, in order
 
@@ -140,10 +163,7 @@ move its buttons. Expect to adjust them.
 4. **Host a WebView provider**, following the order already recorded in
    `STATUS.md` ("Current Roblox blocker"). This is the largest single item and
    it gates login.
-5. **Pointer-lock mouse-look**: `zwp_relative_pointer_v1` +
-   `zwp_pointer_constraints_v1` in the daemon, and a `look` keymap action that
-   turns relative motion into a re-centring camera drag.
-6. Only then launch Genshin, starting from `pengudroid doctor` on the real
+5. Only then launch Genshin, starting from `pengudroid doctor` on the real
    package, and record the first failure in `STATUS.md` the way the BBR2
    bring-up was recorded.
 
@@ -164,6 +184,13 @@ PENGUDROID_TRACE_INPUT=1 pengudroid launch <game>
 #   expect "input: mapped touches are multi-pointer" and, while a stick key is
 #   held and the left button dragged, "input: touch action=0x5 ..." (or `0x105`) frames
 #   listing two pointers.
+```
+
+```sh
+# Mouse-look: press the look key (Left Alt in the Genshin preset).
+#   expect "pointer locked to surface N" in the daemon log (run it with -v),
+#   "input: mouse-look on" in the app log, a hidden cursor, and the camera
+#   following the mouse. Press it again: the cursor returns.
 ```
 
 If the 14-argument `MotionEvent.obtain` is rejected by the framework, the log

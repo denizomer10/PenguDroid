@@ -15,6 +15,8 @@ enum Slot {
     Hold(f32, f32),
     /// Centre x, centre y, radius as a fraction of the display *height*.
     Stick(f32, f32, f32, Dir),
+    /// Mouse-look around a centre; radius as a fraction of the height.
+    Look(f32, f32, f32),
 }
 
 /// Genshin Impact's default mobile HUD (16:9, landscape).
@@ -30,7 +32,14 @@ const GENSHIN: &[(&str, Slot)] = &[
     ("D", Slot::Stick(0.155, 0.745, 0.14, Dir::Right)),
     // Combat cluster, lower right. `hold`, so a long press charges the attack
     // and holds the elemental skill the way a finger would.
-    ("MOUSE_RIGHT", Slot::Hold(0.865, 0.815)),
+    //
+    // Left Alt toggles mouse-look, the way it frees the cursor on PC: the
+    // mouse then turns the camera (a drag on the empty right half of the
+    // screen) and the left button attacks. With mouse-look off the cursor is
+    // a finger again, for menus.
+    ("LEFTALT", Slot::Look(0.62, 0.36, 0.22)),
+    ("MOUSE_LEFT", Slot::Hold(0.865, 0.815)),
+    ("MOUSE_RIGHT", Slot::Hold(0.935, 0.875)),
     ("E", Slot::Hold(0.765, 0.875)),
     ("Q", Slot::Tap(0.672, 0.895)),
     ("SPACE", Slot::Tap(0.935, 0.68)),
@@ -81,6 +90,15 @@ pub fn for_package(package: &str, width: f32, height: f32) -> Option<Keymap> {
                 Slot::Hold(fx, fy) => {
                     let (x, y) = px(fx, fy);
                     Action::Hold { x, y }
+                }
+                Slot::Look(fx, fy, fr) => {
+                    let (cx, cy) = px(fx, fy);
+                    Action::Look {
+                        cx,
+                        cy,
+                        radius: (fr * height).round().max(1.0),
+                        sensitivity: 1.0,
+                    }
                 }
                 Slot::Stick(fx, fy, fr, dir) => {
                     let (cx, cy) = px(fx, fy);
@@ -136,7 +154,8 @@ mod tests {
                 for b in &map.bindings {
                     let (x, y, reach) = match b.action {
                         Action::Tap { x, y } | Action::Hold { x, y } => (x, y, 0.0),
-                        Action::Stick { cx, cy, radius, .. } => (cx, cy, radius),
+                        Action::Stick { cx, cy, radius, .. }
+                        | Action::Look { cx, cy, radius, .. } => (cx, cy, radius),
                         Action::Swipe { x0, y0, .. } => (x0, y0, 0.0),
                     };
                     assert!(x - reach >= 0.0 && x + reach <= w, "{package} {b:?}");

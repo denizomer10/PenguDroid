@@ -50,6 +50,12 @@ mod imp {
     use wayland_protocols::wp::viewporter::client::{wp_viewporter, wp_viewport};
     use wayland_protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zxdg_output_v1};
     use wayland_protocols::wp::cursor_shape::v1::client::{wp_cursor_shape_manager_v1, wp_cursor_shape_device_v1};
+    use wayland_protocols::wp::pointer_constraints::zv1::client::{
+        zwp_locked_pointer_v1, zwp_pointer_constraints_v1,
+    };
+    use wayland_protocols::wp::relative_pointer::zv1::client::{
+        zwp_relative_pointer_manager_v1, zwp_relative_pointer_v1,
+    };
     use std::collections::HashMap;
     use std::os::fd::AsFd;
 
@@ -152,6 +158,12 @@ mod imp {
         viewporter: Option<wp_viewporter::WpViewporter>,
         cursor_manager: Option<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1>,
         cursor: Option<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
+        /// Mouse-look: the two protocols a pointer lock needs, the lock itself
+        /// (and the surface it is on), and the relative-motion source.
+        pointer_constraints: Option<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1>,
+        relative_manager: Option<zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1>,
+        relative_pointer: Option<zwp_relative_pointer_v1::ZwpRelativePointerV1>,
+        pointer_lock: Option<(u32, zwp_locked_pointer_v1::ZwpLockedPointerV1)>,
         pointer_serial: u32,
         output_manager: Option<zxdg_output_manager_v1::ZxdgOutputManagerV1>,
         outputs: HashMap<u32, OutputSize>,
@@ -221,6 +233,13 @@ mod imp {
                 .iter()
                 .find(|(_, v)| v.wl_surface.id() == s.id())
                 .map(|(id, _)| *id)
+        }
+
+        fn release_pointer_lock(&mut self) {
+            if let Some((id, lock)) = self.pointer_lock.take() {
+                lock.destroy();
+                crate::info!("pointer lock on surface {id} released");
+            }
         }
 
         fn push_input(&mut self, event: pengudroid_proto::InputKind) {
@@ -608,6 +627,8 @@ mod imp {
             state.subcompositor = globals.bind(&qh, 1..=1, ()).ok();
             state.viewporter = globals.bind(&qh, 1..=1, ()).ok();
             state.cursor_manager = globals.bind(&qh, 1..=1, ()).ok();
+            state.pointer_constraints = globals.bind(&qh, 1..=1, ()).ok();
+            state.relative_manager = globals.bind(&qh, 1..=1, ()).ok();
             state.frame_compositor = CompositorState::bind(&globals, &qh).ok().map(Arc::new);
             if let Some(compositor) = state.frame_compositor.as_ref() {
                 state.frame_subcompositor = SubcompositorState::bind(compositor.wl_compositor().clone(), &globals, &qh).ok().map(Arc::new);
@@ -921,6 +942,61 @@ mod imp {
             true
         }
 
+        /// The surface holding the pointer lock, if any.
+        pub fn pointer_lock_surface(&self) -> Option<u32> {
+            self.state.pointer_lock.as_ref().map(|(id, _)| *id)
+        }
+
+        /// Lock the pointer to surface `id`, or release the lock it holds.
+        ///
+        /// A lock is what turns a mouse into a camera control: the cursor stops
+        /// at no window edge because it does not move at all, and motion comes
+        /// from `zwp_relative_pointer_v1` instead. The lifetime is persistent,
+        /// so the compositor re-activates it whenever the window regains
+        /// pointer focus. Returns false when either protocol is missing.
+        pub fn set_pointer_lock(&mut self, id: u32, locked: bool) -> bool {
+            if !locked {
+                // Releasing a lock that is not held (or not ours) is a no-op,
+                // not an error: the guest is only stating what it wants.
+                if self.state.pointer_lock.as_ref().is_some_and(|(owner, _)| *owner == id) {
+                    self.state.release_pointer_lock();
+                    let _ = self.conn.flush();
+                }
+                return true;
+            }
+            if self.state.pointer_lock.as_ref().is_some_and(|(owner, _)| *owner == id) {
+                return true;
+            }
+            let qh = self.queue.handle();
+            let (Some(constraints), Some(manager), Some(pointer)) = (
+                self.state.pointer_constraints.clone(),
+                self.state.relative_manager.clone(),
+                self.state.pointer.clone(),
+            ) else {
+                return false;
+            };
+            let Some(surface) = self.state.surfaces.get(&id).map(|s| s.wl_surface.clone()) else {
+                return false;
+            };
+            // One lock per pointer: a second request would be a protocol error.
+            self.state.release_pointer_lock();
+            let lock = constraints.lock_pointer(
+                &surface,
+                &pointer,
+                None,
+                zwp_pointer_constraints_v1::Lifetime::Persistent,
+                &qh,
+                (),
+            );
+            if self.state.relative_pointer.is_none() {
+                self.state.relative_pointer = Some(manager.get_relative_pointer(&pointer, &qh, ()));
+            }
+            self.state.pointer_lock = Some((id, lock));
+            let _ = self.conn.flush();
+            crate::info!("pointer locked to surface {id}");
+            true
+        }
+
         pub fn set_surface_options(&mut self, id: u32, enabled: bool) -> bool {
             let Some(surface) = self.state.surfaces.get_mut(&id) else { return false };
             surface.fps_meter = enabled;
@@ -973,6 +1049,9 @@ mod imp {
             }
             if self.state.keyboard_focus == Some(id) { self.state.release_keyboard(); }
             if self.state.pointer_focus == Some(id) { self.state.pointer_focus = None; }
+            if self.state.pointer_lock.as_ref().is_some_and(|(owner, _)| *owner == id) {
+                self.state.release_pointer_lock();
+            }
             self.state.fps.remove(&id);
             self.state.frames.remove(&id);
             self.state.client_decorated.remove(&id);
@@ -1477,6 +1556,34 @@ mod imp {
         }
     }
 
+    ignore_events!(zwp_pointer_constraints_v1::ZwpPointerConstraintsV1, ());
+    ignore_events!(zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1, ());
+    // `locked`/`unlocked` only report activation; with a persistent lifetime
+    // the compositor re-locks on its own, so there is nothing to do for them.
+    ignore_events!(zwp_locked_pointer_v1::ZwpLockedPointerV1, ());
+
+    impl Dispatch<zwp_relative_pointer_v1::ZwpRelativePointerV1, ()> for State {
+        fn event(
+            state: &mut Self,
+            _: &zwp_relative_pointer_v1::ZwpRelativePointerV1,
+            event: zwp_relative_pointer_v1::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            // The relative pointer reports motion whether or not a lock is
+            // active; only a locked surface asked for it.
+            if let zwp_relative_pointer_v1::Event::RelativeMotion { dx, dy, .. } = event {
+                if let Some((id, _)) = &state.pointer_lock {
+                    state.input.push((
+                        *id,
+                        pengudroid_proto::InputKind::PointerRelative { dx: dx as f32, dy: dy as f32 },
+                    ));
+                }
+            }
+        }
+    }
+
     impl Dispatch<wl_pointer::WlPointer, ()> for State {
         fn event(
             state: &mut Self,
@@ -1856,6 +1963,8 @@ mod imp {
             None
         }
         pub fn set_surface_options(&mut self, _id: u32, _enabled: bool) -> bool { false }
+        pub fn set_pointer_lock(&mut self, _id: u32, _locked: bool) -> bool { false }
+        pub fn pointer_lock_surface(&self) -> Option<u32> { None }
         pub fn contains_surface(&self, _id: u32) -> bool { false }
         pub fn is_toplevel(&self, _id: u32) -> bool { false }
         pub fn destroy_surface(&mut self, _id: u32) -> bool {
