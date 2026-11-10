@@ -2370,6 +2370,8 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) -> bool 
         // a cache miss rebuilds the package info with `mIncludeCode == false`
         // (empty dex path, so the APK's classes are unreachable).
         uid: 10_000,
+        version_name: info.version_name.as_deref(),
+        version_code: info.version_code.unwrap_or(1),
     };
     crate::apphost::bind_application(env, thread, &spec)
 }

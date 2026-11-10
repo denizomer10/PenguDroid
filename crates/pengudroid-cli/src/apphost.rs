@@ -101,6 +101,15 @@ pub struct AppSpec<'a> {
     /// Android uid for the app. There is no package manager here, so a fixed
     /// value is used; it only has to be stable and non-zero.
     pub uid: i32,
+    /// `android:versionName` from the manifest.
+    ///
+    /// Games compare it against a minimum the update server advertises. A
+    /// hardcoded value makes a current build look ancient: Beach Buggy Racing 2
+    /// answered the version check with an "Important Update — please update to
+    /// 2026.10.05, your current version is 1.0" dialog instead of the game.
+    pub version_name: Option<&'a str>,
+    /// `android:versionCode` from the manifest.
+    pub version_code: u32,
 }
 
 fn new_instance(env: &JniEnv, class_name: &str) -> Option<(JClass, JObject)> {
@@ -870,7 +879,7 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         eprintln!("apphost: cannot build ApplicationInfo");
         return false;
     };
-    install_package_manager_replies(env, app_info, spec.package);
+    install_package_manager_replies(env, app_info, spec);
     // `RobloxApplication.onCreate` reads `Settings.Global` (through
     // `Settings.NameValueCache`), which resolves the `settings` provider via
     // `IActivityManager.getContentProvider` *during* the bind. The reply has to
@@ -6988,7 +6997,8 @@ fn install_reply(data: &[u8], symbol: &str) {
 /// lines later `handleBindApplication` asks for the `ApplicationInfo` and
 /// dereferences `metaData` on the result. There is no package manager here, so
 /// both answers are built from the `ApplicationInfo` we already have.
-fn install_package_manager_replies(env: &JniEnv, app_info: JObject, package: &str) {
+fn install_package_manager_replies(env: &JniEnv, app_info: JObject, spec: &AppSpec<'_>) {
+    let package = spec.package;
     let Some(pi_class) = env.find_class("android/content/pm/PackageInfo") else {
         eprintln!("apphost: PackageInfo not found");
         return;
@@ -7010,11 +7020,13 @@ fn install_package_manager_replies(env: &JniEnv, app_info: JObject, package: &st
     ) {
         env.set_object_field(pi, id, app_info);
     }
+    // The real manifest values, not a placeholder: apps compare `versionName`
+    // against a server-advertised minimum and refuse to start when it is older.
     if let Some(id) = env.field_id(pi_class, "versionName", "Ljava/lang/String;") {
-        env.set_object_field(pi, id, env.new_string("1.0"));
+        env.set_object_field(pi, id, env.new_string(spec.version_name.unwrap_or("1.0")));
     }
     if let Some(id) = env.field_id(pi_class, "versionCode", "I") {
-        env.set_int_field(pi, id, 1);
+        env.set_int_field(pi, id, spec.version_code as i32);
     }
     // NewPipe's `PackageValidator` (the media3 `MediaBrowserServiceCompat`
     // caller check) reads `PackageInfo.signatures` for the `"android"` package

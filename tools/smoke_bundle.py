@@ -5,6 +5,10 @@ Usage: python3 -B tools/smoke_bundle.py <bundle> [SMOKE_SECONDS=45] [-- launch a
 
 Writes daemon.log, app.log and result.json next to the bundle run directory
 (target/bundle-smoke by default). Process groups are always reaped.
+
+`PENGUDROID_DAEMON` selects the daemon binary and `PENGUDROID_DAEMON_ARGS` adds
+arguments to it (for example `-v` to see successful frame presents, which are
+otherwise only logged at debug level).
 """
 import json
 import os
@@ -48,8 +52,10 @@ def sample(group):
 try:
     work.mkdir(parents=True, exist_ok=True)
     with (work / "daemon.log").open("wb") as dlog, (work / "app.log").open("wb") as alog:
+        daemon_args = os.environ.get("PENGUDROID_DAEMON_ARGS", "").split()
         daemon = subprocess.Popen(
-            [str(repo / "target/debug/pengudroid-daemon"), "--socket", str(socket)],
+            [os.environ.get("PENGUDROID_DAEMON", str(repo / "target/debug/pengudroid-daemon")),
+             "--socket", str(socket)] + daemon_args,
             cwd=repo, env=env, stdin=subprocess.DEVNULL,
             stdout=dlog, stderr=subprocess.STDOUT, start_new_session=True)
         processes.append(daemon)
