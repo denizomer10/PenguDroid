@@ -2132,11 +2132,68 @@ pub unsafe extern "C" fn eglSwapBuffers(_dpy: EGLDisplay, surface: EGLSurface) -
         exported.offset,
         fd.as_raw_fd(),
     ) {
-        Ok(()) => EGL_TRUE,
+        Ok(()) => {
+            pace_swap();
+            EGL_TRUE
+        }
         Err(e) => {
             log_once(format_args!("eglSwapBuffers: {e}"));
             EGL_FALSE
         }
+    }
+}
+
+/// Minimum interval between two swaps, in microseconds, for a given cap.
+/// `0` means "no cap" (the historical behaviour).
+fn frame_gap_micros(max_fps: u64) -> Option<u64> {
+    if max_fps == 0 {
+        None
+    } else {
+        Some(1_000_000u64.div_ceil(max_fps))
+    }
+}
+
+/// How long to sleep so that `now + sleep` lands on `last + gap`. A swap that
+/// already arrived late (rendering took longer than the gap) sleeps zero, and
+/// an overflowing `last + gap` is treated as "due" rather than sleeping forever.
+fn micros_to_sleep(last_us: u64, now_us: u64, gap_us: u64) -> u64 {
+    match last_us.checked_add(gap_us) {
+        Some(next) => next.saturating_sub(now_us),
+        None => 0,
+    }
+}
+
+/// Cap the guest's swap rate.
+///
+/// `present_dmabuf` is synchronous — it waits for the daemon's ack — but the
+/// daemon acks as soon as the frame is *queued* for the compositor, not when
+/// the compositor presents it. Without a cap a game free-runs at hundreds of
+/// fps and burns a core rendering frames the daemon then drops
+/// (`frame_slot_available` keeps only 3 pending buffers). Sleeping the
+/// remainder of the frame budget here paces the guest to `PENGUDROID_MAX_FPS`
+/// (default 60, `0` disables). This is deliberately guest-side: blocking the
+/// daemon on a wl_callback would stall every other client, including input.
+fn pace_swap() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+    static LAST_US: AtomicU64 = AtomicU64::new(0);
+    static MAX_FPS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let max_fps = *MAX_FPS.get_or_init(|| {
+        std::env::var("PENGUDROID_MAX_FPS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(60)
+    });
+    let Some(gap) = frame_gap_micros(max_fps) else { return };
+    // `Instant` has no absolute epoch; anchor our own clock at the first call
+    // so the arithmetic stays in u64 microseconds.
+    static ANCHOR: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let anchor = *ANCHOR.get_or_init(Instant::now);
+    let now_us = anchor.elapsed().as_micros() as u64;
+    let last = LAST_US.swap(now_us, Ordering::Relaxed);
+    let sleep = micros_to_sleep(last, now_us, gap);
+    if sleep > 0 {
+        std::thread::sleep(Duration::from_micros(sleep));
     }
 }
 
@@ -2319,6 +2376,23 @@ pub unsafe extern "C" fn glBindFramebuffer(target: u32, framebuffer: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_pacing_math() {
+        // 0 disables the cap entirely.
+        assert_eq!(frame_gap_micros(0), None);
+        // 60 fps -> 16667 us (rounded up, never shorter than the frame budget).
+        assert_eq!(frame_gap_micros(60), Some(16_667));
+        assert_eq!(frame_gap_micros(1), Some(1_000_000));
+        // On time or late swap: nothing to sleep.
+        assert_eq!(micros_to_sleep(1_000, 1_000, 16_667), 16_667);
+        assert_eq!(micros_to_sleep(1_000, 17_667, 16_667), 0);
+        assert_eq!(micros_to_sleep(1_000, 50_000, 16_667), 0);
+        // Early swap: sleep exactly the remainder.
+        assert_eq!(micros_to_sleep(1_000, 2_000, 16_667), 15_667);
+        // u64 underflow must not panic on a huge `last`.
+        assert_eq!(micros_to_sleep(u64::MAX, 0, 10), 0);
+    }
 
     #[test]
     fn read_attribs_stops_at_egl_none() {

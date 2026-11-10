@@ -26,15 +26,22 @@ Verified this session on the shipped AppImage, not on the dev tree:
 
 ### Next concrete task
 
-1. **Frame pacing.** `eglSwapBuffers` never waits for the compositor, so BBR2
-   free-runs at 190–760 presents/s and burns a core. Wait for the daemon's
-   present ack (or a fixed cadence) instead of spinning.
-2. **Hardware video decode** (`MediaCodec` with a real `AHardwareBuffer`
+1. **Hardware video decode** (`MediaCodec` with a real `AHardwareBuffer`
    backing) — the last piece NewPipe playback needs.
-3. **Icons.** The shell logs `Error loading image …/icons/<pkg>.png` when icon
+2. **Icons.** The shell logs `Error loading image …/icons/<pkg>.png` when icon
    extraction fails; fall back silently to the placeholder instead.
-4. `AHardwareBuffer`/gralloc, camera, and broader aarch64 translation coverage —
+3. `AHardwareBuffer`/gralloc, camera, and broader aarch64 translation coverage —
    tracked in [LIMITATIONS.md](LIMITATIONS.md).
+
+### Done since the last handoff (2026-11-11)
+
+* **Frame pacing.** `eglSwapBuffers` now paces the guest to
+  `PENGUDROID_MAX_FPS` (default 60, `0` = off): the daemon acks a present as
+  soon as it is queued, so games free-ran at ~190 presents/s and burned a core
+  on frames the compositor then dropped. Measured on BBR2, same APK, 60 s runs:
+  **190/s before → 47/s after** (the cap is 60; the rest is real render time).
+  Guest-side on purpose — blocking the daemon on a `wl_callback` would stall
+  input for every client.
 
 ## Current handoff — Beach Buggy Racing 2 boots into gameplay (2026-11-05)
 

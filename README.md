@@ -139,8 +139,8 @@ Verified today on the shipped `target/PenguDroid-x86_64.AppImage`:
   pointer/keyboard input, MediaCodec (ByteBuffer + Surface), AudioTrack,
   OpenSL ES, PipeWire audio, app services, Play bundles (`.apkm`/`.xapk`).
 * **In progress:** hardware video decode integration, full window/layer
-  association, host IME composition, frame pacing (`eglSwapBuffers` does not
-  wait for the compositor, so games free-run and burn a core).
+  association, host IME composition. Frame pacing is done: `eglSwapBuffers`
+  is capped at `PENGUDROID_MAX_FPS` (default 60) instead of free-running.
 * **Not there yet:** `AHardwareBuffer`/gralloc allocation, camera, stable aarch64
   translation for every game engine. The honest list is in
   [LIMITATIONS.md](docs/LIMITATIONS.md).
@@ -546,6 +546,7 @@ opt-in and cost nothing when unset.
 | `PENGUDROID_TRACE_BINDER` | trace broker transactions by interface and code |
 | `PENGUDROID_TRACE_GLESHIM`, `PENGUDROID_TRACE_GLES`, `PENGUDROID_TRACE_DRAW` | trace the EGL/GLES translation layer and hwui draw calls |
 | `PENGUDROID_DUMP_FRAME=<prefix>` / `_AT=<n>` / `_NOFLIP=1` | write frame *n* as a PPM (`tools/art/ppm2png.py` converts it) |
+| `PENGUDROID_MAX_FPS=<n>` | cap `eglSwapBuffers` at *n* fps (default **60**, `0` = unthrottled). The daemon acks a present as soon as it is queued, so without this a game free-runs at hundreds of fps and burns a core on frames the compositor drops |
 | `PENGUDROID_NO_CODEC2_SERVICE=1` | fall back to the hand-written codec2 stub replies |
 | `PENGUDROID_PROBE_VIEWS=1` | walk the window hierarchy and print every view's class and measured size, plus the `SurfaceView` fields that decide whether the video layer exists (`mHaveFrame`, `mSurfaceControl`, `mBlastBufferQueue`, `mSurface`'s native pointer, `mSurfaceCreated`, `mVisible`) |
 | `PENGUDROID_FORCE_SURFACE=1` | give a zero-width `SurfaceView` a real frame (`PENGUDROID_VIDEO_W`/`_H`, default 720×405) and let the framework's own main-thread pre-draw listener create the surface. Never call `updateSurface()` yourself: it ends in `ExoPlayer.setVideoSurface`, which asserts the main thread |
