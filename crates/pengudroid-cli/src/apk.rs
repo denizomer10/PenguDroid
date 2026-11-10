@@ -38,6 +38,9 @@ pub struct Component {
     pub grant_uri_permissions: bool,
     /// The component's `<meta-data>` children.
     pub meta: Vec<(String, MetaValue)>,
+    /// `android:screenOrientation` of an `<activity>`, as the
+    /// `ActivityInfo.SCREEN_ORIENTATION_*` value (`-1` is `unspecified`).
+    pub screen_orientation: Option<i32>,
 }
 
 /// Everything PenguDroid extracts from a manifest.
@@ -78,6 +81,16 @@ impl ApkInfo {
         } else {
             name.to_string()
         }
+    }
+
+    /// `android:screenOrientation` declared for `activity` (a resolved class
+    /// name). An `<activity-alias>` adds a second entry for the same class
+    /// without the attribute, so every entry is consulted.
+    pub fn screen_orientation(&self, activity: &str) -> Option<i32> {
+        self.activities
+            .iter()
+            .filter(|a| a.name == activity)
+            .find_map(|a| a.screen_orientation)
     }
 
     /// The component to launch, if any.
@@ -663,6 +676,8 @@ pub fn parse_axml(data: &[u8]) -> Result<ApkInfo, String> {
                             grant_uri_permissions: attr_bool(&attrs, "grantUriPermissions")
                                 .unwrap_or(false),
                             meta: Vec::new(),
+                            screen_orientation: attr_int(&pool, &attrs, "screenOrientation")
+                                .map(|v| v as i32),
                         };
                         let idx = match kind {
                             CompKind::Activity => {
@@ -711,6 +726,9 @@ pub fn parse_axml(data: &[u8]) -> Result<ApkInfo, String> {
                                 authority: None,
                                 grant_uri_permissions: false,
                                 meta: Vec::new(),
+                                // An alias has no orientation of its own; the
+                                // target activity's entry carries it.
+                                screen_orientation: None,
                             };
                             info.activities.push(component);
                             let idx = info.activities.len() - 1;
@@ -1102,6 +1120,33 @@ mod tests {
         assert_eq!(info.package, "com.example.demo");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reads_screen_orientation_through_an_alias() {
+        let mut b = Axml::new();
+        b.start("manifest", &[("package", A::Str("com.game"))]);
+        b.start("application", &[]);
+        // sensorLandscape = 6, the value a landscape-only game declares.
+        b.start("activity", &[("name", A::Str(".Game")), ("screenOrientation", A::Int(6))]);
+        b.end("activity");
+        b.start("activity", &[("name", A::Str(".Free"))]);
+        b.end("activity");
+        // `unspecified` is stored as 0xffffffff.
+        b.start("activity", &[("name", A::Str(".Any")), ("screenOrientation", A::Int(u32::MAX))]);
+        b.end("activity");
+        b.start(
+            "activity-alias",
+            &[("name", A::Str(".Launcher")), ("targetActivity", A::Str(".Game"))],
+        );
+        b.end("activity-alias");
+        b.end("application");
+        b.end("manifest");
+        let info = parse_axml(&b.finish()).expect("parse");
+        assert_eq!(info.screen_orientation("com.game.Game"), Some(6));
+        assert_eq!(info.screen_orientation("com.game.Free"), None);
+        assert_eq!(info.screen_orientation("com.game.Any"), Some(-1));
+        assert_eq!(info.screen_orientation("com.game.Missing"), None);
     }
 
     #[test]

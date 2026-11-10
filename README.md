@@ -144,6 +144,11 @@ Verified today on the shipped `target/PenguDroid-x86_64.AppImage`:
 * **Not there yet:** `AHardwareBuffer`/gralloc allocation, camera, stable aarch64
   translation for every game engine. The honest list is in
   [LIMITATIONS.md](docs/LIMITATIONS.md).
+* **Toward Genshin Impact:** not launched yet. Landscape displays, multi-touch
+  keyboard/mouse controls (WASD joystick) and a built-in keymap are implemented
+  but not yet exercised live; the remaining gaps are listed in order in
+  [GENSHIN.md](docs/GENSHIN.md). `pengudroid doctor <apk>` reports them for any
+  package.
 
 ## Status: what actually works vs. what is stubbed
 

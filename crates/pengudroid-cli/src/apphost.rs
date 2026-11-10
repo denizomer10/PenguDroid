@@ -19,30 +19,62 @@ use std::ffi::c_void;
 
 /// The PenguDroid surface geometry, in pixels.
 ///
-/// This is the one place the size is written down. Everything that has to agree
-/// about it reads these: the `DisplayInfo` the framework sees, the
+/// This is the one place the size is read. Everything that has to agree about
+/// it goes through these: the `DisplayInfo` the framework sees, the
 /// `SurfaceControl` handed to `ViewRootImpl`, the window frame, and (through
-/// `PENGUDROID_SURFACE_W`/`_H`, which `art_test` mirrors) the EGL surface the
-/// gleshim renders into. Before this existed the defaults disagreed — portrait in
-/// two places and landscape in two others — so hwui rendered 1280x720 into an
-/// FBO the window frame described as 720x1280.
-const SURFACE_W: i32 = 720;
-const SURFACE_H: i32 = 1280;
+/// the same `PENGUDROID_SURFACE_W`/`_H` pair) the EGL surface the gleshim
+/// renders into and the shim's `ANativeWindow`. Before this existed the
+/// defaults disagreed — portrait in two places and landscape in two others — so
+/// hwui rendered 1280x720 into an FBO the window frame described as 720x1280.
+///
+/// The pair is chosen once by the launcher (`display.rs`): portrait 720x1280
+/// unless the activity is landscape-only or the user asked for a size.
+fn surface_size() -> (i32, i32) {
+    static SIZE: std::sync::OnceLock<(i32, i32)> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        use crate::display::{surface_side, Geometry, SURFACE_H_ENV, SURFACE_W_ENV};
+        (
+            surface_side(SURFACE_W_ENV, Geometry::PORTRAIT.width),
+            surface_side(SURFACE_H_ENV, Geometry::PORTRAIT.height),
+        )
+    })
+}
+
+/// The surface width in pixels.
+fn surface_w() -> i32 {
+    surface_size().0
+}
+
+/// The surface height in pixels.
+fn surface_h() -> i32 {
+    surface_size().1
+}
 
 /// The display density, in dpi.
 ///
 /// Everything the framework lays out is scaled by this: `dp = px * 160 / dpi`.
-/// At 320 dpi the surface is 360x640 dp, which is a conventional small phone.
-/// It used to be 420 dpi while the dp fields were still the *landscape* 1280x720
-/// values, so the app believed it had a 487x274 dp screen — and a Material
-/// `AlertDialog`, whose minimum width is 280 dp, came out wider than the 274 dp
-/// it thought it had and was clipped by the surface edge.
+/// At 320 dpi the portrait surface is 360x640 dp, which is a conventional small
+/// phone. It used to be 420 dpi while the dp fields were still the *landscape*
+/// 1280x720 values, so the app believed it had a 487x274 dp screen — and a
+/// Material `AlertDialog`, whose minimum width is 280 dp, came out wider than
+/// the 274 dp it thought it had and was clipped by the surface edge.
 const DENSITY_DPI: i32 = 320;
 
-/// The surface width in dp.
-const SURFACE_W_DP: i32 = SURFACE_W * 160 / DENSITY_DPI;
-/// The surface height in dp.
-const SURFACE_H_DP: i32 = SURFACE_H * 160 / DENSITY_DPI;
+/// Pixels to dp at the display density.
+const fn px_to_dp(px: i32) -> i32 {
+    px * 160 / DENSITY_DPI
+}
+
+/// `Configuration.ORIENTATION_*` for a surface of this size.
+const fn configuration_orientation(width: i32, height: i32) -> i32 {
+    const ORIENTATION_PORTRAIT: i32 = 1;
+    const ORIENTATION_LANDSCAPE: i32 = 2;
+    if width > height {
+        ORIENTATION_LANDSCAPE
+    } else {
+        ORIENTATION_PORTRAIT
+    }
+}
 use std::path::Path;
 
 use crate::jni::{JClass, JFieldId, JMethodId, JObject, JValue, JniEnv};
@@ -255,9 +287,13 @@ fn new_configuration(env: &JniEnv) -> Option<JObject> {
     };
     set_int("densityDpi", DENSITY_DPI);
     // Derived from the surface so the two can never disagree again.
-    set_int("screenWidthDp", SURFACE_W_DP);
-    set_int("screenHeightDp", SURFACE_H_DP);
-    set_int("smallestScreenWidthDp", SURFACE_W_DP.min(SURFACE_H_DP));
+    set_int("screenWidthDp", px_to_dp(surface_w()));
+    set_int("screenHeightDp", px_to_dp(surface_h()));
+    set_int("smallestScreenWidthDp", px_to_dp(surface_w().min(surface_h())));
+    // `setToDefaults()` leaves this ORIENTATION_UNDEFINED. Resources pick
+    // `layout-land`/`-port` from it, and engines read it to decide which way up
+    // to render, so it has to follow the surface like the dp fields do.
+    set_int("orientation", configuration_orientation(surface_w(), surface_h()));
     // WindowLayout.computeFrames uses Configuration.windowConfiguration bounds
     // for local relayout, not DisplayInfo or screenWidthDp. Empty bounds made a
     // later relayoutAsync collapse a previously valid activity window to 0x0.
@@ -268,7 +304,7 @@ fn new_configuration(env: &JniEnv) -> Option<JObject> {
     if window.is_null() { return None; }
     let rect_class = env.find_class("android/graphics/Rect")?;
     let ctor = env.method_id(rect_class, "<init>", "(IIII)V")?;
-    let coords = [JValue { i: 0 }, JValue { i: 0 }, JValue { i: SURFACE_W }, JValue { i: SURFACE_H }];
+    let coords = [JValue { i: 0 }, JValue { i: 0 }, JValue { i: surface_w() }, JValue { i: surface_h() }];
     let bounds = env.new_object(rect_class, ctor, &coords)?;
     if bounds.is_null() { return None; }
     let set_bounds = env.method_id(window_class, "setBounds", "(Landroid/graphics/Rect;)V")?;
@@ -1062,7 +1098,7 @@ fn surface_video_dimensions(env: &JniEnv, view: JObject) -> (i32, i32) {
         let height = env.field_id(class, "mHeight", "I").map(|f| env.int_field(root, f))?;
         (width > 0 && height > 0).then_some((width, height))
     })();
-    let (container_w, container_h) = root_size.unwrap_or((720, 1280));
+    let (container_w, container_h) = root_size.unwrap_or(surface_size());
     let (mut w, mut h) = if container_w.saturating_mul(9) > container_h.saturating_mul(16) {
         (container_h.saturating_mul(16) / 9, container_h)
     } else {
@@ -1564,15 +1600,15 @@ fn report_surface_views(env: &JniEnv, verbose: bool) {
                         );
                         if ww <= 0 || wh <= 0 {
                             if let Some(f) = env.field_id(vri_class, "mWidth", "I") {
-                                env.set_int_field(vri, f, 720);
+                                env.set_int_field(vri, f, surface_w());
                             }
                             if let Some(f) = env.field_id(vri_class, "mHeight", "I") {
-                                env.set_int_field(vri, f, 1280);
+                                env.set_int_field(vri, f, surface_h());
                             }
                             // Do not write the root's Rect from this worker:
                             // the main thread owns layout and may be reading it.
                             // Frame changes belong in the window-manager reply.
-                            println!("views:   ViewRootImpl.mWidth {ww} -> 720");
+                            println!("views:   ViewRootImpl.mWidth {ww} -> {}", surface_w());
                         }
                         // `layoutRequested` is `mLayoutRequested && (!mStopped ||
                         // mReportNextDraw)`, so a stopped window silently drops
@@ -4464,6 +4500,8 @@ fn spawn_input_pump(env: &JniEnv) {
         // ignoring the wheel anyway. A real fix needs either that hidden setter or
         // an `InputManager.injectInputEvent` path.
         let set_axis_value: Option<JMethodId> = None;
+        // Resolved up front, used only when a keymap is active (see below).
+        let multi_touch = MultiTouchJni::resolve(&env, motion_class);
         let Some(key_class) = env.find_class("android/view/KeyEvent") else {
             return;
         };
@@ -4676,7 +4714,19 @@ fn spawn_input_pump(env: &JniEnv) {
             let path = std::env::var_os("PENGUDROID_KEYMAP_PATH")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| pengudroid_input::keymap::keymap_path(package));
-            let text = std::fs::read_to_string(&path).ok()?;
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                // No profile of the user's own: fall back to the built-in one
+                // for this game, laid out for the current display.
+                let (w, h) = (surface_w(), surface_h());
+                let map = pengudroid_input::presets::for_package(package, w as f32, h as f32)?;
+                println!(
+                    "input: built-in keymap for {package} at {w}x{h} ({} binding(s)); \
+                     save your own to {} to replace it",
+                    map.bindings.len(),
+                    path.display()
+                );
+                return Some(map);
+            };
             match pengudroid_input::keymap::Keymap::parse(&text) {
                 Ok(map) if !map.bindings.is_empty() => {
                     println!(
@@ -4696,9 +4746,87 @@ fn spawn_input_pump(env: &JniEnv) {
             }
         });
         let mut mapped_held = crate::keymap_gesture::HeldPoints::default();
-        // Mapped gestures share one pointer, so the press time of the most
-        // recent `Down` is enough to keep `MotionEvent`'s downTime consistent.
-        let mut mapped_down = 0i64;
+        // With a keymap the mouse and every mapped key are separate fingers of
+        // one multi-pointer stream: walking (a joystick), turning the camera
+        // (the mouse) and pressing a skill overlap, and Android has a single
+        // event stream per window. Without a keymap nothing overlaps, so the
+        // long-verified single-pointer path stays exactly as it was.
+        // `PENGUDROID_LEGACY_TOUCH=1` forces that path even with a keymap, at
+        // the cost of one finger at a time.
+        let multi_touch = multi_touch.filter(|_| {
+            keymap.is_some() && std::env::var_os("PENGUDROID_LEGACY_TOUCH").is_none()
+        });
+        if keymap.is_some() {
+            println!(
+                "input: mapped touches are {}",
+                if multi_touch.is_some() { "multi-pointer" } else { "single-pointer (legacy)" }
+            );
+        }
+        let touch_state = std::cell::RefCell::new(crate::keymap_gesture::TouchState::default());
+        // `downTime` of the gesture in progress: taken at the first finger and
+        // kept until the last one lifts.
+        let gesture_down = std::cell::Cell::new(0i64);
+        let send_touch = |event: crate::keymap_gesture::Event| {
+            use crate::keymap_gesture::Event;
+            let Some(multi) = &multi_touch else {
+                // One finger at a time: the pointer id is irrelevant.
+                match event {
+                    Event::Down { x, y, .. } => {
+                        gesture_down
+                            .set(env.call_static_long(clock_class, uptime, &[]).unwrap_or(0));
+                        inject(ACTION_DOWN, x, y, gesture_down.get());
+                    }
+                    Event::Move { x, y, .. } => inject(ACTION_MOVE, x, y, gesture_down.get()),
+                    Event::Up { x, y, .. } => inject(ACTION_UP, x, y, gesture_down.get()),
+                }
+                return;
+            };
+            let Some(frame) = touch_state.borrow_mut().apply(event) else {
+                return;
+            };
+            let now = env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
+            if frame.starts_gesture {
+                gesture_down.set(now);
+            }
+            let Some(_frame_refs) = env.local_frame(64 + 2 * frame.pointers.len() as i32) else {
+                return;
+            };
+            let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else {
+                return;
+            };
+            let roots = env.object_field(wmg, roots_field);
+            if roots.is_null() {
+                return;
+            }
+            let Some(root) = keyboard_root(&env, roots, root_class, size_m, get_m) else {
+                return;
+            };
+            if std::env::var_os("PENGUDROID_TRACE_INPUT").is_some() {
+                println!(
+                    "input: touch action={:#x} pointers={:?}",
+                    frame.action, frame.pointers
+                );
+            }
+            if let Some(event) = multi.obtain(&env, motion_class, &frame, gesture_down.get(), now) {
+                env.call_void(root, dispatch, &[JValue { l: event }]);
+            }
+        };
+        // Run a mapped binding for a key or mouse-button edge.
+        let run_binding = |action: &pengudroid_input::keymap::Action,
+                           code: u16,
+                           pressed: bool,
+                           held: &mut crate::keymap_gesture::HeldPoints| {
+            let gesture_steps = crate::keymap_gesture::steps(action, code, pressed, held);
+            if !gesture_steps.is_empty() && std::env::var_os("PENGUDROID_TRACE_INPUT").is_some() {
+                println!("input: keymap code={code} -> {} touch step(s)", gesture_steps.len());
+            }
+            for step in gesture_steps {
+                if step.delay_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(step.delay_ms));
+                }
+                send_touch(step.event);
+            }
+        };
 
         let mut last_trace = std::time::Instant::now();
         // `PENGUDROID_TRACE_ROOTS=<ms>`: a timeline of the window roots. The
@@ -4766,38 +4894,7 @@ fn spawn_input_pump(env: &JniEnv) {
                 // playable without also typing into the app.
                 if let Some(map) = &keymap {
                     if let Some(action) = map.action_for(a as u16) {
-                        let gesture_steps = crate::keymap_gesture::steps(
-                            action,
-                            a as u16,
-                            b != 0.0,
-                            &mut mapped_held,
-                        );
-                        if !gesture_steps.is_empty() {
-                            println!(
-                                "input: keymap code={a} -> {} touch step(s)",
-                                gesture_steps.len()
-                            );
-                        }
-                        for step in gesture_steps {
-                            if step.delay_ms > 0 {
-                                std::thread::sleep(std::time::Duration::from_millis(
-                                    step.delay_ms,
-                                ));
-                            }
-                            match step.event {
-                                crate::keymap_gesture::Event::Down { x, y } => {
-                                    mapped_down =
-                                        env.call_static_long(clock_class, uptime, &[]).unwrap_or(0);
-                                    inject(ACTION_DOWN, x, y, mapped_down);
-                                }
-                                crate::keymap_gesture::Event::Move { x, y } => {
-                                    inject(ACTION_MOVE, x, y, mapped_down);
-                                }
-                                crate::keymap_gesture::Event::Up { x, y } => {
-                                    inject(ACTION_UP, x, y, mapped_down);
-                                }
-                            }
-                        }
+                        run_binding(action, a as u16, b != 0.0, &mut mapped_held);
                         continue;
                     }
                 }
@@ -4834,6 +4931,41 @@ fn spawn_input_pump(env: &JniEnv) {
                 }
                 continue;
             }
+            // A mouse button other than the left one can carry a binding
+            // (`MOUSE_RIGHT = tap ...`); unbound, it is ignored as before.
+            if tag == 4 && a as u32 != 0x110 {
+                if let Some(action) = keymap.as_ref().and_then(|m| m.action_for(a as u16)) {
+                    run_binding(action, a as u16, b != 0.0, &mut mapped_held);
+                }
+                continue;
+            }
+            if multi_touch.is_some() {
+                // The mouse is finger 0 of the shared multi-pointer stream.
+                use crate::keymap_gesture::{Event, MOUSE_POINTER};
+                match tag {
+                    1 | 3 => {
+                        last = (a, b);
+                        if pressed {
+                            send_touch(Event::Move { id: MOUSE_POINTER, x: a, y: b });
+                        } else if touch_state.borrow().is_idle() {
+                            // A hover is its own stream; it may not interleave
+                            // with a touch gesture that is in progress.
+                            inject(ACTION_HOVER_MOVE, a, b, down_time);
+                        }
+                    }
+                    4 => {
+                        pressed = b != 0.0;
+                        let (x, y) = last;
+                        send_touch(if pressed {
+                            Event::Down { id: MOUSE_POINTER, x, y }
+                        } else {
+                            Event::Up { id: MOUSE_POINTER, x, y }
+                        });
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             let (action, x, y) = match tag {
                 1 | 3 => {
                     last = (a, b);
@@ -4862,6 +4994,105 @@ fn spawn_input_pump(env: &JniEnv) {
             inject(action, x, y, down_time);
         }
     });
+}
+
+/// JNI handles for building a multi-pointer `MotionEvent`.
+///
+/// `MotionEvent.obtain(long, long, int, float, float, int)` can only describe
+/// one finger. The public 14-argument overload takes `PointerProperties[]` and
+/// `PointerCoords[]`, which is what `ACTION_POINTER_DOWN`/`_UP` need.
+struct MultiTouchJni {
+    obtain: JMethodId,
+    props_class: JClass,
+    props_ctor: JMethodId,
+    props_id: JFieldId,
+    props_tool: JFieldId,
+    coords_class: JClass,
+    coords_ctor: JMethodId,
+    coords_x: JFieldId,
+    coords_y: JFieldId,
+    coords_pressure: JFieldId,
+    coords_size: JFieldId,
+}
+
+impl MultiTouchJni {
+    fn resolve(env: &JniEnv, motion_class: JClass) -> Option<MultiTouchJni> {
+        let props_class = env.find_class("android/view/MotionEvent$PointerProperties")?;
+        let coords_class = env.find_class("android/view/MotionEvent$PointerCoords")?;
+        Some(MultiTouchJni {
+            obtain: env.static_method_id(
+                motion_class,
+                "obtain",
+                "(JJII[Landroid/view/MotionEvent$PointerProperties;\
+                 [Landroid/view/MotionEvent$PointerCoords;IIFFIIII)Landroid/view/MotionEvent;",
+            )?,
+            props_class,
+            props_ctor: env.method_id(props_class, "<init>", "()V")?,
+            props_id: env.field_id(props_class, "id", "I")?,
+            props_tool: env.field_id(props_class, "toolType", "I")?,
+            coords_class,
+            coords_ctor: env.method_id(coords_class, "<init>", "()V")?,
+            coords_x: env.field_id(coords_class, "x", "F")?,
+            coords_y: env.field_id(coords_class, "y", "F")?,
+            coords_pressure: env.field_id(coords_class, "pressure", "F")?,
+            coords_size: env.field_id(coords_class, "size", "F")?,
+        })
+    }
+
+    /// Build the event for `frame`. The caller owns the local references.
+    fn obtain(
+        &self,
+        env: &JniEnv,
+        motion_class: JClass,
+        frame: &crate::keymap_gesture::Frame,
+        down_time: i64,
+        event_time: i64,
+    ) -> Option<JObject> {
+        const TOOL_TYPE_FINGER: i32 = 1;
+        const SOURCE_TOUCHSCREEN: i32 = 0x1002;
+        let count = frame.pointers.len() as i32;
+        let props = env.new_object_array(count, self.props_class, std::ptr::null_mut())?;
+        let coords = env.new_object_array(count, self.coords_class, std::ptr::null_mut())?;
+        if props.is_null() || coords.is_null() {
+            return None;
+        }
+        for (index, pointer) in frame.pointers.iter().enumerate() {
+            let prop = env.new_object(self.props_class, self.props_ctor, &[])?;
+            let coord = env.new_object(self.coords_class, self.coords_ctor, &[])?;
+            if prop.is_null() || coord.is_null() {
+                return None;
+            }
+            env.set_int_field(prop, self.props_id, pointer.id);
+            env.set_int_field(prop, self.props_tool, TOOL_TYPE_FINGER);
+            env.set_float_field(coord, self.coords_x, pointer.x);
+            env.set_float_field(coord, self.coords_y, pointer.y);
+            env.set_float_field(coord, self.coords_pressure, 1.0);
+            env.set_float_field(coord, self.coords_size, 1.0);
+            env.set_object_array_element(props, index as i32, prop);
+            env.set_object_array_element(coords, index as i32, coord);
+        }
+        let event = env.call_static_object(
+            motion_class,
+            self.obtain,
+            &[
+                JValue { j: down_time },
+                JValue { j: event_time },
+                JValue { i: frame.action },
+                JValue { i: count },
+                JValue { l: props },
+                JValue { l: coords },
+                JValue { i: 0 },   // metaState
+                JValue { i: 0 },   // buttonState
+                JValue { f: 1.0 }, // xPrecision
+                JValue { f: 1.0 }, // yPrecision
+                JValue { i: 0 },   // deviceId
+                JValue { i: 0 },   // edgeFlags
+                JValue { i: SOURCE_TOUCHSCREEN },
+                JValue { i: 0 }, // flags
+            ],
+        )?;
+        (!event.is_null()).then_some(event)
+    }
 }
 
 /// Select the top focusable app window and deliver the window-manager focus
@@ -6059,7 +6290,7 @@ fn force_visible(env: &JniEnv, record: JObject) {
                 }
             }
         }
-        force_window_frame(env, root, SURFACE_W, SURFACE_H);
+        force_window_frame(env, root, surface_w(), surface_h());
         dump_draw_state(env, root, index as usize);
         schedule_roots_dump(env);
         // `performTraversals` must run inside a Choreographer frame callback:
@@ -6101,7 +6332,7 @@ fn build_surface_control(env: &JniEnv) -> Option<JObject> {
         env.call_object(
             builder,
             set_size,
-            &[JValue { i: SURFACE_W }, JValue { i: SURFACE_H }],
+            &[JValue { i: surface_w() }, JValue { i: surface_h() }],
         );
     }
     let build = env.method_id(builder_class, "build", "()Landroid/view/SurfaceControl;")?;
@@ -6739,10 +6970,10 @@ pub fn probe_native_display(env: &JniEnv) -> bool {
                     let (w, h, rate) = (width(current), height(current), fps(current));
                     let (mut dataspace, mut format) = (-1, -1);
                     color(display, &mut dataspace, &mut format);
-                    if display_type(display) != 0 || (w, h) != (720, 1280)
+                    if display_type(display) != 0 || (w, h) != surface_size()
                         || !rate.is_finite() || (rate - 60.0).abs() > 0.01
                         || (dataspace, format) != (0, 1) { return None; }
-                    println!("display: native internal 720x1280 @ 60 Hz, SDR RGBA_8888 passed");
+                    println!("display: native internal {w}x{h} @ 60 Hz, SDR RGBA_8888 passed");
                     Some(())
                 })();
                 // Config/display pointers are borrowed from this single allocation.
@@ -6829,7 +7060,7 @@ pub fn probe_window_configuration(env: &JniEnv) -> bool {
         let visible = JValue { i: env.call_static_int(types, default_visible, &[])? };
         if !env.call_void(layout, compute, &[
             JValue { l: params }, JValue { l: insets }, JValue { l: safe }, JValue { l: bounds },
-            JValue { i: 1 }, JValue { i: SURFACE_W }, JValue { i: SURFACE_H },
+            JValue { i: 1 }, JValue { i: surface_w() }, JValue { i: surface_h() },
             visible, JValue { f: 1.0 }, JValue { l: frames },
         ]) { return None; }
         let frame = env.object_field(frames, env.field_id(frames_class, "frame", "Landroid/graphics/Rect;")?);
@@ -6839,7 +7070,7 @@ pub fn probe_window_configuration(env: &JniEnv) -> bool {
         let height = env.method_id(rect_class, "height", "()I")?;
         let (w, h) = (env.call_int(frame, width, &[])?, env.call_int(frame, height, &[])?);
         println!("window: local WindowLayout.computeFrames = {w}x{h}");
-        if w != SURFACE_W || h != SURFACE_H { return None; }
+        if w != surface_w() || h != surface_h() { return None; }
         probe_window_resized_payload(env)?;
         Some(())
     };
@@ -7177,9 +7408,9 @@ fn install_display_replies(env: &JniEnv) {
         set_int(
             field,
             if field.contains("Height") {
-                SURFACE_H
+                surface_h()
             } else {
-                SURFACE_W
+                surface_w()
             },
         );
     }
@@ -7210,7 +7441,7 @@ fn install_display_replies(env: &JniEnv) {
         // This constructor is present in the pinned API-37 framework source.
         let ctor = env.method_id(class, "<init>", "(IIIF)V")?;
         let mode = env.new_object(class, ctor, &[
-            JValue { i: 1 }, JValue { i: SURFACE_W }, JValue { i: SURFACE_H }, JValue { f: 60.0 },
+            JValue { i: 1 }, JValue { i: surface_w() }, JValue { i: surface_h() }, JValue { f: 60.0 },
         ])?;
         let modes = env.new_object_array(1, class, std::ptr::null_mut())?;
         env.set_object_array_element(modes, 0, mode);
@@ -7386,8 +7617,8 @@ fn build_client_window_frames(env: &JniEnv) -> Option<JObject> {
             &[
                 JValue { i: 0 },
                 JValue { i: 0 },
-                JValue { i: SURFACE_W },
-                JValue { i: SURFACE_H },
+                JValue { i: surface_w() },
+                JValue { i: surface_h() },
             ],
         )?;
         env.set_object_field(frames, f, rect);
@@ -8031,20 +8262,27 @@ mod tests {
     #[test]
     fn dp_matches_the_surface_and_density() {
         assert_eq!(DENSITY_DPI, 320);
-        assert_eq!(SURFACE_W, 720);
-        assert_eq!(SURFACE_H, 1280);
-        assert_eq!(SURFACE_W_DP, 360);
-        assert_eq!(SURFACE_H_DP, 640);
-
-        // `dp = px * 160 / dpi` must round-trip back to the pixel size.
-        assert_eq!(SURFACE_W_DP * DENSITY_DPI / 160, SURFACE_W);
-        assert_eq!(SURFACE_H_DP * DENSITY_DPI / 160, SURFACE_H);
+        use crate::display::Geometry;
+        for (geometry, dp) in [
+            (Geometry::PORTRAIT, (360, 640)),
+            (Geometry::LANDSCAPE, (640, 360)),
+            (Geometry { width: 1920, height: 1080 }, (960, 540)),
+        ] {
+            assert_eq!((px_to_dp(geometry.width), px_to_dp(geometry.height)), dp);
+            // `dp = px * 160 / dpi` must round-trip back to the pixel size.
+            assert_eq!(px_to_dp(geometry.width) * DENSITY_DPI / 160, geometry.width);
+            assert_eq!(px_to_dp(geometry.height) * DENSITY_DPI / 160, geometry.height);
+            // A Material dialog needs 280 dp in the narrow direction.
+            assert!(px_to_dp(geometry.width.min(geometry.height)) >= 280);
+        }
     }
 
-    /// 360 dp is wide enough for the narrowest thing the framework will draw.
+    /// The configuration must say which way up the surface is; a landscape
+    /// game laid out with `ORIENTATION_PORTRAIT` picks the wrong resources.
     #[test]
-    fn the_screen_is_wide_enough_for_a_material_dialog() {
-        // `AlertDialog`'s minimum width is 280 dp.
-        assert!(SURFACE_W_DP >= 280, "{SURFACE_W_DP} dp is too narrow");
+    fn configuration_orientation_follows_the_surface() {
+        assert_eq!(configuration_orientation(720, 1280), 1);
+        assert_eq!(configuration_orientation(1280, 720), 2);
+        assert_eq!(configuration_orientation(1920, 1080), 2);
     }
 }

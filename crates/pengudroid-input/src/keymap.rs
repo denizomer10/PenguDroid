@@ -9,7 +9,15 @@
 //! W       = hold 640 900
 //! Space   = tap  660 1150
 //! Shift   = swipe 400 800 700 800 12
+//! A       = stick 230 520 110 left
+//! MOUSE_RIGHT = tap 1110 590
 //! ```
+//!
+//! `stick` is a virtual joystick: every key bound to the same centre and
+//! radius shares one finger, which rests on the centre and is dragged toward
+//! the sum of the held directions. That is what a game's floating movement pad
+//! expects, and it is why WASD needs its own action instead of four `hold`s —
+//! four separate fingers would be four unrelated touches.
 //!
 //! The format is deliberately not JSON: the project has no serialisation
 //! dependency, and a line per binding is easier to hand-edit and to diff. Keys
@@ -34,6 +42,55 @@ pub enum Action {
         y1: f32,
         steps: u32,
     },
+    /// One direction of a virtual joystick centred on `(cx, cy)`.
+    ///
+    /// Keys that share a centre and radius drive the same finger.
+    Stick {
+        cx: f32,
+        cy: f32,
+        radius: f32,
+        dir: Dir,
+    },
+}
+
+/// A joystick direction, in screen space (`Up` is toward smaller `y`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dir {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+impl Dir {
+    /// The unit vector this direction contributes.
+    pub fn vector(self) -> (f32, f32) {
+        match self {
+            Dir::Up => (0.0, -1.0),
+            Dir::Down => (0.0, 1.0),
+            Dir::Left => (-1.0, 0.0),
+            Dir::Right => (1.0, 0.0),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Dir::Up => "up",
+            Dir::Down => "down",
+            Dir::Left => "left",
+            Dir::Right => "right",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Dir> {
+        match text {
+            "up" => Some(Dir::Up),
+            "down" => Some(Dir::Down),
+            "left" => Some(Dir::Left),
+            "right" => Some(Dir::Right),
+            _ => None,
+        }
+    }
 }
 
 /// One key binding.
@@ -86,6 +143,9 @@ impl Keymap {
                     y1,
                     steps,
                 } => format!("swipe {x0} {y0} {x1} {y1} {steps}"),
+                Action::Stick { cx, cy, radius, dir } => {
+                    format!("stick {cx} {cy} {radius} {}", dir.name())
+                }
             };
             out.push_str(&format!("{key} = {action}\n"));
         }
@@ -100,8 +160,10 @@ impl Keymap {
 fn parse_action(text: &str) -> Result<Action, String> {
     let mut parts = text.split_whitespace();
     let kind = parts.next().ok_or("missing action")?;
-    let mut nums = || -> Result<Vec<f32>, String> {
-        parts
+    let words: Vec<&str> = parts.collect();
+    let nums = || -> Result<Vec<f32>, String> {
+        words
+            .iter()
             .map(|p| {
                 let value = p.parse::<f32>().map_err(|_| format!("`{p}` is not a number"))?;
                 if !value.is_finite() || value < 0.0 { return Err(format!("`{p}` must be finite and non-negative")); }
@@ -144,9 +206,37 @@ fn parse_action(text: &str) -> Result<Action, String> {
                 _ => Err("swipe needs x0 y0 x1 y1 [steps]; steps must be an integer from 1 to 240".into()),
             }
         }
+        "stick" => {
+            const USAGE: &str = "stick needs cx cy radius up|down|left|right";
+            let [cx, cy, radius, dir] = words.as_slice() else {
+                return Err(USAGE.into());
+            };
+            let dir = Dir::parse(dir).ok_or(USAGE)?;
+            let mut values = [0.0f32; 3];
+            for (slot, word) in values.iter_mut().zip([cx, cy, radius]) {
+                let value = word
+                    .parse::<f32>()
+                    .map_err(|_| format!("`{word}` is not a number"))?;
+                if !value.is_finite() || value < 0.0 {
+                    return Err(format!("`{word}` must be finite and non-negative"));
+                }
+                *slot = value;
+            }
+            if values[2] < 1.0 {
+                return Err("stick radius must be at least 1".into());
+            }
+            Ok(Action::Stick { cx: values[0], cy: values[1], radius: values[2], dir })
+        }
         other => Err(format!("unknown action `{other}`")),
     }
 }
+
+/// `BTN_LEFT`: the primary button. It is the touch pointer, so it cannot be bound.
+pub const BTN_LEFT: u16 = 0x110;
+pub const BTN_RIGHT: u16 = 0x111;
+pub const BTN_MIDDLE: u16 = 0x112;
+pub const BTN_SIDE: u16 = 0x113;
+pub const BTN_EXTRA: u16 = 0x114;
 
 /// Linux keycode for a name, accepting both `KEY_W` and `W`.
 pub fn keycode(name: &str) -> Option<u16> {
@@ -232,6 +322,15 @@ pub fn keycode(name: &str) -> Option<u16> {
         "PAGEDOWN" => 109,
         "INSERT" => 110,
         "DELETE" => 111,
+        "RIGHTCTRL" => 97,
+        "RIGHTALT" => 100,
+        // Mouse buttons other than the left one, which is the touch itself.
+        // They share the keycode space (`BTN_RIGHT`, `BTN_MIDDLE`, ...), so a
+        // binding can put attack on the right button the way a PC game does.
+        "MOUSE_RIGHT" | "BTN_RIGHT" => BTN_RIGHT,
+        "MOUSE_MIDDLE" | "BTN_MIDDLE" => BTN_MIDDLE,
+        "MOUSE_SIDE" | "BTN_SIDE" => BTN_SIDE,
+        "MOUSE_EXTRA" | "BTN_EXTRA" => BTN_EXTRA,
         _ => return None,
     };
     Some(code)
@@ -306,6 +405,25 @@ pub fn keyname(code: u16) -> String {
         (109, "PAGEDOWN"),
         (110, "INSERT"),
         (111, "DELETE"),
+        (12, "MINUS"),
+        (13, "EQUAL"),
+        (26, "LEFTBRACE"),
+        (27, "RIGHTBRACE"),
+        (39, "SEMICOLON"),
+        (40, "APOSTROPHE"),
+        (41, "GRAVE"),
+        (43, "BACKSLASH"),
+        (51, "COMMA"),
+        (52, "DOT"),
+        (53, "SLASH"),
+        (54, "RIGHTSHIFT"),
+        (58, "CAPSLOCK"),
+        (97, "RIGHTCTRL"),
+        (100, "RIGHTALT"),
+        (BTN_RIGHT, "MOUSE_RIGHT"),
+        (BTN_MIDDLE, "MOUSE_MIDDLE"),
+        (BTN_SIDE, "MOUSE_SIDE"),
+        (BTN_EXTRA, "MOUSE_EXTRA"),
     ];
     NAMES
         .iter()
@@ -406,6 +524,39 @@ SHIFT = swipe 400 800 700 800 12
         assert!(Keymap::parse("W = hold -1 2").is_err());
         assert!(Keymap::parse("W = swipe 0 0 1 1 999999").is_err());
         assert!(Keymap::parse("W = swipe 0 0 1 1 1.5").is_err());
+        assert!(Keymap::parse("W = stick 1 2 3").is_err());
+        assert!(Keymap::parse("W = stick 1 2 3 north").is_err());
+        assert!(Keymap::parse("W = stick 1 2 0 up").is_err());
+        assert!(Keymap::parse("W = stick 1 2 3 up extra").is_err());
+    }
+
+    #[test]
+    fn stick_parses_and_round_trips() {
+        let text = "W = stick 230 520 110 up\nMOUSE_RIGHT = tap 1110 590\n";
+        let map = Keymap::parse(text).expect("parse");
+        assert_eq!(
+            map.action_for(17),
+            Some(&Action::Stick { cx: 230.0, cy: 520.0, radius: 110.0, dir: Dir::Up })
+        );
+        assert_eq!(map.action_for(BTN_RIGHT), Some(&Action::Tap { x: 1110.0, y: 590.0 }));
+        assert_eq!(map.render(), text);
+    }
+
+    /// A name `render` cannot write back would make the GUI editor silently
+    /// corrupt a profile on save.
+    #[test]
+    fn every_parsable_key_renders_to_a_parsable_name() {
+        for code in 1..=0x114u16 {
+            let name = keyname(code);
+            if name.starts_with("KEY_") {
+                continue;
+            }
+            assert_eq!(keycode(&name), Some(code), "{name}");
+        }
+        for name in ["MINUS", "GRAVE", "CAPSLOCK", "RIGHTSHIFT", "MOUSE_MIDDLE", "SLASH"] {
+            let code = keycode(name).expect(name);
+            assert_eq!(keyname(code), name);
+        }
     }
 
     #[test]

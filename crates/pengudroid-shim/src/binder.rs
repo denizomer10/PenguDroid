@@ -2304,8 +2304,12 @@ fn push_dynamic_display_info(parcel: &mut Vec<u8>) {
         push_sized_parcelable(parcel, |parcel| {
             parcel.extend_from_slice(&1i32.to_ne_bytes()); // mode ID
             push_sized_parcelable(parcel, |parcel| {
-                parcel.extend_from_slice(&720i32.to_ne_bytes());
-                parcel.extend_from_slice(&1280i32.to_ne_bytes());
+                // The same pair the app host puts in `DisplayInfo`; a
+                // SurfaceFlinger mode that disagrees with it makes native
+                // display discovery report a different panel than Java sees.
+                let (width, height) = crate::android_native::surface_size();
+                parcel.extend_from_slice(&width.to_ne_bytes());
+                parcel.extend_from_slice(&height.to_ne_bytes());
             });
             for word in [320.0f32.to_bits(), 320.0f32.to_bits(), 0,
                 60.0f32.to_bits(), 60.0f32.to_bits()] {

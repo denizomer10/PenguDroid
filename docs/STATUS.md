@@ -2,9 +2,58 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
-## Where we left off — desktop manager verified (2026-11-11)
+## Current handoff — groundwork for landscape games and Genshin (2026-11-10)
 
-Pick up here. The project currently does these things end to end:
+**Nothing in this section has been run against a live Android runtime.** It was
+written in an environment with no Android 17 system tree, no native bridge
+build and no GPU. The code builds and its unit tests pass (416 Rust tests; the
+three `pengudroid-hostgpu` tests need a GPU and fail there for that reason
+alone). The first job of the next session on a real desktop is the check list
+at the end of [GENSHIN.md](GENSHIN.md).
+
+What was added, all aimed at the stated end goal (a playable Genshin Impact):
+
+* **Landscape display.** The display was a fixed 720x1280 portrait panel, so
+  landscape games — BBR2 included, see the 720x1280 screenshots — ran in a
+  portrait window. `pengudroid launch` now reads the launcher activity's
+  `android:screenOrientation` and creates a 1280x720 display for
+  landscape-only activities; `PENGUDROID_DISPLAY=WxH` overrides. The app host
+  (`DisplayInfo`, `Configuration` incl. `orientation`, window frame) and the
+  shim's SurfaceFlinger display mode read the same `PENGUDROID_SURFACE_W`/`_H`
+  pair as the gleshim and `ANativeWindow`. **This changes BBR2's verified
+  portrait behaviour**; `PENGUDROID_DISPLAY=720x1280` restores it.
+* **Multi-touch keymapper.** Each mapped gesture owns a pointer id; the pump
+  sends multi-pointer `MotionEvent`s. New `stick` action (WASD → one joystick
+  finger) and bindable mouse buttons (`MOUSE_RIGHT`, …). Active only when a
+  keymap is loaded, so the no-keymap input path is byte-for-byte the old one.
+* **Built-in Genshin keymap**, scaled to the display, used when the user has no
+  profile; `pengudroid keymap-preset` prints it. Positions are approximate.
+* **`pengudroid doctor` rewritten around requirements.** It no longer says
+  "needs ART, not available": it names the engine, the ABI that would run, and
+  each thing the package references that this tree lacks (ARM64 stubs for
+  `libOpenSLES.so`/`libvulkan.so`/…, WebView, Play services). Exit code is 0
+  whenever the app can be launched at all.
+
+Measured facts from the code review that shaped the list in GENSHIN.md:
+
+* `tools/build-guest-stubs.py` builds ARM64 stubs for `libEGL`,
+  `libGLESv1_CM`, `libGLESv2`, `libGLESv3` and `libandroid` only. An ARM64 game
+  that links `libOpenSLES.so` (Unity, Wwise) has nothing forwarding it to the
+  host.
+* No crate implements `vkCreateAndroidSurfaceKHR` or AAudio.
+* The daemon's input protocol has absolute pointer motion only — no
+  relative-pointer or pointer-constraints path, so there is no mouse-look.
+
+### Next concrete task
+
+1. Run the GENSHIN.md check list on a real desktop (landscape BBR2, portrait
+   NewPipe, multi-pointer trace).
+2. Then the ordered list in GENSHIN.md: a small ARM64 Unity/IL2CPP game, the
+   `libOpenSLES` bridge, WebView, pointer lock — and only then Genshin itself.
+
+## Previous handoff — desktop manager verified (2026-11-11)
+
+The project does these things end to end:
 
 | Capability | Evidence |
 |---|---|

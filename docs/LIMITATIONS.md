@@ -265,14 +265,16 @@ silently fall back to a container.
   `pengudroid native`, with `AAssetManager`, `ALooper`, EGL/GLES and Vulkan. This
   is the path `pengudroid launch` picks, and `fixtures/native-game` is a playable
   game at ~56 fps on an RTX 3080.
-* **Genshin Impact still cannot run here.** Its Android build is `arm64-v8a`
-  only; the NDK translator above is the right tool for that and now initialises
-  and starts ARM64 code, but it does not yet complete guest execution (see 2.1).
-  On top of that it ships ~20 GB of OBB data, a proprietary anti-cheat, and it
-  needs `system_server` for login and rendering surfaces. There is no legitimate
-  way to obtain or run it in this environment, so "Genshin renders" is not a
-  claim this project can make. What it *can* claim is the same class of workload:
-  NativeActivity games that call EGL/GLES/Vulkan directly.
+* **Genshin Impact has not been run.** Its Android build is `arm64-v8a` only.
+  The native bridge now executes ARM64 games (Beach Buggy Racing 2), so
+  translation is no longer the blocker it was when this section was written;
+  what stands between the tree and a playable session is listed, in order, in
+  [GENSHIN.md](GENSHIN.md): a bridged `libOpenSLES.so`, a hosted WebView for
+  login, Vulkan window-system integration (or a clean GLES fallback),
+  pointer-lock mouse-look, and the unknowns only a run can answer — IL2CPP
+  performance under translation and the game's own tamper checks. A landscape
+  display and multi-touch keyboard controls are implemented but not yet
+  exercised live. "Genshin renders" is still not a claim this project makes.
 
 ## 3. Native `.so` compatibility
 

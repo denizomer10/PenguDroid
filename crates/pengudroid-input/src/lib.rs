@@ -9,13 +9,16 @@
 //! * [`keymap`] stores per-package key bindings and turns them into gestures, so
 //!   a keyboard can drive a game that only understands a touchscreen.
 //!
+//! [`presets`] holds built-in keymaps for games whose touch layout is known.
+//!
 //! [`mapper`] joins the two: it reads a physical keyboard through `evdev` and
 //! replays each bound key as a touch on the virtual panel.
 
 pub mod keymap;
 pub mod mapper;
+pub mod presets;
 pub mod uinput;
 
-pub use keymap::{Action, Binding, Keymap};
+pub use keymap::{Action, Binding, Dir, Keymap};
 pub use mapper::KeyMapper;
 pub use uinput::{EventReader, InputEvent, VirtualKeyboard, VirtualTouch};

@@ -306,6 +306,15 @@ fn surface_dimension(var: &str, default: i32) -> i32 {
         .unwrap_or(default)
 }
 
+/// The guest display size, chosen by the launcher (portrait 720x1280 unless
+/// the activity is landscape-only or a size was requested).
+pub(crate) fn surface_size() -> (i32, i32) {
+    (
+        surface_dimension("PENGUDROID_SURFACE_W", 720),
+        surface_dimension("PENGUDROID_SURFACE_H", 1280),
+    )
+}
+
 /// `ANativeWindow_fromSurface(env, surface)`.
 #[no_mangle]
 pub unsafe extern "C" fn ANativeWindow_fromSurface(
@@ -326,13 +335,13 @@ pub unsafe extern "C" fn ANativeWindow_release(_w: *mut c_void) {}
 /// `ANativeWindow_getWidth(w)`.
 #[no_mangle]
 pub unsafe extern "C" fn ANativeWindow_getWidth(_w: *mut c_void) -> i32 {
-    surface_dimension("PENGUDROID_SURFACE_W", 720)
+    surface_size().0
 }
 
 /// `ANativeWindow_getHeight(w)`.
 #[no_mangle]
 pub unsafe extern "C" fn ANativeWindow_getHeight(_w: *mut c_void) -> i32 {
-    surface_dimension("PENGUDROID_SURFACE_H", 1280)
+    surface_size().1
 }
 
 /// `ANativeWindow_getFormat(w)` — `WINDOW_FORMAT_RGBA_8888`.

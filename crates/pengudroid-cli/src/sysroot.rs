@@ -981,8 +981,24 @@ pub fn art_test(args: &[String]) -> i32 {
         // One surface geometry for the whole tree: the shim reports these through
         // `ANativeWindow_getWidth`/`_getHeight`, the gleshim sizes its FBO from
         // them, and the host lays the window frame out against the same numbers.
-        .env("PENGUDROID_SURFACE_W", "720")
-        .env("PENGUDROID_SURFACE_H", "1280");
+        // `pengudroid launch` chooses the pair from the activity's orientation
+        // (see `display.rs`); a bare `art-test` keeps the portrait default.
+        .env(
+            crate::display::SURFACE_W_ENV,
+            crate::display::surface_side(
+                crate::display::SURFACE_W_ENV,
+                crate::display::Geometry::PORTRAIT.width,
+            )
+            .to_string(),
+        )
+        .env(
+            crate::display::SURFACE_H_ENV,
+            crate::display::surface_side(
+                crate::display::SURFACE_H_ENV,
+                crate::display::Geometry::PORTRAIT.height,
+            )
+            .to_string(),
+        );
     if !native_lib_dirs.is_empty() {
         let dirs = std::env::join_paths(&native_lib_dirs)
             .map_err(|e| format!("cannot encode native library directories: {e}"))

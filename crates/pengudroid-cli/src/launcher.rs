@@ -388,6 +388,39 @@ pub fn launch(args: &[String]) -> i32 {
             let activity = component
                 .clone()
                 .or_else(|| info.main_activity_name().map(|s| s.to_string()));
+            // The display is created in the orientation the activity asks
+            // for: a landscape-only game must not be laid out on a portrait
+            // panel. `PENGUDROID_DISPLAY=WxH` picks an exact size, and an
+            // explicit `PENGUDROID_SURFACE_W`/`_H` pair is left alone.
+            if std::env::var_os(crate::display::SURFACE_W_ENV).is_none()
+                && std::env::var_os(crate::display::SURFACE_H_ENV).is_none()
+            {
+                let orientation = activity
+                    .as_deref()
+                    .and_then(|name| info.screen_orientation(&info.resolve(name)));
+                let requested = std::env::var(crate::display::DISPLAY_ENV).ok();
+                let geometry = match crate::display::choose(requested.as_deref(), orientation) {
+                    Ok(geometry) => geometry,
+                    Err(e) => {
+                        eprintln!("pengudroid launch: {e}");
+                        return 2;
+                    }
+                };
+                println!(
+                    "  display : {}x{} ({})",
+                    geometry.width,
+                    geometry.height,
+                    if requested.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+                        crate::display::DISPLAY_ENV
+                    } else if geometry.is_landscape() {
+                        "the activity is landscape-only"
+                    } else {
+                        "portrait default"
+                    }
+                );
+                cmd.env(crate::display::SURFACE_W_ENV, geometry.width.to_string());
+                cmd.env(crate::display::SURFACE_H_ENV, geometry.height.to_string());
+            }
             if let Some(activity) = &activity {
                 cmd.arg("--bind-app");
                 cmd.env("PENGUDROID_LAUNCH_ACTIVITY", activity);
