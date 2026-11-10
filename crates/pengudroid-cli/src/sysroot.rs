@@ -926,6 +926,18 @@ pub fn art_test(args: &[String]) -> i32 {
                 return 1;
             }
         };
+        // The generated GL forwarders (`libEGL.so`, ...) run inside this
+        // process and fill their slot tables with
+        // `dlopen("libpengudroid_gleshim.so")`. Guest-side `dlopen` searches
+        // this directory first, and the shim is not otherwise present under its
+        // own soname in the guest namespace, so link it in explicitly. Without
+        // this only host Mesa resolves, every EGL entry point bypasses the shim
+        // and the app's surfaces are never drawn.
+        if let Some(gleshim) = crate::nativelib::find_gleshim() {
+            let link = prepared.join("libpengudroid_gleshim.so");
+            let _ = std::fs::remove_file(&link);
+            let _ = std::os::unix::fs::symlink(&gleshim, &link);
+        }
         cmd.env("PENGUDROID_BRIDGE_LIB_PATH", &prepared_bridge.path);
         native_bridge = Some(prepared_bridge.name);
         ld_path = format!("{}:{ld_path}", prepared.display());
@@ -934,13 +946,19 @@ pub fn art_test(args: &[String]) -> i32 {
     // host GPU and presents every `eglSwapBuffers` as a dma-buf. Without it
     // hwui's EGL calls land on the sysroot's Bionic `libEGL`, which has no
     // driver behind it, so nothing is ever drawn.
-    let preload = match crate::nativelib::find_gleshim() {
+    let gleshim = crate::nativelib::find_gleshim();
+    let preload = match &gleshim {
         Some(g) => format!("{}:{}", shim.display(), g.display()),
         None => shim.display().to_string(),
     };
     // Extra preloads for diagnostics are loaded *after* the VM instead (see
     // `art_main`), because ART installs its fault handler during Runtime::Init
     // and a preloaded handler would be replaced by it.
+    if let Some(g) = &gleshim {
+        // Absolute path: the GL forwarders resolve their slots by soname from
+        // inside the guest, where a bare name only finds host Mesa.
+        cmd.env("PENGUDROID_GLESHIM", g);
+    }
     cmd.env("LD_PRELOAD", &preload)
         .env("LD_LIBRARY_PATH", &ld_path)
         .env("ANDROID_ROOT", &layout.android_root)
@@ -1545,8 +1563,84 @@ static BRIDGE_CALLBACKS: RuntimeCallbacks = RuntimeCallbacks {
     get_native_methods: bridge_get_native_methods,
 };
 
-unsafe extern "C" fn bridge_get_method_shorty(_env: *mut c_void, _method: *mut c_void) -> *const c_char {
-    c"".as_ptr()
+/// One type's Dalvik shorty character, from its `Class.getName()` text.
+/// Primitive class names map to their type letter; reference types and
+/// arrays (named like `[I` or `[Ljava/lang/String;`) both collapse to `L`,
+/// the dex shorty convention berberis parses.
+fn shorty_char_for_class_name(name: &str) -> char {
+    match name {
+        "boolean" => 'Z',
+        "byte" => 'B',
+        "char" => 'C',
+        "short" => 'S',
+        "int" => 'I',
+        "long" => 'J',
+        "float" => 'F',
+        "double" => 'D',
+        "void" => 'V',
+        _ => 'L',
+    }
+}
+
+/// Reduce a method's signature to a Dalvik shorty (return-type character
+/// first, then one character per parameter) through `ToReflectedMethod` and
+/// `java.lang.reflect`.
+///
+/// The descriptor cannot be read via JVMTI on ART: `JavaVM::GetEnv` only
+/// accepts JNI 1.x versions and refuses `JVMTI_VERSION_1_0` (measured:
+/// "Bad JNI version passed to GetEnv: 805371904"), and no other API hands
+/// out a `jvmtiEnv`. ART's `ToReflectedMethod` instead ignores its
+/// `jclass`/`jboolean` parameters and builds a reflect `Method` (or
+/// `Constructor` for `<init>`) straight from the `jmethodID`.
+fn reflected_shorty(env: crate::jni::JniEnv, method: *mut c_void) -> Option<String> {
+    let _frame = env.local_frame(32)?;
+    let reflected = env.to_reflected_method(method, false)?;
+    let member_class = env.object_class(reflected)?;
+    let class_char = |class: crate::jni::JClass| -> Option<char> {
+        let class_of_class = env.object_class(class)?;
+        let get_name = env.method_id(class_of_class, "getName", "()Ljava/lang/String;")?;
+        let name = env.call_object(class, get_name, &[])?;
+        Some(shorty_char_for_class_name(&env.get_string(name)?))
+    };
+    let mut shorty = String::new();
+    match env.method_id(member_class, "getReturnType", "()Ljava/lang/Class;") {
+        Some(get_return_type) => {
+            let ret = env.call_object(reflected, get_return_type, &[])?;
+            shorty.push(class_char(ret)?);
+        }
+        // A `Constructor` has no `getReturnType`; `method_id` already
+        // described and cleared the NoSuchMethodError. Constructors return
+        // void.
+        None => shorty.push('V'),
+    }
+    let get_parameter_types =
+        env.method_id(member_class, "getParameterTypes", "()[Ljava/lang/Class;")?;
+    let parameters = env.call_object(reflected, get_parameter_types, &[])?;
+    for i in 0..env.array_length(parameters) {
+        shorty.push(class_char(env.array_get(parameters, i))?);
+    }
+    Some(shorty)
+}
+
+/// berberis asks for the shorty of every method whose varargs it converts.
+/// The result is cached and intentionally leaked: berberis reads the string
+/// after the callback returns, so the bytes must outlive every call.
+unsafe extern "C" fn bridge_get_method_shorty(env: *mut c_void, method: *mut c_void) -> *const c_char {
+    static SHORTY_CACHE: std::sync::Mutex<Option<std::collections::HashMap<usize, CString>>> =
+        std::sync::Mutex::new(None);
+    let mut cache = SHORTY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let map = cache.get_or_insert_with(std::collections::HashMap::new);
+    if let Some(shorty) = map.get(&(method as usize)) {
+        return shorty.as_ptr();
+    }
+    let Some(shorty) = reflected_shorty(crate::jni::JniEnv(env), method).and_then(|s| CString::new(s).ok())
+    else {
+        // Keep berberis's own failure loud ("Failed to convert Dalvik char")
+        // instead of inventing a shorty, but say which method failed here.
+        eprintln!("art: shorty lookup failed for {method:p}");
+        return c"".as_ptr();
+    };
+    map.entry(method as usize).or_insert(shorty).as_ptr()
 }
 
 unsafe extern "C" fn bridge_get_native_method_count(_env: *mut c_void, _class: *mut c_void) -> u32 {
@@ -2416,6 +2510,28 @@ mod tests {
     fn binding_without_classpath_fails_before_accessing_jni() {
         let env = crate::jni::JniEnv(std::ptr::null_mut());
         assert!(!bind_application_now(&env, &[]));
+    }
+
+    #[test]
+    fn class_names_reduce_to_shorty_chars() {
+        // The shorty berberis parses: return type first, one character per
+        // parameter, references and arrays collapsed to `L`.
+        for (name, expected) in [
+            ("boolean", 'Z'),
+            ("byte", 'B'),
+            ("char", 'C'),
+            ("short", 'S'),
+            ("int", 'I'),
+            ("long", 'J'),
+            ("float", 'F'),
+            ("double", 'D'),
+            ("void", 'V'),
+            ("java.lang.String", 'L'),
+            ("[I", 'L'),
+            ("[Ljava/lang/String;", 'L'),
+        ] {
+            assert_eq!(shorty_char_for_class_name(name), expected, "{name}");
+        }
     }
 
     // Synthetic metadata and ELF headers only. No test loads an Android runtime

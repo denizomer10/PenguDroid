@@ -386,6 +386,38 @@ fn lock_state() -> MutexGuard<'static, State> {
     state().lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Every EGL attribute list in practice is a handful of pairs; a caller that
+/// has not written `EGL_NONE` by then is not passing a list this shim can read.
+const MAX_ATTRIB_PAIRS: usize = 64;
+const EGL_NONE: c_int = 0x3038;
+
+/// Copy an `EGL_NONE`-terminated attribute list into a `Vec`.
+///
+/// Returns `None` when the caller's list is unterminated. That case used to be
+/// an unbounded `loop` that read past the end of the mapping forever: a guest
+/// with a stale or mis-translated pointer left the render thread spinning at
+/// 100% CPU with no syscalls, which is indistinguishable from a hang. Callers
+/// treat `None` as "forward the original pointer unchanged".
+unsafe fn read_attribs(attribs: *const c_int) -> Option<Vec<c_int>> {
+    if attribs.is_null() {
+        return None;
+    }
+    let mut pairs = Vec::new();
+    for index in 0..MAX_ATTRIB_PAIRS {
+        let key = *attribs.add(index * 2);
+        if key == EGL_NONE {
+            pairs.push(EGL_NONE);
+            return Some(pairs);
+        }
+        pairs.push(key);
+        pairs.push(*attribs.add(index * 2 + 1));
+    }
+    log_once(format_args!(
+        "EGL attribute list at {attribs:p} has no EGL_NONE terminator; forwarding it unchanged"
+    ));
+    None
+}
+
 static LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Emit the first diagnostic only. Bytecode loaders call EGL from many threads
@@ -1212,34 +1244,94 @@ pub unsafe extern "C" fn eglChooseConfig(
     // host reports "no matching config" and the app cannot create a context.
     const EGL_SURFACE_TYPE: c_int = 0x3033;
     const EGL_PBUFFER_BIT: c_int = 0x0001;
-    const EGL_NONE: c_int = 0x3038;
-    let mut rewritten: Vec<c_int> = Vec::new();
-    if !attribs.is_null() {
-        let mut i = 0isize;
-        loop {
-            let key = *attribs.offset(i);
-            if key == EGL_NONE {
-                rewritten.push(EGL_NONE);
-                break;
+    const EGL_RENDERABLE_TYPE: c_int = 0x3040;
+    const EGL_OPENGL_ES2_BIT: c_int = 0x0004;
+
+    let trace = std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some();
+    let Some(original) = read_attribs(attribs) else {
+        return match host() {
+            // SAFETY: forwarded verbatim; the caller owns the out-pointers.
+            Ok(host) => (host.choose_config)(dpy, attribs, configs, config_size, num_config),
+            Err(_) => EGL_FALSE,
+        };
+    };
+
+    let trace_list = |label: &str, list: &[c_int]| {
+        if trace {
+            let mut pairs = Vec::new();
+            for pair in list.chunks(2) {
+                if pair.len() == 2 {
+                    pairs.push(format!("({:#x},{:#x})", pair[0], pair[1]));
+                }
             }
-            let val = *attribs.offset(i + 1);
-            if key == EGL_SURFACE_TYPE {
-                rewritten.push(EGL_SURFACE_TYPE);
-                rewritten.push(EGL_PBUFFER_BIT);
-            } else {
-                rewritten.push(key);
-                rewritten.push(val);
-            }
-            i += 2;
+            eprintln!("[gleshim] eglChooseConfig {label}=[{}]", pairs.join(" "));
+        }
+    };
+
+    // The requested sizes are advisory on PenguDroid: the shim renders into its
+    // own FBO and exports that, so a 32-bit depth buffer the host cannot offer
+    // must not fail window creation. Real games ask for `EGL_DEPTH_SIZE=32`,
+    // which llvmpipe (24-bit) answers with zero configs.
+    const RELAXABLE: [c_int; 10] = [
+        0x3020, // EGL_BUFFER_SIZE
+        0x3024, // EGL_RED_SIZE
+        0x3023, // EGL_GREEN_SIZE
+        0x3022, // EGL_BLUE_SIZE
+        0x3021, // EGL_ALPHA_SIZE
+        0x3025, // EGL_DEPTH_SIZE
+        0x3026, // EGL_STENCIL_SIZE
+        0x3032, // EGL_SAMPLES
+        0x3031, // EGL_SAMPLE_BUFFERS
+        0x3029, // EGL_LEVEL
+    ];
+
+    let mut exact = original.clone();
+    for pair in exact.chunks_mut(2) {
+        if pair.len() == 2 && pair[0] == EGL_SURFACE_TYPE {
+            pair[1] = EGL_PBUFFER_BIT;
         }
     }
-    let attribs = if rewritten.is_empty() { attribs } else { rewritten.as_ptr() };
-    match host() {
-        // SAFETY: the attribute list is NUL-terminated and the out-pointers are
-        // the caller's.
-        Ok(host) => (host.choose_config)(dpy, attribs, configs, config_size, num_config),
-        Err(_) => EGL_FALSE,
+    let mut relaxed = exact.clone();
+    for pair in relaxed.chunks_mut(2) {
+        if pair.len() == 2 && RELAXABLE.contains(&pair[0]) {
+            pair[1] = 0;
+        }
     }
+    let mut minimal = vec![
+        EGL_SURFACE_TYPE,
+        EGL_PBUFFER_BIT,
+        EGL_RENDERABLE_TYPE,
+        EGL_OPENGL_ES2_BIT,
+        EGL_NONE,
+    ];
+    // Keep the app's renderable type: an ES3 app must not be handed an ES2-only
+    // config, or `eglCreateContext` fails one step later.
+    if let Some(index) = exact.chunks(2).position(|pair| pair.len() == 2 && pair[0] == EGL_RENDERABLE_TYPE) {
+        minimal[3] = exact[index * 2 + 1];
+    }
+
+    let attempts: [(&str, &Vec<c_int>); 3] =
+        [("req", &exact), ("relaxed", &relaxed), ("minimal", &minimal)];
+
+    let mut last = EGL_FALSE;
+    for (label, list) in attempts {
+        trace_list(label, list);
+        let Ok(host) = host() else {
+            return EGL_FALSE;
+        };
+        // SAFETY: every list is `EGL_NONE`-terminated by construction and the
+        // out-pointers belong to the caller.
+        let result = (host.choose_config)(dpy, list.as_ptr(), configs, config_size, num_config);
+        let count = if num_config.is_null() { 0 } else { *num_config };
+        if trace {
+            eprintln!("[gleshim] eglChooseConfig {label} -> {result} count={count}");
+        }
+        last = result;
+        if result != EGL_FALSE && count > 0 {
+            return result;
+        }
+    }
+    last
 }
 
 #[no_mangle]
@@ -1277,15 +1369,15 @@ pub unsafe extern "C" fn eglCreateContext(
     // which this host renderer does not perform. Consume this one hint here;
     // retain every rendering/safety attribute for the host's own validation.
     let mut translated = Vec::new();
-    if !attribs.is_null() {
+    if let Some(original) = read_attribs(attribs) {
         let mut index = 0;
-        loop {
-            let key = *attribs.add(index);
-            if key == 0x3038 { translated.push(key); break; }
-            let value = *attribs.add(index + 1);
+        while index + 1 < original.len() {
+            let key = original[index];
+            let value = original[index + 1];
             if key != 0x3570 { translated.extend([key, value]); }
             index += 2;
         }
+        translated.push(EGL_NONE);
     }
     let attribs = if translated.is_empty() { attribs } else { translated.as_ptr() };
     match host() {
@@ -1587,19 +1679,18 @@ pub unsafe extern "C" fn eglCreatePbufferSurface(
     let mut w = env_dim("PENGUDROID_SURFACE_W", 720);
     let mut h = env_dim("PENGUDROID_SURFACE_H", 1280);
     if !attribs.is_null() {
-        let mut i = 0isize;
-        loop {
-            let key = *attribs.offset(i);
-            if key == 0x3038 {
-                break; // EGL_NONE
+        if let Some(list) = read_attribs(attribs) {
+            let mut i = 0;
+            while i + 1 < list.len() {
+                let key = list[i];
+                let val = list[i + 1];
+                if key == EGL_WIDTH && val > 0 {
+                    w = val as u32;
+                } else if key == EGL_HEIGHT && val > 0 {
+                    h = val as u32;
+                }
+                i += 2;
             }
-            let val = *attribs.offset(i + 1);
-            if key == EGL_WIDTH && val > 0 {
-                w = val as u32;
-            } else if key == EGL_HEIGHT && val > 0 {
-                h = val as u32;
-            }
-            i += 2;
         }
     }
     let rec = Box::new(SurfaceRec { w, h, tex: 0, fbo: 0, surface_id: 0, owns_surface: false });
@@ -1851,6 +1942,124 @@ pub unsafe extern "C" fn egl_get_init_count(_dpy: *mut c_void) -> u32 {
 #[no_mangle]
 pub unsafe extern "C" fn egl_get_string_for_current_context(_name: u32) -> *const c_char {
     std::ptr::null()
+}
+
+/// `android::egl_get_string_for_current_context(unsigned int, unsigned int)` —
+/// the per-display overload. `GLConsumer`/`libandroid_runtime` use it to read a
+/// single extension string, so both return the same (absent) value.
+#[export_name = "_ZN7android34egl_get_string_for_current_contextEjj"]
+pub unsafe extern "C" fn egl_get_string_for_current_context2(
+    _dpy: u32,
+    _name: u32,
+) -> *const c_char {
+    std::ptr::null()
+}
+
+/// `android::egl_get_num_extensions_for_current_context()` — `libhwui` sizes
+/// its EGL extension table from this.
+#[export_name = "_ZN7android42egl_get_num_extensions_for_current_contextEv"]
+pub unsafe extern "C" fn egl_get_num_extensions_for_current_context() -> i32 {
+    0
+}
+
+/// `android::eglQueryStringImplementationANDROIDImpl(void*, int)` — the
+/// unfiltered `eglQueryString` used by `libhwui` when it wants the real
+/// implementation's string rather than the sanitized one.
+#[export_name = "_ZN7android39eglQueryStringImplementationANDROIDImplEPvi"]
+pub unsafe extern "C" fn eglQueryStringImplementationANDROIDImpl(
+    dpy: *mut c_void,
+    name: c_int,
+) -> *const c_char {
+    eglQueryString(dpy, name)
+}
+
+/// `android::egl_set_cache_filename(const char*)` — `libhwui` points the
+/// driver's blob cache at the app's cache directory during
+/// `HardwareRenderer.setupPersistentGraphicsCache`.
+///
+/// The shim renders into a host-backed offscreen FBO chain, so there is no
+/// guest driver cache to persist. Returning immediately is the whole
+/// implementation; the alternative is forwarding to the *host* `libEGL`, whose
+/// blob cache belongs to Mesa and must not be pointed at a guest path.
+#[export_name = "_ZN7android22egl_set_cache_filenameEPKc"]
+pub unsafe extern "C" fn egl_set_cache_filename(filename: *const c_char) {
+    if std::env::var_os("PENGUDROID_TRACE_GLESHIM").is_some() {
+        let shown = if filename.is_null() {
+            "<null>".to_string()
+        } else {
+            std::ffi::CStr::from_ptr(filename).to_string_lossy().into_owned()
+        };
+        log_once(format_args!("egl_set_cache_filename({shown}) ignored"));
+    }
+}
+
+thread_local! {
+    /// `gl_hooks_t*` installed by `libhwui` through `setGlThreadSpecific`.
+    static GL_THREAD_SPECIFIC: std::cell::Cell<*const c_void> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// `android::setGlThreadSpecific(const gl_hooks_t*)` — `libhwui` installs its
+/// hook table per thread during `Extensions::initialize()`, and reads it back
+/// through `getGlThreadSpecific()` on every GL entry point.
+#[export_name = "_ZN7android19setGlThreadSpecificEPKNS_10gl_hooks_tE"]
+pub unsafe extern "C" fn setGlThreadSpecific(hooks: *const c_void) {
+    GL_THREAD_SPECIFIC.with(|slot| slot.set(hooks));
+}
+
+/// `android::getGlThreadSpecific()` — the matching getter.
+#[export_name = "_ZN7android18getGlThreadSpecificEv"]
+pub unsafe extern "C" fn getGlThreadSpecific() -> *const c_void {
+    GL_THREAD_SPECIFIC.with(|slot| slot.get())
+}
+
+/// `android::eglBeginFrameImpl(void*, void*)` — see [`eglBeginFrame`].
+#[export_name = "_ZN7android17eglBeginFrameImplEPvS0_"]
+pub unsafe extern "C" fn eglBeginFrameImpl(_dpy: *mut c_void, _surface: *mut c_void) {}
+
+/// `eglGetPlatformDisplay(EGLenum, void*, const EGLAttrib*)` — the EGL 1.5
+/// entry point `libhwui` prefers. Forwarded to the host's
+/// `eglGetPlatformDisplayEXT`, which takes the same arguments.
+#[no_mangle]
+pub unsafe extern "C" fn eglGetPlatformDisplay(
+    platform: u32,
+    native_display: *mut c_void,
+    attribs: *const isize,
+) -> EGLDisplay {
+    let host = match host() {
+        Ok(host) => host,
+        Err(e) => {
+            log_once(format_args!("{e}"));
+            return std::ptr::null_mut();
+        }
+    };
+    // `EGL_EXT_platform_base` declares `EGLint *` where EGL 1.5 has
+    // `EGLAttrib *`, so the two lists are not layout-compatible and cannot be
+    // passed through. The shim only supports the surfaceless platform, which
+    // defines no attributes at all, so a non-empty list is dropped rather than
+    // reinterpreted (a misread pointer-sized value would fault in Mesa).
+    if !attribs.is_null() && *attribs != 0 {
+        log_once(format_args!(
+            "eglGetPlatformDisplay: dropping platform attributes (unsupported)"
+        ));
+    }
+    if let Some(get_platform_display) = host.get_platform_display_ext {
+        // SAFETY: the shim ignores the attribute list, so the empty list the
+        // EXT signature expects is always the correct one here.
+        let display = get_platform_display(platform, native_display, std::ptr::null());
+        if !display.is_null() {
+            lock_state().display = display as usize;
+            return display;
+        }
+    }
+    // SAFETY: `native_display` is whatever the caller passed.
+    eglGetDisplay(native_display)
+}
+
+/// `eglQueryAPI()` — EGL 1.5. The shim only ever binds OpenGL ES.
+#[no_mangle]
+pub unsafe extern "C" fn eglQueryAPI() -> u32 {
+    0x30A0 // EGL_OPENGL_ES_API
 }
 
 /// `eglBeginFrame(EGLDisplay, EGLSurface)`.
@@ -2110,6 +2319,27 @@ pub unsafe extern "C" fn glBindFramebuffer(target: u32, framebuffer: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_attribs_stops_at_egl_none() {
+        let list = [0x3033, 0x0004, 0x3040, 0x0004, EGL_NONE];
+        let got = unsafe { read_attribs(list.as_ptr()) }.expect("terminated list");
+        assert_eq!(got, list);
+        assert!(unsafe { read_attribs(std::ptr::null()) }.is_none());
+    }
+
+    /// An unterminated list must be rejected instead of scanned forever. This
+    /// was a real guest-visible hang: the render thread spun in this loop until
+    /// the process was killed.
+    #[test]
+    fn read_attribs_rejects_unterminated_list() {
+        // Any key other than EGL_NONE: the point is that none appears.
+        let list = [0x3098 as c_int; MAX_ATTRIB_PAIRS * 4];
+        assert!(
+            unsafe { read_attribs(list.as_ptr()) }.is_none(),
+            "a list without EGL_NONE must not be accepted"
+        );
+    }
 
     /// Resolve a GL entry point through the shim's own `eglGetProcAddress`.
     unsafe fn gl_proc<T: Copy>(name: &str) -> Option<T> {

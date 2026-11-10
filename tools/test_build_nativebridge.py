@@ -963,10 +963,43 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(json.loads(json.dumps(build.OWNER))["schema"], 1)
 
 
-@unittest.skipUnless((build.DEPS / "manifest.json").is_file()
-                     and (build.LLVM / "clang++").is_file()
-                     and (build.ROOT / "extra/platform-headers/cutils/log.h").is_file(),
-                     "requires the existing verified API37/platform-libc++ bootstrap and cached extras")
+class SourceCompatibilityPatchTests(unittest.TestCase):
+    """The upstream fix list is applied on every build, so it must be stable."""
+
+    def test_each_patch_has_a_known_source_root(self):
+        for root, relative, _old, _new, change in build.source_compatibility_patches():
+            self.assertIn(root, ("digitalis", "native_bridge_support"), change)
+            self.assertFalse(relative.is_absolute(), change)
+            self.assertTrue(change, "every patch needs a stated reason")
+
+    def test_no_patch_targets_its_own_output(self):
+        # `apply_source_compatibility_patches` reports `changed_this_run: False`
+        # by finding `new`, so a patch whose `old` is still contained in `new`
+        # would re-apply forever and report a dirty tree on every build.
+        for _root, relative, old, new, change in build.source_compatibility_patches():
+            self.assertNotIn(old, new, "patch %r is not idempotent: %s" % (relative, change))
+            self.assertNotEqual(old, new, change)
+
+    @unittest.skipUnless((build.DEPS / "sources" / "native_bridge_support").is_dir(),
+                         "requires the prepared native_bridge_support source tree")
+    def test_the_prepared_tree_is_already_patched(self):
+        # Running the driver twice in a row must be a no-op: the patches are
+        # applied in `prepare_root`, and a patch that keeps matching would report
+        # a dirty tree (and change source) on every build.
+        for _ in range(2):
+            report = {}
+            build.apply_source_compatibility_patches(report)
+            entries = report["source_compatibility_patches"]
+            self.assertEqual(len(entries), len(build.source_compatibility_patches()))
+            self.assertFalse(
+                any(entry["changed_this_run"] for entry in entries),
+                "already-applied patch matched again: %s"
+                % [entry["change"] for entry in entries if entry["changed_this_run"]],
+            )
+            for entry in entries:
+                self.assertTrue(Path(entry["path"]).is_file(), entry["path"])
+
+
 class PinnedIntegrationTests(unittest.TestCase):
     def setUp(self):
         build.prepare_root()

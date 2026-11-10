@@ -49,6 +49,7 @@ NBS = DEPS / "sources/native_bridge_support"
 EXT = DEPS / "sources/ext"
 PREBUILT = EXT / "clang-prebuilt"
 CXX_COMPAT = ROOT / "gen" / "cxx-compat"
+CXX_COMPAT_LIBC = ROOT / "gen" / "cxx-compat-libc"
 LIBDL_SRC = EXT / "bionic-libdl"
 SCUDO_SRC = EXT / "scudo"
 GWP_ASAN_SRC = EXT / "gwp_asan"
@@ -76,8 +77,11 @@ CRT = NDK / "usr/lib/aarch64-linux-android/37"
 # Digitalis installs this as system/etc/ld.config.arm64.txt; the guest linker
 # reads it from kLdConfigArchFilePath and it is what makes the exported guest
 # "default" namespace search /system/lib64/arm64/bootstrap:/system/lib64/arm64.
+# An explicit checkout wins; otherwise use the pinned nativebridge-deps copy.
 LD_CONFIG = (REPO / ".toolchain/platform_frameworks_libs_binary_translation-android16"
              / "prebuilt/system/etc/ld.config.arm64.txt")
+if not LD_CONFIG.is_file():
+    LD_CONFIG = DEPS / "sources/digitalis/prebuilt/system/etc/ld.config.arm64.txt"
 BUNDLE = ROOT / "bundle"
 RUSTC = Path.home() / ".cargo/bin/rustc"
 
@@ -743,16 +747,32 @@ class GuestBuild:
                 "-funwind-tables", *DEVICE_CFLAGS]
         stl = props.get("stl")
         if cpp:
-            # Always drive libc++ explicitly. `--sysroot` points at the NDK, so
-            # clang would otherwise inject that libc++ *after* the module's own
-            # includes, which breaks libc++'s `<string.h>` overlay against
-            # `bionic/libc/include`. Declaring it here puts libc++ first, so its
-            # wrappers `#include_next` into bionic's headers, as in AOSP.
-            argv += ["-nostdinc++", "-I", str(CXX_COMPAT), "-I", str(LIBCXX)]
-            if LIBCXX_COMMON != LIBCXX:
-                argv += ["-I", str(LIBCXX_COMMON)]
-            if "noexcept" in self.linkage_hint(name):
-                argv += ["-D_LIBCPP_HAS_NO_EXCEPTIONS", "-D_LIBCPP_HAS_NO_C_ATOMIC_IMP"]
+            # Soong's stl: "none" (bionic's libc_defaults) means libc++ headers
+            # are not on the include path at all. That keeps Bionic's
+            # <stdatomic.h> on its C branch, where _Atomic is still the Clang C
+            # atomic type: both trivially default-constructible and valid in
+            # constinit. Pulling libc++ in maps _Atomic to std::atomic, which
+            # cannot satisfy both requirements. The final linker module also
+            # says stl: none, but links libc++_static_noexcept by hand, so it
+            # still needs libc++ headers.
+            links_libcxx = any(dependency in {"libc++", "libc++_static",
+                                             "libc++_static_noexcept"}
+                               for key in ("static_libs", "whole_static_libs", "shared_libs")
+                               for dependency in props.get(key, []))
+            if stl == "none" and not links_libcxx:
+                argv += ["-nostdinc++", "-I", str(CXX_COMPAT_LIBC)]
+            else:
+                # Always drive libc++ explicitly. `--sysroot` points at the
+                # NDK, so clang would otherwise inject that libc++ *after* the
+                # module's own includes, which breaks libc++'s `<string.h>`
+                # overlay against `bionic/libc/include`. Declaring it here puts
+                # libc++ first, so its wrappers `#include_next` into bionic's
+                # headers, as in AOSP.
+                argv += ["-nostdinc++", "-I", str(CXX_COMPAT), "-I", str(LIBCXX)]
+                if LIBCXX_COMMON != LIBCXX:
+                    argv += ["-I", str(LIBCXX_COMMON)]
+                if "noexcept" in self.linkage_hint(name):
+                    argv += ["-D_LIBCPP_HAS_NO_EXCEPTIONS", "-D_LIBCPP_HAS_NO_C_ATOMIC_IMP"]
         del stl
         for directory in self.include_flags(name, props):
             argv += ["-I", directory]
@@ -1499,53 +1519,54 @@ def prepare_root():
     CXX_COMPAT.mkdir(exist_ok=True)
     (CXX_COMPAT / "bits").mkdir(exist_ok=True)
     (CXX_COMPAT / "__new").mkdir(exist_ok=True)
+    (CXX_COMPAT / "__atomic").mkdir(exist_ok=True)
+    CXX_COMPAT_LIBC.mkdir(exist_ok=True)
+    (CXX_COMPAT_LIBC / "sanitizer").mkdir(exist_ok=True)
     (CXX_COMPAT / "__config").write_text(
         "#pragma once\n"
         "#include_next <__config>\n"
         "#undef _LIBCPP_HAS_C_ATOMIC_IMP\n"
-        "#define _LIBCPP_HAS_C_ATOMIC_IMP 0\n"
+        "#define _LIBCPP_HAS_C_ATOMIC_IMP 1\n"
         "#undef _LIBCPP_HAS_GCC_ATOMIC_IMP\n"
-        "#define _LIBCPP_HAS_GCC_ATOMIC_IMP 1\n"
+        "#define _LIBCPP_HAS_GCC_ATOMIC_IMP 0\n"
     )
-    atomic_macro_undefs = (
-        "#undef atomic_compare_exchange_strong\n"
-        "#undef atomic_compare_exchange_strong_explicit\n"
-        "#undef atomic_compare_exchange_weak\n"
-        "#undef atomic_compare_exchange_weak_explicit\n"
-        "#undef atomic_exchange\n"
-        "#undef atomic_exchange_explicit\n"
-        "#undef atomic_fetch_add\n"
-        "#undef atomic_fetch_add_explicit\n"
-        "#undef atomic_fetch_and\n"
-        "#undef atomic_fetch_and_explicit\n"
-        "#undef atomic_fetch_or\n"
-        "#undef atomic_fetch_or_explicit\n"
-        "#undef atomic_fetch_sub\n"
-        "#undef atomic_fetch_sub_explicit\n"
-        "#undef atomic_fetch_xor\n"
-        "#undef atomic_fetch_xor_explicit\n"
-        "#undef atomic_init\n"
-        "#undef atomic_is_lock_free\n"
-        "#undef atomic_load\n"
-        "#undef atomic_load_explicit\n"
-        "#undef atomic_store\n"
-        "#undef atomic_store_explicit\n"
-        "#undef atomic_thread_fence\n"
-        "#undef atomic_signal_fence\n"
-        "#undef kill_dependency\n"
-    )
+    # Delegate to libc++'s C++-aware <stdatomic.h>. Including Bionic's
+    # C-only bits/stdatomic.h here defines atomic_* macros that rewrite
+    # libc++'s own function templates (shared_ptr.h) and break every later
+    # <memory> include.
     (CXX_COMPAT / "stdatomic.h").write_text(
         "#pragma once\n"
-        + atomic_macro_undefs
-        + "#include <atomic>\n"
-        + "#ifdef _Atomic\n"
-        + "#undef _Atomic\n"
-        + "#endif\n"
-        + "#include <bits/stdatomic.h>\n"
+        "#include_next <stdatomic.h>\n"
     )
+    # android_crash_detail.cpp includes <bits/stdatomic.h> directly. In C++
+    # that must still resolve to the C++ wrapper, not Bionic's C macros.
     (CXX_COMPAT / "bits" / "stdatomic.h").write_text(
+        "#pragma once\n"
+        "#ifdef __cplusplus\n"
+        "#include_next <stdatomic.h>\n"
+        "#else\n"
         "#include_next <bits/stdatomic.h>\n"
+        "#endif\n"
     )
+    # libc++ implements P0883 (C++20) by giving __atomic_base a user-provided
+    # default constructor. Bionic's constinit WriteProtected<libc_globals>
+    # holds _Atomic members in a union whose default constructor is deleted
+    # when the member is not trivially default-constructible, so restore the
+    # pre-C++20 defaulted constructor in an overlay header.
+    atomic_header = None
+    for root in (LIBCXX, LIBCXX_COMMON):
+        if root and (Path(root) / "__atomic" / "atomic.h").is_file():
+            atomic_header = Path(root) / "__atomic" / "atomic.h"
+            break
+    if atomic_header is None:
+        raise BuildError("pinned libc++ is missing __atomic/atomic.h")
+    atomic_text = atomic_header.read_text()
+    p0883 = ("  _LIBCPP_HIDE_FROM_ABI constexpr __atomic_base() "
+             "noexcept(is_nothrow_default_constructible_v<_Tp>) : __a_(_Tp()) {}")
+    trivial = "  _LIBCPP_HIDE_FROM_ABI __atomic_base() noexcept = default;"
+    if atomic_text.count(p0883) != 1:
+        raise BuildError("pinned libc++ __atomic_base constructor changed; update compat overlay")
+    (CXX_COMPAT / "__atomic" / "atomic.h").write_text(atomic_text.replace(p0883, trivial))
     (CXX_COMPAT / "__new" / "nothrow_t.h").write_text(
         "#pragma once\n"
         "#include <__config>\n"
@@ -1555,6 +1576,34 @@ def prepare_root():
         "};\n"
         "extern _LIBCPP_EXPORTED_FROM_ABI const nothrow_t nothrow;\n"
         "_LIBCPP_END_UNVERSIONED_NAMESPACE_STD\n"
+    )
+    # Bionic's libc is built with stl: "none", so its C++ TUs see no libc++
+    # headers. They only need the small slice of <new> they actually use.
+    # AOSP gets this from compiler-rt's sysroot headers. The only use in the
+    # linked libc sources is behind __has_feature(hwaddress_sanitizer), which
+    # is off here, but the include itself is unconditional.
+    (CXX_COMPAT_LIBC / "sanitizer" / "hwasan_interface.h").write_text(
+        "#pragma once\n"
+        "#ifdef __cplusplus\n"
+        "extern \"C\" {\n"
+        "#endif\n"
+        "void __hwasan_handle_longjmp(void*);\n"
+        "#ifdef __cplusplus\n"
+        "}\n"
+        "#endif\n"
+    )
+    (CXX_COMPAT_LIBC / "new").write_text(
+        "#pragma once\n"
+        "#include <stddef.h>\n"
+        "namespace std {\n"
+        "using ::size_t;\n"
+        "struct nothrow_t { nothrow_t() = default; };\n"
+        "extern const nothrow_t nothrow;\n"
+        "}  // namespace std\n"
+        "inline void* operator new(std::size_t, void* p) noexcept { return p; }\n"
+        "inline void* operator new[](std::size_t, void* p) noexcept { return p; }\n"
+        "inline void operator delete(void*, void*) noexcept {}\n"
+        "inline void operator delete[](void*, void*) noexcept {}\n"
     )
 
 

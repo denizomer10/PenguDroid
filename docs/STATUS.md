@@ -2,7 +2,109 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
-## Current handoff — Intel BSP compatibility pass (2026-11-02)
+## Current handoff — `pthread_attr_t` ABI mismatch fixed; BBR2 now runs `SDL_main` (2026-11-04)
+
+Beach Buggy Racing 2 used to die ~13 s after launch inside berberis'
+`ScopedVirtualGuestCallFrame` constructor with `cpu->sp == 0x1001`. That was not
+a berberis bug and not a `libfmod.so` bug: it was a **guest/host
+`pthread_attr_t` layout mismatch at the libc proxy boundary**.
+
+### Root cause (measured, not guessed)
+
+The guest's `pthread_attr_*` calls are proxied to host glibc, so the 56 bytes a
+guest thread passes to `pthread_create` are written by **glibc**, while the
+bridge memcpy'd them and read them as **bionic** fields. Every field was
+shifted by one slot:
+
+| offset | glibc meaning | bionic meaning (what the bridge read) |
+|--------|---------------|---------------------------------------|
+| 8 | detachstate bit | `stack_base` |
+| 16 | `guardsize` (0x1000) | `stack_size` |
+| 24 | `stackaddr_set` | `guard_size` |
+| 32 | `stacksize` (0x20000) | `sched_policy` |
+
+So FMOD's real request — a **128 KiB detached stack** — reached the guest as a
+4096-byte stack with `stack_base == 0x1`, and the first translated call used
+`sp == 0x1001`.
+
+Evidence: a throwaway host program dumped `pthread_attr_t` bytes after
+`init` / `setstacksize(0x40000)` / `setdetachstate(DETACHED)` and matched the
+guest's observed words **byte for byte** (`0 0 0x1000 0 0 0 0` →
+`0 1 0x1000 0 0x20000 0 0`). Two further traps confirmed:
+
+* `pthread_attr_getstack` on glibc returns a garbage base (`-stacksize`,
+  `0xfffffffffffe0000`) when no explicit address was set — and the garbage is
+  page-aligned, so alignment is not a valid sanity check;
+* glibc `stacksize == 0` means "libc default" (8 MiB), not zero, so trusting it
+  handed the guest a single 4 KiB page.
+
+### Fix
+
+The translation now happens with the *host's own accessors* in both directions,
+and is owned by the build driver (`tools/build-nativebridge.py`,
+`apply_source_compatibility_patches`) rather than hand-edited:
+
+* `DoCustomTrampoline_pthread_create` reads the guest attr with
+  `pthread_attr_getstack`/`pthread_attr_getguardsize`, rejects implausible bases
+  (`< 0x10000`, `> 0x7fffffffffff`, `size < 0x1000`), floors an unset guest stack
+  to `kDefaultGuestStackSize` (1 MiB), and requests the host stack with
+  `pthread_attr_setstacksize`;
+* `DoCustomTrampoline_pthread_getattr_np` reports guest stack bounds with
+  `pthread_attr_setstack`/`setstacksize`/`setguardsize` instead of writing bionic
+  struct fields directly.
+
+The driver's compatibility-patch list became `(root, relative_path, old, new,
+change)` so it can patch both `sources/digitalis` and
+`sources/native_bridge_support`; `is_known_compatibility_overlay` accepts the
+latter when the host-accessor read is present. Re-running the driver is
+idempotent (all 9 patches report `changed_this_run: False`). As
+defence-in-depth the `AllocStack` guard in `tools/nativebridge-glibc-tls.patch.json`
+and `target/guest-pc-ring/rebuild.py` still rejects implausible guest stacks.
+
+### Measured state after the fix
+
+A 90-second run (`target/bbr2-patch-run.sh shot1 /tmp/px/libmain.so.orig 90`)
+ends with `elapsed 90.17`, `app_exit null`, `daemon_alive true`, and **zero**
+`SIGSEGV`/`SIGABRT`/fatal-signal lines. Reached, in order:
+
+* `SDL: Running main function SDL_main from library .../libmain.so`;
+* `[blast] handed out a Surface` and `[blast] update 720x1280`;
+* `[pd-attach] tid=… host stack_size=0x104000` (ART thread attach succeeds);
+* `fmod: AudioDevice::init : Actual buffer size: 8192 bytes` + `AudioTrack`;
+* the apphost probe finds the window: `views: root 0 mWidth=720 mHeight=1280
+  … mAdded=true mAppVisible=true` (11 times);
+* 52 guest threads, ~1.1 GB resident, alive for the whole window.
+
+Everything from `SDL: onPause()` to `onDestroy()` in the log happens in the
+final ~400 ms and is the harness SIGTERM, not a crash.
+
+### Remaining blocker: no GL at all
+
+The engine never starts rendering — the log contains **no** `eglChooseConfig`,
+`eglCreateContext`, `eglMakeCurrent` or `vkCreateInstance` line, and the only
+`eglSwapBuffers` is the teardown one. Live sampling during a run shows the
+main thread parked in `ep_poll` (Looper idle, which is normal) while a single
+`SDLThread` burns ~90 % of one core, i.e. an engine/audio thread free-running
+instead of presenting frames.
+
+Two suspects, both cheap to test next:
+
+1. **AudioTrack is not back-pressuring.** `AudioSystem.listAudioPorts` fails
+   784 times in 90 s (~9/s) and our `AudioTrack.write` accepts far faster than
+   real time, which is exactly how an FMOD/SDL mixer thread ends up spinning at
+   full speed. Making `write` block on the daemon's PipeWire ring would fix the
+   spin and probably unblock the first frame.
+2. **The SurfaceView never gets a real consumer.** The BLAST buffer queue is
+   created `1x1` and only later updated to `720x1280`, four host surfaces
+   (`surface 1..4`) are created for one activity, and the daemon never logs a
+   single present. The `apphost` SurfaceView-refresh path still needs the
+   non-blocking probe / `ViewRootImpl` descent work.
+
+Also benign and already explained: `NoSuchMethodError:
+Constructor.getReturnType()` is our own `reflected_shorty` probe
+(`crates/pengudroid-cli/src/sysroot.rs:1606`) logging and clearing itself.
+
+## Previous handoff — Intel BSP compatibility pass (2026-11-02)
 
 The [Intel Edge AOSP BSP](https://github.com/edge-aosp-bsp) was analysed against
 this runtime across its Binder/HAL, Mesa, Vulkan, EGL, gralloc and memory

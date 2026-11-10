@@ -5418,6 +5418,10 @@ fn launch_hosted_activity(
         }
         Some(_) => {
             println!("apphost: handleLaunchActivity returned an Activity for {activity_name}");
+            // The device's TransactionExecutor steps ON_CREATE -> ON_START ->
+            // ON_RESUME; deliver the missing START step so activities that gate
+            // behavior on `onStart` (SDLActivity's native thread) work.
+            start_activity(env, thread_class, thread, record);
             resume_activity(env, thread_class, thread, record);
             // `handleResumeActivity` calls `makeVisible()` only when it decides the
             // activity will be visible; drive it explicitly so the decor view is
@@ -5549,15 +5553,9 @@ fn resume_existing_activity(
     // activity returns to a STOPPED record. Only the latter needs onRestart /
     // onStart; API 37 deliberately throws when asked to start a paused record.
     if env.boolean_field(record, stopped) {
-        let Some(handle) = env.method_id(
-            thread_class,
-            "handleStartActivity",
-            "(Landroid/app/ActivityThread$ActivityClientRecord;Landroid/app/servertransaction/PendingTransactionActions;Landroid/app/ActivityOptions$SceneTransitionInfo;)V",
-        ) else { return; };
-        let Some((_, pending)) = new_instance(env, "android/app/servertransaction/PendingTransactionActions") else { return; };
-        if !env.call_void(thread, handle, &[
-            JValue { l: record }, JValue { l: pending }, JValue { l: std::ptr::null_mut() },
-        ]) { return; }
+        if !start_activity(env, thread_class, thread, record) {
+            return;
+        }
     }
     resume_activity(env, thread_class, thread, record);
     force_visible(env, record);
@@ -6105,6 +6103,36 @@ fn build_surface_control(env: &JniEnv) -> Option<JObject> {
     }
     println!("apphost: built a SurfaceControl via SurfaceControl.Builder");
     Some(sc)
+}
+
+/// Run the ON_START lifecycle step (`Activity.onStart`) for a record.
+///
+/// `handleLaunchActivity` only runs `onCreate` and `handleResumeActivity` runs
+/// `onResume`; on a device `TransactionExecutor.performLifecycleSequence`
+/// steps through `handleStartActivity` in between. Apps such as SDLActivity
+/// gate their native main thread on `onStart` (it flips `mIsResumedCalled`,
+/// which `handleNativeState` requires before starting `SDLThread`), so a launch
+/// that skips the START step never runs their native code. `Activity.performResume`
+/// only restarts a stopped record, so it does not cover a fresh launch.
+fn start_activity(env: &JniEnv, thread_class: JClass, thread: JObject, record: JObject) -> bool {
+    let Some(handle) = env.method_id(
+        thread_class,
+        "handleStartActivity",
+        "(Landroid/app/ActivityThread$ActivityClientRecord;Landroid/app/servertransaction/PendingTransactionActions;Landroid/app/ActivityOptions$SceneTransitionInfo;)V",
+    ) else {
+        eprintln!("apphost: Android 17 ActivityThread.handleStartActivity contract missing");
+        return false;
+    };
+    let Some((_, pending)) = new_instance(env, "android/app/servertransaction/PendingTransactionActions") else {
+        return false;
+    };
+    let ok = env.call_void(thread, handle, &[
+        JValue { l: record }, JValue { l: pending }, JValue { l: std::ptr::null_mut() },
+    ]);
+    if !ok {
+        eprintln!("apphost: handleStartActivity threw");
+    }
+    ok
 }
 
 /// Drive `onResume` and the window attach.

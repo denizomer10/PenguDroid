@@ -40,6 +40,7 @@ pub const JNI_ERR: i32 = -1;
 mod slot {
     pub const GET_VERSION: usize = 4;
     pub const FIND_CLASS: usize = 6;
+    pub const TO_REFLECTED_METHOD: usize = 9;
     pub const THROW: usize = 13;
     pub const THROW_NEW: usize = 14;
     pub const EXCEPTION_OCCURRED: usize = 15;
@@ -193,6 +194,40 @@ impl JniEnv {
             return None;
         }
         Some(c)
+    }
+
+    /// `GetObjectClass(obj)`.
+    pub fn object_class(&self, obj: JObject) -> Option<JClass> {
+        if obj.is_null() {
+            return None;
+        }
+        let f: unsafe extern "C" fn(*mut c_void, JObject) -> JClass =
+            unsafe { self.func(slot::GET_OBJECT_CLASS) };
+        let c = unsafe { f(self.0, obj) };
+        if c.is_null() {
+            self.describe_exception();
+            return None;
+        }
+        Some(c)
+    }
+
+    /// `ToReflectedMethod(methodID, isStatic)`.
+    ///
+    /// ART ignores the `jclass` parameter and derives the reflect
+    /// `Method`/`Constructor` from the `jmethodID` alone (see
+    /// `art/runtime/jni/jni_internal.cc`).
+    pub fn to_reflected_method(&self, method: JMethodId, is_static: bool) -> Option<JObject> {
+        if method.is_null() {
+            return None;
+        }
+        let f: unsafe extern "C" fn(*mut c_void, JClass, JMethodId, u8) -> JObject =
+            unsafe { self.func(slot::TO_REFLECTED_METHOD) };
+        let obj = unsafe { f(self.0, std::ptr::null_mut(), method, is_static as u8) };
+        if obj.is_null() {
+            self.describe_exception();
+            return None;
+        }
+        Some(obj)
     }
 
     /// `GetStaticMethodID(clazz, name, sig)`.

@@ -170,6 +170,9 @@ pub fn native(args: &[String]) -> i32 {
     let ld_path = format!("{}:{}", compat.display(), libdir.display());
     cmd.env("LD_PRELOAD", preload)
         .env("LD_LIBRARY_PATH", ld_path)
+        // Absolute shim path for the GL forwarders, which resolve their slots by
+        // soname and would otherwise only reach host Mesa.
+        .env("PENGUDROID_GLESHIM", &gleshim)
         .env("PENGUDROID_SURFACE_W", args.width.to_string())
         .env("PENGUDROID_SURFACE_H", args.height.to_string())
         .env("PENGUDROID_SUPPRESS_DESTRUCTORS", "1");

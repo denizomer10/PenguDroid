@@ -81,11 +81,15 @@ REQUIRED_OUTPUT = (
     *(f"{OVERLAYS[1]}/bootstrap/{name}" for name in ART_NAMES),
 )
 VDSO_SOURCE = REPO / ".toolchain/nativebridge-deps/sources/native_bridge_support/android_api/vdso/vdso_arm64.S"
-COMPILER = Path("/usr/lib/llvm-22/bin/clang")
+COMPILER = Path(os.environ.get("PENGUDROID_LLVM_DIR", "/usr/lib/llvm-22/bin")) / "clang"
 VDSO_FLAGS = (
     "--target=aarch64-linux-android37", "-fPIC", "-shared", "-nostdlib",
     "-Wl,-soname,linux-vdso.so.1", "-Wl,--exclude-libs,ALL",
     "-Wl,-z,separate-code", "-Wl,--image-base=0x4000", "-Wl,--hash-style=both",
+    # DF_1_GLOBAL: runtime-created (classloader) namespaces only inherit the
+    # parent's shared group, so without it an app namespace cannot resolve
+    # native_bridge_intercept_symbol and every guest GL stub fails to load.
+    "-Wl,-z,global",
 )
 SPARSE_MAGIC = 0xED26FF3A
 MAX_IMAGE = 16 * 1024**3

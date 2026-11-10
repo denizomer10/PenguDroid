@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "description": "Opt-in GNU x86_64 host / ARM64 Bionic guest bootstrap TLS. Apply only to driver-owned staged copies, after exact base-source hash validation. No pthread_self interposition or host TCB writes.",
+  "description": "Opt-in GNU x86_64 host / ARM64 Bionic guest bootstrap TLS. Apply only to driver-owned staged copies, after exact base-source hash validation. No pthread_self interposition or host TCB writes. Also rejects guest-supplied pthread stacks that cannot describe a real stack.",
   "sources": [
     {
       "path": "guest_loader/guest_loader.cc",
@@ -31,6 +31,10 @@
         {
           "old": "  // region digitalis\n  // On a glibc host running the translator under a bionic compatibility layer,\n  // TLS_SLOT_THREAD_ID (%fs+0x08) is glibc's DTV pointer rather than a\n  // pthread_internal_t*. Such a host seeds a synthetic bionic pthread record in\n  // TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE; take the thread id from there and let\n  // the store below replace it with the live GuestThread pointer.\n  const size_t host_thread_id_slot = IsConfigFlagSet(kGlibcHostThreadIdHandoff)\n                                         ? TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE\n                                         : TLS_SLOT_THREAD_ID;\n  tls[g_static_tls_config.tls_slot_thread_id] = GetTls()[host_thread_id_slot];\n  // endregion\n  tls[g_static_tls_config.tls_slot_bionic_tls] = GetTls()[TLS_SLOT_BIONIC_TLS];\n  GetTls()[TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE] = GetThreadStateStorage(*state_);",
           "new": "  if (IsConfigFlagSet(kGlibcHostThreadIdHandoff)) {\n    const auto bridge = GetPengudroidBridgeTls(tls, GetThreadStateStorage(*state_));\n    tls[g_static_tls_config.tls_slot_thread_id] = bridge.guest_pthread;\n    tls[g_static_tls_config.tls_slot_bionic_tls] = bridge.bionic_tls;\n  } else {\n    // Native Bionic only. GNU hosts must never seed/read guest slots in FS.\n    tls[g_static_tls_config.tls_slot_thread_id] = GetTls()[TLS_SLOT_THREAD_ID];\n    tls[g_static_tls_config.tls_slot_bionic_tls] = GetTls()[TLS_SLOT_BIONIC_TLS];\n    GetTls()[TLS_SLOT_NATIVE_BRIDGE_GUEST_STATE] = GetThreadStateStorage(*state_);\n  }"
+        },
+        {
+          "old": "  if (stack) {\n    // User-provided stack.\n    stack_ = nullptr;  // Do not unmap in Destroy!\n    mmap_size_ = 0;\n    guard_size_ = guard_size;\n    stack_size_ = stack_size;\n    stack_top_ = ToGuestAddr(stack) + stack_size_;\n    return true;\n  }",
+          "new": "  if (stack) {\n    // A guest-supplied stack is only usable when it actually describes a stack.\n    // Bionic trusts pthread_attr_t::stack_base blindly, so a guest that fills its\n    // attr from a foreign layout can hand us garbage (observed: stack_base=0x1,\n    // stack_size=0x1000). That translates to a NULL host stack with\n    // stack_top_ == stack_size + 1, and the first push faults near address 0.\n    // Allocate a private stack instead of dying.\n    const uintptr_t guest_stack_base = static_cast<uintptr_t>(ToGuestAddr(stack));\n    if (guest_stack_base % kPageSize == 0 && stack_size >= kPageSize) {\n      // User-provided stack.\n      stack_ = nullptr;  // Do not unmap in Destroy!\n      mmap_size_ = 0;\n      guard_size_ = guard_size;\n      stack_size_ = stack_size;\n      stack_top_ = guest_stack_base + stack_size_;\n      return true;\n    }\n    TRACE(\"ignoring implausible guest stack\");\n  }"
         }
       ]
     }

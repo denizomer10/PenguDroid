@@ -233,6 +233,28 @@ def ensure_art_header_module():
         path.write_text(ART_HEADER_BLUEPRINT)
 
 
+def ensure_gl_forwarder_modules():
+    """Generate the host GL modules the native-bridge proxies link against.
+
+    `libberberis_proxy_libEGL`/`_libGLESv2`/`_libGLESv3` require AOSP host
+    modules named `libEGL`, `libGLESv2` and `libGLESv3`, which are absent from
+    the pinned slice. A proxy resolves each guest call with
+    `dlsym(proxy_handle, name)`, i.e. out of its own dependency closure, so the
+    replacement modules must export the real entry points; tools/gl-forwarders.py
+    generates register-preserving jumps into the PenguDroid GL shim and host
+    Mesa/glvnd.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "pengudroid_gl_forwarders", REPO / "tools/gl-forwarders.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    stubs = DEPS / "sources/native_bridge_support/android_api"
+    module.generate(ROOT / "extra/gl-forwarders",
+                    lambda library: (stubs / library / "stubs_arm64.cc").read_text())
+
+
 def verify_elf(path, elf_type, machine=62):
     with Path(path).open("rb") as stream:
         header = stream.read(20)
@@ -404,6 +426,28 @@ def tokenize(text):
     return result
 
 
+# The pinned digitalis android_api proxy modules reference the
+# native_bridge_support proxy filegroups but, unlike the libc module, drop the
+# filegroups' companion defaults (the upstream modules declare them in
+# `defaults`). Restore the contract during property resolution instead of
+# patching the hash-pinned upstream files: key is the bare filegroup name the
+# module lists in `srcs`, value is the companion defaults module reference.
+PROXY_FILEGROUP_DEFAULTS = {
+    "native_bridge_proxy_libandroid_files":
+        "//frameworks/libs/native_bridge_support/android_api/libandroid:native_bridge_proxy_libandroid_defaults",
+}
+
+# The pinned `libberberis_proxy_libGLESv1_CM` module is the one GL proxy whose
+# blueprint omits the `shared_libs` entry its EGL/GLESv2/GLESv3 siblings declare.
+# A proxy resolves every guest call with `dlsym(proxy_handle, name)`, and that
+# handle's scope is the module's own dependency closure, so without the entry
+# every GLES1 slot would fall back to DoBadThunk and abort the guest. Restore the
+# dependency during property resolution rather than patching the pinned file.
+PROXY_SHARED_LIBS = {
+    "libberberis_proxy_libGLESv1_CM": ("libGLESv1_CM",),
+}
+
+
 class Blueprints:
     def __init__(self, roots, source_dirs=None, translation_arch=None):
         self.modules, self.resolved, self.used, self.inherited = {}, {}, {}, {}
@@ -549,6 +593,13 @@ class Blueprints:
                     properties[key] = str(source_dir / value)
 
         paths(raw)
+        for source in raw.get("srcs", []):
+            if not isinstance(source, str) or not source.startswith(("//", ":")):
+                continue
+            companion = PROXY_FILEGROUP_DEFAULTS.get(source.rpartition(":")[2])
+            if (companion and companion.rpartition(":")[2] != name
+                    and companion not in raw.get("defaults", [])):
+                raw.setdefault("defaults", []).append(companion)
         result = {}
         for default in raw.get("defaults", []):
             default = self.canonical(default)
@@ -557,6 +608,15 @@ class Blueprints:
                 raise BuildError(f"unsupported defaults module {default} for {name}; expected {expected_default}")
             result = merge(result, self.raw_props(default, stack + (name,)))
         result = merge(result, raw)
+        # Restored companion defaults may repeat the proxy filegroup the module
+        # already declares; compiling a source twice would duplicate its
+        # symbols. Blueprint list concatenation is order-preserving.
+        if isinstance(result.get("srcs"), list):
+            result["srcs"] = list(dict.fromkeys(result["srcs"]))
+        restored = PROXY_SHARED_LIBS.get(name)
+        if restored:
+            shared = list(result.get("shared_libs", []))
+            result["shared_libs"] = shared + [lib for lib in restored if lib not in shared]
         self.inherited[name] = result
         return copy.deepcopy(result)
 
@@ -1738,31 +1798,133 @@ def publish_report(report):
     atomic_json(ROOT / "report.json", report)
 
 
-def apply_source_compatibility_patches(report):
-    """Apply narrowly scoped fixes for upstream sources that are UB under this build."""
-    patches = [
+def source_compatibility_patches():
+    """Return `(root, relative path, old, new, change)` upstream fixes, in order."""
+    return [
         (
+            "digitalis",
             Path("cpu_emulation/backend/x86_64/read_flags_optimizer.cc"),
             "  MachineEdge* postloop_edge;\n  MachineEdge* loop_edge;",
             "  MachineEdge* postloop_edge = nullptr;\n  MachineEdge* loop_edge = nullptr;",
             "initialize loop successor edges before CHECK_EQ/Contains traversal",
         ),
         (
+            "digitalis",
             Path("base/include/berberis/base/config.h"),
             "inline constexpr uint32_t kGearSwitchThreshold = 1000;",
             "inline constexpr uint32_t kGearSwitchThreshold = UINT32_MAX;",
             "keep guest execution in the lite translator until heavy optimizer compatibility is proven",
         ),
         (
+            "digitalis",
             Path("proxy_loader/proxy_library_builder.cc"),
             "handle_ = dlopen(library_name, RTLD_GLOBAL);",
             "handle_ = dlopen(library_name, RTLD_NOW | RTLD_GLOBAL);",
             "include a binding mode when loading guest libraries through the host glibc loader",
         ),
+        (
+            "native_bridge_support",
+            Path("android_api/libc/proxy/pthread_translation.cc"),
+            "  void* guest_stack = attr.stack_base;\n  size_t guest_stack_size = attr.stack_size;\n  size_t guest_guard_size = attr.guard_size;",
+            "  // Guest pthread_attr_* calls are served by the host libc, so the attr in\n"
+            "  // guest memory follows the HOST pthread_attr_t layout and has to be read\n"
+            "  // with the host accessors. Reading the bionic fields directly shifts every\n"
+            "  // field on a glibc host: guard size is taken for the stack size and the\n"
+            "  // requested stack size for sched_policy, which turns a 128 KiB request\n"
+            "  // into a 4 KiB stack and a bogus stack base.\n"
+            "  void* guest_stack = nullptr;\n"
+            "  size_t guest_stack_size = 0;\n"
+            "  size_t guest_guard_size = 0;\n"
+            "  if (pthread_attr_getstack(&attr, &guest_stack, &guest_stack_size) != 0 ||\n"
+            "      pthread_attr_getguardsize(&attr, &guest_guard_size) != 0) {\n"
+            "    guest_stack = nullptr;\n"
+            "    guest_stack_size = 0;\n"
+            "    guest_guard_size = 0;\n"
+            "  }\n"
+            "  // A host libc reports an unusable base for attrs without an explicit\n"
+            "  // stack, so only keep values that can describe a real guest stack.\n"
+            "  if (guest_stack == nullptr ||\n"
+            "      reinterpret_cast<uintptr_t>(guest_stack) < 0x10000 ||\n"
+            "      reinterpret_cast<uintptr_t>(guest_stack) > 0x00007fffffffffffULL ||\n"
+            "      guest_stack_size < 0x1000) {\n"
+            "    guest_stack = nullptr;\n"
+            "    guest_stack_size = 0;\n"
+            "  }",
+            "read guest pthread_attr_t through host accessors in pthread_create",
+        ),
+        (
+            "native_bridge_support",
+            Path("android_api/libc/proxy/pthread_translation.cc"),
+            "  attr.stack_base = nullptr;\n  attr.stack_size = std::max(guest_stack_size, GetStackSizeForTranslation());",
+            "  pthread_attr_setstacksize(\n"
+            "      &attr, std::max(guest_stack_size, GetStackSizeForTranslation()));",
+            "request the translation host stack through the host attr setter",
+        ),
+        (
+            "native_bridge_support",
+            Path("android_api/libc/proxy/pthread_translation.cc"),
+            "    guest_attr->stack_base = ToHostAddr<void>(stack_base);",
+            "    void* guest_attr_stack_base = ToHostAddr<void>(stack_base);",
+            "report guest stack bounds through host attr setters in pthread_getattr_np",
+        ),
+        (
+            "native_bridge_support",
+            Path("android_api/libc/proxy/pthread_translation.cc"),
+            "    if (tid != getpid()) {\n      guest_attr->stack_size = stack_size;\n      guest_attr->guard_size = guard_size;\n    }",
+            "    size_t guest_attr_stack_size = stack_size;\n"
+            "    if (tid == getpid()) {\n"
+            "      pthread_attr_getstacksize(guest_attr, &guest_attr_stack_size);\n"
+            "    }\n"
+            "    if (guest_attr_stack_base != nullptr) {\n"
+            "      pthread_attr_setstack(guest_attr, guest_attr_stack_base,\n"
+            "                            guest_attr_stack_size);\n"
+            "    } else {\n"
+            "      pthread_attr_setstacksize(guest_attr, guest_attr_stack_size);\n"
+            "    }\n"
+            "    if (tid != getpid()) {\n"
+            "      pthread_attr_setguardsize(guest_attr, guard_size);\n"
+            "    }",
+            "apply guest stack size and guard through host attr setters",
+        ),
+        (
+            "native_bridge_support",
+            Path("android_api/libc/proxy/pthread_translation.cc"),
+            "  // Avoid using pthread_attr_get/set*, as they do error-checking we don't want\n"
+            "  // here! ATTENTION: this is not standard-compliant, just OK for bionic!\n"
+            "  // Guest pthread_attr_* calls are served by the host libc",
+            "  // Guest pthread_attr_* calls are served by the host libc",
+            "drop the outdated direct-field comment in pthread_create",
+        ),
+        (
+            "native_bridge_support",
+            Path("android_api/libc/proxy/pthread_translation.cc"),
+            "      guest_stack_size < 0x1000) {\n"
+            "    guest_stack = nullptr;\n"
+            "    guest_stack_size = 0;\n"
+            "  }\n"
+            "  // Ensure host stack is big enough to do translation.",
+            "      guest_stack_size < 0x1000) {\n"
+            "    guest_stack = nullptr;\n"
+            "    guest_stack_size = 0;\n"
+            "  }\n"
+            "  // A host libc reports 0 for \"use the libc default\", so fall back to the\n"
+            "  // bionic default instead of handing the guest a single 4 KiB page.\n"
+            "  constexpr size_t kDefaultGuestStackSize = 1024 * 1024;\n"
+            "  if (guest_stack == nullptr && guest_stack_size < kDefaultGuestStackSize) {\n"
+            "    guest_stack_size = kDefaultGuestStackSize;\n"
+            "  }\n"
+            "  // Ensure host stack is big enough to do translation.",
+            "give threads with a default-sized attr the bionic default guest stack",
+        ),
     ]
+
+
+def apply_source_compatibility_patches(report):
+    """Apply narrowly scoped fixes for upstream sources that are UB under this build."""
+    patches = source_compatibility_patches()
     applied = []
-    for relative, old, new, change in patches:
-        source = DEPS / "sources/digitalis" / relative
+    for root, relative, old, new, change in patches:
+        source = DEPS / "sources" / root / relative
         text = source.read_text()
         if old in text:
             source.write_text(text.replace(old, new, 1))
@@ -1841,6 +2003,10 @@ def main():
                         (path / "cpu_emulation/backend/x86_64/read_flags_optimizer.cc").read_text()
                         and "kGearSwitchThreshold = UINT32_MAX;" in
                         (path / "base/include/berberis/base/config.h").read_text()
+                    ) or (
+                        artifact.get("destination") == "sources/native_bridge_support"
+                        and "pthread_attr_getstack(&attr, &guest_stack, &guest_stack_size);" in
+                        (path / "android_api/libc/proxy/pthread_translation.cc").read_text()
                     )
                     if not digest_matches and not is_known_compatibility_overlay:
                         raise BuildError(f"modified dependency: {path}")
@@ -1867,6 +2033,8 @@ def main():
             roots["build/soong"] = ROOT / "extra/soong"
             ensure_art_header_module()
             roots["art-headers"] = ROOT / "extra/art-headers"
+            ensure_gl_forwarder_modules()
+            roots["pengudroid/gl-forwarders"] = ROOT / "extra/gl-forwarders"
             source_dirs = {ROOT / "extra/bionic-libc/Android.bp": DEPS / "sources/bionic/libc"}
             model = Blueprints(roots, source_dirs, translation_arch="arm64_to_x86_64")
             report["platform_sources"] = describe_platform_sources(model)

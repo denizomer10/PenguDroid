@@ -336,6 +336,9 @@ extern "C" fn pengudroid_fault_handler(sig: c_int, _info: *mut c_void, ctx: *mut
             }
         }
         append(&mut out, &mut n, "[pengudroid] end of backtrace\n");
+        append(&mut out, &mut n, "[pengudroid] frame-pointer chain (interrupted thread):\n");
+        append_frame_chain(&mut out, &mut n, fault_rbp(ctx), rsp);
+        append(&mut out, &mut n, "[pengudroid] end of frame chain\n");
         libc::write(2, out.as_ptr() as *const c_void, n);
         libc::_exit(128 + sig);
     }
@@ -370,6 +373,64 @@ unsafe fn fault_rsp(ctx: *mut c_void) -> u64 {
     }
     let uc = ctx as *const libc::ucontext_t;
     (*uc).uc_mcontext.gregs[libc::REG_RSP as usize] as u64
+}
+
+/// Read `REG_RBP` out of the `ucontext_t` a `SA_SIGINFO` handler receives.
+///
+/// # Safety
+/// `ctx` must be the `ucontext_t*` from the signal frame.
+unsafe fn fault_rbp(ctx: *mut c_void) -> u64 {
+    if ctx.is_null() {
+        return 0;
+    }
+    let uc = ctx as *const libc::ucontext_t;
+    (*uc).uc_mcontext.gregs[libc::REG_RBP as usize] as u64
+}
+
+/// Walk the saved frame-pointer chain of the *faulting* thread.
+///
+/// `backtrace()` unwinds the handler's own stack, so it stops at the frame that
+/// took the signal whenever the interrupted code has no unwind info (a JIT, or
+/// a C++ runtime built without `.eh_frame` coverage at that point). The frame
+/// pointers are still there, so reading them from `rbp` recovers the callers --
+/// which is what answers "who asked the bridge to enter guest code".
+///
+/// # Safety
+/// Every read is bounds-checked against plausible stack layout: `rbp` must be
+/// 8-byte aligned, above the faulting `rsp`, and the chain must move upwards.
+unsafe fn append_frame_chain(out: &mut [u8], n: &mut usize, mut rbp: u64, mut rsp: u64) {
+    for depth in 0..32u32 {
+        if rbp < 0x10000 || rbp & 7 != 0 || rbp <= rsp { return; }
+        let slot = rbp as *const u64;
+        let next = unsafe { std::ptr::read_volatile(slot) };
+        let ret = unsafe { std::ptr::read_volatile(slot.add(1)) };
+        if ret < 0x10000 { return; }
+        let mut info: libc::Dl_info = std::mem::zeroed();
+        let mut line = format!("[pengudroid]   fp#{depth} {ret:#x}");
+        if unsafe { libc::dladdr(ret as *const c_void, &mut info) } != 0 {
+            if !info.dli_fbase.is_null() {
+                line.push_str(&format!(" +{:#x}", ret - info.dli_fbase as u64));
+            }
+            if !info.dli_sname.is_null() {
+                line.push(' ');
+                line.push_str(
+                    &unsafe { std::ffi::CStr::from_ptr(info.dli_sname) }.to_string_lossy(),
+                );
+            }
+            if !info.dli_fname.is_null() {
+                line.push_str(" (");
+                line.push_str(
+                    &unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }.to_string_lossy(),
+                );
+                line.push(')');
+            }
+        }
+        line.push('\n');
+        append(out, n, &line);
+        if *n >= out.len() { return; }
+        rsp = rbp;
+        rbp = next;
+    }
 }
 
 /// Print a symbolized backtrace for log lines containing `PENGUDROID_TRACE_BT`.
