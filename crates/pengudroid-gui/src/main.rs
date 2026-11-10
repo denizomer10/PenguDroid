@@ -283,11 +283,18 @@ fn select(ui: &MainWindow, state: &State, index: i32) {
 }
 
 fn refresh(ui: &MainWindow, state: &State) {
-    let entries: Vec<AppEntry> = state.registry.apps().iter().map(|a| AppEntry {
-        package: a.package.clone().into(), label: a.label.clone().into(), activity: a.activity.clone().into(),
-        running: a.running, stopping: state.stopping.contains(&a.package),
-        icon: slint::Image::load_from_path(&registry::icon_path(&a.package)).unwrap_or_default(),
-        has_icon: registry::icon_path(&a.package).is_file(),
+    let entries: Vec<AppEntry> = state.registry.apps().iter().map(|a| {
+        // Only attempt to load an icon that exists: Slint logs
+        // "Error loading image …" for every missing file on every refresh,
+        // which flooded the log for apps whose icon extraction failed.
+        let icon_file = registry::icon_path(&a.package);
+        let has_icon = icon_file.is_file();
+        AppEntry {
+            package: a.package.clone().into(), label: a.label.clone().into(), activity: a.activity.clone().into(),
+            running: a.running, stopping: state.stopping.contains(&a.package),
+            icon: if has_icon { slint::Image::load_from_path(&icon_file).unwrap_or_default() } else { Default::default() },
+            has_icon,
+        }
     }).collect();
     ui.set_apps(ModelRc::new(VecModel::from(entries)));
     ui.set_running_count(state.registry.running_count() as i32);

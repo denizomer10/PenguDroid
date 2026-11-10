@@ -388,7 +388,13 @@ implements EGL on a surfaceless host context:
   `eglCreateImageKHR` — `EGL_NO_CONTEXT` segfaults on iris) and sends
   `PresentDmabuf` to the daemon. The shim creates a surface on demand (or uses
   `PENGUDROID_SURFACE_ID`) and expects an `Ack`; if the daemon is absent it
-  returns `EGL_FALSE` instead of hanging.
+  returns `EGL_FALSE` instead of hanging. After a successful present the swap
+  is **paced**: the daemon acks as soon as the frame is queued, so without a
+  cap a game free-runs at hundreds of fps burning a core on frames the daemon
+  then drops (`frame_slot_available` keeps 3 pending buffers). The shim sleeps
+  the remainder of the `PENGUDROID_MAX_FPS` frame budget (default 60, `0` =
+  unthrottled) — measured 190/s → 47/s on BBR2. Guest-side on purpose:
+  blocking the daemon on a `wl_callback` would stall input for all clients.
 
 `EGL_GL_TEXTURE_2D_KHR` → dma-buf → `zwp_linux_dmabuf_v1` is the app-facing form
 of the zero-copy path. `fixtures/egl-app` is a native program that loads the

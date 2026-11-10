@@ -208,12 +208,15 @@ verdict:          not runnable natively: ARM-only code (needs the ARM translator
 ```
 
 Its engine is `lib/arm64-v8a/libmain.so` (17.8 MB, SDL3-based) plus `libSDL3.so`,
-`libfmod*.so`, crash reporters and ad SDKs. So it needs both missing pieces at
-once: ARM64 execution (§2.1) **and** an `Activity` start, i.e. `system_server`.
-`pengudroid launch` gets as far as materialising the bundle into the per-app
-prefix, creating the VM, registering the framework natives and invoking
-`ActivityThread.main` — and stops exactly there, with the note
-`starting com.vectorunit.cobalt.MainActivity needs system_server`.
+`libfmod*.so`, crash reporters and ad SDKs. It needs both the ARM64 translator
+(§2.4) **and** an `Activity` start, i.e. `system_server`.
+
+**Update (2026-11-05): this game now runs.** With the translator bridge fixed
+(guest/host `pthread_attr_t` layout, TLS handoff) and the manifest's real
+`versionName`/`versionCode` reported to `PackageInfo`, BBR2 2026.10.05 boots
+splash → update check → title → **live gameplay** (22,911 presents in a 120 s
+run before frame pacing; ~47/s after, capped at `PENGUDROID_MAX_FPS`=60). See
+[STATUS.md](STATUS.md) and the screenshots in `docs/screenshots/`.
 
 ### 2.4 Where the translator stops, precisely
 
@@ -250,11 +253,11 @@ AOSP ARM64 GSI ships the stock `linker64`, which does not. The matching guest
 two ARM64 artifacts (and replacing the staged stock copies) is the next concrete
 step; the translator itself no longer has a bring-up blocker in this tree.
 
-**What that means for “make the game open”.** Beach Buggy Racing 2 is ARM64-only.
-The translator now loads and initializes, but without the modified guest
-linker/TLS handshake the guest never starts. This is a build-integration gap,
-not a claim that the game runs. Do not substitute an x86_64 copy, patch the game
-binaries, or silently fall back to a container: none of those are PenguDroid.
+**Update (2026-11-05): superseded.** The guest linker/TLS handshake works now
+(the bridge carries a matching guest runtime with native-bridge linker
+support), and BBR2 — ARM64-only — runs end to end. The standing rule is
+unchanged: never substitute an x86_64 copy, patch the game binaries, or
+silently fall back to a container.
 
 **Consequences for real games.**
 

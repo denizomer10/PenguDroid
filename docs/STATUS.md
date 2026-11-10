@@ -190,6 +190,11 @@ final ~400 ms and is the harness SIGTERM, not a crash.
 
 ### Remaining blocker: no GL at all
 
+> **SUPERSEDED (2026-11-05).** This was a measurement error — the game had been
+> presenting frames all along; the real blocker was the hardcoded
+> `versionName="1.0"`. See the current handoff at the top of this file. Kept for
+> the record.
+
 The engine never starts rendering — the log contains **no** `eglChooseConfig`,
 `eglCreateContext`, `eglMakeCurrent` or `vkCreateInstance` line, and the only
 `eglSwapBuffers` is the teardown one. Live sampling during a run shows the
