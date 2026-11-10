@@ -2,6 +2,40 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
+## Where we left off — desktop manager verified (2026-11-11)
+
+Pick up here. The project currently does these things end to end:
+
+| Capability | Evidence |
+|---|---|
+| BBR2 (2026.10.05) boots and plays | 22,911 presents / 120 s; splash → update → title → race ([screenshots](screenshots/)) |
+| NewPipe v0.29.1 renders its live feed | 107 presents / 45 s, network-fetched thumbnails |
+| One-click AppImage manager | `target/PenguDroid-x86_64.AppImage` (13 MB, bridge embedded) |
+| `+` install → library → launch → stop → uninstall | verified on a real desktop: NewPipe and GTLCS installed through the shell |
+| Tests | 390 Rust (`cargo test --workspace --offline`), 242 Python |
+
+Verified this session on the shipped AppImage, not on the dev tree:
+
+* `AppImage <apk>` installs through the same worker the `+` button uses and the
+  package appears in **Your library** with **Launch / Stop / Uninstall**.
+* `apps.txt` was persisted (the shell's registry caught up with the window).
+* The manager's install list, replace-on-reinstall, and uninstall paths now have
+  regression tests (`registry::tests::installed_app_can_be_listed_and_removed`).
+  `merge_installed` persists the merged list, so a batch install cannot leave the
+  file and the window disagreeing.
+
+### Next concrete task
+
+1. **Frame pacing.** `eglSwapBuffers` never waits for the compositor, so BBR2
+   free-runs at 190–760 presents/s and burns a core. Wait for the daemon's
+   present ack (or a fixed cadence) instead of spinning.
+2. **Hardware video decode** (`MediaCodec` with a real `AHardwareBuffer`
+   backing) — the last piece NewPipe playback needs.
+3. **Icons.** The shell logs `Error loading image …/icons/<pkg>.png` when icon
+   extraction fails; fall back silently to the placeholder instead.
+4. `AHardwareBuffer`/gralloc, camera, and broader aarch64 translation coverage —
+   tracked in [LIMITATIONS.md](LIMITATIONS.md).
+
 ## Current handoff — Beach Buggy Racing 2 boots into gameplay (2026-11-05)
 
 **Beach Buggy Racing 2 runs.** The splash, the loading path and live gameplay all

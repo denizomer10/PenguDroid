@@ -187,7 +187,12 @@ fn main() -> Result<(), slint::PlatformError> {
                             Ok(results) => {
                                 let mut messages = Vec::new();
                                 for result in results { match result {
-                                    Ok(entry) => { messages.push(format!("Installed {}", entry.label)); state.registry.merge_installed(entry); }
+                                    Ok(entry) => {
+                                        messages.push(format!("Installed {}", entry.label));
+                                        if let Err(e) = state.registry.merge_installed(entry) {
+                                            messages.push(format!("Could not save the app list: {e}"));
+                                        }
+                                    }
                                     Err(e) => messages.push(format!("Install failed: {e}")),
                                 } }
                                 ui.set_status(if messages.is_empty() { "Install cancelled".into() } else { messages.join(" · ").into() });

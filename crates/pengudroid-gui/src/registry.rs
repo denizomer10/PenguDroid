@@ -163,14 +163,20 @@ impl Registry {
         Ok(entry)
     }
 
-    /// Merge worker results without losing the live process state held by the UI.
-    pub fn merge_installed(&mut self, mut entry: Entry) {
+    /// Merge a worker's install result without losing the live process state
+    /// held by the UI, and persist the merged list.
+    ///
+    /// The worker already saved its own copy, but the UI's registry is what the
+    /// user sees; saving here keeps the file and the window in agreement when
+    /// several packages are installed in one batch.
+    pub fn merge_installed(&mut self, mut entry: Entry) -> Result<(), String> {
         if let Some(old) = self.entries.iter().find(|old| old.package == entry.package) {
             entry.running = old.running;
             entry.pid = old.pid;
         }
         self.entries.retain(|old| old.package != entry.package);
         self.entries.push(entry);
+        self.save()
     }
 
     pub fn uninstall(&mut self, package: &str) -> Result<(), String> {
@@ -341,6 +347,79 @@ mod tests {
         assert!(!restored.app_setting("org.example.second", "fps_meter", true));
         assert!(!restored.app_setting("org.example.first", "keymapper", false));
         assert!(restored.app_setting("org.example.second", "keymapper", false));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn installed_app_can_be_listed_and_removed() {
+        let dir = std::env::temp_dir().join(format!("pd-uninstall-{}", std::process::id()));
+        let mut registry = Registry::load_from(&dir);
+        // `merge_installed` is the path a worker's install result takes; it is
+        // what actually populates the launcher list, so exercise it directly
+        // rather than re-running `pengudroid info`.
+        registry.merge_installed(Entry {
+            package: "org.example.one".into(),
+            label: "One".into(),
+            activity: "org.example.one.Main".into(),
+            apk: PathBuf::from("/tmp/one.apk"),
+            running: true,
+            pid: Some(1234),
+        })
+        .unwrap();
+        registry.merge_installed(Entry {
+            package: "org.example.two".into(),
+            label: "Two".into(),
+            activity: "org.example.two.Main".into(),
+            apk: PathBuf::from("/tmp/two.apk"),
+            running: false,
+            pid: None,
+        })
+        .unwrap();
+        assert_eq!(registry.apps().len(), 2);
+
+        // Reinstalling the same package replaces the entry and keeps the live
+        // process state instead of dropping it.
+        registry.merge_installed(Entry {
+            package: "org.example.one".into(),
+            label: "One (updated)".into(),
+            activity: "org.example.one.Main".into(),
+            apk: PathBuf::from("/tmp/one-v2.apk"),
+            running: false,
+            pid: None,
+        })
+        .unwrap();
+        let live = registry.apps().iter().find(|e| e.package == "org.example.one").unwrap();
+        assert!(live.running, "a replace must not forget that the app is running");
+        assert_eq!(live.pid, Some(1234));
+        let reloaded = Registry::load_from(&dir);
+        assert_eq!(reloaded.apps().len(), 2);
+        let one = reloaded.apps().iter().find(|e| e.package == "org.example.one").unwrap();
+        assert_eq!(one.label, "One (updated)");
+        assert_eq!(one.apk, PathBuf::from("/tmp/one-v2.apk"));
+        // Running state is intentionally not persisted: a pid from a previous
+        // session is meaningless, so a reloaded entry must start stopped.
+        assert!(!one.running);
+        assert_eq!(one.pid, None);
+
+        let mut registry = reloaded;
+        registry.uninstall("org.example.one").unwrap();
+        assert!(registry.apps().iter().all(|e| e.package != "org.example.one"));
+        assert_eq!(Registry::load_from(&dir).apps().len(), 1);
+        // Removing something that is not installed is an error, not a silent
+        // success, so the UI can tell the user why nothing happened.
+        assert!(registry.uninstall("org.example.one").is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn installing_a_missing_file_is_rejected_before_any_work() {
+        let dir = std::env::temp_dir().join(format!("pd-missing-{}", std::process::id()));
+        let mut registry = Registry::load_from(&dir);
+        let err = registry
+            .install(Path::new("/nonexistent/definitely-not-an.apk"))
+            .unwrap_err();
+        assert!(err.contains("does not exist"), "{err}");
+        assert!(registry.apps().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 

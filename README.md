@@ -41,6 +41,11 @@ screens → title → race):
 
 ![Beach Buggy Racing 2 boot sequence](docs/screenshots/bbr2-boot-sequence.png)
 
+And the desktop shell that wraps all of it — the same window the AppImage opens,
+with NewPipe installed through the `+` button:
+
+![PenguDroid desktop manager with NewPipe installed](docs/screenshots/manager.png)
+
 ```
 $ pengudroid run com.vectorunit.cobalt.googleplay.apkm
 package:       com.vectorunit.cobalt.googleplay
@@ -120,12 +125,22 @@ package, like Proton.
 `docs/STATUS.md` is the up-to-date handoff note: exactly what runs, what does
 not, and the failure point of each attempt.
 
+Verified today on the shipped `target/PenguDroid-x86_64.AppImage`:
+
+* **Games boot.** Beach Buggy Racing 2 reaches live gameplay (splash → update
+  check → title → race); NewPipe renders its live feed with real thumbnails.
+* **The manager works.** `+` (or `AppImage <apk>`) installs a package into
+  **Your library**, and **Launch / Stop / Uninstall** drive a real Android
+  process. NewPipe and GTLCS were both installed and listed through it.
+* **Tests:** 390 Rust (`cargo test --workspace --offline`) and 242 Python.
+
 * **Working:** daemon/lifecycle, binder broker, property store, ART in-process,
   activity lifecycle driven from the host, hwui drawing, dma-buf presentation,
   pointer/keyboard input, MediaCodec (ByteBuffer + Surface), AudioTrack,
   OpenSL ES, PipeWire audio, app services, Play bundles (`.apkm`/`.xapk`).
 * **In progress:** hardware video decode integration, full window/layer
-  association, host IME composition.
+  association, host IME composition, frame pacing (`eglSwapBuffers` does not
+  wait for the compositor, so games free-run and burn a core).
 * **Not there yet:** `AHardwareBuffer`/gralloc allocation, camera, stable aarch64
   translation for every game engine. The honest list is in
   [LIMITATIONS.md](docs/LIMITATIONS.md).
@@ -494,7 +509,7 @@ LD_LIBRARY_PATH=$PWD/../.toolchain/llvm-22-root/usr/lib \
     python3 -m unittest discover -s .
 ```
 
-Both suites are green: 388 Rust tests and 242 Python tests. The Python tests
+Both suites are green: 390 Rust tests and 242 Python tests. The Python tests
 compile real ARM64 guests and link the native bridge, so they need the pinned
 LLVM 22 toolchain in `.toolchain/`; without it they skip rather than fail.
 
