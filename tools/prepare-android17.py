@@ -6,6 +6,13 @@ Only extracted files survive preparation. Review Google's GSI license before
 obtaining the archive; do not redistribute its binaries with this project.
 
     python3 -B tools/prepare-android17.py --archive /path/to/aosp_x86_64-....zip
+    python3 -B tools/prepare-android17.py --download --cache
+
+`--cache` installs into the per-user runtime cache
+(`$XDG_CACHE_HOME/pengudroid/runtime/android17-x86_64`, else
+`~/.cache/pengudroid/...`) and points `--archive` at the matching download
+directory, so no path has to be repeated on later runs. `--download` fetches
+the pinned archive when it is absent, verifying SHA-256 before preparation.
 
 Needs debugfs (ext4) and fsck.erofs (EROFS/APEX), found on PATH or locally in
 .toolchain/host-tools/. Android sparse images are expanded with bounded memory.
@@ -22,6 +29,8 @@ import struct
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 import zipfile
 import zlib
 
@@ -65,6 +74,70 @@ class PreparationError(RuntimeError):
 def digest(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def cache_home(env=None):
+    """The per-user cache root PenguDroid owns; `--cache` derives paths from it."""
+    env = os.environ if env is None else env
+    explicit = env.get("XDG_CACHE_HOME")
+    if explicit:
+        return Path(explicit) / "pengudroid"
+    home = env.get("HOME")
+    if not home:
+        raise PreparationError("HOME is unset; pass --archive/--output instead of --cache")
+    return Path(home) / ".cache" / "pengudroid"
+
+
+def cache_paths(env=None):
+    """(download archive, runtime output) inside the per-user cache."""
+    base = cache_home(env)
+    return base / "downloads" / FILENAME, base / "runtime" / "android17-x86_64"
+
+
+def download(archive, url=URL, expected=SHA256, stream=None, opener=None):
+    """Fetch the pinned archive once, verifying the digest before keeping it.
+
+    A partial transfer never becomes the archive: it is written to `.part` and
+    only renamed after the SHA-256 matches, so an interrupted run is retried
+    from scratch instead of feeding a truncated image to the extractor.
+    """
+    archive = Path(archive)
+    if archive.is_file():
+        found = digest(archive)
+        if found == expected:
+            print(f"reusing verified archive {archive}", flush=True)
+            return archive
+        raise PreparationError(
+            f"archive SHA-256 mismatch: {archive} has {found}; expected {expected}")
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    partial = archive.with_name(archive.name + ".part")
+    opener = opener or urllib.request.urlopen
+    print(f"downloading {url}", flush=True)
+    try:
+        with opener(url, timeout=60) as response, partial.open("wb") as output:
+            total = int(response.headers.get("Content-Length") or 0)
+            written = 0
+            next_report = 0
+            while True:
+                chunk = response.read(BUFFER)
+                if not chunk:
+                    break
+                output.write(chunk)
+                written += len(chunk)
+                if written >= next_report:
+                    share = f" of {total / 1024**3:.2f} GiB" if total else ""
+                    print(f"  {written / 1024**3:.2f} GiB{share}", file=stream or sys.stderr, flush=True)
+                    next_report = written + 256 * 1024**2
+    except (urllib.error.URLError, OSError) as error:
+        partial.unlink(missing_ok=True)
+        raise PreparationError(f"download failed: {error}") from error
+    found = digest(partial)
+    if found != expected:
+        partial.unlink(missing_ok=True)
+        raise PreparationError(f"downloaded archive SHA-256 mismatch: got {found}; expected {expected}")
+    partial.rename(archive)
+    print(f"downloaded {archive}", flush=True)
+    return archive
 
 
 def exact(stream, count):
@@ -274,17 +347,27 @@ def prepare(archive, output, erofs=None, debugfs=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--archive", type=Path, default=REPO / ".toolchain/downloads" / FILENAME)
     parser.add_argument("--output", type=Path, default=REPO / ".toolchain/sysroot-android17")
+    parser.add_argument("--cache", action="store_true",
+                        help="install into the per-user cache (XDG_CACHE_HOME/pengudroid)")
+    parser.add_argument("--download", action="store_true",
+                        help="fetch the pinned GSI when the archive is absent")
     parser.add_argument("--fsck-erofs", dest="erofs")
     parser.add_argument("--debugfs")
     args = parser.parse_args()
+    if args.cache:
+        args.archive, args.output = cache_paths()
     output = args.output.absolute()
-    if not output.parent.is_dir():
-        parser.error(f"output parent does not exist: {output.parent}")
     try:
-        prepare(args.archive, output, args.erofs, args.debugfs)
+        # An already-prepared runtime is verified without touching the archive,
+        # so a repeated `--cache` run never re-downloads the GSI.
+        if args.download and not output.exists():
+            download(args.archive.absolute())
+        output.parent.mkdir(parents=True, exist_ok=True)
+        prepare(args.archive.absolute(), output, args.erofs, args.debugfs)
     except (PreparationError, OSError, ValueError, subprocess.SubprocessError, zipfile.BadZipFile) as error:
         print(f"prepare-android17: {error}", file=sys.stderr)
         return 1

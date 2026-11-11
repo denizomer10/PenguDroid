@@ -22,6 +22,8 @@ use std::sync::Mutex;
 
 use libc::{c_int, c_ulong, c_void};
 
+use crate::mediasession::Operation;
+
 /// Protocol version `libbinder` expects from Android 10 onward.
 const BINDER_CURRENT_PROTOCOL_VERSION: c_int = 8;
 
@@ -700,6 +702,29 @@ pub unsafe extern "C" fn __pengudroid_binder_set_media_transactions(
         return false;
     }
     *MEDIA_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner()) = Some(codes);
+    true
+}
+
+static MEDIA_SESSION: crate::mediasession::Session = crate::mediasession::Session::new();
+static MEDIA_SESSION_TRANSACTIONS: Mutex<Option<crate::mediasession::Transactions>> =
+    Mutex::new(None);
+
+/// Install the `ISession` setter codes read from the loaded API-37 Stub, in
+/// [`crate::mediasession::OPERATIONS`] order. Zero marks a method that revision
+/// does not declare; false preserves the previous table.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_media_session_transactions(
+    codes: *const u32,
+    len: usize,
+) -> bool {
+    let count = crate::mediasession::OPERATIONS.len();
+    if codes.is_null() || len != count { return false; }
+    let codes: [u32; crate::mediasession::OPERATIONS.len()] =
+        std::slice::from_raw_parts(codes, len).try_into().unwrap();
+    let Some(table) = crate::mediasession::Transactions::new(codes) else {
+        return false;
+    };
+    *MEDIA_SESSION_TRANSACTIONS.lock().unwrap_or_else(|e| e.into_inner()) = Some(table);
     true
 }
 
@@ -2775,7 +2800,45 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                     NEXT_HANDLE.fetch_add(1, Ordering::Relaxed)
                 )));
             }
-            _ => return Reply::unknown_transaction(tr, "unimplemented media method (including session setters, controller and queue transfer)"),
+            (Some("media_session_session"), code) => {
+                // The queue arms above answer ISession's two handle getters;
+                // every other ISession method that reached the framework from
+                // here is a setter the hosted session records locally.
+                let Some(op) = MEDIA_SESSION_TRANSACTIONS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .and_then(|table| table.operation(code))
+                else {
+                    return Reply::unknown_transaction(
+                        tr,
+                        "unimplemented ISession method: setters need \
+                         __pengudroid_binder_set_media_session_transactions",
+                    );
+                };
+                let data = if tr.data_size != 0 && tr.data_ptr != 0 {
+                    std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize)
+                } else { &[] };
+                // SetFlags(int) and SetCurrentVolume(int) carry their value as
+                // the first parcel word; no other recorded setter reads one.
+                let word = data
+                    .get(0..4)
+                    .map(|word| i32::from_ne_bytes(word.try_into().unwrap()))
+                    .unwrap_or(0);
+                if op == Operation::IsPlaybackActive {
+                    parcel.extend_from_slice(
+                        &i32::from(MEDIA_SESSION.playback_active()).to_ne_bytes(),
+                    );
+                } else {
+                    MEDIA_SESSION.apply(op, word, word);
+                    if op == Operation::Disconnect {
+                        MEDIA_SESSION.reset();
+                    }
+                }
+                if trace_enabled() {
+                    unsafe { diag(&format!("[binder]   -> ISession {op:?}\n")); }
+                }
+            }
+            _ => return Reply::unknown_transaction(tr, "unimplemented media method (including controller and queue transfer)"),
         }
     }
     if tr.target_handle == handle_for("media.resource_manager") {
@@ -5171,6 +5234,71 @@ mod tests {
             ("media_session_controller", 101), ("media_session_queue", 101)] {
             assert_unknown_transaction(unsafe { make_reply(&transaction(handle_for(name), code, &[]), 1) });
         }
+    }
+
+    /// The hosted session's setters have no `system_server` peer, so they
+    /// record what the app reported instead of being forwarded, and
+    /// `isPlaybackActive` answers from that record rather than inventing
+    /// playback. Codes come from the loaded `ISession$Stub`; 0 means "this
+    /// framework revision does not declare the method" and never dispatches.
+    #[test]
+    fn media_session_setters_record_reported_state_only() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = reset_table(&MEDIA_TRANSACTION_CODES, None);
+        let _session_restore = reset_table(&MEDIA_SESSION_TRANSACTIONS, None);
+        MEDIA_SESSION.reset();
+        let session = handle_for("media_session_session");
+        let setters = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21];
+        assert!(!unsafe { __pengudroid_binder_set_media_session_transactions(std::ptr::null(), setters.len()) });
+        assert!(!unsafe { __pengudroid_binder_set_media_session_transactions(setters.as_ptr(), setters.len() - 1) });
+        let mut duplicate = setters;
+        duplicate[5] = setters[4];
+        assert!(!unsafe { __pengudroid_binder_set_media_session_transactions(duplicate.as_ptr(), duplicate.len()) });
+        let mut out_of_range = setters;
+        out_of_range[10] = 0x00ff_fffe;
+        assert!(!unsafe { __pengudroid_binder_set_media_session_transactions(out_of_range.as_ptr(), out_of_range.len()) });
+        assert_eq!(*MEDIA_SESSION_TRANSACTIONS.lock().unwrap(), None);
+        for code in setters {
+            assert_unknown_transaction(unsafe { make_reply(&transaction(session, code, &[]), 1) });
+        }
+        // The host installs both tables; the media table must be present for
+        // the session block to be entered at all.
+        let media = [101, 102, 103, 104];
+        assert!(unsafe { __pengudroid_binder_set_media_transactions(media.as_ptr(), media.len()) });
+
+        assert!(unsafe { __pengudroid_binder_set_media_session_transactions(setters.as_ptr(), setters.len()) });
+        let word = 5i32.to_ne_bytes();
+        // A setter answers with a bare status word (padded to 8 bytes): AIDL void.
+        let void_reply = [0u8; 8];
+        for code in [11, 13, 15, 20] {
+            let reply = unsafe { make_reply(&transaction(session, code, &word), 1) };
+            assert_eq!(reply.flags, 0);
+            assert_eq!(reply.parcel, void_reply);
+        }
+        assert!(MEDIA_SESSION.playback_active());
+        assert_eq!((MEDIA_SESSION.flags(), MEDIA_SESSION.volume()), (5, 5));
+        let reply = unsafe { make_reply(&transaction(session, 21, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(reply.parcel, [0i32, 1].into_iter().flat_map(i32::to_ne_bytes).collect::<Vec<u8>>());
+
+        // A disconnect ends the session, so a reused handle reports nothing.
+        let reply = unsafe { make_reply(&transaction(session, 12, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(reply.parcel, void_reply);
+        assert!(!MEDIA_SESSION.playback_active());
+        assert_eq!((MEDIA_SESSION.flags(), MEDIA_SESSION.volume()), (0, 0));
+        let reply = unsafe { make_reply(&transaction(session, 21, &[]), 1) };
+        assert_eq!(reply.parcel, [0i32, 0].into_iter().flat_map(i32::to_ne_bytes).collect::<Vec<u8>>());
+
+        // A method this framework revision omits is installed as 0 and refused.
+        let mut sparse = setters;
+        sparse[4] = 0;
+        assert!(unsafe { __pengudroid_binder_set_media_session_transactions(sparse.as_ptr(), sparse.len()) });
+        assert_unknown_transaction(unsafe { make_reply(&transaction(session, 15, &word), 1) });
+        let reply = unsafe { make_reply(&transaction(session, 20, &word), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(reply.parcel, void_reply);
+        assert_eq!(MEDIA_SESSION.volume(), 5);
     }
 
     /// `MediaMetricsManager.createPlaybackSession` turns the reply to

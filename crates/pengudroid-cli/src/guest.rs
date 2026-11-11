@@ -28,6 +28,8 @@ struct GuestArgs {
     title: String,
     width: u32,
     height: u32,
+    /// Explicit density, in dpi. `None` lets `geometry` pick one from the size.
+    density: Option<i32>,
     /// APK to run (the daemon's `RunApk` passes `--apk`; the CLI passes the
     /// parsed fields directly).
     apk: Option<String>,
@@ -40,8 +42,9 @@ fn parse_args(args: &[String]) -> Result<GuestArgs, String> {
         package: "unknown".into(),
         component: String::new(),
         title: "PenguDroid app".into(),
-        width: 720,
-        height: 1280,
+        width: crate::geometry::DEFAULT_WIDTH,
+        height: crate::geometry::DEFAULT_HEIGHT,
+        density: None,
         apk: None,
     };
     let mut it = args.iter();
@@ -58,6 +61,10 @@ fn parse_args(args: &[String]) -> Result<GuestArgs, String> {
             }
             "--height" => {
                 g.height = val().ok_or("--height needs a value")?.parse().map_err(|_| "bad height")?
+            }
+            "--density" => {
+                g.density =
+                    Some(val().ok_or("--density needs a value")?.parse().map_err(|_| "bad density")?)
             }
             _ => {}
         }
@@ -97,6 +104,26 @@ pub fn guest_main(args: &[String]) -> i32 {
             Err(e) => eprintln!("guest: warning: {e}"),
         }
     }
+    // One geometry for the window, the guest-side shim and anything the guest
+    // starts: the size the daemon allocated and the density that turns it into
+    // dp have to agree, or the framework lays out for a screen nobody shows.
+    let geometry = crate::geometry::Geometry::for_window(g.width, g.height, g.density);
+    g.width = geometry.width as u32;
+    g.height = geometry.height as u32;
+    for (key, value) in geometry.export() {
+        std::env::set_var(key, value);
+    }
+    if geometry.is_tablet() {
+        println!(
+            "guest: {}x{} @ {} dpi is {}x{} dp — tablet layout",
+            geometry.width,
+            geometry.height,
+            geometry.density_dpi,
+            geometry.width_dp(),
+            geometry.height_dp()
+        );
+    }
+
     // SAFETY: correct handler signature.
     unsafe {
         libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);

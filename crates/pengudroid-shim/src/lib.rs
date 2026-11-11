@@ -89,6 +89,7 @@ mod android_native;
 mod audiotrack;
 mod binder;
 mod audiofocus;
+mod mediasession;
 mod virtual_input;
 mod blast;
 mod codec2;

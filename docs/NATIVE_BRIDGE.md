@@ -358,19 +358,63 @@ Verified in this checkout, with no Android runtime:
   `x86_64` paths.
 * An API-37 AArch64 guest library cross-builds and links with Bionic versions.
 
-**Not verified:** the translator binary exists and loads (`LoadNativeBridge =
-true`, `PreInitializeNativeBridge = true`, `Initialized Berberis (aarch64)`),
-but no guest instruction has been translated on this host: initialization stops
-at the missing `__native_bridge_config_static_tls` guest-linker hook described
-above. The full guest-runtime quartet must come from a matching Android-17
-Soong product build (`native_bridge_guest_linker.native_bridge`,
-`libnative_bridge_guest_libc.native_bridge`,
-`native_bridge_guest_app_process.native_bridge`,
-`libnative_bridge_vdso.native_bridge`); the cached Bionic tree is header slices
-only, so extending `tools/build-nativebridge.py` into a Bionic builder is not a
-small change. A full AOSP product build with `enable_arm64_to_x86_64.mk` remains
-the supported upstream route. Nothing here establishes that Beach Buggy Racing
-2 runs.
+**Verified on a real ARM64 game (2026-11-12):** Beach Buggy Racing 2
+(`com.vectorunit.cobalt.googleplay`, arm64-v8a only, no x86_64 payload) launches
+through the no-`--sysroot` path and reaches its own main loop:
+
+```
+./target/debug/pengudroid launch <bbr2.apkm> --backend auto
+```
+
+with `PENGUDROID_NATIVE_BRIDGE_LIB=.toolchain/nativebridge-stage`,
+`PENGUDROID_ARM64_GUEST_ROOT=.toolchain/guest-arm64-bridge`,
+`PENGUDROID_BRIDGE_TLS=1` and `BERBERIS_FLAGS=glibc-host-thread-id-handoff`.
+The log shows the guest linker handshake, `Initialized Berberis (aarch64)`,
+SDL's `surfaceCreated`/`surfaceChanged`/`Window size: 720x1280`,
+`Running main function SDL_main from libmain.so`, FMOD audio bring-up, HTTP 200
+from the game's own backend, and `eglSwapBuffers` reaching the host with
+`presented surface 1 720x1280`. A SIGQUIT thread dump shows `SDLThread` in
+`state=R` with tens of seconds of user CPU, i.e. the translated main loop is
+running rather than deadlocked.
+
+Throughput is the open problem, not correctness: the initial scenes present at
+well under 1 fps, against 22,911 presents per 120 s for the same game through
+the x86_64 path. The guest VM runs `-Xint` and every guest instruction is
+translated, so frame production is bounded by interpretation, not by the GPU.
+
+### Guest libraries the bridge cannot translate
+
+The translator executes instructions; it does not supply Android libraries. Two
+kinds are routed through the native-bridge stub mechanism instead:
+
+* **`libandroid.so`** (the NDK `ANativeWindow`/asset/looper API) and
+* **the guest GL/EGL family**, whose real entry points live in the host
+  Mesa/gleshim, not in the guest.
+
+Each guest `lib<name>.so` is a **NativeBridgeSupport stub**: it imports
+`native_bridge_intercept_symbol`, and its constructor installs a guest vDSO hook
+so the guest linker resolves symbols through
+`proxy_loader::InterceptGuestSymbol`. That maps a symbol to
+`dlopen("libberberis_proxy_<name>.so")`, which forwards to the staged host
+library (`tools/gl-forwarders.py` provides the versioned-soname forwarders).
+Forwarders load the gleshim first and only then versioned Mesa, and must never
+`dlopen` an unversioned soname.
+
+The guest runtime itself is assembled by
+`tools/assemble-arm64-bridge-guest.py --guest-stubs`, which verifies destination
+paths, the manifest, the bridge contract and the file closure before staging
+under `.toolchain/guest-arm64-bridge`; `tools/build-guest-stubs.py` builds the
+stub libraries.
+
+### One guest-side JNI bug that is not ours
+
+BBR2 logs a repeatable
+`java.lang.NoSuchMethodError: no non-static method
+"Ljava/lang/reflect/Constructor;.getReturnType()Ljava/lang/Class;"`. ART's
+`Constructor` genuinely has no such method (verified by parsing
+`core-oj.jar`'s `classes.dex`), so a guest native library is issuing a bogus
+`GetMethodID`. It is logged and does not kill `SDLThread`, so it is not a
+launch blocker.
 
 ## What Beach Buggy Racing 2 needs
 
@@ -380,16 +424,20 @@ Offline inventory across every APK member found no x86_64 payload. Reaching that
 code therefore needs, in order:
 
 1. An Android 17 / API 37 x86_64 runtime. **Present** — see
-   [ANDROID17.md](ANDROID17.md); it currently runs imageless.
-2. A built Digitalis ARM64 bridge, prepared for glibc.
-3. Guest libraries staged where the bridge accepts them.
-4. Graphics, input and audio proxying for an SDL3/Unity-class engine — the
-   translator only covers instruction execution, not rendering.
+   [ANDROID17.md](ANDROID17.md).
+2. A built Digitalis ARM64 bridge, prepared for glibc. **Present.**
+3. Guest libraries staged where the bridge accepts them. **Present** — the
+   guest stub bundle above.
+4. Graphics, input and audio proxying for an SDL3/Unity-class engine. **Present,
+   at low frame rates** — `libandroid` and GL go through the stub chain into the
+   host gleshim, and frames reach the compositor.
 5. Framework services the game calls at startup, which are the remaining
-   `docs/ANDROID17.md` work.
+   `docs/ANDROID17.md` work. **Partly present** — the game schedules past its
+   own splash, network and billing calls; the still-visible gaps are audio port
+   enumeration and input plumbing.
 
-The bridge is necessary and not sufficient. Each of those is separately
-testable, and the self-test above is the first.
+The bridge was necessary and not sufficient; what remains is throughput, not
+capability.
 
 ## Removing the feature later
 

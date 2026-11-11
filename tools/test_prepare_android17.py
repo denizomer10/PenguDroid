@@ -203,5 +203,69 @@ class RuntimeTests(unittest.TestCase):
             prepare.filesystem(image)
 
 
+class DownloadTests(unittest.TestCase):
+    """`--download` must never keep bytes it could not verify."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.work = Path(self.temporary.name)
+        self.payload = b"pinned-gsi-bytes" * 1024
+        self.expected = hashlib.sha256(self.payload).hexdigest()
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def opener(self, body=None, status_error=None):
+        if status_error:
+            def failing(url, timeout=None):
+                raise prepare.urllib.error.URLError(status_error)
+            return failing
+
+        class Response(io.BytesIO):
+            headers = {"Content-Length": str(len(body))}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exit):
+                self.close()
+                return False
+
+        return lambda url, timeout=None: Response(body)
+
+    def test_download_is_atomic_and_verifies_sha256(self):
+        archive = self.work / "nested" / "runtime.zip"
+        prepare.download(archive, url="https://example.invalid/gsi.zip", expected=self.expected,
+                         stream=io.StringIO(), opener=self.opener(body=self.payload))
+        self.assertEqual(archive.read_bytes(), self.payload)
+        self.assertFalse(archive.with_name(archive.name + ".part").exists())
+
+        kept = {path for path in self.work.rglob("*") if path.is_file()}
+        prepare.download(archive, url="https://example.invalid/gsi.zip", expected=self.expected,
+                         stream=io.StringIO(), opener=self.opener(body=b"other"))
+        self.assertEqual(archive.read_bytes(), self.payload)
+        with self.assertRaisesRegex(prepare.PreparationError, "SHA-256 mismatch"):
+            prepare.download(self.work / "fresh.zip", expected="0" * 64,
+                             stream=io.StringIO(), opener=self.opener(body=self.payload))
+        self.assertEqual({p for p in self.work.rglob("*") if p.is_file()}, kept)
+
+    def test_interrupted_download_leaves_no_partial_archive(self):
+        archive = self.work / "runtime.zip"
+        with self.assertRaisesRegex(prepare.PreparationError, "download failed"):
+            prepare.download(archive, stream=io.StringIO(),
+                             opener=self.opener(status_error="connection reset"))
+        self.assertFalse(archive.exists())
+        self.assertFalse(archive.with_name(archive.name + ".part").exists())
+
+    def test_cache_paths_follow_xdg_then_home(self):
+        archive, output = prepare.cache_paths({"XDG_CACHE_HOME": "/tmp/xdg", "HOME": "/home/nobody"})
+        self.assertEqual(archive, Path("/tmp/xdg/pengudroid/downloads") / prepare.FILENAME)
+        self.assertEqual(output, Path("/tmp/xdg/pengudroid/runtime/android17-x86_64"))
+        archive, output = prepare.cache_paths({"HOME": "/home/nobody"})
+        self.assertEqual(output, Path("/home/nobody/.cache/pengudroid/runtime/android17-x86_64"))
+        with self.assertRaisesRegex(prepare.PreparationError, "HOME is unset"):
+            prepare.cache_home({})
+
+
 if __name__ == "__main__":
     unittest.main()

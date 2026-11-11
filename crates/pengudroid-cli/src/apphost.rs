@@ -19,30 +19,49 @@ use std::ffi::c_void;
 
 /// The PenguDroid surface geometry, in pixels.
 ///
-/// This is the one place the size is written down. Everything that has to agree
-/// about it reads these: the `DisplayInfo` the framework sees, the
-/// `SurfaceControl` handed to `ViewRootImpl`, the window frame, and (through
-/// `PENGUDROID_SURFACE_W`/`_H`, which `art_test` mirrors) the EGL surface the
-/// gleshim renders into. Before this existed the defaults disagreed — portrait in
-/// two places and landscape in two others — so hwui rendered 1280x720 into an
-/// FBO the window frame described as 720x1280.
-const SURFACE_W: i32 = 720;
-const SURFACE_H: i32 = 1280;
+/// The size is not a constant here: the launcher picks it from `--width`/
+/// `--height` (see [`crate::geometry`]) and exports
+/// `PENGUDROID_SURFACE_W`/`_H`/`_DENSITY_DPI`. Everything that has to agree
+/// about it reads these accessors: the `DisplayInfo` the framework sees, the
+/// `SurfaceControl` handed to `ViewRootImpl`, the window frame, and the EGL
+/// surface the gleshim renders into. Before this existed the defaults disagreed
+/// — portrait in two places and landscape in two others — so hwui rendered
+/// 1280x720 into an FBO the window frame described as 720x1280.
+///
+/// The density is part of the same policy. Everything the framework lays out is
+/// scaled by it (`dp = px * 160 / dpi`), so a 1024x768 window at 320 dpi would
+/// report only 512x384 dp and lay out like a phone in a big frame; the policy
+/// lowers the density until such a window reports at least 600 dp on its short
+/// side and the framework switches to tablet layouts.
+fn geometry() -> crate::geometry::Geometry {
+    crate::geometry::Geometry::from_env()
+}
+
+/// Surface width in pixels.
+fn surface_w() -> i32 {
+    geometry().width
+}
+
+/// Surface height in pixels.
+fn surface_h() -> i32 {
+    geometry().height
+}
 
 /// The display density, in dpi.
-///
-/// Everything the framework lays out is scaled by this: `dp = px * 160 / dpi`.
-/// At 320 dpi the surface is 360x640 dp, which is a conventional small phone.
-/// It used to be 420 dpi while the dp fields were still the *landscape* 1280x720
-/// values, so the app believed it had a 487x274 dp screen — and a Material
-/// `AlertDialog`, whose minimum width is 280 dp, came out wider than the 274 dp
-/// it thought it had and was clipped by the surface edge.
-const DENSITY_DPI: i32 = 320;
+fn density_dpi() -> i32 {
+    geometry().density_dpi
+}
 
-/// The surface width in dp.
-const SURFACE_W_DP: i32 = SURFACE_W * 160 / DENSITY_DPI;
+/// The surface width in dp (`Configuration.screenWidthDp`).
+fn surface_w_dp() -> i32 {
+    geometry().width_dp()
+}
+
 /// The surface height in dp.
-const SURFACE_H_DP: i32 = SURFACE_H * 160 / DENSITY_DPI;
+fn surface_h_dp() -> i32 {
+    geometry().height_dp()
+}
+
 use std::path::Path;
 
 use crate::jni::{JClass, JFieldId, JMethodId, JObject, JValue, JniEnv};
@@ -253,11 +272,11 @@ fn new_configuration(env: &JniEnv) -> Option<JObject> {
             env.set_int_field(config, id, value);
         }
     };
-    set_int("densityDpi", DENSITY_DPI);
+    set_int("densityDpi", density_dpi());
     // Derived from the surface so the two can never disagree again.
-    set_int("screenWidthDp", SURFACE_W_DP);
-    set_int("screenHeightDp", SURFACE_H_DP);
-    set_int("smallestScreenWidthDp", SURFACE_W_DP.min(SURFACE_H_DP));
+    set_int("screenWidthDp", surface_w_dp());
+    set_int("screenHeightDp", surface_h_dp());
+    set_int("smallestScreenWidthDp", surface_w_dp().min(surface_h_dp()));
     // WindowLayout.computeFrames uses Configuration.windowConfiguration bounds
     // for local relayout, not DisplayInfo or screenWidthDp. Empty bounds made a
     // later relayoutAsync collapse a previously valid activity window to 0x0.
@@ -268,7 +287,7 @@ fn new_configuration(env: &JniEnv) -> Option<JObject> {
     if window.is_null() { return None; }
     let rect_class = env.find_class("android/graphics/Rect")?;
     let ctor = env.method_id(rect_class, "<init>", "(IIII)V")?;
-    let coords = [JValue { i: 0 }, JValue { i: 0 }, JValue { i: SURFACE_W }, JValue { i: SURFACE_H }];
+    let coords = [JValue { i: 0 }, JValue { i: 0 }, JValue { i: surface_w() }, JValue { i: surface_h() }];
     let bounds = env.new_object(rect_class, ctor, &coords)?;
     if bounds.is_null() { return None; }
     let set_bounds = env.method_id(window_class, "setBounds", "(Landroid/graphics/Rect;)V")?;
@@ -374,7 +393,7 @@ fn fix_app_configuration(env: &JniEnv, data: JObject) {
         }
     }
     if let Some(id) = env.field_id(cfg_class, "densityDpi", "I") {
-        env.set_int_field(cfg, id, DENSITY_DPI);
+        env.set_int_field(cfg, id, density_dpi());
     }
     // `ResourcesManager` builds every new `Resources` from its process-wide
     // configuration, and `Resources.getSystem()` exposes that same instance.
@@ -397,7 +416,7 @@ fn fix_app_configuration(env: &JniEnv, data: JObject) {
                         }
                     }
                     if let Some(id) = env.field_id(cfg_class, "densityDpi", "I") {
-                        env.set_int_field(sys_cfg, id, DENSITY_DPI);
+                        env.set_int_field(sys_cfg, id, density_dpi());
                     }
                     if let Some(get_locales) = env.method_id(
                         cfg_class,
@@ -809,6 +828,7 @@ pub fn probe_platform_state(env: &JniEnv) -> bool {
         let _frame = env.local_frame(32)?;
         install_system_features_cache(env)?;
         install_media_transactions(env)?;
+        install_media_session_transactions(env)?;
         install_user_thermal_transactions(env)?;
         let class = env.find_class("android/content/pm/SystemFeaturesCache")?;
         let get = env.static_method_id(class, "getInstance", "()Landroid/content/pm/SystemFeaturesCache;")?;
@@ -860,6 +880,10 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
     }
     if install_media_transactions(env).is_none() {
         eprintln!("apphost: cannot resolve Android 17 media session/metrics transactions");
+        return false;
+    }
+    if install_media_session_transactions(env).is_none() {
+        eprintln!("apphost: cannot resolve Android 17 media session setter transactions");
         return false;
     }
     if install_virtual_keyboard(env).is_none() {
@@ -6059,7 +6083,7 @@ fn force_visible(env: &JniEnv, record: JObject) {
                 }
             }
         }
-        force_window_frame(env, root, SURFACE_W, SURFACE_H);
+        force_window_frame(env, root, surface_w(), surface_h());
         dump_draw_state(env, root, index as usize);
         schedule_roots_dump(env);
         // `performTraversals` must run inside a Choreographer frame callback:
@@ -6101,7 +6125,7 @@ fn build_surface_control(env: &JniEnv) -> Option<JObject> {
         env.call_object(
             builder,
             set_size,
-            &[JValue { i: SURFACE_W }, JValue { i: SURFACE_H }],
+            &[JValue { i: surface_w() }, JValue { i: surface_h() }],
         );
     }
     let build = env.method_id(builder_class, "build", "()Landroid/view/SurfaceControl;")?;
@@ -6621,6 +6645,54 @@ fn install_media_transactions(env: &JniEnv) -> Option<()> {
     Some(())
 }
 
+/// The hosted session has no `system_server` peer, so its setters update shim
+/// state. A method this framework revision does not declare is passed as 0 and
+/// never dispatches.
+///
+/// `ISession.aidl` was renamed over time (`connect`→`setActive`,
+/// `disconnect`→`destroySession`, `setSessionActivity`→`setLaunchPendingIntent`,
+/// `setSessionExtras`→`setExtras`) and `isPlaybackActive` is gone, so each
+/// logical operation lists the names it has shipped under, newest first.
+const MEDIA_SESSION_SETTERS: [&[&str]; 11] = [
+    &["setActive", "connect"],
+    &["destroySession", "disconnect"],
+    &["setFlags"],
+    &["setMetadata"],
+    &["setPlaybackState"],
+    &["setLaunchPendingIntent", "setSessionActivity"],
+    &["setExtras", "setSessionExtras"],
+    &["setPlaybackToLocal"],
+    &["setPlaybackToRemote"],
+    &["setCurrentVolume"],
+    &["isPlaybackActive"],
+];
+
+fn install_media_session_transactions(env: &JniEnv) -> Option<()> {
+    let _frame = env.local_frame(16)?;
+    let stub = env.find_class("android/media/session/ISession$Stub")?;
+    let mut codes = [0u32; MEDIA_SESSION_SETTERS.len()];
+    for (out, candidates) in codes.iter_mut().zip(MEDIA_SESSION_SETTERS) {
+        for method in candidates {
+            let name = format!("TRANSACTION_{method}");
+            let Some(field) = env.try_static_field_id(stub, &name, "I") else { continue };
+            let code = env.static_int_field(stub, field);
+            if code > 0 {
+                *out = code as u32;
+                break;
+            }
+        }
+    }
+    if codes.iter().all(|&code| code == 0) {
+        eprintln!("apphost: the framework ISession$Stub declares no known setter");
+        return None;
+    }
+    let setter = shim_symbol("__pengudroid_binder_set_media_session_transactions")?;
+    let setter: unsafe extern "C" fn(*const u32, usize) -> bool = unsafe { std::mem::transmute(setter) };
+    if !unsafe { setter(codes.as_ptr(), codes.len()) } { return None; }
+    println!("media: framework ISession setter transaction codes = {codes:?}");
+    Some(())
+}
+
 /// Read generated framework constants instead of assuming a platform release's
 /// private AIDL method order. The APK's targetSdk never selects this wire ABI.
 fn install_audio_focus_transactions(env: &JniEnv) -> Option<()> {
@@ -6829,7 +6901,7 @@ pub fn probe_window_configuration(env: &JniEnv) -> bool {
         let visible = JValue { i: env.call_static_int(types, default_visible, &[])? };
         if !env.call_void(layout, compute, &[
             JValue { l: params }, JValue { l: insets }, JValue { l: safe }, JValue { l: bounds },
-            JValue { i: 1 }, JValue { i: SURFACE_W }, JValue { i: SURFACE_H },
+            JValue { i: 1 }, JValue { i: surface_w() }, JValue { i: surface_h() },
             visible, JValue { f: 1.0 }, JValue { l: frames },
         ]) { return None; }
         let frame = env.object_field(frames, env.field_id(frames_class, "frame", "Landroid/graphics/Rect;")?);
@@ -6839,7 +6911,7 @@ pub fn probe_window_configuration(env: &JniEnv) -> bool {
         let height = env.method_id(rect_class, "height", "()I")?;
         let (w, h) = (env.call_int(frame, width, &[])?, env.call_int(frame, height, &[])?);
         println!("window: local WindowLayout.computeFrames = {w}x{h}");
-        if w != SURFACE_W || h != SURFACE_H { return None; }
+        if w != surface_w() || h != surface_h() { return None; }
         probe_window_resized_payload(env)?;
         Some(())
     };
@@ -7177,9 +7249,9 @@ fn install_display_replies(env: &JniEnv) {
         set_int(
             field,
             if field.contains("Height") {
-                SURFACE_H
+                surface_h()
             } else {
-                SURFACE_W
+                surface_w()
             },
         );
     }
@@ -7189,7 +7261,7 @@ fn install_display_replies(env: &JniEnv) {
     // makes `DisplayMetrics.density` zero — which turns
     // `ThreadedRenderer.setLightCenter`'s `zRatio` into Infinity and aborts the
     // first traversal with "lightZ must be a finite positive".
-    set_int("logicalDensityDpi", DENSITY_DPI);
+    set_int("logicalDensityDpi", density_dpi());
     // Display.STATE_ON = 2, Display.TYPE_INTERNAL = 1, Surface.ROTATION_0 = 0.
     set_int("state", 2);
     set_int("committedState", 2);
@@ -7210,7 +7282,7 @@ fn install_display_replies(env: &JniEnv) {
         // This constructor is present in the pinned API-37 framework source.
         let ctor = env.method_id(class, "<init>", "(IIIF)V")?;
         let mode = env.new_object(class, ctor, &[
-            JValue { i: 1 }, JValue { i: SURFACE_W }, JValue { i: SURFACE_H }, JValue { f: 60.0 },
+            JValue { i: 1 }, JValue { i: surface_w() }, JValue { i: surface_h() }, JValue { f: 60.0 },
         ])?;
         let modes = env.new_object_array(1, class, std::ptr::null_mut())?;
         env.set_object_array_element(modes, 0, mode);
@@ -7386,8 +7458,8 @@ fn build_client_window_frames(env: &JniEnv) -> Option<JObject> {
             &[
                 JValue { i: 0 },
                 JValue { i: 0 },
-                JValue { i: SURFACE_W },
-                JValue { i: SURFACE_H },
+                JValue { i: surface_w() },
+                JValue { i: surface_h() },
             ],
         )?;
         env.set_object_field(frames, f, rect);
@@ -8029,22 +8101,36 @@ mod tests {
     /// than a Material `AlertDialog`'s 280 dp minimum, so dialogs overflowed the
     /// window and lost their buttons.
     #[test]
-    fn dp_matches_the_surface_and_density() {
-        assert_eq!(DENSITY_DPI, 320);
-        assert_eq!(SURFACE_W, 720);
-        assert_eq!(SURFACE_H, 1280);
-        assert_eq!(SURFACE_W_DP, 360);
-        assert_eq!(SURFACE_H_DP, 640);
+    fn dp_fields_follow_the_surface_and_density() {
+        let g = geometry();
+        assert_eq!(surface_w(), g.width);
+        assert_eq!(surface_h(), g.height);
+        assert_eq!(density_dpi(), g.density_dpi);
+        assert_eq!(surface_w_dp(), g.width_dp());
+        assert_eq!(surface_h_dp(), g.height_dp());
 
         // `dp = px * 160 / dpi` must round-trip back to the pixel size.
-        assert_eq!(SURFACE_W_DP * DENSITY_DPI / 160, SURFACE_W);
-        assert_eq!(SURFACE_H_DP * DENSITY_DPI / 160, SURFACE_H);
+        assert_eq!(surface_w_dp() * density_dpi() / 160, surface_w());
+        assert_eq!(surface_h_dp() * density_dpi() / 160, surface_h());
     }
 
-    /// 360 dp is wide enough for the narrowest thing the framework will draw.
+    /// The unset environment is the documented default phone surface.
     #[test]
-    fn the_screen_is_wide_enough_for_a_material_dialog() {
-        // `AlertDialog`'s minimum width is 280 dp.
-        assert!(SURFACE_W_DP >= 280, "{SURFACE_W_DP} dp is too narrow");
+    fn the_default_geometry_is_a_360x640_dp_phone() {
+        if std::env::var_os("PENGUDROID_SURFACE_W").is_some() {
+            return; // the harness pinned a window; the policy is tested in `geometry`
+        }
+        assert_eq!((surface_w(), surface_h(), density_dpi()), (720, 1280, 320));
+        assert_eq!((surface_w_dp(), surface_h_dp()), (360, 640));
+        assert!(surface_w_dp() >= crate::geometry::MIN_USABLE_DP);
+    }
+
+    /// A large window must reach the framework as a tablet, not as a phone laid
+    /// out in a big frame.
+    #[test]
+    fn a_tablet_shaped_window_exports_tablet_dp() {
+        let g = crate::geometry::Geometry::for_window(1024, 768, None);
+        assert!(g.is_tablet());
+        assert!(g.smallest_width_dp() >= crate::geometry::TABLET_MIN_DP);
     }
 }

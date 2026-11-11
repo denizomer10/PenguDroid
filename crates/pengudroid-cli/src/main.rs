@@ -18,6 +18,7 @@ mod bundle;
 mod client;
 mod deps;
 mod doctor;
+mod geometry;
 mod gpu;
 mod input;
 mod guest;
@@ -31,6 +32,7 @@ mod nativelib;
 mod native;
 mod process_identity;
 mod runner;
+mod runtime;
 mod sysroot;
 mod telephony;
 
@@ -71,8 +73,10 @@ fn real_main() -> i32 {
         "deps" => deps::run(&args[2..]),
         "doctor" => doctor::run(&args[2..]),
         "sysroot" => sysroot::sysroot(&args[2..]),
+        "runtime" => runtime::runtime(&args[2..]),
         "art-test" => sysroot::art_test(&args[2..]),
         "__art" => sysroot::art_main(&args[2..]),
+        "geometry" => geometry::run(&args[2..]),
         "gpu-info" => gpu::info(),
         "gpu-test" => gpu::test(),
         "video-decode-test" => gpu::video_test(&args[2..]),
@@ -689,10 +693,13 @@ fn print_help() {
          \x20   info <app.apk>                              show manifest details\n\
          \x20   deps <lib.so>                               bionic import coverage\n\
          \x20   doctor <app.apk>                            can this APK run? what is missing?\n\
+         \x20   runtime [--status] [--download]           find/prepare the Android runtime (no --sysroot needed)\n\
          \x20   sysroot <dir>                               inspect an extracted Android system tree\n\
          \x20   art-test --sysroot <dir>                    try JNI_CreateJavaVM against it\n\
          \x20     [--classpath <apk|jar>] [--find-class <C>] [--main <C>]\n\
          \x20     [--jni-lib <so>] [--register-natives <so>]\n\
+         \x20   geometry [--width W] [--height H] [--density DPI] [--resize WxH]\n\
+         \x20                                              print the layout geometry and its resize policy\n\
          \x20   gpu-info                                    report host EGL/GLES/GPU capabilities\n\
          \x20   video-decode-test <one-frame.h264>           verify hardware decode + GPU export\n\
          \x20   gpu-test                                    render offscreen on the GPU + export a dmabuf\n\

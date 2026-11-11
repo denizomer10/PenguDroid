@@ -68,10 +68,13 @@ try:
             if daemon.poll() is not None or time.monotonic() >= deadline:
                 raise RuntimeError("private daemon socket unavailable")
             time.sleep(0.05)
+        # The launcher resolves its own runtime (cache or in-checkout tree), so a
+        # plain smoke run exercises the same no---sysroot path users take.
         args = [str(repo / "target/debug/pengudroid"), "launch", str(bundle),
                 "--backend", os.environ.get("SMOKE_BACKEND", "auto"),
-                "--sysroot", str(repo / ".toolchain/sysroot-android17"),
                 "--prefix", str(work / "prefix")] + extra
+        if os.environ.get("SMOKE_SYSROOT"):
+            args += ["--sysroot", os.environ["SMOKE_SYSROOT"]]
         app = subprocess.Popen(args, cwd=repo, env=env, stdin=subprocess.DEVNULL,
                                stdout=alog, stderr=subprocess.STDOUT, start_new_session=True)
         processes.append(app)

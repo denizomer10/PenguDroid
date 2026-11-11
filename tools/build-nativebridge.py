@@ -2005,7 +2005,9 @@ def main():
                         (path / "base/include/berberis/base/config.h").read_text()
                     ) or (
                         artifact.get("destination") == "sources/native_bridge_support"
-                        and "pthread_attr_getstack(&attr, &guest_stack, &guest_stack_size);" in
+                        and "// Guest pthread_attr_* calls are served by the host libc" in
+                        (path / "android_api/libc/proxy/pthread_translation.cc").read_text()
+                        and "pthread_attr_getguardsize(&attr, &guest_guard_size)" in
                         (path / "android_api/libc/proxy/pthread_translation.cc").read_text()
                     )
                     if not digest_matches and not is_known_compatibility_overlay:

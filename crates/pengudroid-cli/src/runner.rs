@@ -13,8 +13,8 @@ use crate::client::Client;
 use pengudroid_proto::{Message, Role};
 
 /// Default window size for a phone-shaped app.
-const DEFAULT_W: u32 = 720;
-const DEFAULT_H: u32 = 1280;
+const DEFAULT_W: u32 = crate::geometry::DEFAULT_WIDTH;
+const DEFAULT_H: u32 = crate::geometry::DEFAULT_HEIGHT;
 
 /// Set when the CLI receives SIGINT/SIGTERM; used to take the guest down with us.
 static STOP: AtomicBool = AtomicBool::new(false);

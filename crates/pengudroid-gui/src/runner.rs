@@ -80,24 +80,33 @@ fn launch_preferences(cmd: &mut Command, fps: bool, keymapper: bool) {
 
 /// The Android tree to run against.
 ///
-/// `PENGUDROID_SYSROOT` wins, then the in-repo tree, then the per-user install
-/// location. Returning `None` lets `pengudroid launch` print its own guidance.
+/// `PENGUDROID_ART_SYSROOT`/`PENGUDROID_SYSROOT` win, then the in-repo tree, then
+/// the per-user locations — including the runtime cache that `pengudroid
+/// runtime` fills, so the desktop app never asks the user for a path.
 pub fn sysroot() -> Option<PathBuf> {
-    if let Some(explicit) = std::env::var_os("PENGUDROID_SYSROOT") {
-        let path = PathBuf::from(explicit);
-        if path.exists() {
-            return Some(path);
+    for name in ["PENGUDROID_ART_SYSROOT", "PENGUDROID_SYSROOT"] {
+        if let Some(explicit) = std::env::var_os(name) {
+            let path = PathBuf::from(explicit);
+            if path.exists() {
+                return Some(path);
+            }
         }
     }
     let mut candidates = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
         candidates.push(cwd.join(".toolchain/sysroot-android17"));
     }
+    if let Some(cache) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
+        candidates.push(PathBuf::from(cache).join("pengudroid/runtime/android17-x86_64"));
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        candidates.push(
+            PathBuf::from(&home).join(".cache/pengudroid/runtime/android17-x86_64"),
+        );
+        candidates.push(PathBuf::from(&home).join(".local/share/pengudroid/sysroot"));
+    }
     if let Some(data) = std::env::var_os("XDG_DATA_HOME") {
         candidates.push(PathBuf::from(data).join("pengudroid/sysroot"));
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        candidates.push(PathBuf::from(home).join(".local/share/pengudroid/sysroot"));
     }
     candidates.into_iter().find(|p| p.exists())
 }

@@ -258,6 +258,25 @@ impl JniEnv {
         Some(id)
     }
 
+    /// `GetStaticFieldID(clazz, name, sig)` without logging a missing field.
+    ///
+    /// AIDL method names move between platform revisions, so callers probe
+    /// several candidate names; an absent candidate is expected, not an error.
+    pub fn try_static_field_id(&self, class: JClass, name: &str, sig: &str) -> Option<JFieldId> {
+        let cname = std::ffi::CString::new(name).ok()?;
+        let csig = std::ffi::CString::new(sig).ok()?;
+        let f: unsafe extern "C" fn(*mut c_void, JClass, *const i8, *const i8) -> JFieldId =
+            unsafe { self.func(slot::GET_STATIC_FIELD_ID) };
+        let id = unsafe { f(self.0, class, cname.as_ptr(), csig.as_ptr()) };
+        if id.is_null() {
+            let clear: unsafe extern "C" fn(*mut c_void) =
+                unsafe { self.func(slot::EXCEPTION_CLEAR) };
+            unsafe { clear(self.0) };
+            return None;
+        }
+        Some(id)
+    }
+
     /// `GetStaticIntField(clazz, field_id)`.
     pub fn static_int_field(&self, class: JClass, field: JFieldId) -> i32 {
         let f: unsafe extern "C" fn(*mut c_void, JClass, JFieldId) -> i32 =

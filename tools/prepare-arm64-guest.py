@@ -383,7 +383,11 @@ def build_vdso(work, destination, source, compiler):
     if not os.access(compiler, os.X_OK):
         raise PreparationError(f"compiler is not executable: {compiler}")
     compiler_hash = digest(compiler)
+    # A relocated compiler tree keeps its runtime libraries next to the binary,
+    # so the caller's LD_LIBRARY_PATH has to survive the otherwise minimal env.
     env = {"PATH": str(compiler.parent) + os.pathsep + os.defpath, "LC_ALL": "C"}
+    if "LD_LIBRARY_PATH" in os.environ:
+        env["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
     version = subprocess.run([str(compiler), "--version"], capture_output=True, text=True,
                              check=True, timeout=30, env=env)
     subprocess.run([str(compiler), *VDSO_FLAGS, str(snapshot), "-o", str(destination)],

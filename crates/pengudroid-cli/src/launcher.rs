@@ -199,7 +199,8 @@ pub fn create_prefix(prefix: &Path, package: &str) -> Result<Vec<(String, String
     Ok(out)
 }
 
-/// The ART sysroot to use: `--sysroot`, else `$PENGUDROID_ART_SYSROOT`.
+/// The ART runtime to use: `--sysroot`, else `$PENGUDROID_ART_SYSROOT`, else the
+/// per-user cache / in-checkout tree. `--sysroot` is an override, not a requirement.
 fn art_sysroot(explicit: Option<&str>) -> Option<PathBuf> {
     // Absolute, because the guest runs with the app's asset directory as its
     // working directory: a relative `--sysroot` would resolve against that.
@@ -207,7 +208,42 @@ fn art_sysroot(explicit: Option<&str>) -> Option<PathBuf> {
     if let Some(p) = explicit {
         return Some(absolute(PathBuf::from(p)));
     }
-    std::env::var_os("PENGUDROID_ART_SYSROOT").map(|p| absolute(PathBuf::from(p)))
+    if let Some(p) = std::env::var_os("PENGUDROID_ART_SYSROOT") {
+        return Some(absolute(PathBuf::from(p)));
+    }
+    crate::runtime::locate()
+}
+
+/// Ask once, on a terminal, before spending a gigabyte of bandwidth. Anything
+/// non-interactive (the desktop app, scripts, CI) gets instructions instead of
+/// a prompt it could never answer.
+fn offer_runtime_install() -> Option<PathBuf> {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return None;
+    }
+    if std::env::var_os("PENGUDROID_AUTO_RUNTIME").is_some_and(|v| v == "0") {
+        return None;
+    }
+    eprint!(
+        "pengudroid launch: no Android runtime found. Download the pinned API-37 runtime now \
+         (one time, ~1 GiB)? [y/N] "
+    );
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return None;
+    }
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes" | "e" | "evet") {
+        return None;
+    }
+    match crate::runtime::provision(true) {
+        Ok(tree) => Some(tree),
+        Err(error) => {
+            eprintln!("pengudroid launch: {error}");
+            None
+        }
+    }
 }
 
 /// `pengudroid launch <app.apk> [options]`
@@ -217,6 +253,9 @@ pub fn launch(args: &[String]) -> i32 {
     let mut sysroot_arg: Option<String> = None;
     let mut backend_arg: Option<String> = None;
     let mut component: Option<String> = None;
+    let mut width: Option<u32> = None;
+    let mut height: Option<u32> = None;
+    let mut density: Option<i32> = None;
     let mut app_args: Vec<String> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -225,6 +264,27 @@ pub fn launch(args: &[String]) -> i32 {
             "--sysroot" => sysroot_arg = it.next().cloned(),
             "--backend" => backend_arg = it.next().cloned(),
             "--component" => component = it.next().cloned(),
+            "--width" => match it.next().and_then(|v| v.parse().ok()) {
+                Some(v) => width = Some(v),
+                None => {
+                    eprintln!("pengudroid launch: --width needs a number");
+                    return 2;
+                }
+            },
+            "--height" => match it.next().and_then(|v| v.parse().ok()) {
+                Some(v) => height = Some(v),
+                None => {
+                    eprintln!("pengudroid launch: --height needs a number");
+                    return 2;
+                }
+            },
+            "--density" => match it.next().and_then(|v| v.parse().ok()) {
+                Some(v) => density = Some(v),
+                None => {
+                    eprintln!("pengudroid launch: --density needs a number (dpi)");
+                    return 2;
+                }
+            },
             "--" => {
                 app_args.extend(it.by_ref().cloned());
                 break;
@@ -237,7 +297,10 @@ pub fn launch(args: &[String]) -> i32 {
         }
     }
     let Some(apk_path) = apk_path else {
-        eprintln!("usage: pengudroid launch <app.apk> [--backend auto|native|art] [--prefix DIR] [--sysroot DIR] [-- ARGS]");
+        eprintln!(
+            "usage: pengudroid launch <app.apk> [--backend auto|native|art] [--prefix DIR] \
+             [--sysroot DIR] [--width PX] [--height PX] [--density DPI] [-- ARGS]"
+        );
         return 2;
     };
 
@@ -343,6 +406,12 @@ pub fn launch(args: &[String]) -> i32 {
             if let Some(c) = &component {
                 cmd.arg("--component").arg(c);
             }
+            if let Some(w) = width {
+                cmd.arg("--width").arg(w.to_string());
+            }
+            if let Some(h) = height {
+                cmd.arg("--height").arg(h.to_string());
+            }
             apply_env(&mut cmd, &env);
             if let Some(dir) = asset_root(&app_path, &prefix, &split_paths) {
                 cmd.current_dir(dir);
@@ -350,10 +419,10 @@ pub fn launch(args: &[String]) -> i32 {
             run_child(cmd)
         }
         Backend::Art => {
-            let Some(sysroot) = art_sysroot(sysroot_arg.as_deref()) else {
+            let Some(sysroot) = art_sysroot(sysroot_arg.as_deref()).or_else(offer_runtime_install) else {
                 eprintln!(
-                    "pengudroid launch: this app needs ART; pass --sysroot <dir> or set \
-                     PENGUDROID_ART_SYSROOT (see `pengudroid sysroot`)"
+                    "pengudroid launch: this app needs ART; run `pengudroid runtime --download` \
+                     once, pass --sysroot <dir>, or set PENGUDROID_ART_SYSROOT"
                 );
                 return 1;
             };
@@ -365,6 +434,17 @@ pub fn launch(args: &[String]) -> i32 {
                 .arg(&app_path);
             for split in &split_paths {
                 cmd.arg("--classpath").arg(split);
+            }
+            // The guest geometry is one decision for the whole tree, so it is
+            // passed to the ART launcher rather than set piecemeal here.
+            if let Some(w) = width {
+                cmd.arg("--width").arg(w.to_string());
+            }
+            if let Some(h) = height {
+                cmd.arg("--height").arg(h.to_string());
+            }
+            if let Some(d) = density {
+                cmd.arg("--density").arg(d.to_string());
             }
             // The framework's JNI natives live in libandroid_runtime.so and
             // are registered by calling every exported `register_*` entry

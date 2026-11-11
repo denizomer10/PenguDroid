@@ -265,14 +265,16 @@ silently fall back to a container.
   `pengudroid native`, with `AAssetManager`, `ALooper`, EGL/GLES and Vulkan. This
   is the path `pengudroid launch` picks, and `fixtures/native-game` is a playable
   game at ~56 fps on an RTX 3080.
-* **Genshin Impact still cannot run here.** Its Android build is `arm64-v8a`
-  only; the NDK translator above is the right tool for that and now initialises
-  and starts ARM64 code, but it does not yet complete guest execution (see 2.1).
-  On top of that it ships ~20 GB of OBB data, a proprietary anti-cheat, and it
-  needs `system_server` for login and rendering surfaces. There is no legitimate
-  way to obtain or run it in this environment, so "Genshin renders" is not a
-  claim this project can make. What it *can* claim is the same class of workload:
-  NativeActivity games that call EGL/GLES/Vulkan directly.
+* **Genshin Impact is not a claim this project makes.** Its Android build is
+  `arm64-v8a` only, and the translator completes guest execution for the class
+  of workload it targets (see the BBR2 evidence in
+  [NATIVE_BRIDGE.md](NATIVE_BRIDGE.md)). Genshin is still out of reach for
+  reasons the translator does not address: ~20 GB of OBB data, a proprietary
+  anti-cheat, and `system_server`-backed login and surfaces. There is no
+  legitimate way to obtain or run it in this environment, so no measurement of
+  it exists here. What the project does verify is the same class of workload on
+  a real ARM64 game: Beach Buggy Racing 2, an SDL3 engine calling EGL/GLES
+  directly, which loads, renders and presents frames — slowly (2.5).
 
 ## 3. Native `.so` compatibility
 
@@ -351,6 +353,58 @@ buffers through it fail), hardware composition, and GLES coverage beyond the
 exported core functions. The compat directory maps `libGLESv2.so` to the *host*
 driver and the shim loads it `RTLD_GLOBAL`, so an app's direct GL imports resolve
 in practice.
+
+### 4.1 Window resize keeps the internal resolution; it does not relayout the guest
+
+A resized window does **not** make the guest render at a new pixel size, and it
+does not re-configure the guest's `Configuration`. The daemon's viewporter path
+is deliberate about this (`configure_window` in
+`crates/pengudroid-daemon/src/graphics.rs`): `surface.width/height` — the guest's
+own buffer — is left untouched, and only `display_width/display_height` and the
+viewport destination change, so the compositor scales the fixed-size guest frame
+into the new window. Input is mapped back into guest space by
+`guest_coordinates`, so a touch lands on the widget the user sees even though
+the guest never learned the window changed.
+
+Consequences, stated plainly:
+
+* **Aspect ratio is preserved and letterboxed.** Free-form drags do not stretch
+  the picture, and the app's internal resolution is stable — a game keeps its
+  render target, a video keeps its decoded size.
+* **Density is never re-derived mid-session.** It is chosen at launch
+  (`crates/pengudroid-cli/src/geometry.rs::for_window`). Re-deriving it on resize
+  would rescale every touch target under the user's finger, so
+  `Geometry::for_resize` keeps the launch density and only the dp size — and
+  therefore the phone/tablet classification — follows the new window.
+* **Tablet layouts are a launch-time choice.** `smallestScreenWidthDp >= 600`
+  switches the framework to tablet layouts, and the density that makes that true
+  is picked from the window size at launch (`--width`/`--height`, or the
+  defaults 720x1280 at 320 dpi). A phone-launched session that is later
+  maximized crosses 600 dp only if the new window is at least
+  `Geometry::tablet_side_px()` wide (1200 px at 320 dpi). When it does, the
+  framework's `Configuration` is still not updated, because no daemon→guest
+  resize notification exists: there is no `SurfaceResized` message in
+  `pengudroid-proto`, and `apphost` builds `Configuration`/`DisplayInfo` once.
+* **An app that forces a fixed orientation may letterbox more.** BBR2 asks for
+  landscape (`requestedOrientation=11`) on a portrait 720x1280 surface, so its
+  content is presented inside that frame rather than filling a landscape window.
+
+`pengudroid geometry` prints the resolved policy without launching anything:
+
+```
+$ pengudroid geometry --resize 1920x1200
+720x1280 px at 320 dpi -> 360x640 dp, smallestScreenWidthDp 360, phone
+tablet layouts start at a 1200 px window side at this density
+resized to 1920x1200 px -> 960x600 dp, smallestScreenWidthDp 600, tablet (density kept at 320 dpi)
+  note: the guest keeps rendering at 720x1280 px; the compositor scales that frame into the new window, and the app is not told about the size change
+```
+
+Relayout-on-resize — replaying `IWindow.resized` into a live guest so `hwui`
+re-measures at the new dp size — is wired only behind
+`PENGUDROID_PUMP_RESIZED` and has not been validated against an interactive
+drag. `ViewRootImpl.mClientWindowFrames.frame` is forced best-effort, and logs
+`apphost: Android 17 ViewRootImpl.mClientWindowFrames.frame is unavailable` when
+the field or its `Rect` cannot be resolved.
 
 **OpenSL ES is implemented for the common case.** `slCreateEngine`, the object
 model, engine/output-mix/player interfaces and the Android simple buffer queue

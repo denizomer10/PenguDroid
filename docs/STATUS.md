@@ -2,7 +2,69 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
-## Where we left off — desktop manager verified (2026-11-11)
+## Where we left off — ARM64 BBR2 runs without `--sysroot` (2026-11-12)
+
+Pick up here. The headline change since 2026-11-11 is that an **ARM64-only game
+launches from a plain `pengudroid launch`** with no `--sysroot` argument and no
+manual runtime step, reaches its own `main`, renders, and presents frames.
+
+Verified this session:
+
+| Claim | Evidence |
+|---|---|
+| BBR2 (arm64-v8a only) launches with no `--sysroot` | `pengudroid launch <apkm> --backend auto`, 300 s run: `app_exit: null`, daemon alive, clean teardown |
+| The guest main loop really runs | SIGQUIT dump: `SDLThread` in `state=R`, 23.7 s user CPU, 6816 switches |
+| Frames reach the host compositor | `PENGUDROID_TRACE_GLESHIM=1`: `eglCreateWindowSurface -> 720x1280`, `presented surface 1 720x1280` |
+| The game's own backend is reachable | HTTP 200 from `free2play.cobalt.vectorunit.com` inside the guest |
+| Audio, billing, SQLite, GMS paths run | FMOD `stream`/`mixer`/`Studio` threads, `BillingClient` and `SQLiteCursor` activity |
+| Resize policy is inspectable | `pengudroid geometry [--width W] [--height H] [--density DPI] [--resize WxH]` |
+| Tests | `cargo test --workspace --offline` green; `python3 -m unittest discover -s tools -p 'test_*.py'` 256 passing |
+| New regressions | `geometry` resize/dp policy (`crates/pengudroid-cli/src/geometry.rs`), guest-bundle assembler (`tools/test_assemble_arm64_bridge_guest.py`) |
+
+### How the two launch blockers were fixed
+
+1. **`JNI DETECTED ERROR: fid == null`** aborted ART before the game's code ran.
+   Fixed by reporting the manifest's real field layout rather than a synthetic
+   one, with a `GetFieldID`/`GetLongField` tracer left behind under `TRACE`.
+2. **An EGL loader failure** followed it. Guest `libandroid.so` and the guest
+   GL/EGL family are now **NativeBridgeSupport stubs** that resolve through the
+   guest vDSO hook into `libberberis_proxy_<name>.so`, and from there into the
+   staged host forwarder (gleshim first, then versioned Mesa). The guest runtime
+   that carries those stubs is assembled by
+   `tools/assemble-arm64-bridge-guest.py --guest-stubs`. See
+   [NATIVE_BRIDGE.md](NATIVE_BRIDGE.md).
+
+### What is still wrong, in priority order
+
+1. **Frame rate under translation.** The initial scenes present at well under
+   1 fps (fewer than 60 swaps in a 60 s run) against 22,911 presents/120 s for
+   the same game on the x86_64 path. The guest VM runs `-Xint` and every guest
+   instruction is translated. This is the single blocker between "it runs" and
+   "it is playable", and it is a performance problem, not a compatibility one.
+2. **No guest relayout on window resize.** The compositor preserves the guest's
+   internal resolution and scales the frame (correct, verified), but the guest is
+   never told the window changed, so tablet layouts cannot switch on mid-session.
+   There is no `SurfaceResized` message in `pengudroid-proto`. Details and the
+   exact policy are in [LIMITATIONS.md](LIMITATIONS.md) §4.1; use
+   `pengudroid geometry --resize WxH` to see the classification a session would
+   report.
+3. **Service gaps that show up as log noise.** `listAudioPorts` fails ~900 times
+   per run, audio code 171 and input code 1 are unimplemented, and
+   `berberis: trans#`/`dispatch#` DEBUG lines dominate the log.
+4. **A guest JNI bug that is not ours.** BBR2 issues a `GetMethodID` for
+   `Constructor.getReturnType()`, which does not exist (verified by parsing
+   `core-oj.jar`). It is logged and does not kill the main loop.
+
+### Next concrete task
+
+Add a **daemon → guest resize notification** (`SurfaceResized` in
+`pengudroid-proto`, sent from `configure_window`, consumed by the CLI) so a
+resized window can re-configure `Configuration`/`DisplayInfo` and let tablet
+layouts follow the window. `Geometry::for_resize` and
+`Geometry::tablet_side_px` already implement the decision half of that policy
+and are tested.
+
+## Desktop manager verified (2026-11-11)
 
 Pick up here. The project currently does these things end to end:
 
