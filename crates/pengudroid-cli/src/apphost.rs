@@ -1972,7 +1972,9 @@ const MAX_NUDGES: u32 = 3;
 const MAX_FORCE_PASSES: u32 = 4;
 
 fn spawn_resized_pump(env: &JniEnv) {
-    if std::env::var_os("PENGUDROID_PUMP_RESIZED").is_none() {
+    let pump = std::env::var_os("PENGUDROID_PUMP_RESIZED").is_some();
+    let follow = std::env::var_os("PENGUDROID_FOLLOW_RESIZE").is_some();
+    if !pump && !follow {
         return;
     }
     let Some(vm) = env.get_java_vm() else { return };
@@ -1984,11 +1986,193 @@ fn spawn_resized_pump(env: &JniEnv) {
         };
         let mut seen: std::collections::HashMap<usize, (i32, u32)> =
             std::collections::HashMap::new();
+        let mut follow = FollowResize::new();
         loop {
-            pump_resized(&env, &mut seen);
+            if pump {
+                pump_resized(&env, &mut seen);
+            }
+            if follow_enabled() {
+                follow.poll(&env);
+            }
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
     });
+}
+
+fn follow_enabled() -> bool {
+    std::env::var_os("PENGUDROID_FOLLOW_RESIZE").is_some()
+}
+
+/// `PENGUDROID_FOLLOW_RESIZE=1`: let the guest relayout when the window changes
+/// size.
+///
+/// The compositor keeps the guest's own buffer and only scales it into the new
+/// window, which is what keeps a resized game or video at its internal
+/// resolution — but it also means nothing ever tells the guest that the window
+/// moved. This asks the daemon what the surface is actually showing and, when
+/// that differs from the geometry the session published, publishes the new one
+/// and asks the window roots for a synchronous relayout: the reply then carries
+/// frames of the new size, and a window that crosses 600 dp switches tablet
+/// layouts (`Geometry::for_resize` keeps the density, so text does not rescale).
+struct FollowResize {
+    client: Option<crate::client::Client>,
+    surface_id: Option<u32>,
+    /// Last `display_width`/`display_height` published to the environment.
+    applied: Option<(u32, u32)>,
+    /// Consecutive failed polls, so a surface that goes away reports once and
+    /// then every ten seconds instead of on every tick.
+    failures: u32,
+}
+
+impl FollowResize {
+    fn new() -> Self {
+        FollowResize { client: None, surface_id: None, applied: None, failures: 0 }
+    }
+
+    fn poll(&mut self, env: &JniEnv) {
+        // The GL shim publishes this each time it creates a window. It is re-read
+        // on every tick because an app replaces its window — a splash handing over
+        // to the game — and the daemon keeps only the live one.
+        self.surface_id = ["PENGUDROID_LAST_SURFACE_ID", "PENGUDROID_SURFACE_ID"]
+            .iter()
+            .find_map(|key| std::env::var(key).ok().and_then(|v| v.parse().ok()));
+        let Some(surface_id) = self.surface_id else { return };
+        if self.client.is_none() {
+            self.client = crate::client::Client::connect()
+                .and_then(|c| {
+                    c.handshake(pengudroid_proto::Role::Cli)?;
+                    Ok(c)
+                })
+                .ok();
+            if self.client.is_none() {
+                return;
+            }
+        }
+        let sizes = match self.client.as_ref() {
+            Some(client) => client.surface_geometry(surface_id),
+            None => return,
+        };
+        let (_, _, display_w, display_h) = match sizes {
+            Ok(Some(sizes)) => sizes,
+            // Between two windows there is nothing to size against yet.
+            Ok(None) => return,
+            Err(e) => {
+                // A daemon that went away must not wedge the pump: drop the
+                // connection and try again on the next tick.
+                self.failures += 1;
+                if self.failures == 1 || self.failures % 40 == 0 {
+                    println!(
+                        "apphost: cannot read surface {surface_id} geometry via {}: {e}",
+                        pengudroid_proto::default_socket_path().display()
+                    );
+                }
+                self.client = None;
+                return;
+            }
+        };
+        if display_w == 0 || display_h == 0 {
+            return;
+        }
+        self.failures = 0;
+        if self.applied == Some((display_w, display_h)) {
+            return;
+        }
+        self.applied = Some((display_w, display_h));
+        let g = geometry().for_resize(display_w, display_h);
+        for (key, value) in g.export() {
+            std::env::set_var(key, value);
+        }
+        let roots = window_roots(env);
+        let mut poked = 0;
+        for root in &roots {
+            if poke_relayout(env, *root) {
+                poked += 1;
+            }
+        }
+        println!(
+            "apphost: window is now {display_w}x{display_h}; guest relayout at {}x{} px \
+             ({}x{} dp{}), {poked} root(s) poked",
+            g.width,
+            g.height,
+            g.width_dp(),
+            g.height_dp(),
+            if g.is_tablet() { ", tablet" } else { "" },
+        );
+    }
+}
+
+/// The `ViewRootImpl` of every window, in `WindowManagerGlobal.mViews` order.
+fn window_roots(env: &JniEnv) -> Vec<JObject> {
+    let mut roots = Vec::new();
+    let Some(wmg_class) = env.find_class("android/view/WindowManagerGlobal") else {
+        return roots;
+    };
+    let (Some(get_instance), Some(views_field)) = (
+        env.static_method_id(wmg_class, "getInstance", "()Landroid/view/WindowManagerGlobal;"),
+        env.field_id(wmg_class, "mViews", "Ljava/util/ArrayList;"),
+    ) else {
+        return roots;
+    };
+    let Some(wmg) = env.call_static_object(wmg_class, get_instance, &[]) else {
+        return roots;
+    };
+    let views = env.object_field(wmg, views_field);
+    if views.is_null() {
+        return roots;
+    }
+    let Some(list_class) = env.find_class("java/util/ArrayList") else {
+        return roots;
+    };
+    let (Some(size_m), Some(get_m)) = (
+        env.method_id(list_class, "size", "()I"),
+        env.method_id(list_class, "get", "(I)Ljava/lang/Object;"),
+    ) else {
+        return roots;
+    };
+    let Some(view_class) = env.find_class("android/view/View") else {
+        return roots;
+    };
+    let Some(get_root) = env.method_id(view_class, "getViewRootImpl", "()Landroid/view/ViewRootImpl;")
+    else {
+        return roots;
+    };
+    let count = env.call_int(views, size_m, &[]).unwrap_or(0);
+    for index in 0..count {
+        env.describe_exception();
+        let Some(view) = env.call_object(views, get_m, &[JValue { i: index as i32 }]) else {
+            continue;
+        };
+        if view.is_null() {
+            continue;
+        }
+        let Some(root) = env.call_object(view, get_root, &[]) else {
+            continue;
+        };
+        if !root.is_null() {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+/// Ask one window for a relayout whose frames come from the window manager.
+fn poke_relayout(env: &JniEnv, root: JObject) -> bool {
+    let Some(vri_class) = env.find_class("android/view/ViewRootImpl") else {
+        return false;
+    };
+    // `relayoutAsync` is oneway, so the client keeps the frames it computed
+    // from a stale `mMeasuredWidth`. `mForceNextWindowRelayout` makes
+    // `performTraversals` call `IWindowSession.relayout`, whose reply the host
+    // fills from the geometry above.
+    if let Some(f) = env.field_id(vri_class, "mForceNextWindowRelayout", "Z") {
+        env.set_boolean_field(root, f, true);
+    }
+    if let Some(f) = env.field_id(vri_class, "mLayoutRequested", "Z") {
+        env.set_boolean_field(root, f, true);
+    }
+    env.method_id(vri_class, "scheduleTraversals", "()V")
+        .map(|m| env.call_void(root, m, &[]))
+        .unwrap_or(false)
 }
 
 /// `PENGUDROID_PUMP_RESIZED=1`: play the window manager's `IWindow.resized`.

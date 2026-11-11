@@ -377,10 +377,12 @@ from the game's own backend, and `eglSwapBuffers` reaching the host with
 `state=R` with tens of seconds of user CPU, i.e. the translated main loop is
 running rather than deadlocked.
 
-Throughput is the open problem, not correctness: the initial scenes present at
-well under 1 fps, against 22,911 presents per 120 s for the same game through
-the x86_64 path. The guest VM runs `-Xint` and every guest instruction is
-translated, so frame production is bounded by interpretation, not by the GPU.
+Throughput was measured rather than assumed. A 170 s run presented 5,280
+frames, and the swap counter moved from 240 at t=100 s to 2,640 at t=140 s: the
+first ~100 s are loading and shader warm-up, after which the game holds a
+vsync-locked 60 fps. The guest VM runs `-Xint` and every guest instruction is
+translated, so that warm-up is CPU-bound interpretation; steady-state rendering
+is not, and the GPU path is the same one the x86_64 build uses.
 
 ### Guest libraries the bridge cannot translate
 

@@ -15,11 +15,14 @@ Verified this session:
 | BBR2 (arm64-v8a only) launches with no `--sysroot` | `pengudroid launch <apkm> --backend auto`, 300 s run: `app_exit: null`, daemon alive, clean teardown |
 | The guest main loop really runs | SIGQUIT dump: `SDLThread` in `state=R`, 23.7 s user CPU, 6816 switches |
 | Frames reach the host compositor | `PENGUDROID_TRACE_GLESHIM=1`: `eglCreateWindowSurface -> 720x1280`, `presented surface 1 720x1280` |
+| It is fast once warm, too | swap counter 240 at t=100 s → 2,640 at t=140 s (60 fps), 5,280 presents per 170 s |
 | The game's own backend is reachable | HTTP 200 from `free2play.cobalt.vectorunit.com` inside the guest |
 | Audio, billing, SQLite, GMS paths run | FMOD `stream`/`mixer`/`Studio` threads, `BillingClient` and `SQLiteCursor` activity |
 | Resize policy is inspectable | `pengudroid geometry [--width W] [--height H] [--density DPI] [--resize WxH]` |
+| The host can ask a live surface its size | `SurfaceGeometry` (protocol v4); roundtrip tested, and a live BBR2 run read `496x883` back and relaid out the guest |
+| A resize is applied to the guest | `PENGUDROID_FOLLOW_RESIZE=1`: `window is now 496x883 … 1 root(s) poked`, 246 presents afterwards |
 | Tests | `cargo test --workspace --offline` green; `python3 -m unittest discover -s tools -p 'test_*.py'` 256 passing |
-| New regressions | `geometry` resize/dp policy (`crates/pengudroid-cli/src/geometry.rs`), guest-bundle assembler (`tools/test_assemble_arm64_bridge_guest.py`) |
+| New regressions | `geometry` resize/dp policy (`crates/pengudroid-cli/src/geometry.rs`), guest-bundle assembler (`tools/test_assemble_arm64_bridge_guest.py`), `SurfaceGeometry` unknown-surface error |
 
 ### How the two launch blockers were fixed
 
@@ -36,18 +39,22 @@ Verified this session:
 
 ### What is still wrong, in priority order
 
-1. **Frame rate under translation.** The initial scenes present at well under
-   1 fps (fewer than 60 swaps in a 60 s run) against 22,911 presents/120 s for
-   the same game on the x86_64 path. The guest VM runs `-Xint` and every guest
-   instruction is translated. This is the single blocker between "it runs" and
-   "it is playable", and it is a performance problem, not a compatibility one.
-2. **No guest relayout on window resize.** The compositor preserves the guest's
-   internal resolution and scales the frame (correct, verified), but the guest is
-   never told the window changed, so tablet layouts cannot switch on mid-session.
-   There is no `SurfaceResized` message in `pengudroid-proto`. Details and the
-   exact policy are in [LIMITATIONS.md](LIMITATIONS.md) §4.1; use
-   `pengudroid geometry --resize WxH` to see the classification a session would
-   report.
+1. **Time to first frame, not frame rate.** Once warm, BBR2 holds a
+   vsync-locked 60 fps: the swap counter went 240 → 2,640 between t=100 s and
+   t=140 s of a traced run, and 170 s produced 5,280 presents. The whole cost is
+   front-loaded — roughly 100 s of loading and shader work first — because the
+   guest VM runs `-Xint` and every guest instruction is translated. Cheaper
+   warm-up is a performance problem, not a compatibility one.
+2. **Guest relayout on resize works, but the drag that triggers it is untested.**
+   The compositor preserves the guest's internal resolution and scales the frame
+   (correct, verified). `PENGUDROID_FOLLOW_RESIZE=1` closes the loop: it polls
+   `SurfaceGeometry` (protocol v4), republishes the geometry with
+   `Geometry::for_resize` and pokes each root so `hwui` measures again at the new
+   dp size. A live BBR2 run proves the pull, the publish and the poke
+   (`window is now 496x883 … 1 root(s) poked`, then 246 presents). What is
+   missing is a configure event from a real drag — the headless harness has no
+   seat. See [LIMITATIONS.md](LIMITATIONS.md) §4.1–4.2; `pengudroid geometry
+   --resize WxH` prints the classification a session would report.
 3. **Service gaps that show up as log noise.** `listAudioPorts` fails ~900 times
    per run, audio code 171 and input code 1 are unimplemented, and
    `berberis: trans#`/`dispatch#` DEBUG lines dominate the log.
@@ -57,12 +64,13 @@ Verified this session:
 
 ### Next concrete task
 
-Add a **daemon → guest resize notification** (`SurfaceResized` in
-`pengudroid-proto`, sent from `configure_window`, consumed by the CLI) so a
-resized window can re-configure `Configuration`/`DisplayInfo` and let tablet
-layouts follow the window. `Geometry::for_resize` and
-`Geometry::tablet_side_px` already implement the decision half of that policy
-and are tested.
+Validate the live resize follower on an interactive session: launch with
+`PENGUDROID_FOLLOW_RESIZE=1`, drag the window across the 600 dp line, and read
+the `apphost: window is now …` line plus the daemon's `SurfaceGeometry` reply.
+The pull half is verified; the `IWindowSession.relayout` half is not, because it
+needs a configure event. After that, the warm-up: ~100 s of loading and shader
+compilation under `-Xint` is the remaining cost, and it is a performance
+problem — [LIMITATIONS.md](LIMITATIONS.md) §2.
 
 ## Desktop manager verified (2026-11-11)
 

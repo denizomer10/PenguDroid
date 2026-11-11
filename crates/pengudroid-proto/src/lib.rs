@@ -29,7 +29,9 @@ use std::fmt;
 /// unregistration and detached launches (`QueryRun`).
 /// v3 adds a mandatory per-frame source crop to `PresentShm`; v2 peers must
 /// reconnect with matching binaries rather than interpreting allocation padding.
-pub const PROTO_VERSION: u16 = 3;
+/// v4 adds `SurfaceGeometry`, so a host can ask what a surface is actually
+/// showing instead of assuming the size it asked for at creation.
+pub const PROTO_VERSION: u16 = 4;
 
 /// Marker used by the daemon's pid/heartbeat file.
 pub const PROTO_MAGIC: u32 = 0x5044_5247; // "PDRG"
@@ -78,6 +80,7 @@ pub enum MsgKind {
     DestroySurface = 67,
     PresentShm = 68,
     SetSurfaceOptions = 69,
+    SurfaceGeometry = 99,
 
     GetProp = 70,
     PropValue = 71,
@@ -145,6 +148,7 @@ impl MsgKind {
             67 => DestroySurface,
             68 => PresentShm,
             69 => SetSurfaceOptions,
+            99 => SurfaceGeometry,
             70 => GetProp,
             71 => PropValue,
             72 => SetProp,
@@ -315,6 +319,10 @@ pub enum Message {
     SetSubsurfacePosition { surface_id: u32, x: i32, y: i32 },
     DestroySurface { surface_id: u32 },
     SetSurfaceOptions { surface_id: u32, fps_meter: bool },
+    /// Ask what a surface is showing. `width`/`height` are the guest's own
+    /// buffer (its internal resolution); `display_*` is the size the compositor
+    /// currently scales that buffer into, which is what a window resize changes.
+    SurfaceGeometry { surface_id: u32, width: u32, height: u32, display_width: u32, display_height: u32 },
     /// Snapshot a CPU buffer (memfd passed out-of-band), never a GPU dma-buf.
     /// `width`/`height` describe the allocation, `stride` is bytes per row, and
     /// `format` is an Android HAL pixel format. Only `crop` is displayed; even
@@ -393,6 +401,19 @@ pub enum Message {
 }
 
 impl Message {
+    /// The request form of [`Message::SurfaceGeometry`].
+    ///
+    /// Request and reply share one variant, so the reply-shaped fields are zero.
+    pub fn query_surface_geometry(surface_id: u32) -> Message {
+        Message::SurfaceGeometry {
+            surface_id,
+            width: 0,
+            height: 0,
+            display_width: 0,
+            display_height: 0,
+        }
+    }
+
     pub fn kind(&self) -> MsgKind {
         use Message::*;
         match self {
@@ -420,6 +441,7 @@ impl Message {
             SetSubsurfacePosition { .. } => MsgKind::SetSubsurfacePosition,
             DestroySurface { .. } => MsgKind::DestroySurface,
             SetSurfaceOptions { .. } => MsgKind::SetSurfaceOptions,
+            SurfaceGeometry { .. } => MsgKind::SurfaceGeometry,
             PresentDmabuf { .. } => MsgKind::PresentDmabuf,
             PresentShm { .. } => MsgKind::PresentShm,
             VideoDecoderOpen { .. } => MsgKind::VideoDecoderOpen,
@@ -558,6 +580,13 @@ impl Message {
             }
             DestroySurface { surface_id } => e.u32(*surface_id),
             SetSurfaceOptions { surface_id, fps_meter } => { e.u32(*surface_id); e.u8(u8::from(*fps_meter)); }
+            SurfaceGeometry { surface_id, width, height, display_width, display_height } => {
+                e.u32(*surface_id);
+                e.u32(*width);
+                e.u32(*height);
+                e.u32(*display_width);
+                e.u32(*display_height);
+            }
             PresentShm { surface_id, width, height, stride, format, crop } => {
                 e.u32(*surface_id);
                 e.u32(*width);
@@ -762,6 +791,13 @@ impl Message {
             },
             K::DestroySurface => DestroySurface { surface_id: d.u32()? },
             K::SetSurfaceOptions => SetSurfaceOptions { surface_id: d.u32()?, fps_meter: d.u8()? != 0 },
+            K::SurfaceGeometry => SurfaceGeometry {
+                surface_id: d.u32()?,
+                width: d.u32()?,
+                height: d.u32()?,
+                display_width: d.u32()?,
+                display_height: d.u32()?,
+            },
             K::PresentShm => PresentShm {
                 surface_id: d.u32()?, width: d.u32()?, height: d.u32()?,
                 stride: d.u32()?, format: d.u32()?,
@@ -1215,6 +1251,13 @@ mod tests {
             crop: BufferCrop::full(426, 240) });
         roundtrip(Message::SetSurfaceOptions { surface_id: 4, fps_meter: true });
         roundtrip(Message::SetSurfaceOptions { surface_id: 4, fps_meter: false });
+        roundtrip(Message::SurfaceGeometry {
+            surface_id: 4,
+            width: 720,
+            height: 1280,
+            display_width: 1600,
+            display_height: 900,
+        });
         roundtrip(Message::RunApk {
             path: "/tmp/app.apk".into(),
             component: Some("com.x/.Main".into()),

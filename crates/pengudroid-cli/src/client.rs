@@ -62,6 +62,23 @@ impl Client {
         Ok((reply, fds))
     }
 
+    /// What a surface is showing: `(buffer_w, buffer_h, display_w, display_h)`, or
+    /// `None` when the daemon does not have that surface right now.
+    ///
+    /// An app that replaces its window (a splash screen handing over to the game)
+    /// destroys one surface and creates another, and a caller polling across that
+    /// gap gets `-3` for a moment. That is an answer, not a failure.
+    pub fn surface_geometry(&self, surface_id: u32) -> Result<Option<(u32, u32, u32, u32)>, String> {
+        match self.request(&Message::query_surface_geometry(surface_id))?.0 {
+            Message::SurfaceGeometry { width, height, display_width, display_height, .. } => {
+                Ok(Some((width, height, display_width, display_height)))
+            }
+            Message::Error { code: -3, .. } => Ok(None),
+            Message::Error { message, .. } => Err(message),
+            other => Err(format!("unexpected reply to SurfaceGeometry: {:?}", other.kind())),
+        }
+    }
+
     /// Like [`Client::request`], but attaches file descriptors to the outgoing
     /// message (used to hand the daemon a GPU-exported dma-buf).
     pub fn request_with_fds(

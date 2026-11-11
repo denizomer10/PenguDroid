@@ -921,6 +921,17 @@ mod imp {
             true
         }
 
+        /// What a surface is showing: `(buffer_w, buffer_h, display_w, display_h)`.
+        ///
+        /// The first pair is the guest's own frame size, which a window resize
+        /// deliberately leaves alone; the second is the size the compositor
+        /// scales it into.
+        pub fn surface_geometry(&mut self, id: u32) -> Option<(u32, u32, u32, u32)> {
+            self.state.surfaces.get(&id).map(|s| {
+                (s.width, s.height, s.display_width, s.display_height)
+            })
+        }
+
         pub fn set_surface_options(&mut self, id: u32, enabled: bool) -> bool {
             let Some(surface) = self.state.surfaces.get_mut(&id) else { return false };
             surface.fps_meter = enabled;
@@ -1856,6 +1867,7 @@ mod imp {
             None
         }
         pub fn set_surface_options(&mut self, _id: u32, _enabled: bool) -> bool { false }
+        pub fn surface_geometry(&mut self, _id: u32) -> Option<(u32, u32, u32, u32)> { None }
         pub fn contains_surface(&self, _id: u32) -> bool { false }
         pub fn is_toplevel(&self, _id: u32) -> bool { false }
         pub fn destroy_surface(&mut self, _id: u32) -> bool {

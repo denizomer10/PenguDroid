@@ -259,6 +259,15 @@ support), and BBR2 — ARM64-only — runs end to end. The standing rule is
 unchanged: never substitute an x86_64 copy, patch the game binaries, or
 silently fall back to a container.
 
+**Measured throughput (2026-11-12).** A 170 s run with
+`PENGUDROID_TRACE_GLESHIM=1` presented 5,280 frames and ended with
+`app_exit: null`. The gleshim swap counter read 240 at t=100 s and 2,640 at
+t=140 s: the game spends roughly its first 100 s loading and compiling shaders,
+then holds a vsync-locked **60 fps**. Frame production is therefore not the
+blocker it was long assumed to be — the earlier "well under 1 fps" reading came
+from a 60 s sample that landed entirely inside the warm-up. What remains slow is
+the path *to* the first frame, which is CPU-bound interpretation (`-Xint`).
+
 **Consequences for real games.**
 
 * **Native x86_64 `NativeActivity` games run today, on the GPU** —
@@ -274,7 +283,8 @@ silently fall back to a container.
   legitimate way to obtain or run it in this environment, so no measurement of
   it exists here. What the project does verify is the same class of workload on
   a real ARM64 game: Beach Buggy Racing 2, an SDL3 engine calling EGL/GLES
-  directly, which loads, renders and presents frames — slowly (2.5).
+  directly, which loads, renders and presents frames at 60 fps once warm (see
+  "Measured throughput" above).
 
 ## 3. Native `.so` compatibility
 
@@ -354,7 +364,7 @@ exported core functions. The compat directory maps `libGLESv2.so` to the *host*
 driver and the shim loads it `RTLD_GLOBAL`, so an app's direct GL imports resolve
 in practice.
 
-### 4.1 Window resize keeps the internal resolution; it does not relayout the guest
+### 4.1 Window resize keeps the internal resolution
 
 A resized window does **not** make the guest render at a new pixel size, and it
 does not re-configure the guest's `Configuration`. The daemon's viewporter path
@@ -376,15 +386,15 @@ Consequences, stated plainly:
   would rescale every touch target under the user's finger, so
   `Geometry::for_resize` keeps the launch density and only the dp size — and
   therefore the phone/tablet classification — follows the new window.
-* **Tablet layouts are a launch-time choice.** `smallestScreenWidthDp >= 600`
-  switches the framework to tablet layouts, and the density that makes that true
-  is picked from the window size at launch (`--width`/`--height`, or the
-  defaults 720x1280 at 320 dpi). A phone-launched session that is later
-  maximized crosses 600 dp only if the new window is at least
-  `Geometry::tablet_side_px()` wide (1200 px at 320 dpi). When it does, the
-  framework's `Configuration` is still not updated, because no daemon→guest
-  resize notification exists: there is no `SurfaceResized` message in
-  `pengudroid-proto`, and `apphost` builds `Configuration`/`DisplayInfo` once.
+* **Tablet layouts are a launch-time choice unless the resize follower is on.**
+  `smallestScreenWidthDp >= 600` switches the framework to tablet layouts, and
+  the density that makes that true is picked from the window size at launch
+  (`--width`/`--height`, or the defaults 720x1280 at 320 dpi). A phone-launched
+  session that is later maximized crosses 600 dp only if the new window is at
+  least `Geometry::tablet_side_px()` wide (1200 px at 320 dpi).
+  `PENGUDROID_FOLLOW_RESIZE=1` makes that transition happen live — see §4.2.
+  Without it, `apphost` builds `Configuration`/`DisplayInfo` once and nothing
+  changes.
 * **An app that forces a fixed orientation may letterbox more.** BBR2 asks for
   landscape (`requestedOrientation=11`) on a portrait 720x1280 surface, so its
   content is presented inside that frame rather than filling a landscape window.
@@ -399,18 +409,73 @@ resized to 1920x1200 px -> 960x600 dp, smallestScreenWidthDp 600, tablet (densit
   note: the guest keeps rendering at 720x1280 px; the compositor scales that frame into the new window, and the app is not told about the size change
 ```
 
-Relayout-on-resize — replaying `IWindow.resized` into a live guest so `hwui`
-re-measures at the new dp size — is wired only behind
-`PENGUDROID_PUMP_RESIZED` and has not been validated against an interactive
-drag. `ViewRootImpl.mClientWindowFrames.frame` is forced best-effort, and logs
-`apphost: Android 17 ViewRootImpl.mClientWindowFrames.frame is unavailable` when
-the field or its `Rect` cannot be resolved.
-
 **OpenSL ES is implemented for the common case.** `slCreateEngine`, the object
 model, engine/output-mix/player interfaces and the Android simple buffer queue
 are real: `Enqueue` forwards each buffer to a per-player `pw-cat`. The fixture
 uses the canonical headers so the vtable ABI is genuinely verified. Recorders,
 prefetch, effects and the other interfaces return `SL_RESULT_FEATURE_UNSUPPORTED`.
+
+### 4.2 Following a live resize (`PENGUDROID_FOLLOW_RESIZE`)
+
+Relayout-on-resize — replaying `IWindow.resized` into a live guest so `hwui`
+re-measures at the new dp size — is wired behind `PENGUDROID_PUMP_RESIZED` and
+`PENGUDROID_FOLLOW_RESIZE`. The second implies the first.
+
+Verified live on BBR2 (60 s and 100 s runs with `PENGUDROID_FOLLOW_RESIZE=1`):
+
+```
+apphost: window is now 496x883; guest relayout at 496x883 px (248x441 dp), 1 root(s) poked
+```
+
+— one poll, one publish, one root poked — and the game kept presenting
+afterwards: 246 presents on the live surface, `app_exit: null`. So the pull, the
+geometry publish and the poke all run against a real daemon and a real guest
+window.
+
+What is **not** verified is the transition itself: the headless smoke harness has
+no Wayland seat, so no configure event arrives to change the window size
+mid-session. A drag across the 600 dp line is the missing test.
+
+The shape of it is a **pull**, not a daemon push:
+
+* `pengudroid-gleshim` runs in a separate `.so` mapping from the rest of the
+  process, and the app host lives in the child the daemon spawns, not in the CLI
+  parent. There is no shared static to signal through and no thread the daemon
+  can call, so a `SurfaceResized` push would need new plumbing on both sides.
+  Instead the host asks: `SurfaceGeometry` (protocol v4) returns the guest
+  buffer size and the window size for one surface, and the follower compares the
+  window size against what it last applied.
+* When it changed, the host republishes the geometry into the environment with
+  `Geometry::for_resize(width, height).export()` and pokes every window root.
+  The environment is the same channel `Geometry::from_env` reads at launch, so
+  `Configuration`/`DisplayInfo` and the daemon agree by construction.
+* `relayoutAsync` is one-way (the client keeps its locally computed frames), so
+  the poke sets `mForceNextWindowRelayout` and `mLayoutRequested` and calls
+  `scheduleTraversals()`. That forces `IWindowSession.relayout`, whose reply is
+  what actually updates the guest's frame.
+
+To find the surface it must ask about, the shim publishes
+`PENGUDROID_LAST_SURFACE_ID` when it creates a window. **The newest window wins,
+and the follower re-reads it on every tick**, because apps replace their window:
+BBR2 creates five surfaces during loading and destroys each when the next
+appears, so at any moment the daemon holds exactly one — the last. A follower
+that latched onto surface 1 (the first) spent the whole run asking about a
+surface that no longer existed; that is what the live run showed before this was
+fixed.
+
+The variable is deliberately **not** `PENGUDROID_SURFACE_ID`: that one is an
+*input* meaning "attach to an existing surface instead of creating one", so
+writing it from the shim would alias a game's second window onto its first.
+
+The daemon answers this query with `-3` when it has no such surface — normal
+while a window is being replaced, and the client turns it into `Ok(None)` rather
+than an error — and `-19` when it has no compositor at all, which is a real
+failure. The follower retries quietly on `-3` and reports anything else, backing
+off to one line per ten seconds so a dead surface cannot flood the log.
+
+`ViewRootImpl.mClientWindowFrames.frame` is forced best-effort, and logs
+`apphost: Android 17 ViewRootImpl.mClientWindowFrames.frame is unavailable` when
+the field or its `Rect` cannot be resolved.
 
 ## 5. SurfaceFlinger is bypassed, not emulated
 
@@ -469,8 +534,9 @@ private mount view. Do not run untrusted APKs under PenguDroid.
 
 ## 9. Protocol is versioned but young
 
-The control protocol is v2 and hand-rolled. It is tested for round-trips and
-truncation handling, but has no negotiation for capability differences and no
+The control protocol is v4 (`PROTO_VERSION` in
+`crates/pengudroid-proto/src/lib.rs`) and hand-rolled. It is tested for
+round-trips and truncation handling, but has no negotiation for capability differences and no
 framing for large zero-copy transfers beyond fd passing.
 
 Guest-service calls are forwarded per connection with reply ordering implicit

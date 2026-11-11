@@ -40,7 +40,11 @@ input. The desktop launcher sends `0` or `1` from the selected app's checkbox;
 changes apply on the next launch. `PENGUDROID_KEYMAP_PATH` is the resolved
 profile path passed to the guest before its prefix changes HOME.
 
-## Protocol (v2)
+## Protocol (v4)
+
+`PROTO_VERSION` in `crates/pengudroid-proto/src/lib.rs` is the authoritative
+number; `Hello` must match it exactly or the daemon rejects the connection, so
+bump it whenever a message layout changes.
 
 Transport uses a non-empty `PENGUDROID_SOCKET` when set; otherwise it uses `$XDG_RUNTIME_DIR/pengudroid/daemon.sock` with mode `0600`. Set `PENGUDROID_SOCKET` to run a private daemon while keeping `XDG_RUNTIME_DIR` pointed at the real Wayland/PipeWire session. The CLI, daemon, and guest must use the same socket value.
 
@@ -59,12 +63,13 @@ Frames use a length prefix: `[u32 body_len][body]`, where `body = [kind u8][fiel
 | `GuestCall { code, data, token }` / `GuestCallReply { status, data }` | Daemon ↔ guest | Deliver a guest service call and its reply. |
 | `CreateSurface { width, height, title }` → `SurfaceCreated { … }` + fd | Guest → daemon | Create a Wayland toplevel and shared buffer. |
 | `SetSurfaceOptions { surface_id, fps_meter }` → `Ack` | Guest → daemon | Set per-window FPS title display for a surface owned by this connection's process. |
+| `SurfaceGeometry { surface_id, … }` → `SurfaceGeometry { width, height, display_width, display_height }` | CLI/guest → daemon | Ask what a surface is showing: the guest's own buffer size versus the window it is scaled into. Send it with `Message::query_surface_geometry`. `Error { code: -3 }` means the daemon has no such surface, which happens normally while an app replaces its window; `-19` means there is no compositor. Used by `PENGUDROID_FOLLOW_RESIZE` to follow a live window resize (see [LIMITATIONS.md](LIMITATIONS.md) §4.2). |
 | `PresentFrame { surface_id }` → `Ack` | Guest → daemon | Commit the shared buffer. |
 | `PresentShm { surface_id, width, height, stride, format }` + fd → `Ack` | Guest → daemon | Snapshot a CPU memfd buffer and present it through `wl_shm`. Android formats 1/2/4/5 are supported; stride is in bytes. `Ack` means the source buffer may be reused; it does not prove that the frame appeared on screen. |
 | `GetProp` / `SetProp` / `ListProps` | CLI/guest | Access the property store. |
 | `Shutdown` → `Goodbye` | CLI → daemon | Shut down cleanly. |
 
-Errors are returned as `Error { code, message }`, where `code` is a negative errno: `-2` file not found, `-3` unknown PID, `-5` spawn or fd error, `-17` name conflict, `-19` graphics unavailable, `-22` unknown handle, `-32` guest disconnected, and `-110` guest service timeout (5 seconds).
+Errors are returned as `Error { code, message }`, where `code` is a negative errno: `-2` file not found, `-3` unknown PID or surface, `-5` spawn or fd error, `-17` name conflict, `-19` graphics unavailable, `-22` unknown handle, `-32` guest disconnected, and `-110` guest service timeout (5 seconds).
 
 ## Local verification
 

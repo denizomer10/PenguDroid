@@ -861,6 +861,14 @@ fn ensure_surface_id(st: &mut State, rec: &mut SurfaceRec) -> Result<u32, String
         Message::SurfaceCreated { surface_id, .. } => {
             rec.surface_id = surface_id;
             rec.owns_surface = true;
+            // The host's resize follower lives in this same process and has to
+            // know which surface the window manager is scaling. It gets its own
+            // variable: `PENGUDROID_SURFACE_ID` is an *input* that makes a later
+            // window attach to an existing surface instead of creating one, so
+            // writing it here would alias a game's second window onto its first.
+            // The newest window wins because that is the one that stays: a game
+            // creates a splash surface and destroys it when the real one appears.
+            std::env::set_var("PENGUDROID_LAST_SURFACE_ID", surface_id.to_string());
             if let Some(conn) = st.conn.as_ref() {
                 let fps_meter = std::env::var("PENGUDROID_FPS_METER").is_ok_and(|value| value == "1" || value == "true");
                 conn.send_message(&Message::SetSurfaceOptions { surface_id, fps_meter }, &[])
