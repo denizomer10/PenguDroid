@@ -1445,8 +1445,9 @@ pub fn art_main(args: &[String]) -> i32 {
                 }
             }
             if std::env::var_os("PENGUDROID_CRASH_BT").is_some() {
-                // Take the fault handler slot away from ART, which otherwise
-                // reports `HandleUnexpectedSignal reenter` and nothing else.
+                // Install a last-resort native backtrace dump. It chains to
+                // ART's own handler, which owns `SIGBUS` while a userfaultfd
+                // compaction runs, instead of displacing it.
                 if let Ok(name) = CString::new("__pengudroid_install_crash_handler") {
                     let f = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
                     if f.is_null() {

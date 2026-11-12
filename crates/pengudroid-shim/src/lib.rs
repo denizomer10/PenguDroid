@@ -245,12 +245,40 @@ extern "C" {
     fn backtrace(buffer: *mut *mut c_void, size: c_int) -> c_int;
 }
 
+/// Signals the last-resort handler takes over.
+const CRASH_SIGNALS: [c_int; 5] = [
+    libc::SIGSEGV,
+    libc::SIGBUS,
+    libc::SIGILL,
+    libc::SIGFPE,
+    libc::SIGABRT,
+];
+
+/// A handler that was installed before ours.
+#[derive(Clone, Copy)]
+struct SavedHandler {
+    action: usize,
+    flags: c_int,
+}
+
+const NO_HANDLER: SavedHandler = SavedHandler { action: 0, flags: 0 };
+
+/// Previously installed handlers, indexed like [`CRASH_SIGNALS`].
+///
+/// Written once from [`__pengudroid_install_crash_handler`] before any fault can
+/// be taken, then only read from the handler. A `static mut` keeps the handler
+/// lock-free (a mutex in a signal handler can deadlock).
+static mut SAVED_HANDLERS: [SavedHandler; CRASH_SIGNALS.len()] =
+    [NO_HANDLER; CRASH_SIGNALS.len()];
+
 /// Install a last-resort fault handler that prints a native backtrace.
 ///
-/// ART installs its own handler during `Runtime::Init`, so the host calls this
-/// *after* `JNI_CreateJavaVM` and thereby takes the slot over. ART's handler is
-/// what turns a guest fault into `HandleUnexpectedSignal reenter` without a
-/// usable dump; replacing it shows the faulting chain instead.
+/// The previous handler is *chained to*, not replaced. ART installs handlers
+/// that must keep working: with userfaultfd GC enabled every missing page of a
+/// compacting collection arrives as a real `SIGBUS` that ART's own handler
+/// resolves by copying the page, and swallowing that signal turns a resolved
+/// fault into a fatal one. Whatever the earlier handler leaves unresolved falls
+/// through to the dump below.
 #[no_mangle]
 pub extern "C" fn __pengudroid_install_crash_handler() {
     // `sigaction`/`sigaltstack` are *interposed* by this shim (Bionic layout in,
@@ -279,23 +307,87 @@ pub extern "C" fn __pengudroid_install_crash_handler() {
         };
         real_sigaltstack(&ss, std::ptr::null_mut());
         std::mem::forget(stack);
-        for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE, libc::SIGABRT] {
+        for (i, &sig) in CRASH_SIGNALS.iter().enumerate() {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            if real_sigaction(sig, std::ptr::null(), &mut old) == 0 {
+                let prior = SavedHandler {
+                    action: old.sa_sigaction,
+                    flags: old.sa_flags,
+                };
+                // Ignore `SIG_DFL`/`SIG_IGN` and a re-install over ourselves.
+                SAVED_HANDLERS[i] = if prior.action > 1
+                    && prior.action != pengudroid_fault_handler as usize
+                {
+                    prior
+                } else {
+                    NO_HANDLER
+                };
+            }
             real_sigaction(sig, &sa, std::ptr::null_mut());
+        }
+        if std::env::var_os("PENGUDROID_DEBUG_FAULTS").is_some() {
+            let mut now: libc::sigaction = std::mem::zeroed();
+            let ours = pengudroid_fault_handler as usize;
+            for &sig in CRASH_SIGNALS.iter() {
+                let installed = real_sigaction(sig, std::ptr::null(), &mut now) == 0
+                    && now.sa_sigaction == ours;
+                eprintln!(
+                    "[pengudroid] fault hook sig={sig} installed={installed} now={:#x} ours={ours:#x}",
+                    now.sa_sigaction
+                );
+            }
         }
     }
 }
 
-extern "C" fn pengudroid_fault_handler(sig: c_int, _info: *mut c_void, ctx: *mut c_void) {
+/// Give the handler that was installed before ours a chance to resolve `sig`.
+///
+/// Returns `true` when it did — ART's userfaultfd `SIGBUS` handler returns after
+/// populating the faulting page, and the faulting instruction then re-executes.
+///
+/// # Safety
+/// Must be called from a signal handler with the signal's own `siginfo_t` and
+/// `ucontext_t`.
+unsafe fn chain_to_saved_handler(sig: c_int, info: *mut c_void, ctx: *mut c_void) -> bool {
+    let Some(index) = CRASH_SIGNALS.iter().position(|&s| s == sig) else {
+        return false;
+    };
+    let saved = SAVED_HANDLERS[index];
+    if saved.action == NO_HANDLER.action {
+        return false;
+    }
+    if saved.flags & libc::SA_SIGINFO != 0 {
+        let f: unsafe extern "C" fn(c_int, *mut c_void, *mut c_void) =
+            std::mem::transmute::<usize, unsafe extern "C" fn(c_int, *mut c_void, *mut c_void)>(
+                saved.action,
+            );
+        f(sig, info, ctx);
+    } else {
+        let f: unsafe extern "C" fn(c_int) =
+            std::mem::transmute::<usize, unsafe extern "C" fn(c_int)>(saved.action);
+        f(sig);
+    }
+    true
+}
+
+extern "C" fn pengudroid_fault_handler(sig: c_int, info: *mut c_void, ctx: *mut c_void) {
+    // Let whoever had the signal first resolve it. ART's userfaultfd `SIGBUS`
+    // handler returns after copying the missing page in, and the faulting
+    // instruction simply re-executes; dumping and exiting here would turn a
+    // normal compacting collection into a crash.
+    if unsafe { chain_to_saved_handler(sig, info, ctx) } {
+        return;
+    }
     // Write first, allocate later: if the fault happened inside the allocator or
     // on an exhausted stack, anything fancier may never run.
     const ENTER: &[u8] = b"\n[pengudroid] fault handler entered\n";
     unsafe { libc::write(2, ENTER.as_ptr() as *const c_void, ENTER.len()) };
     let rip = unsafe { fault_rip(ctx) };
     let rsp = unsafe { fault_rsp(ctx) };
-    let addr = if _info.is_null() {
+    let addr = if info.is_null() {
         0
     } else {
-        unsafe { (*(_info as *const libc::siginfo_t)).si_addr() as usize }
+        unsafe { (*(info as *const libc::siginfo_t)).si_addr() as usize }
     };
     let mut out = [0u8; 8192];
     let mut n = 0usize;

@@ -34,7 +34,25 @@ extern int __pengudroid_binder_mmap_prot(int fd, int prot);
 
 #define PD_IOCTL_NOT_HANDLED (-4096L)
 
+/* `_IOWR(0xAA, 0x3F, struct uffdio_api)`: the userfaultfd API handshake.  The
+ * kernel answers with the features and ioctls it supports; ART then picks its
+ * GC strategy from that answer. */
+#define PD_UFFDIO_API 0xC018AA3F
+/* Linux 6.8 added UFFDIO_MOVE, and 6.13 UFFD_FEATURE_MOVE advertises it.  ART's
+ * mark-compact takes a separate "move" path when it sees that bit, and on this
+ * host that path faults right after compaction.  Hide it so ART uses the
+ * long-standing UFFDIO_COPY/POISON path. */
+#define PD_UFFD_FEATURE_MOVE (1ULL << 16)
+#define PD_UFFDIO_MOVE_BIT (1ULL << 5)
+
 extern long syscall(long number, ...);
+extern char *getenv(const char *name);
+
+struct pd_uffdio_api {
+    unsigned long long api;
+    unsigned long long features;
+    unsigned long long ioctls;
+};
 
 #if defined(__x86_64__)
 # define PD_SYS_OPENAT 257
@@ -96,7 +114,17 @@ int ioctl(int fd, unsigned long request, ...) {
     if (handled != PD_IOCTL_NOT_HANDLED) {
         return (int)handled;
     }
-    return (int)syscall(PD_SYS_IOCTL, fd, request, arg);
+    long r = syscall(PD_SYS_IOCTL, fd, request, arg);
+    /* Report no UFFDIO_MOVE support (see the comment on PD_UFFD_FEATURE_MOVE).
+     * PENGUDROID_UFFD_ALLOW_MOVE=1 keeps the kernel's real answer so the two
+     * paths can be compared. */
+    if (r == 0 && request == PD_UFFDIO_API && arg != 0 &&
+        getenv("PENGUDROID_UFFD_ALLOW_MOVE") == 0) {
+        struct pd_uffdio_api *api = (struct pd_uffdio_api *)arg;
+        api->features &= ~PD_UFFD_FEATURE_MOVE;
+        api->ioctls &= ~PD_UFFDIO_MOVE_BIT;
+    }
+    return (int)r;
 }
 
 static __pd_mode_t pd_mode_from_va(int flags, __pd_va_list *ap) {

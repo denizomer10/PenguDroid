@@ -2,47 +2,106 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
-## Where we left off — boot image loads; ART's uffd GC is the last blocker (2026-11-13)
+## Where we left off — boot image loads, but uffd GC cannot run under the bridge (2026-11-13)
 
 Pick up here. The x86_64 boot image from the Android 17 GSI **validates and
-loads** for the first time, which retires the "impossible to load" verdict in
-[ANDROID17.md](ANDROID17.md). Two independent bugs stood in the way and both are
-fixed:
+loads**, which retires the "impossible to load" verdict in
+[ANDROID17.md](ANDROID17.md). Getting there needed three fixes, all shipped:
 
 | Fix | Evidence |
 |---|---|
 | `gUseReadBarrier = !gUseUserfaultfd` is derived, not a flag | `objdump` of the sole store (`0x5873be`); `KernelSupportsUffd()` probes `syscall(323)` with `UFFD_USER_MODE_ONLY`, which is allowed with `vm.unprivileged_userfaultfd=0` |
 | Toggling `ro.dalvik.vm.enable_uffd_gc` clears the read-barrier rejection | `PENGUDROID_PROP_ro.dalvik.vm.enable_uffd_gc=true`: the `ValidateOatFile found read barrier state mismatch` error disappears |
 | The boot classpath must match the image's OAT header exactly | Parsed the ELF-wrapped OAT headers: 14 entries, `core-icu4j.jar` **last**. `Layout::detect` and its unit test now encode that order |
-| With both fixed, the image is adopted | `-verbose:image` decompresses all 14 components, and `ICU4J` registers (`libicu_jni.so`, `I18n APEX ICU file found`) |
+| With all three, the image is adopted | `-verbose:image` decompresses all 14 components, and `ICU4J` registers (`libicu_jni.so`, `I18n APEX ICU file found`) |
 
-What still blocks shipping image mode is inside ART's uffd GC, not the shim: the
-first mark-compact logs `post_compact_end:0x2091000`, then a
-`ClassLinker::LinkFields` store at `0x2093398` — past that end, in a
-reserved-but-unregistered page — takes `SIGBUS`/`BUS_ADRERR`. Selecting a
-non-uffd collector is not an option: `-Xgc:MS` and `-Xgc:SS` abort with
-`Check failed: foreground_collector_type_ == kCollectorTypeCMC`, so this runtime
-is a uffd-GC-only build. Host kernel here is 7.0.0; the faulting path is an
-ART/kernel interaction the shim cannot intercept away.
+### Why image mode still cannot ship
 
-Also corrected: the old note that `-Xint` was needed because *the JIT* crashed
-`nterp` was wrong — that crash was the read-barrier/image mismatch. Whether
-`-Xint` can now be dropped is **still unverified**, because the uffd-GC SIGBUS
-arrives first; `launcher.rs` therefore keeps `-Xint`.
+The image forces `gUseReadBarrier=false`, which forces userfaultfd GC, and this
+`libart.so` is a **uffd-CMC-only build**: `-Xgc:MS` and `-Xgc:SS` abort with
+`Check failed: foreground_collector_type_ == kCollectorTypeCMC`, and clearing
+`UFFD_FEATURE_SIGBUS` from the `UFFDIO_API` reply only brings the read-barrier
+rejection back (`oat file: false, runtime: true`). There is no image mode without
+uffd.
 
-Unchanged and re-verified this session: `cargo test --offline -p pengudroid-cli`
-green (94+7+2+3+2), and BBR2 still launches via `pengudroid launch <apkm>
---backend auto` (100 s smoke run, guest profile installer active, no fatal
-signal).
+The first *compacting* collection then dies:
+
+```
+post_compact_end:0x2092000     <- compacted space ends here
+Fatal signal 7 (SIGBUS), code 2 (BUS_ADRERR) fault addr 0x2092378
+FATAL art: runtime_common.cc:466] HandleUnexpectedSignal reenter
+```
+
+Traced with `strace -f -e trace=madvise,mremap,userfaultfd,ioctl`:
+
+* the GC thread calls `UFFDIO_API` (features `UFFD_FEATURE_SIGBUS`) on a fresh
+  uffd, then `UFFDIO_REGISTER [0x2000000, 0x209a000)` — note the end is
+  `post_compact_end` rounded *past*, into reserved-but-unused space;
+* a *mutator* thread faults at an address inside that registered range but
+  **outside the copying plan** (it is filler/free space above the compacted
+  end), *before* the GC thread issues the `UFFDIO_COPY` calls;
+* `BUS_ADRERR` is exactly what `UFFD_FEATURE_SIGBUS` produces by design — the
+  kernel sends `SIGBUS` so ART's handler can populate the page. ART's handler
+  cannot map that address to a plan entry, so it declares the fault fatal, and a
+  second fault during the fatal report produces `reenter`.
+
+Two things were ruled out along the way:
+
+| Ruled out | How |
+|---|---|
+| A kernel/`mremap(DONTUNMAP)` bug | A standalone C repro replays ART's exact sequence (mmap 512 MB → `MREMAP_DONTUNMAP|FIXED` → register MISSING → `madvise(DONTNEED)` → `UFFDIO_COPY` back → unregister → write past the copy-back end): every write succeeds |
+| The shim stealing ART's `SIGBUS` | Our last-resort handler is now **chained** rather than replacing (`chain_to_saved_handler`), and with `PENGUDROID_CRASH_BT=1 PENGUDROID_DEBUG_FAULTS=1` it verifies `installed=true` on all five signals — the fault then goes through ART's own saved handler and is still fatal |
+
+**Root cause.** With `UFFD_FEATURE_SIGBUS`, resolving a missing page requires the
+kernel to deliver `SIGBUS` *into guest code* and then re-execute the faulting
+instruction. Here that guest code is ARM64 running under the prebuilt
+translation bridge (`libberis_arm64.so`, no source in this repository), which
+cannot resume translated execution after a delivered signal. So the uffd
+resolution path cannot work, no matter how the shim behaves.
+
+**Workaround that proves the diagnosis.** Sizing the heap so no compaction
+happens during startup avoids the uffd dance entirely, and the image boot then
+runs far past the old crash point — `ACRA` initialising for
+`org.schabi.newpipe`, `WorkManager`/`SystemJobService` created, `DisplayManager`
+returning the 720x1280 PenguDroid display, binder lookups for netstats/user/
+appops/SurfaceFlingerAIDL/jobscheduler/connectivity/mount:
+
+```sh
+env 'PENGUDROID_PROP_ro.dalvik.vm.enable_uffd_gc=true' \
+PENGUDROID_LAUNCH_ACTIVITY=org.schabi.newpipe.MainActivity \
+./target/debug/pengudroid art-test --sysroot .toolchain/sysroot-android17 \
+  --classpath ~/Downloads/NewPipe_v0.29.1.apk \
+  --register-natives libandroid_runtime.so,libhwui.so \
+  --bind-app --main android.app.ActivityThread \
+  --vm-option -Xms512m --vm-option -Xmx1g --vm-option -verbose:image
+```
+
+The first collection that compacts still kills it, so this is a *diagnostic*,
+not a shipping configuration: `launcher.rs` keeps the imageless `-Xint` path as
+the default.
+
+### Kernel 6.8+ `UFFDIO_MOVE` masking (kept, with an opt-out)
+
+Host kernel 7.0.0 advertises the new `UFFD_FEATURE_MOVE`, which makes ART take
+its newest `UFFDIO_MOVE`-based compaction path. The shim's `ioctl` interposer
+clears `UFFD_FEATURE_MOVE` and the `_UFFDIO_MOVE` capability bit from the
+`UFFDIO_API` reply, so ART uses the older `UFFDIO_COPY` path that this note
+describes. `strace` confirms zero `UFFDIO_MOVE` calls. It does not by itself
+avoid the fault above; opt out with `PENGUDROID_UFFD_ALLOW_MOVE=1` (see
+[API.md](API.md)).
+
+Unchanged and re-verified: `cargo test --offline -p pengudroid-cli` green
+(94+7+2+3+2), and BBR2 still launches via `pengudroid launch <apkm> --backend
+auto` (100 s smoke run, guest profile installer active, no fatal signal).
 
 ### Next concrete task
 
-Make ART's uffd GC survive that first compaction on this host kernel (or accept
-imageless mode permanently and delete the dead image plumbing). The classpath
-order fix is correct regardless and should stay. Then re-measure startup: image
-mode is the ~100 s warm-up's payoff.
+Make the translator resume after a delivered guest signal, or find an image
+whose read-barrier state matches a non-uffd collector. Nothing in the shim can
+substitute for either: the classpath order fix is correct and stays, but image
+mode is gated on signal-resume support in `libberis_arm64.so`.
 
-Reproduce in ~3 s with NewPipe (dotted property names need `env`):
+Reproduce the fatal in ~40 s with NewPipe (dotted property names need `env`):
 
 ```sh
 PENGUDROID_LAUNCH_ACTIVITY=org.schabi.newpipe.MainActivity \
@@ -54,9 +113,8 @@ env 'PENGUDROID_PROP_ro.dalvik.vm.enable_uffd_gc=true' \
 ```
 
 Drop the `env '...'` and the image is rejected at the read-barrier check (today's
-default); keep it and the image loads, then the SIGBUS arrives. `-Xgc:MS` and
-`-Xgc:SS` abort with the kCollectorTypeCMC check, which is how the uffd-only
-nature of this runtime was established.
+default); keep it and the image loads, then the SIGBUS arrives. Adding
+`-Xms512m -Xmx1g` moves the crash past app startup instead.
 
 ## Where we left off — ARM64 BBR2 runs without `--sysroot` (2026-11-12)
 

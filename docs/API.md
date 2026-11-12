@@ -63,7 +63,27 @@ rather than being silently ignored. Known users are
 `ro.dalvik.vm.enable_uffd_gc`, which is what makes the boot image validate
 ([ANDROID17.md](ANDROID17.md)).
 
-## Protocol (v4)
+## Debug hooks for runtime faults
+
+`PENGUDROID_CRASH_BT=1` installs the shim's last-resort fault handler after
+`JNI_CreateJavaVM`. It does **not** replace an existing handler: whatever was
+installed first (ART's) is queried with `sigaction(sig, NULL, &old)` and invoked
+first, and the shim only dumps a native backtrace if that returns without
+resolving the fault. This matters because ART owns `SIGBUS` while a
+userfaultfd compaction is running — replacing that handler would turn every
+normal page-in into a crash. `PENGUDROID_DEBUG_FAULTS=1` prints the install
+result per signal (`fault hook sig=N installed=…`) so a silently failed hook is
+visible.
+
+`PENGUDROID_UFFD_ALLOW_MOVE=1` stops the shim's `ioctl` interposer from clearing
+`UFFD_FEATURE_MOVE`/`_UFFDIO_MOVE` out of ART's `UFFDIO_API` reply. Host kernels
+6.8+ advertise `UFFDIO_MOVE`, which selects ART's newest compaction path; the
+shim masks it by default so ART stays on the older `UFFDIO_COPY` path, which is
+the one reproduced and documented in [STATUS.md](STATUS.md). Neither setting
+makes the boot image usable — that needs signal resume inside translated guest
+code (see [LIMITATIONS.md](LIMITATIONS.md) §2).
+
+## Protocol (v5)
 
 `PROTO_VERSION` in `crates/pengudroid-proto/src/lib.rs` is the authoritative
 number; `Hello` must match it exactly or the daemon rejects the connection, so

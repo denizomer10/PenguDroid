@@ -271,8 +271,14 @@ the path *to* the first frame, which is CPU-bound interpretation (`-Xint`).
 `-Xint` is kept because ART's image cannot be used yet, not because the JIT is
 broken: the boot image now validates and loads once
 `ro.dalvik.vm.enable_uffd_gc` is set and the boot classpath matches the image's
-OAT header, but ART's userfaultfd GC then faults right after its first
-mark-compact. See [STATUS.md](STATUS.md) for the full chain and repro.
+OAT header, but ART's userfaultfd GC then faults on its first *compacting*
+collection. That GC relies on `UFFD_FEATURE_SIGBUS`, i.e. on the kernel
+delivering `SIGBUS` into guest code and the faulting instruction being
+re-executed once ART has copied the page in; ARM64 guest code running under the
+prebuilt translation bridge cannot resume that way, so the resolution path is
+unavailable here. Sizing the heap past the first compaction (`-Xms512m`) lets
+the image boot all the way into app startup, which confirms the diagnosis. See
+[STATUS.md](STATUS.md) for the full chain and repro.
 
 **Consequences for real games.**
 
@@ -631,7 +637,8 @@ hanging forever, so a wedged guest cannot freeze its peers.
    register, an APK's DEX loads, and the host drives `handleBindApplication` +
    `handleLaunchActivity` so a real Activity draws and presents (§2).
    **Still open**: swapping `-Xint` for the JIT/AOT image (the image loads, but
-   ART's uffd GC faults after its first mark-compact — see [STATUS.md](STATUS.md))
+   ART's uffd GC needs `SIGBUS` resumed inside translated guest code — see
+   [STATUS.md](STATUS.md))
    and the platform services (`ActivityManager` lifecycle, input, `MediaCodec`).
 6. ~~Wire the PipeWire audio pump.~~ **Done**: the daemon owns a shared ring and
    drains it into `pw-cat` (`audio-test --via-daemon`); silence by default,
