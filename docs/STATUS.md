@@ -24,6 +24,36 @@ Verified this session:
 | Tests | `cargo test --workspace --offline` green; `python3 -m unittest discover -s tools -p 'test_*.py'` 256 passing |
 | New regressions | `geometry` resize/dp policy (`crates/pengudroid-cli/src/geometry.rs`), guest-bundle assembler (`tools/test_assemble_arm64_bridge_guest.py`), `SurfaceGeometry` unknown-surface error |
 
+### The audio-port poll loop is answered (2026-11-12, later)
+
+`AudioManager.updateAudioPortCache` polls the audio **policy** service — not the
+flinger — about seven times a second for the life of the process. Nothing was
+modelled there, so each poll fell through to an empty success reply, the
+framework read a count out of nothing, and every poll logged
+`AudioSystem: Function: listAudioPorts Line: 1914 Failed`: measured at 1,123
+occurrences per 150 s BBR2 run, the largest single source of log noise. Once
+ports were answered the same loop moved on to `listAudioPatches` (Line 1985).
+
+| Claim | Evidence |
+|---|---|
+| `media.audio_policy` code 51 is `listAudioPorts` | `PENGUDROID_TRACE_BINDER=1`: 1,123 dispatches of code 51 on that handle in 150 s |
+| The codes come from the shipped framework, never hardcoded | `IAudioPolicyService$Stub` fields read at bind time: `[51, 56]` reported in the run |
+| Both polls are answered | 90 s run: `listAudioPorts: 0`, `listAudioPatches: 0`, no `shim symbol` failure (was 1,123 + a trailing loop of patches) |
+| Nothing else about audio changed | Same run still reaches the same stage as the pre-fix run (4 surfaces handed out, `ActivityThread` attached, main Looper entered, `surfaceCreated`), and only one unrelated `Function: getAttributesForStreamType` remains |
+| Regression test | `cargo test -p pengudroid-shim --offline audio_policy` |
+
+Implementation: `__pengudroid_binder_set_audio_policy_transactions` installs up
+to four distinct codes; the dispatch answers only those, with
+`status=0, count=0, generation=0`. An empty list is the truthful answer (audio
+reaches the host through the forwarder without a framework port), and a zero
+count means the framework never reads an entry, so the reply parses the same way
+whichever order the revision declares the out parameters in. Every other
+audio-policy method keeps the old fallthrough — inventing a reply for
+`getOutputForAttr` would hand the framework a handle to a device we do not have.
+If a future framework renames the fields, the install fails, the launch prints
+`audio policy transaction codes unavailable`, and behaviour degrades to what it
+was before this table existed.
+
 ### How the two launch blockers were fixed
 
 1. **`JNI DETECTED ERROR: fid == null`** aborted ART before the game's code ran.
@@ -55,9 +85,10 @@ Verified this session:
    missing is a configure event from a real drag — the headless harness has no
    seat. See [LIMITATIONS.md](LIMITATIONS.md) §4.1–4.2; `pengudroid geometry
    --resize WxH` prints the classification a session would report.
-3. **Service gaps that show up as log noise.** `listAudioPorts` fails ~900 times
-   per run, audio code 171 and input code 1 are unimplemented, and
-   `berberis: trans#`/`dispatch#` DEBUG lines dominate the log.
+3. **Service gaps that show up as log noise.** `listAudioPorts` and
+   `listAudioPatches` are now answered (see below); audio code 171 and input
+   code 1 are still unimplemented, and `berberis: trans#`/`dispatch#` DEBUG
+   lines dominate the log.
 4. **A guest JNI bug that is not ours.** BBR2 issues a `GetMethodID` for
    `Constructor.getReturnType()`, which does not exist (verified by parsing
    `core-oj.jar`). It is logged and does not kill the main loop.

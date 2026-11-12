@@ -878,6 +878,11 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         eprintln!("apphost: cannot resolve framework audio focus transactions");
         return false;
     }
+    // Non-fatal: an empty audio-port cache only costs log noise, so a
+    // framework revision that renames the field must not block the launch.
+    if install_audio_policy_transactions(env).is_none() {
+        eprintln!("apphost: audio policy transaction codes unavailable; the framework audio-port cache stays empty");
+    }
     if install_media_transactions(env).is_none() {
         eprintln!("apphost: cannot resolve Android 17 media session/metrics transactions");
         return false;
@@ -6879,6 +6884,18 @@ fn install_media_session_transactions(env: &JniEnv) -> Option<()> {
 
 /// Read generated framework constants instead of assuming a platform release's
 /// private AIDL method order. The APK's targetSdk never selects this wire ABI.
+/// `AudioSystem.listAudioPorts`/`listAudioPatches` probe the audio policy
+/// service, not the flinger, and `AudioManager.updateAudioPortCache` retries
+/// them continuously. Publishing the real codes lets the shim answer with an
+/// empty list instead of leaving the framework to read a count out of an empty
+/// parcel.
+fn install_audio_policy_transactions(env: &JniEnv) -> Option<()> {
+    install_service_transactions(env,
+        "android/media/IAudioPolicyService$Stub",
+        "__pengudroid_binder_set_audio_policy_transactions",
+        &["listAudioPorts", "listAudioPatches"])
+}
+
 fn install_audio_focus_transactions(env: &JniEnv) -> Option<()> {
     let _frame = env.local_frame(16)?;
     let stub = env.find_class("android/media/IAudioService$Stub")?;

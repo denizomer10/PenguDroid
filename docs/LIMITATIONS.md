@@ -504,7 +504,12 @@ normal app reaches through `TelephonyManager`; the rest of the ~250-method
 interface returns `-ENOSYS`. The transaction codes are the AIDL declaration
 order for a given AOSP release and can shift when methods are inserted.
 
-The camera reports "zero cameras"; `AudioFlinger` returns empty replies.
+The camera reports "zero cameras"; `AudioFlinger` returns empty replies, and the
+audio **policy** service answers `listAudioPorts`/`listAudioPatches` with an
+empty list (the codes are read from the shipped `IAudioPolicyService$Stub`, so
+they are never guessed). Empty is truthful here — audio reaches the host without
+a framework port — but it also means anything that enumerates ports or patches
+to *choose* a route sees none.
 **`AudioTrack` no longer goes through it**: the Java class is hosted at the JNI
 boundary (`crates/pengudroid-shim/src/audiotrack.rs` interposes
 `AndroidRuntime::registerNativeMethods` and replaces the native table

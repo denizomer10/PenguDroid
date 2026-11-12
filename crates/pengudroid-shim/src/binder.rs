@@ -754,6 +754,54 @@ pub unsafe extern "C" fn __pengudroid_binder_set_user_transactions(
     true
 }
 
+/// API-37 `IAudioPolicyService` list queries that are answered with an empty
+/// list, unknown until installed from its Stub.
+///
+/// `AudioSystem::listAudioPorts`/`listAudioPatches` live on the audio *policy*
+/// service (they moved there from `IAudioFlinger`), and
+/// `AudioManager.updateAudioPortCache` polls them roughly every 40 ms for the
+/// lifetime of the process. Without an answer the framework reads a count out
+/// of an empty parcel and reports `AudioSystem: Function: listAudioPorts Line:
+/// 1914 Failed` on every poll — the single largest source of log noise in a
+/// BBR2 run (1,123 calls in 150 s), and the failure that replaced it once ports
+/// were answered.
+static AUDIO_POLICY_EMPTY_LISTS: Mutex<([u32; 4], usize)> = Mutex::new(([0; 4], 0));
+
+fn audio_policy_empty_lists() -> ([u32; 4], usize) {
+    *AUDIO_POLICY_EMPTY_LISTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Install `IAudioPolicyService$Stub.TRANSACTION_list*` codes that we answer
+/// with an unmodelled-but-truthful empty list.
+///
+/// `len` must be 1..=4 and every code must be distinct and in 1..0x00ff_fffe.
+/// The table is copied and replaced atomically; false preserves the previous
+/// value. No audio-policy method dispatches before a successful installation,
+/// so a framework revision that renames a field keeps today's fallthrough
+/// rather than receiving a reply shaped for the wrong method.
+///
+/// # Safety
+/// For a non-null pointer and `len` in 1..=4, `codes` must point to `len`
+/// aligned, readable u32s for the duration of this call. Not retained.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_audio_policy_transactions(
+    codes: *const u32,
+    len: usize,
+) -> bool {
+    if codes.is_null() || len == 0 || len > 4 { return false; }
+    let codes: [u32; 4] = {
+        let slice = std::slice::from_raw_parts(codes, len);
+        let mut table = [0u32; 4];
+        table[..len].copy_from_slice(slice);
+        table
+    };
+    for (i, &code) in codes[..len].iter().enumerate() {
+        if code == 0 || code >= 0x00ff_fffe || codes[..i].contains(&code) { return false; }
+    }
+    *AUDIO_POLICY_EMPTY_LISTS.lock().unwrap_or_else(|e| e.into_inner()) = (codes, len);
+    true
+}
+
 /// `IContentProvider` transaction codes, read out of this framework.jar with
 /// `--dump-class android.content.IContentProvider`.
 ///
@@ -2493,6 +2541,28 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
     }
     if reply_has_status(tr.target_handle, tr.code) {
         parcel.extend_from_slice(&0u32.to_ne_bytes());
+    }
+    if tr.target_handle == handle_for("media.audio_policy") {
+        let (codes, len) = audio_policy_empty_lists();
+        if codes[..len].contains(&tr.code) {
+            // `listAudioPorts(role, type, out int num_ports, out AudioPort[],
+            // out int generation)` and `listAudioPatches(out int num_patches,
+            // out AudioPatch[], out int generation)`. No ports or patches are
+            // modelled: `AudioTrack`/`AAudio` reach the host through the
+            // forwarder without a framework port, so the truthful answer is an
+            // empty list. Both out parameters are counts, and both are zero, so
+            // the reply parses the same way whichever order this revision
+            // declares them in — and a zero count means the framework never
+            // reads an entry.
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // no ports/patches
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // generation 0
+            if trace_enabled() {
+                diag("[binder]   -> audio policy list: nothing modelled\n");
+            }
+        }
+        // Any other audio-policy method keeps the fallthrough it had before
+        // this table existed; inventing a reply for e.g. getOutputForAttr would
+        // hand the framework a handle to a device we do not have.
     }
     // Any transaction that carries a local binder object is a client handing us
     // a node it wants called back on. `attachApplication` is the one that
@@ -5374,6 +5444,55 @@ mod tests {
         let reply = unsafe { make_reply(&transaction(target, 101, &[]), 1) };
         assert_eq!(reply.flags, 0);
         assert_eq!(&reply.parcel[4..8], &0i32.to_ne_bytes());
+    }
+
+    /// `AudioManager.updateAudioPortCache` polls `listAudioPorts` and then
+    /// `listAudioPatches` on the audio policy service for the life of the
+    /// process. Until this table existed each transaction fell through to an
+    /// empty success: the framework read a count out of nothing and logged
+    /// `AudioSystem: listAudioPorts … Failed` 1,123 times in a 150 s BBR2 run,
+    /// then repeated the same failure for `listAudioPatches`. The reply must be
+    /// an empty list rather than a fabricated entry, and only the installed
+    /// codes may answer.
+    #[test]
+    fn audio_policy_lists_no_ports_only_for_the_installed_code() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = reset_table(&AUDIO_POLICY_EMPTY_LISTS, ([0; 4], 0));
+        let target = handle_for("media.audio_policy");
+        let (ports, patches) = (51u32, 52u32);
+        // Uninstalled: the fallthrough stays exactly as it was (status only),
+        // so a renamed field degrades to today's behaviour, not to a wrong reply.
+        let reply = unsafe { make_reply(&transaction(target, ports, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes());
+        assert_eq!(reply.parcel.len(), 8); // status + padding, never a list
+        let set = |codes: &[u32]| unsafe {
+            __pengudroid_binder_set_audio_policy_transactions(codes.as_ptr(), codes.len())
+        };
+        assert!(!unsafe { __pengudroid_binder_set_audio_policy_transactions(std::ptr::null(), 1) });
+        assert!(!set(&[]));
+        assert!(!set(&[ports, patches, 1, 2, 3]));
+        assert!(!set(&[0]));
+        assert!(!set(&[0x00ff_fffe]));
+        assert!(!set(&[ports, ports])); // duplicates install nothing
+        assert_eq!(audio_policy_empty_lists().1, 0);
+        assert!(set(&[ports, patches]));
+        assert_eq!(audio_policy_empty_lists(), ([ports, patches, 0, 0], 2));
+        for code in [ports, patches] {
+            let reply = unsafe { make_reply(&transaction(target, code, &[]), 1) };
+            assert_eq!(reply.flags, 0);
+            assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes()); // AIDL status OK
+            assert_eq!(&reply.parcel[4..8], &0u32.to_ne_bytes()); // empty list
+            assert_eq!(&reply.parcel[8..12], &0u32.to_ne_bytes()); // generation 0
+        }
+        // Other audio-policy methods are untouched: `getOutputForAttr` must not
+        // be told "no ports" and then be handed a zero handle.
+        let reply = unsafe { make_reply(&transaction(target, 900, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(reply.parcel.len(), 8);
+        // The codes belong to this Stub only.
+        let reply = unsafe { make_reply(&transaction(handle_for("audio"), ports, &[]), 1) };
+        assert_unknown_transaction(reply);
     }
 
     /// `Settings.NameValueCache` reads `Bundle.getString("value")` from the
