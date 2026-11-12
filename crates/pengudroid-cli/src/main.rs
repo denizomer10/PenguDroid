@@ -67,6 +67,7 @@ fn real_main() -> i32 {
         "start" => cmd_start(&args[2..]),
         "ps" => cmd_ps(),
         "tap" => cmd_tap(&args[2..]),
+        "window" => cmd_window(&args[2..]),
         "key" => cmd_key(&args[2..]),
         "input" => cmd_tap(&args[2..]),
         "info" | "inspect" => cmd_info(&args[2..]),
@@ -239,6 +240,97 @@ fn cmd_ps() -> i32 {
         Ok((other, _)) => fail(&format!("unexpected reply: {other:?}")),
         Err(e) => fail(&e),
     }
+}
+
+/// `pengudroid window` — report or change a window's state.
+///
+/// The daemon hands surface ids out in creation order and has no list message,
+/// so listing walks this many ids and prints the ones that answer.
+const MAX_SURFACE_PROBES: u32 = 64;
+
+/// `pengudroid window [<surface_id>] [--maximize|--unmaximize|--fullscreen|--windowed]`
+///
+/// With no id it lists every live surface. With an id and no flag it reports
+/// what that surface is showing. A flag asks the compositor for that state and
+/// then waits for the resulting `configure`, so the printed size is the one the
+/// guest will actually be laid out at.
+fn cmd_window(args: &[String]) -> i32 {
+    let usage = || {
+        eprintln!("usage: pengudroid window [<surface_id>] [--maximize|--unmaximize|--fullscreen|--windowed]");
+        2
+    };
+    // No id: list what is on screen. Surface ids are handed out in creation
+    // order, so walking a bounded range finds them without a list message.
+    let Some(surface_id) = args.first().and_then(|v| v.parse::<u32>().ok()) else {
+        if !args.is_empty() {
+            return usage();
+        }
+        let client = match connect() {
+            Ok(c) => c,
+            Err(e) => return fail(&e),
+        };
+        let mut found = 0;
+        for id in 1..=MAX_SURFACE_PROBES {
+            let Ok(Some((buffer_w, buffer_h, display_w, display_h))) = client.surface_geometry(id)
+            else { continue };
+            found += 1;
+            let g = crate::geometry::Geometry::phone().for_resize(display_w, display_h);
+            println!(
+                "surface {id}: {buffer_w}x{buffer_h} px internal, {display_w}x{display_h} px window \
+                 ({}x{} dp{})",
+                g.width_dp(),
+                g.height_dp(),
+                if g.is_tablet() { ", tablet" } else { "" },
+            );
+        }
+        if found == 0 {
+            println!("pengudroid: no windows; is anything running?");
+        }
+        return 0;
+    };
+    let mut wanted: Option<u32> = None;
+    for flag in &args[1..] {
+        let state = match flag.as_str() {
+            "--maximize" => pengudroid_proto::WINDOW_MAXIMIZED,
+            "--fullscreen" => pengudroid_proto::WINDOW_FULLSCREEN,
+            "--unmaximize" | "--windowed" => 0,
+            _ => return usage(),
+        };
+        wanted = Some(state);
+    }
+    let client = match connect() {
+        Ok(c) => c,
+        Err(e) => return fail(&e),
+    };
+    let before = client.surface_geometry(surface_id).ok().flatten();
+    if let Some(state) = wanted {
+        if let Err(e) = client.set_window_state(surface_id, state) {
+            return fail(&e);
+        }
+    }
+    // The compositor answers with a `configure`, which shows up as a new display
+    // size on a later poll; give it a moment instead of printing the old one.
+    let mut after = before;
+    for _ in 0..15 {
+        after = client.surface_geometry(surface_id).ok().flatten();
+        if wanted.is_none() || after != before {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let Some((buffer_w, buffer_h, display_w, display_h)) = after else {
+        eprintln!("pengudroid: no surface {surface_id}");
+        return 1;
+    };
+    let g = crate::geometry::Geometry::phone().for_resize(display_w, display_h);
+    println!(
+        "surface {surface_id}: {buffer_w}x{buffer_h} px internal, {display_w}x{display_h} px window \
+         ({}x{} dp{})",
+        g.width_dp(),
+        g.height_dp(),
+        if g.is_tablet() { ", tablet" } else { "" },
+    );
+    0
 }
 
 /// `pengudroid tap <x> <y>` — inject a click at surface pixel `<x>,<y>`.
@@ -689,6 +781,8 @@ fn print_help() {
          \x20   start --demo [--wait]                       same, for the built-in demo\n\
          \x20   key <linux-keycode> [down|up]              inject a physical key (default: press + release)\n\
          \x20   tap <x> <y>                                inject a pointer click\n\
+         \x20   window [<id>] [--maximize|--fullscreen]     list windows, or report/change size + state\n\
+         \x20                                              (--unmaximize/--windowed go back)\n\
          \x20   ps                                          list running guests\n\
          \x20   info <app.apk>                              show manifest details\n\
          \x20   deps <lib.so>                               bionic import coverage\n\

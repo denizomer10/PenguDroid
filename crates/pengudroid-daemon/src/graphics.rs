@@ -932,6 +932,31 @@ mod imp {
             })
         }
 
+        /// Maximize, fullscreen, or return a window to normal. The compositor
+        /// answers with a `configure`, which is what actually changes
+        /// `display_width`/`display_height`; the guest buffer keeps its own
+        /// size either way.
+        pub fn set_window_state(&mut self, id: u32, state: u32) -> bool {
+            let Some(top) = self.state.surfaces.get(&id).and_then(|s| s.xdg_toplevel.clone()) else {
+                return false;
+            };
+            if state & pengudroid_proto::WINDOW_FULLSCREEN != 0 {
+                // Fullscreen already fills the output; leaving maximized set
+                // makes some compositors restore the maximized frame afterwards.
+                top.unset_maximized();
+                top.set_fullscreen(None);
+            } else {
+                top.unset_fullscreen();
+                if state & pengudroid_proto::WINDOW_MAXIMIZED != 0 {
+                    top.set_maximized();
+                } else {
+                    top.unset_maximized();
+                }
+            }
+            let _ = self.conn.flush();
+            true
+        }
+
         pub fn set_surface_options(&mut self, id: u32, enabled: bool) -> bool {
             let Some(surface) = self.state.surfaces.get_mut(&id) else { return false };
             surface.fps_meter = enabled;
@@ -1867,6 +1892,7 @@ mod imp {
             None
         }
         pub fn set_surface_options(&mut self, _id: u32, _enabled: bool) -> bool { false }
+        pub fn set_window_state(&mut self, _id: u32, _state: u32) -> bool { false }
         pub fn surface_geometry(&mut self, _id: u32) -> Option<(u32, u32, u32, u32)> { None }
         pub fn contains_surface(&self, _id: u32) -> bool { false }
         pub fn is_toplevel(&self, _id: u32) -> bool { false }

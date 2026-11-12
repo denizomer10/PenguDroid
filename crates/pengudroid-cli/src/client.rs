@@ -79,6 +79,16 @@ impl Client {
         }
     }
 
+    /// Maximize, fullscreen, or return a window to normal. `state` is a set of
+    /// `pengudroid_proto::WINDOW_*` bits.
+    pub fn set_window_state(&self, surface_id: u32, state: u32) -> Result<(), String> {
+        match self.request(&Message::SetWindowState { surface_id, state })?.0 {
+            Message::Ack => Ok(()),
+            Message::Error { message, .. } => Err(message),
+            other => Err(format!("unexpected reply to SetWindowState: {:?}", other.kind())),
+        }
+    }
+
     /// Like [`Client::request`], but attaches file descriptors to the outgoing
     /// message (used to hand the daemon a GPU-exported dma-buf).
     pub fn request_with_fds(

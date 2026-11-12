@@ -764,6 +764,22 @@ fn handle(
             (Some(reply), vec![], false)
         }
 
+        Message::SetWindowState { surface_id, state } => {
+            // A window state is not a per-process secret the way pixels are: the
+            // host asks for it from its own connection, exactly like input.
+            if state & !pengudroid_proto::WINDOW_STATE_KNOWN != 0 {
+                return (Some(Message::Error {
+                    code: -22,
+                    message: format!("unknown window state bits {state:#x}"),
+                }), vec![], false);
+            }
+            let mut guard = daemon.graphics.lock().unwrap();
+            let ok = guard.as_mut().is_some_and(|gfx| gfx.set_window_state(surface_id, state));
+            if ok { (Some(Message::Ack), vec![], false) } else {
+                (Some(Message::Error { code: -3, message: format!("no surface {surface_id}") }), vec![], false)
+            }
+        }
+
         Message::SetSubsurfacePosition { surface_id, x, y } => {
             let mut guard = daemon.graphics.lock().unwrap();
             let ok = match guard.as_mut() {

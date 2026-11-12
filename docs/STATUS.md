@@ -19,10 +19,50 @@ Verified this session:
 | The game's own backend is reachable | HTTP 200 from `free2play.cobalt.vectorunit.com` inside the guest |
 | Audio, billing, SQLite, GMS paths run | FMOD `stream`/`mixer`/`Studio` threads, `BillingClient` and `SQLiteCursor` activity |
 | Resize policy is inspectable | `pengudroid geometry [--width W] [--height H] [--density DPI] [--resize WxH]` |
-| The host can ask a live surface its size | `SurfaceGeometry` (protocol v4); roundtrip tested, and a live BBR2 run read `496x883` back and relaid out the guest |
-| A resize is applied to the guest | `PENGUDROID_FOLLOW_RESIZE=1`: `window is now 496x883 … 1 root(s) poked`, 246 presents afterwards |
+| The host can ask a live surface its size | `SurfaceGeometry` (protocol v4); roundtrip tested, and a live BBR2 run read `668x1189` back and relaid out the guest |
+| A resize is applied to the guest | `PENGUDROID_FOLLOW_RESIZE=1`: `window is now 668x1189 … 1 root(s) poked`, then `2560x1373 … tablet` after a maximize, 246 presents afterwards |
+| A window can be resized without a seat | `pengudroid window [<id>] [--maximize|--unmaximize|--fullscreen]` (`SetWindowState`, protocol v5): a real Mutter `configure` takes a 334x594 dp phone window to 1280x686 dp **tablet** and back, guest buffer unchanged |
 | Tests | `cargo test --workspace --offline` green; `python3 -m unittest discover -s tools -p 'test_*.py'` 256 passing |
 | New regressions | `geometry` resize/dp policy (`crates/pengudroid-cli/src/geometry.rs`), guest-bundle assembler (`tools/test_assemble_arm64_bridge_guest.py`), `SurfaceGeometry` unknown-surface error |
+
+### A window can be resized without a seat (2026-11-12, later still)
+
+The resize path had one untested link: a compositor `configure`. The daemon is a
+Wayland client, so only the compositor can send one — and the smoke harness has
+no pointer to drag a window with. `Message::SetWindowState` closes that gap for
+testing *and* for users: the daemon calls the same `xdg_toplevel` requests a
+title-bar button issues, Mutter answers with a real `configure`, and the
+ordinary path runs from there.
+
+```
+$ pengudroid window                       # list live windows
+surface 1: 720x1280 px internal, 668x1189 px window (334x594 dp)
+$ pengudroid window 1 --maximize
+surface 1: 720x1280 px internal, 2560x1373 px window (1280x686 dp, tablet)
+$ pengudroid window 1 --unmaximize
+surface 1: 720x1280 px internal, 668x1189 px window (334x594 dp)
+```
+
+| Piece | Where |
+|---|---|
+| `SetWindowState { surface_id, state }`, `WINDOW_MAXIMIZED`/`WINDOW_FULLSCREEN`, `PROTO_VERSION` 5 | `crates/pengudroid-proto/src/lib.rs` |
+| `set_window_state` (toplevel request + flush) | `crates/pengudroid-daemon/src/graphics.rs` |
+| Message handler, unknown-bit rejection | `crates/pengudroid-daemon/src/server.rs` |
+| `pengudroid window [<id>] [--maximize|--unmaximize|--fullscreen|--windowed]` | `crates/pengudroid-cli/src/main.rs` |
+
+Notes worth keeping:
+
+* **The version had to move.** Adding a message kind changes nothing about the
+  wire format of existing ones, but peers are checked for an exact match, so
+  `PROTO_VERSION` went to 5. A stale `libpengudroid_shim.so` then shows up as
+  `client protocol v4 != daemon v5; rebuild/restart matching peers` — rebuild the
+  whole workspace, not just the CLI.
+* **The state applies to one window.** After a relayout BBR2 replaces its window,
+  so un-maximizing the previous id changes nothing on screen. `pengudroid window`
+  with no id lists what is live; `window <newest> --unmaximize` moves it.
+* **Fullscreen is the honest "fill the output".** Maximize is bounded by the
+  compositor's work area (`2560x1373`), fullscreen is not (`2560x1440`); both keep
+  the guest buffer and switch to tablet layouts.
 
 ### The audio-port poll loop is answered (2026-11-12, later)
 
@@ -75,16 +115,18 @@ was before this table existed.
    front-loaded — roughly 100 s of loading and shader work first — because the
    guest VM runs `-Xint` and every guest instruction is translated. Cheaper
    warm-up is a performance problem, not a compatibility one.
-2. **Guest relayout on resize works, but the drag that triggers it is untested.**
-   The compositor preserves the guest's internal resolution and scales the frame
+2. **Resize is verified end to end; only a pointer drag is untested.** The
+   compositor preserves the guest's internal resolution and scales the frame
    (correct, verified). `PENGUDROID_FOLLOW_RESIZE=1` closes the loop: it polls
    `SurfaceGeometry` (protocol v4), republishes the geometry with
    `Geometry::for_resize` and pokes each root so `hwui` measures again at the new
-   dp size. A live BBR2 run proves the pull, the publish and the poke
-   (`window is now 496x883 … 1 root(s) poked`, then 246 presents). What is
-   missing is a configure event from a real drag — the headless harness has no
-   seat. See [LIMITATIONS.md](LIMITATIONS.md) §4.1–4.2; `pengudroid geometry
-   --resize WxH` prints the classification a session would report.
+   dp size. `SetWindowState` (protocol v5) can now drive the configure without a
+   seat, and live runs walked the whole path: `668x1189` (334x594 dp, phone) →
+   `--maximize` → a real Mutter `configure` → `2560x1373` (1280x686 dp,
+   **tablet**) → `2176x1167` (1088x583 dp, phone again), with the guest buffer
+   never reallocated (`720x1280` throughout). What is still untested is a human
+   pointer drag; Mutter sent these configures. See [LIMITATIONS.md](LIMITATIONS.md) §4.1–4.2; `pengudroid
+   geometry --resize WxH` prints the classification a session would report.
 3. **Service gaps that show up as log noise.** `listAudioPorts` and
    `listAudioPatches` are now answered (see below); audio code 171 and input
    code 1 are still unimplemented, and `berberis: trans#`/`dispatch#` DEBUG
@@ -95,13 +137,10 @@ was before this table existed.
 
 ### Next concrete task
 
-Validate the live resize follower on an interactive session: launch with
-`PENGUDROID_FOLLOW_RESIZE=1`, drag the window across the 600 dp line, and read
-the `apphost: window is now …` line plus the daemon's `SurfaceGeometry` reply.
-The pull half is verified; the `IWindowSession.relayout` half is not, because it
-needs a configure event. After that, the warm-up: ~100 s of loading and shader
-compilation under `-Xint` is the remaining cost, and it is a performance
-problem — [LIMITATIONS.md](LIMITATIONS.md) §2.
+The warm-up: ~100 s of loading and shader compilation under `-Xint` is the
+remaining cost, and it is a performance problem — [LIMITATIONS.md](LIMITATIONS.md)
+§2. The resize path needs no more work to be correct; a human pointer drag on a
+second compositor would only widen coverage.
 
 ## Desktop manager verified (2026-11-11)
 

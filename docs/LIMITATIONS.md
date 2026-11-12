@@ -432,9 +432,55 @@ afterwards: 246 presents on the live surface, `app_exit: null`. So the pull, the
 geometry publish and the poke all run against a real daemon and a real guest
 window.
 
-What is **not** verified is the transition itself: the headless smoke harness has
-no Wayland seat, so no configure event arrives to change the window size
-mid-session. A drag across the 600 dp line is the missing test.
+The transition itself is now verified too, because the window state can be
+driven without a seat: `Message::SetWindowState` (protocol v5) asks the daemon
+for `WINDOW_MAXIMIZED`/`WINDOW_FULLSCREEN`, the daemon calls the same
+`xdg_toplevel` requests a title-bar button issues, and Mutter answers with a real
+`configure` — the same event an interactive drag produces.
+
+```
+$ pengudroid window 1
+surface 1: 720x1280 px internal, 668x1189 px window (334x594 dp)
+$ pengudroid window 1 --maximize
+surface 1: 720x1280 px internal, 2560x1373 px window (1280x686 dp, tablet)
+$ pengudroid window 1 --fullscreen
+surface 1: 720x1280 px internal, 2560x1440 px window (1280x720 dp, tablet)
+$ pengudroid window 1 --unmaximize
+surface 1: 720x1280 px internal, 668x1189 px window (334x594 dp)
+```
+
+and the follower published each step in the guest, in both directions:
+
+```
+apphost: window is now 668x1189; guest relayout at 668x1189 px (334x594 dp), 1 root(s) poked
+apphost: window is now 2560x1373; guest relayout at 2560x1373 px (1280x686 dp, tablet), 1 root(s) poked
+apphost: window is now 2176x1167; guest relayout at 2176x1167 px (1088x583 dp), 1 root(s) poked
+```
+
+Four things those runs established:
+
+* **Internal resolution survives.** The guest buffer stayed `720x1280` (and
+  `668x1189` on BBR2's own window) while the window became `2560x1373`; the
+  compositor scaled it and never reallocated. Frame size and window size are
+  independent, in every direction.
+* **The tablet switch is dynamic and reversible.** `334x594 dp` classifies as a
+  phone, `1280x686 dp` as a tablet, and `1088x583 dp` as a phone again — the
+  600 dp line is crossed without a relaunch, because `Geometry::for_resize`
+  keeps the density.
+* **The guest reacts.** After the first relayout BBR2 created a *new* surface
+  already sized to the maximized window (`surface 7 configured (2560×1373)`),
+  which is the app replacing its window in response to the configuration change.
+  That is also why the second step above is `2176x1167`: un-maximizing the *old*
+  window does nothing to the new one, so the state command has to be aimed at the
+  window that is on screen — `pengudroid window` with no id lists them.
+* **No relaunch is needed for any of it.** Each step is a `configure` and a
+  relayout inside the same process.
+
+An interactive pointer drag is still untested as such — Mutter, not a pointer,
+sent these configures — but the configure handler is the same one a drag ends up
+in, and the compositor-gated test
+`native_frame_resize_maximize_and_close_keep_video_and_input_aligned` covers the
+frame math.
 
 The shape of it is a **pull**, not a daemon push:
 
@@ -539,10 +585,14 @@ private mount view. Do not run untrusted APKs under PenguDroid.
 
 ## 9. Protocol is versioned but young
 
-The control protocol is v4 (`PROTO_VERSION` in
+The control protocol is v5 (`PROTO_VERSION` in
 `crates/pengudroid-proto/src/lib.rs`) and hand-rolled. It is tested for
 round-trips and truncation handling, but has no negotiation for capability differences and no
-framing for large zero-copy transfers beyond fd passing.
+framing for large zero-copy transfers beyond fd passing. The version is checked
+exactly, so a stale peer is refused rather than misparsed — including a stale
+`libpengudroid_shim.so`, which shows up in the daemon log as
+`client protocol v4 != daemon v5; rebuild/restart matching peers`, not as a
+mystery hang.
 
 Guest-service calls are forwarded per connection with reply ordering implicit
 (the oldest outstanding call is answered first). A call waits up to
