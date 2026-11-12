@@ -41,6 +41,28 @@ input. The desktop launcher sends `0` or `1` from the selected app's checkbox;
 changes apply on the next launch. `PENGUDROID_KEYMAP_PATH` is the resolved
 profile path passed to the guest before its prefix changes HOME.
 
+## Runtime properties
+
+The guest gets Android system properties from a seed table in the shim. Any of
+them can be overridden for one run with `PENGUDROID_PROP_<exact.property.name>`;
+because the names contain dots, quote the assignment and use `env`:
+
+```sh
+env 'PENGUDROID_PROP_ro.dalvik.vm.enable_uffd_gc=true' \
+  ./target/debug/pengudroid art-test --sysroot .toolchain/sysroot-android17 ...
+```
+
+`pengudroid launch` inherits the environment the same way.
+
+The override is applied before `JNI_CreateJavaVM`, so it is visible to
+`__system_property_get` and to ART's own startup property reads. It is a
+debugging knob, not a supported configuration: an override that contradicts the
+platform identity (API level, ABI, release) aborts the launch with a message
+rather than being silently ignored. Known users are
+`ro.dalvik.vm.native.bridge` ([NATIVE_BRIDGE.md](NATIVE_BRIDGE.md)) and
+`ro.dalvik.vm.enable_uffd_gc`, which is what makes the boot image validate
+([ANDROID17.md](ANDROID17.md)).
+
 ## Protocol (v4)
 
 `PROTO_VERSION` in `crates/pengudroid-proto/src/lib.rs` is the authoritative
