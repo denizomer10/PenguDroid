@@ -250,15 +250,16 @@ impl Layout {
             }
         }
 
-        // Preserve the ART/ICU prefix used to build the boot image. Framework
-        // jars, including Android 17's split jars, must come from its fragment.
+        // The ART APEX's own jars lead, then the framework fragment's jars, then
+        // the remaining APEX fragments (ICU last). This is the order recorded in
+        // the shipped boot image's OAT header; `OatFile::ValidateBootClassPath`
+        // compares it verbatim, so any reordering rejects the whole image.
         let mut boot_locations: Vec<String> = [
             "/apex/com.android.art/javalib/core-oj.jar",
             "/apex/com.android.art/javalib/core-libart.jar",
             "/apex/com.android.art/javalib/okhttp.jar",
             "/apex/com.android.art/javalib/bouncycastle.jar",
             "/apex/com.android.art/javalib/apache-xml.jar",
-            "/apex/com.android.i18n/javalib/core-icu4j.jar",
         ].into_iter().map(String::from).collect();
         let fragment = system.join("etc/classpaths/bootclasspath.pb");
         let data = std::fs::read(&fragment)
@@ -277,6 +278,15 @@ impl Layout {
             if !boot_locations.contains(&location) {
                 boot_locations.push(location);
             }
+        }
+
+        // ICU4J sits between the framework fragment's jars and the module
+        // fragments. The order is not alphabetical: the boot image's OAT header
+        // records it as entry 14, so inserting it anywhere else rejects the image
+        // and dropping it leaves `com.android.icu.*` unregistered.
+        let icu4j = "/apex/com.android.i18n/javalib/core-icu4j.jar".to_string();
+        if !boot_locations.contains(&icu4j) {
+            boot_locations.push(icu4j);
         }
 
         // Module fragments extend the boot classpath beyond the image's jars.
@@ -2864,10 +2874,13 @@ mod tests {
             "/system/framework/framework-location.jar",
         ]);
         let layout = Layout::detect(&fixture.0).unwrap();
-        assert_eq!(&layout.boot_locations[6..], &[
+        // The framework fragment's jars follow the ART APEX jars directly, and
+        // ICU4J trails them, exactly as the shipped boot image records it.
+        assert_eq!(&layout.boot_locations[5..], &[
             "/system/framework/framework-location.jar", "/system/framework/framework.jar",
+            "/apex/com.android.i18n/javalib/core-icu4j.jar",
         ]);
-        assert_eq!(layout.boot_jars[6], layout.framework.join("framework-location.jar"));
+        assert_eq!(layout.boot_jars[5], layout.framework.join("framework-location.jar"));
     }
 
     #[test]

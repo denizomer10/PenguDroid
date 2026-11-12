@@ -70,13 +70,38 @@ Two extraction details matter for anyone reproducing this:
   `framework/x86_64/boot.art`; passing `framework/x86_64/boot.art` makes ART look
   for `framework/x86_64/x86_64/boot.art` and miss.
 
-**Open at this checkpoint:** the boot image does not load — ART reports
-`ValidateOatFile found read barrier state mismatch (oat file: false, runtime:
-true)` and falls back to imageless running. All 154 `-X`/`-XX` options exported
-by this `libart.so` were enumerated and none controls read barriers, so this is
-not currently configurable. Imageless mode works (NewPipe runs) but costs
-startup time and boot-image sharing. See [STATUS.md](STATUS.md) for the measured
-gaps.
+**Boot image state (latest):** the image now *validates and loads*, but the
+guest then dies in the userfaultfd garbage collector, so imageless running is
+still what ships. The full chain, all confirmed empirically:
+
+1. This `libart.so` computes `gUseReadBarrier = !gUseUserfaultfd` from a single
+   store (`0x5873be`). The shipped artifacts were built with read barriers
+   **off**, so `true` on our side rejects the image with
+   `ValidateOatFile found read barrier state mismatch (oat file: false, runtime:
+   true)`. No `-X`/`-XX` option controls it — it is derived state, not a flag.
+2. `KernelSupportsUffd()` probes `syscall(323)` with flags
+   `O_CLOEXEC|UFFD_USER_MODE_ONLY` (`0x80001`), which is allowed even when
+   `vm.unprivileged_userfaultfd=0`. It succeeds here, so ART does run its
+   uffd-GC build.
+3. Setting `PENGUDROID_PROP_ro.dalvik.vm.enable_uffd_gc=true` flips that path,
+   which clears the read-barrier rejection and lets the image load.
+4. The boot classpath must then match the image's OAT header byte for byte
+   (14 entries, `core-icu4j.jar` last — see `Layout::detect`). With that fixed,
+   ART decompresses and adopts all 14 components and `ICU4J` registers.
+
+The remaining blocker sits inside ART's uffd GC: the first mark-compact reports
+`post_compact_end:0x2091000` and then a `ClassLinker::LinkFields` store lands at
+`0x2093398` — past the compacted end — as `SIGBUS`/`BUS_ADRERR`. That region is
+reserved but not uffd-registered, so the write is fatal. Pinning a different
+collector is not an escape: `-Xgc:MS` and `-Xgc:SS` abort with
+`Check failed: foreground_collector_type_ == kCollectorTypeCMC`, i.e. this
+runtime is a uffd-GC-only build.
+
+So one property toggle and one classpath order are what is left between
+imageless mode and full image sharing; the faulting compaction is an ART/
+host-kernel interaction (host kernel is 7.0.0) that the shim cannot paper over.
+Imageless mode is therefore still the default and remains fully functional. See
+[STATUS.md](STATUS.md) for the measured startup gap and reproduce commands.
 
 An earlier checkpoint recorded real API-37 bringup using the official x86_64
 GSI `CP2A.260605.012`, SHA-256

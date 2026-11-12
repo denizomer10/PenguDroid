@@ -2,6 +2,62 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
+## Where we left off — boot image loads; ART's uffd GC is the last blocker (2026-11-13)
+
+Pick up here. The x86_64 boot image from the Android 17 GSI **validates and
+loads** for the first time, which retires the "impossible to load" verdict in
+[ANDROID17.md](ANDROID17.md). Two independent bugs stood in the way and both are
+fixed:
+
+| Fix | Evidence |
+|---|---|
+| `gUseReadBarrier = !gUseUserfaultfd` is derived, not a flag | `objdump` of the sole store (`0x5873be`); `KernelSupportsUffd()` probes `syscall(323)` with `UFFD_USER_MODE_ONLY`, which is allowed with `vm.unprivileged_userfaultfd=0` |
+| Toggling `ro.dalvik.vm.enable_uffd_gc` clears the read-barrier rejection | `PENGUDROID_PROP_ro.dalvik.vm.enable_uffd_gc=true`: the `ValidateOatFile found read barrier state mismatch` error disappears |
+| The boot classpath must match the image's OAT header exactly | Parsed the ELF-wrapped OAT headers: 14 entries, `core-icu4j.jar` **last**. `Layout::detect` and its unit test now encode that order |
+| With both fixed, the image is adopted | `-verbose:image` decompresses all 14 components, and `ICU4J` registers (`libicu_jni.so`, `I18n APEX ICU file found`) |
+
+What still blocks shipping image mode is inside ART's uffd GC, not the shim: the
+first mark-compact logs `post_compact_end:0x2091000`, then a
+`ClassLinker::LinkFields` store at `0x2093398` — past that end, in a
+reserved-but-unregistered page — takes `SIGBUS`/`BUS_ADRERR`. Selecting a
+non-uffd collector is not an option: `-Xgc:MS` and `-Xgc:SS` abort with
+`Check failed: foreground_collector_type_ == kCollectorTypeCMC`, so this runtime
+is a uffd-GC-only build. Host kernel here is 7.0.0; the faulting path is an
+ART/kernel interaction the shim cannot intercept away.
+
+Also corrected: the old note that `-Xint` was needed because *the JIT* crashed
+`nterp` was wrong — that crash was the read-barrier/image mismatch. Whether
+`-Xint` can now be dropped is **still unverified**, because the uffd-GC SIGBUS
+arrives first; `launcher.rs` therefore keeps `-Xint`.
+
+Unchanged and re-verified this session: `cargo test --offline -p pengudroid-cli`
+green (94+7+2+3+2), and BBR2 still launches via `pengudroid launch <apkm>
+--backend auto` (100 s smoke run, guest profile installer active, no fatal
+signal).
+
+### Next concrete task
+
+Make ART's uffd GC survive that first compaction on this host kernel (or accept
+imageless mode permanently and delete the dead image plumbing). The classpath
+order fix is correct regardless and should stay. Then re-measure startup: image
+mode is the ~100 s warm-up's payoff.
+
+Reproduce in ~3 s with NewPipe (dotted property names need `env`):
+
+```sh
+PENGUDROID_LAUNCH_ACTIVITY=org.schabi.newpipe.MainActivity \
+env 'PENGUDROID_PROP_ro.dalvik.vm.enable_uffd_gc=true' \
+./target/debug/pengudroid art-test --sysroot .toolchain/sysroot-android17 \
+  --classpath ~/Downloads/NewPipe_v0.29.1.apk \
+  --register-natives libandroid_runtime.so,libhwui.so \
+  --bind-app --main android.app.ActivityThread --vm-option -verbose:image
+```
+
+Drop the `env '...'` and the image is rejected at the read-barrier check (today's
+default); keep it and the image loads, then the SIGBUS arrives. `-Xgc:MS` and
+`-Xgc:SS` abort with the kCollectorTypeCMC check, which is how the uffd-only
+nature of this runtime was established.
+
 ## Where we left off — ARM64 BBR2 runs without `--sysroot` (2026-11-12)
 
 Pick up here. The headline change since 2026-11-11 is that an **ARM64-only game
@@ -139,8 +195,10 @@ was before this table existed.
 
 The warm-up: ~100 s of loading and shader compilation under `-Xint` is the
 remaining cost, and it is a performance problem — [LIMITATIONS.md](LIMITATIONS.md)
-§2. The resize path needs no more work to be correct; a human pointer drag on a
-second compositor would only widen coverage.
+§2. Root cause work has since moved to the top of this file: the image itself
+now loads, and ART's uffd GC is what still blocks using it. The resize path needs
+no more work to be correct; a human pointer drag on a second compositor would
+only widen coverage.
 
 ## Desktop manager verified (2026-11-11)
 

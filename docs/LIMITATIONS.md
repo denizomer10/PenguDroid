@@ -74,7 +74,8 @@ The path there was ABI translation, not environment emulation:
   `/odm`, `/data`, ...) into `$PENGUDROID_ROOT` at the libc boundary —
   `open`/`openat`, `fopen`, `stat`, `access`, `readlink`, `opendir`, `realpath`.
   Host paths (`/proc`, `/dev`, `/etc`) are untouched.
-* **The boot class path is not just the boot image.** The image covers 12 jars,
+* **The boot class path is not just the boot image.** The image covers 14
+  components (`boot.art` records `component_count=14`),
   but Android 13 moved connectivity, bluetooth, conscrypt, permission,
   tethering, wifi, mediaprovider and friends into mainline APEX modules, each
   publishing `etc/classpaths/bootclasspath.pb`. On a device init concatenates
@@ -267,6 +268,11 @@ then holds a vsync-locked **60 fps**. Frame production is therefore not the
 blocker it was long assumed to be — the earlier "well under 1 fps" reading came
 from a 60 s sample that landed entirely inside the warm-up. What remains slow is
 the path *to* the first frame, which is CPU-bound interpretation (`-Xint`).
+`-Xint` is kept because ART's image cannot be used yet, not because the JIT is
+broken: the boot image now validates and loads once
+`ro.dalvik.vm.enable_uffd_gc` is set and the boot classpath matches the image's
+OAT header, but ART's userfaultfd GC then faults right after its first
+mark-compact. See [STATUS.md](STATUS.md) for the full chain and repro.
 
 **Consequences for real games.**
 
@@ -624,8 +630,9 @@ hanging forever, so a wedged guest cannot freeze its peers.
    ART closure `dlopen`s, `JNI_CreateJavaVM` returns `JNI_OK`, framework natives
    register, an APK's DEX loads, and the host drives `handleBindApplication` +
    `handleLaunchActivity` so a real Activity draws and presents (§2).
-   **Still open**: the JIT (only `-Xint` works) and the platform services
-   (`ActivityManager` lifecycle, input, `MediaCodec`).
+   **Still open**: swapping `-Xint` for the JIT/AOT image (the image loads, but
+   ART's uffd GC faults after its first mark-compact — see [STATUS.md](STATUS.md))
+   and the platform services (`ActivityManager` lifecycle, input, `MediaCodec`).
 6. ~~Wire the PipeWire audio pump.~~ **Done**: the daemon owns a shared ring and
    drains it into `pw-cat` (`audio-test --via-daemon`); silence by default,
    `--tone` audible. ~~OpenSL ES buffer-queue player~~ **Done**: `Enqueue` →
