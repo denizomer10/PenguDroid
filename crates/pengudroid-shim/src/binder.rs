@@ -2723,6 +2723,16 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                     diag(&format!("[binder]   -> AudioAttributes ({} bytes)\n", attrs.len()));
                 }
             }
+        } else if len > 3 && tr.code == codes[3] {
+            // `getStreamTypeForAttributes(AudioAttributes)` returns the legacy
+            // stream type as a bare int. The only attributes we ever serve are
+            // media/music, whose legacy stream is STREAM_MUSIC (3); answering 0
+            // (STREAM_VOICE_CALL) made `getAudioAttributesForLegacyStream`
+            // reject the round trip.
+            parcel.extend_from_slice(&3u32.to_ne_bytes()); // STREAM_MUSIC
+            if trace_enabled() {
+                diag("[binder]   -> stream type 3 (STREAM_MUSIC)\n");
+            }
         } else if codes[..len].contains(&tr.code) {
             // `listAudioPorts(role, type, out int num_ports, out AudioPort[],
             // out int generation)` and `listAudioPatches(out int num_patches,
@@ -6053,6 +6063,19 @@ mod tests {
         let reply = unsafe { make_reply(&transaction(target, ports, &[]), 1) };
         assert_eq!(&reply.parcel[4..8], &0u32.to_ne_bytes());
         assert_eq!(&reply.parcel[8..12], &0u32.to_ne_bytes());
+        // The fourth installed code is getStreamTypeForAttributes: a bare int
+        // reply of STREAM_MUSIC (3), never the attributes payload.
+        let stream_code = 88u32;
+        assert!(set(&[ports, patches, attrs_code, stream_code]));
+        let reply = unsafe { make_reply(&transaction(target, stream_code, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes());
+        assert_eq!(&reply.parcel[4..8], &3u32.to_ne_bytes());
+        assert_eq!(reply.parcel.len(), 8);
+        // With only three codes installed the stream code keeps the fallthrough.
+        assert!(set(&[ports, patches, attrs_code]));
+        let reply = unsafe { make_reply(&transaction(target, stream_code, &[]), 1) };
+        assert_eq!(reply.parcel.len(), 8); // status + padding only
         unsafe { __pengudroid_binder_set_audio_attributes(std::ptr::null(), 0) }; // ignored
         *AUDIO_ATTRIBUTES.lock().unwrap_or_else(|e| e.into_inner()) = old;
     }

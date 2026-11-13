@@ -53,11 +53,30 @@ STREAM_MUSIC). Validation: shim **159 passed**, cli green (94+7+2+3+2), pushed
 at `842d52d`. Resize re-verified again this segment: `2560x1373`→tablet
 (1280x686 dp), `2176x1167`/`668x1189`/`720x1280`→phone, density kept.
 
+Smokes #8–#10 (`/tmp/bbr2-bridge8/9/10.log`): still exactly one
+`getAttributesForStreamType Failed`. Smoke #10 with `PENGUDROID_TRACE_BINDER=1`
+proved code 87 **is** dispatched and answered with
+`[status=0][present=1][24-byte writeToParcel]` and rc=0 — dex disassembly of
+`IAudioPolicyService$Stub$Proxy.getAttributesForStreamType` (classes2.dex,
+method 51484) shows the Proxy does `readException(); readTypedObject(CREATOR)`,
+and `android/media/audio/common/AudioAttributes.readFromParcel` reads
+`[size][4 ints][stringArray]`, which is exactly what the host-marshalled
+payload is (size=24 self-inclusive). So the 87 reply parses; the residual
+error comes from the follow-up code 88 (`TRANSACTION_getStreamTypeForAttributes`),
+which fell through and answered stream type 0. Fixed in the next commit:
+`getStreamTypeForAttributes` is now the fourth installed audio-policy code and
+answers `[status=0][3]` (STREAM_MUSIC). Smoke #10 otherwise ran 240 s with
+**0 fatal, 0 UNKNOWN_TRANSACTION**, frames presenting (vsync frame 434220) and
+`POST /v8/login.php` → `HTTP/1.1 200 OK` against the real backend.
+Validation: shim **159 passed**, cli green (94+7+2+3+2), `cargo build
+--offline` clean.
+
 ### Next concrete task
 
-Watch bridged smoke #8 (`/tmp/bbr2-bridge8.log`, 900 s) and confirm
-`getAttributesForStreamType Failed` is gone and nothing new appears; check how
-far BBR2 gets toward gameplay (menu/race, frame presents). Iterate any new gap
+Watch bridged smoke #11 (`/tmp/bbr2-bridge11.log`, 900 s) and confirm the
+`getAttributesForStreamType Failed` / `getAudioAttributesForLegacyStream` errors
+are gone and nothing new appears; check how far BBR2 gets toward gameplay
+(menu/race, frame presents, further backend calls). Iterate any new gap
 the same way: root-cause from the log + API-37 dex, shim in `pengudroid-shim`,
 install codes from the real `TRANSACTION_*` fields in `apphost`, tests,
 bridged smoke. Genshin launch path uses the same bridge env (the Genshin APKM

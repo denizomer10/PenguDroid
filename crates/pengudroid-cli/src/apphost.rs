@@ -6959,11 +6959,12 @@ fn install_media_session_transactions(env: &JniEnv) -> Option<()> {
 /// parcel.
 fn install_audio_policy_transactions(env: &JniEnv) -> Option<()> {
     // The third code is getAttributesForStreamType, answered with the
-    // marshalled AudioAttributes installed by install_audio_attributes_reply.
+    // marshalled AudioAttributes installed by install_audio_attributes_reply;
+    // the fourth is getStreamTypeForAttributes, answered with STREAM_MUSIC.
     install_service_transactions(env,
         "android/media/IAudioPolicyService$Stub",
         "__pengudroid_binder_set_audio_policy_transactions",
-        &["listAudioPorts", "listAudioPatches", "getAttributesForStreamType"])
+        &["listAudioPorts", "listAudioPatches", "getAttributesForStreamType", "getStreamTypeForAttributes"])
 }
 
 /// `AudioSystem.getAttributesForStreamType` asks the audio policy service for
