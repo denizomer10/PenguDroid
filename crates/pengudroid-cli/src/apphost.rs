@@ -6972,32 +6972,20 @@ fn install_audio_policy_transactions(env: &JniEnv) -> Option<()> {
 /// Answer with a media/music AudioAttributes for STREAM_MUSIC, marshalled by
 /// the framework itself so the parcel layout matches this build.
 fn install_audio_attributes_reply(env: &JniEnv) {
+    // The Stub's return type is the AIDL `android.media.audio.common.AudioAttributes`
+    // (fields usage/contentType/flags/source/tags), NOT the framework
+    // `android.media.AudioAttributes` — the Proxy reads it with the common
+    // CREATOR, so the parcel must be marshalled from the common class.
     let build = (|| -> Option<Vec<u8>> {
-        let builder_class = env.find_class("android/media/AudioAttributes$Builder")?;
-        let ctor = env.method_id(builder_class, "<init>", "()V")?;
-        let builder = env.new_object(builder_class, ctor, &[])?;
-        // USAGE_MEDIA=1, CONTENT_TYPE_MUSIC=2, STREAM_MUSIC=3.
-        for (method, value) in [("setUsage", 1), ("setContentType", 2), ("setLegacyStreamType", 3)] {
-            let id = env.method_id(
-                builder_class,
-                method,
-                "(I)Landroid/media/AudioAttributes$Builder;",
-            )?;
-            let built = env.call_object(
-                builder,
-                id,
-                &[JValue { i: value }],
-            )?;
-            if built.is_null() {
-                return None;
-            }
+        let class = env.find_class("android/media/audio/common/AudioAttributes")?;
+        let ctor = env.method_id(class, "<init>", "()V")?;
+        let attrs = env.new_object(class, ctor, &[])?;
+        // USAGE_MEDIA=1, CONTENT_TYPE_MUSIC=2.
+        for (field, value) in [("usage", 1), ("contentType", 2), ("flags", 0), ("source", 0)] {
+            let id = env.field_id(class, field, "I")?;
+            env.set_int_field(attrs, id, value);
         }
-        let build_id = env.method_id(builder_class, "build", "()Landroid/media/AudioAttributes;")?;
-        let attrs = env.call_object(builder, build_id, &[])?;
-        if attrs.is_null() {
-            return None;
-        }
-        marshal_object(env, attrs, "android/media/AudioAttributes")
+        marshal_object(env, attrs, "android/media/audio/common/AudioAttributes")
     })();
     match build {
         Some(data) => {

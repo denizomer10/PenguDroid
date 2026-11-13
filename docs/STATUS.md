@@ -42,18 +42,28 @@ at 720x1280, FMOD `AudioDevice::init` OK and `AudioTrack sink restarted (1/5)`
 time). Remaining noise is benign (billing "Service not registered",
 PlayGames/GMS absence, `classes.dex` entry misses).
 
+Smoke #7 (`/tmp/bbr2-bridge7.log`, 900 s): **0 fatal, 0 `UNKNOWN_TRANSACTION`,
+0 NPE** — the `metaData` fix removed the last `Bundle.getBoolean` NPE, audio
+reaches `AudioTrack sink restarted`, backend TLS stays up. Its only remaining
+error was `AudioSystem: getAttributesForStreamType Failed` (audio policy code
+87 fell through to null), fixed in `842d52d`: `getAttributesForStreamType`
+is now the third installed audio-policy code and answers
+`[present=1][host-marshalled AudioAttributes]` (USAGE_MEDIA/CONTENT_TYPE_MUSIC/
+STREAM_MUSIC). Validation: shim **159 passed**, cli green (94+7+2+3+2), pushed
+at `842d52d`. Resize re-verified again this segment: `2560x1373`→tablet
+(1280x686 dp), `2176x1167`/`668x1189`/`720x1280`→phone, density kept.
+
 ### Next concrete task
 
-Commit the `metaData` fix, then run a longer bridged smoke (900 s) and watch
-how far BBR2 gets toward gameplay (menu/race, frame presents). Iterate any new
-gap the same way: root-cause from the log + API-37 dex, shim in
-`pengudroid-shim`, install codes from the real `TRANSACTION_*` fields in
-`apphost`, tests, bridged smoke. Genshin launch path uses the same bridge env
-(the Genshin APKM itself is never executed; image mode stays blocked on the
-translator signal-resume issue — document, don't chase). Non-bridged BBR2
-smokes stay fully clean (`/tmp/bbr2-smoke3/4.log`). Resize (protocol v5) was
-re-verified after the shim segment: `2560x1373`→tablet, `2176x1167`/`668x1189`
-→phone, guest buffer `720x1280`.
+Watch bridged smoke #8 (`/tmp/bbr2-bridge8.log`, 900 s) and confirm
+`getAttributesForStreamType Failed` is gone and nothing new appears; check how
+far BBR2 gets toward gameplay (menu/race, frame presents). Iterate any new gap
+the same way: root-cause from the log + API-37 dex, shim in `pengudroid-shim`,
+install codes from the real `TRANSACTION_*` fields in `apphost`, tests,
+bridged smoke. Genshin launch path uses the same bridge env (the Genshin APKM
+itself is never executed; image mode stays blocked on the translator
+signal-resume issue — document, don't chase). Non-bridged BBR2 smokes stay
+fully clean (`/tmp/bbr2-smoke3/4.log`).
 
 ## Where we left off — the last null-reply NPE classes are shimmed (2026-11-13)
 
