@@ -897,6 +897,8 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
     // framework revision that renames the field must not block the launch.
     if install_audio_policy_transactions(env).is_none() {
         eprintln!("apphost: audio policy transaction codes unavailable; the framework audio-port cache stays empty");
+    } else {
+        install_audio_attributes_reply(env);
     }
     if install_media_transactions(env).is_none() {
         eprintln!("apphost: cannot resolve Android 17 media session/metrics transactions");
@@ -6956,10 +6958,54 @@ fn install_media_session_transactions(env: &JniEnv) -> Option<()> {
 /// empty list instead of leaving the framework to read a count out of an empty
 /// parcel.
 fn install_audio_policy_transactions(env: &JniEnv) -> Option<()> {
+    // The third code is getAttributesForStreamType, answered with the
+    // marshalled AudioAttributes installed by install_audio_attributes_reply.
     install_service_transactions(env,
         "android/media/IAudioPolicyService$Stub",
         "__pengudroid_binder_set_audio_policy_transactions",
-        &["listAudioPorts", "listAudioPatches"])
+        &["listAudioPorts", "listAudioPatches", "getAttributesForStreamType"])
+}
+
+/// `AudioSystem.getAttributesForStreamType` asks the audio policy service for
+/// the legacy-stream attributes and logs `getAttributesForStreamType Failed`
+/// when the reply decodes as null (BBR2 hit this on every AudioTrack setup).
+/// Answer with a media/music AudioAttributes for STREAM_MUSIC, marshalled by
+/// the framework itself so the parcel layout matches this build.
+fn install_audio_attributes_reply(env: &JniEnv) {
+    let build = (|| -> Option<Vec<u8>> {
+        let builder_class = env.find_class("android/media/AudioAttributes$Builder")?;
+        let ctor = env.method_id(builder_class, "<init>", "()V")?;
+        let builder = env.new_object(builder_class, ctor, &[])?;
+        // USAGE_MEDIA=1, CONTENT_TYPE_MUSIC=2, STREAM_MUSIC=3.
+        for (method, value) in [("setUsage", 1), ("setContentType", 2), ("setLegacyStreamType", 3)] {
+            let id = env.method_id(
+                builder_class,
+                method,
+                "(I)Landroid/media/AudioAttributes$Builder;",
+            )?;
+            let built = env.call_object(
+                builder,
+                id,
+                &[JValue { i: value }],
+            )?;
+            if built.is_null() {
+                return None;
+            }
+        }
+        let build_id = env.method_id(builder_class, "build", "()Landroid/media/AudioAttributes;")?;
+        let attrs = env.call_object(builder, build_id, &[])?;
+        if attrs.is_null() {
+            return None;
+        }
+        marshal_object(env, attrs, "android/media/AudioAttributes")
+    })();
+    match build {
+        Some(data) => {
+            install_reply(&data, "__pengudroid_binder_set_audio_attributes");
+            println!("audio: legacy-stream AudioAttributes installed ({} bytes)", data.len());
+        }
+        None => eprintln!("apphost: could not marshal AudioAttributes; getAttributesForStreamType stays null"),
+    }
 }
 
 fn install_audio_focus_transactions(env: &JniEnv) -> Option<()> {

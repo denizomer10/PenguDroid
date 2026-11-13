@@ -767,6 +767,14 @@ pub unsafe extern "C" fn __pengudroid_binder_set_user_transactions(
 /// were answered.
 static AUDIO_POLICY_EMPTY_LISTS: Mutex<([u32; 4], usize)> = Mutex::new(([0; 4], 0));
 
+/// A serialized `AudioAttributes` for the legacy-stream query
+/// (`getAttributesForStreamType`), marshalled by the host with the framework's
+/// own `AudioAttributes.writeToParcel`. `AudioSystem.getAttributesForStreamType`
+/// logs an ERROR and hands out no attributes when this is empty, which makes
+/// every `AudioTrack` construction fall back noisily (seen in BBR2).
+static AUDIO_ATTRIBUTES: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
 fn audio_policy_empty_lists() -> ([u32; 4], usize) {
     *AUDIO_POLICY_EMPTY_LISTS.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -800,6 +808,23 @@ pub unsafe extern "C" fn __pengudroid_binder_set_audio_policy_transactions(
     }
     *AUDIO_POLICY_EMPTY_LISTS.lock().unwrap_or_else(|e| e.into_inner()) = (codes, len);
     true
+}
+
+/// `void __pengudroid_binder_set_audio_attributes(const uint8_t *bytes, size_t len)`
+///
+/// Installs the marshalled `AudioAttributes` that
+/// `IAudioPolicyService.getAttributesForStreamType` (the third installed
+/// code) answers with.
+///
+/// # Safety
+/// `ptr` must point to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_audio_attributes(ptr: *const u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
+    *AUDIO_ATTRIBUTES.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
 }
 
 /// `IContentProvider` transaction codes, read out of this framework.jar with
@@ -2684,7 +2709,21 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
     }
     if tr.target_handle == handle_for("media.audio_policy") {
         let (codes, len) = audio_policy_empty_lists();
-        if codes[..len].contains(&tr.code) {
+        if len > 2 && tr.code == codes[2] {
+            // `getAttributesForStreamType(int)` returns an `AudioAttributes`
+            // typed object. Serve the host-marshalled attributes; without an
+            // installed payload the status-only fallthrough decodes as null,
+            // which is what produced `AudioSystem: getAttributesForStreamType
+            // Failed` in the bridged BBR2 run.
+            let attrs = AUDIO_ATTRIBUTES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if !attrs.is_empty() {
+                parcel.extend_from_slice(&1u32.to_ne_bytes()); // present
+                parcel.extend_from_slice(&attrs);
+                if trace_enabled() {
+                    diag(&format!("[binder]   -> AudioAttributes ({} bytes)\n", attrs.len()));
+                }
+            }
+        } else if codes[..len].contains(&tr.code) {
             // `listAudioPorts(role, type, out int num_ports, out AudioPort[],
             // out int generation)` and `listAudioPatches(out int num_patches,
             // out AudioPatch[], out int generation)`. No ports or patches are
@@ -5977,6 +6016,45 @@ mod tests {
         // The codes belong to this Stub only.
         let reply = unsafe { make_reply(&transaction(handle_for("audio"), ports, &[]), 1) };
         assert_unknown_transaction(reply);
+    }
+
+    /// `AudioSystem.getAttributesForStreamType` asks the audio policy service
+    /// (third installed code) for an `AudioAttributes` typed object; a
+    /// status-only reply decodes as null and logs `getAttributesForStreamType
+    /// Failed` on every AudioTrack setup in BBR2. The reply must be
+    /// `[present=1][marshalled AudioAttributes]` and only when the host
+    /// installed a payload — otherwise the fallthrough stays null.
+    #[test]
+    fn audio_policy_serves_installed_attributes_for_the_third_code() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = reset_table(&AUDIO_POLICY_EMPTY_LISTS, ([0; 4], 0));
+        let mut attrs = AUDIO_ATTRIBUTES.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::mem::take(&mut *attrs);
+        drop(attrs);
+        let target = handle_for("media.audio_policy");
+        let (ports, patches, attrs_code) = (51u32, 52u32, 87u32);
+        let set = |codes: &[u32]| unsafe {
+            __pengudroid_binder_set_audio_policy_transactions(codes.as_ptr(), codes.len())
+        };
+        assert!(set(&[ports, patches, attrs_code]));
+        // No payload installed: the attributes code falls through to null.
+        let reply = unsafe { make_reply(&transaction(target, attrs_code, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(reply.parcel.len(), 8); // status + padding, no typed object
+        // With a payload: status + presence + bytes.
+        let payload = [0x11u8, 0x22, 0x33, 0x44, 0x55];
+        unsafe { __pengudroid_binder_set_audio_attributes(payload.as_ptr(), payload.len()) };
+        let reply = unsafe { make_reply(&transaction(target, attrs_code, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes());
+        assert_eq!(&reply.parcel[4..8], &1u32.to_ne_bytes()); // present
+        assert_eq!(&reply.parcel[8..8 + payload.len()], &payload[..]);
+        // The empty-list codes still answer the empty list, not the attributes.
+        let reply = unsafe { make_reply(&transaction(target, ports, &[]), 1) };
+        assert_eq!(&reply.parcel[4..8], &0u32.to_ne_bytes());
+        assert_eq!(&reply.parcel[8..12], &0u32.to_ne_bytes());
+        unsafe { __pengudroid_binder_set_audio_attributes(std::ptr::null(), 0) }; // ignored
+        *AUDIO_ATTRIBUTES.lock().unwrap_or_else(|e| e.into_inner()) = old;
     }
 
     /// `Settings.NameValueCache` reads `Bundle.getString("value")` from the
