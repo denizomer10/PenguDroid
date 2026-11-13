@@ -26,10 +26,15 @@ passed**, `cargo test --offline -p pengudroid-cli` green (94+7+2+3+2), and the
 `UNKNOWN_TRANSACTION`, zero `ParceledListSlice.getList()` NPEs and zero
 "Could not acquire gfx stats buffer" NPEs**; apphost logs
 `empty-list shortcut=[23,20]`, `empty-list jobscheduler=[8,17]`,
-`fd-reply graphicsstats=[1]`. Remaining noise is benign (aconfig mmap WARNs,
-`classes.dex` entry misses, GMS/Tenjin ads SDK complaints, 2x
-`libbinder.Parcel: Expecting binder but got null!` after app-thread capture on
-handle 17, "Failed to load FMOD libs").
+`fd-reply graphicsstats=[1]`. A longer 600 s run (`/tmp/bbr2-smoke4.log`) is
+likewise fully clean (0 fatal / 0 `UNKNOWN_TRANSACTION` / 0 NPEs); the app
+spends the whole window in `-Xint` loading (Tenjin ads, `ProfileInstaller`),
+which is the performance blocker, not a crash. Resize re-verified after this
+segment: `pengudroid geometry --resize` classifies `2560x1373` as tablet
+(1280x686 dp), `2176x1167`/`668x1189` as phone, guest buffer stays `720x1280`.
+Remaining noise is benign (aconfig mmap WARNs, `classes.dex` entry misses,
+GMS/Tenjin ads SDK complaints, 2x `libbinder.Parcel: Expecting binder but got
+null!` after app-thread capture on handle 17, "Failed to load FMOD libs").
 
 ### Next concrete task
 
