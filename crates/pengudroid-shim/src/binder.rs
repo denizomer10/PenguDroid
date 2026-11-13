@@ -984,6 +984,12 @@ const IDEC_SET_VSYNC_RATE: u32 = 2;
 /// `IDisplayEventConnection` transaction code for `requestNextVsync` (oneway).
 const IDEC_REQUEST_NEXT_VSYNC: u32 = 3;
 
+/// `IDisplayEventConnection` transaction code for `getLatestVsyncEventData`.
+/// The interface is native-only AIDL (no Java Stub), so the code is the AIDL
+/// declaration order: stealReceiveChannel=1, setVsyncRate=2,
+/// requestNextVsync=3, getLatestVsyncEventData=4.
+const IDEC_GET_LATEST_VSYNC_EVENT_DATA: u32 = 4;
+
 /// Measured API-37 x86_64 DisplayEventReceiver::Event: a 24-byte header and
 /// 200-byte VSync union, including frameTimelinesLength/numberQueuedBuffers.
 const DISPLAY_EVENT_SIZE: usize = 224;
@@ -1063,23 +1069,24 @@ const IDM_GET_DISPLAY_INFO: u32 = 1;
 /// Framework-marshalled virtual keyboard InputDevice, including its native map.
 static VIRTUAL_INPUT_DEVICE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 // Internal virtual_input::reply semantic IDs, never default wire codes.
-const INPUT_OPERATIONS: [u32; 8] = [1, 2, 3, 4, 5, 6, 7, 22];
-static INPUT_TRANSACTION_CODES: Mutex<Option<[u32; 8]>> = Mutex::new(None);
+const INPUT_OPERATIONS: [u32; 9] = [1, 2, 3, 4, 5, 6, 7, 22, 8];
+static INPUT_TRANSACTION_CODES: Mutex<Option<[u32; 9]>> = Mutex::new(None);
 
 /// Install IInputManager$Stub codes in getInputDevice, getInputDeviceIds,
 /// isInputDeviceEnabled, enableInputDevice, disableInputDevice, hasKeys,
-/// getKeyCodeForKeyLocation, registerInputDevicesChangedListener order.
-/// `len` must be 8 u32 elements. Only isInputDeviceEnabled may be zero (absent
+/// getKeyCodeForKeyLocation, registerInputDevicesChangedListener,
+/// getVelocityTrackerStrategy order.
+/// `len` must be 9 u32 elements. Only isInputDeviceEnabled may be zero (absent
 /// on API 37); zero never dispatches. Other codes must be distinct and in
 /// 1..0x00ff_fffe. False preserves the previous table; there is no default.
 ///
 /// # Safety
-/// For a non-null pointer and len == 8, `codes` must point to eight aligned,
+/// For a non-null pointer and len == 9, `codes` must point to nine aligned,
 /// readable u32s for this call. The contents are copied, not retained.
 #[no_mangle]
 pub unsafe extern "C" fn __pengudroid_binder_set_input_transactions(codes: *const u32, len: usize) -> bool {
-    if codes.is_null() || len != 8 { return false; }
-    let codes: [u32; 8] = std::slice::from_raw_parts(codes, len).try_into().unwrap();
+    if codes.is_null() || len != 9 { return false; }
+    let codes: [u32; 9] = std::slice::from_raw_parts(codes, len).try_into().unwrap();
     if codes.iter().enumerate().any(|(i, &c)| (c == 0 && i != 2) || c >= 0x00ff_fffe)
         || codes.iter().enumerate().any(|(i, c)| *c != 0 && codes[..i].contains(c)) { return false; }
     *INPUT_TRANSACTION_CODES.lock().unwrap_or_else(|e| e.into_inner()) = Some(codes);
@@ -1088,17 +1095,22 @@ pub unsafe extern "C" fn __pengudroid_binder_set_input_transactions(codes: *cons
 
 
 static AUDIO_FOCUS: crate::audiofocus::AudioFocus = crate::audiofocus::AudioFocus::new();
+static CAPTURE_POLICY: crate::audiofocus::CapturePolicy = crate::audiofocus::CapturePolicy::new();
 static AUDIO_FOCUS_TRANSACTIONS: Mutex<Option<crate::audiofocus::Transactions>> =
     Mutex::new(None);
 
-/// Install request/abandon/unregister/current focus codes from the loaded Stub.
-/// All must be nonzero, distinct user codes; false preserves the previous table.
+/// Install request/abandon/unregister/current/setAllowedCapturePolicy/
+/// getAllowedCapturePolicy codes from the loaded Stub. All must be nonzero,
+/// distinct user codes; false preserves the previous table.
 /// Until installation, no focus operation dispatches.
 #[no_mangle]
 pub extern "C" fn __pengudroid_binder_set_audio_focus_transactions(
     request: u32, abandon: u32, unregister: u32, current: u32,
+    set_capture_policy: u32, get_capture_policy: u32,
 ) -> bool {
-    let Some(table) = crate::audiofocus::Transactions::new([request, abandon, unregister, current]) else {
+    let Some(table) = crate::audiofocus::Transactions::new(
+        [request, abandon, unregister, current, set_capture_policy, get_capture_policy],
+    ) else {
         return false;
     };
     *AUDIO_FOCUS_TRANSACTIONS.lock().unwrap_or_else(|e| e.into_inner()) = Some(table);
@@ -1199,6 +1211,15 @@ pub(crate) fn monotonic_ms() -> u128 {
     // SAFETY: `ts` is a valid `timespec`.
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as u128 * 1000 + ts.tv_nsec as u128 / 1_000_000
+}
+
+/// Nanoseconds on `CLOCK_MONOTONIC` — the same clock `System.nanoTime()` reads,
+/// which is what vsync timestamps must be on.
+pub(crate) fn monotonic_ns() -> i64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `ts` is a valid `timespec`.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
 }
 
 unsafe fn diag(line: &str) {
@@ -2337,6 +2358,25 @@ fn first_string16(data: &[u8]) -> Option<String> {
     Some(decode_utf16le(data.get(16..end)?))
 }
 
+/// Argument bytes after a Java `writeInterfaceToken` header for `descriptor`.
+///
+/// The token is a `u32` char count, UTF-16LE code units, a NUL, padded to 4
+/// bytes; libbinder prefixes it with a 12-byte header (`[u32][i32 -1]["TSYS"]`),
+/// so the string may start at offset 12 or 0.
+fn after_interface_token<'a>(data: &'a [u8], descriptor: &str) -> Option<&'a [u8]> {
+    let token: Vec<u16> = descriptor.encode_utf16().collect();
+    for start in [12usize, 0] {
+        let n = u32::from_le_bytes(data.get(start..start + 4)?.try_into().ok()?) as usize;
+        if n != token.len() { continue; }
+        let text = data.get(start + 4..start + 4 + n * 2)?;
+        if !text.chunks_exact(2).zip(&token).all(|(b, c)| u16::from_le_bytes([b[0], b[1]]) == *c) { continue; }
+        if data.get(start + 4 + n * 2..start + 6 + n * 2)? != [0, 0] { continue; }
+        let end = (start + 6 + n * 2 + 3) & !3;
+        return data.get(end..);
+    }
+    None
+}
+
 /// Whether a reply starts with an AIDL `Status` word. SurfaceComposer and its
 /// client are API-37 generated AIDL; neither has a handwritten reply variant.
 fn reply_has_status(handle: u32, code: u32) -> bool {
@@ -2986,6 +3026,29 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             Some(crate::audiofocus::Operation::Abandon) => parcel.extend_from_slice(&AUDIO_FOCUS.abandon().to_ne_bytes()),
             Some(crate::audiofocus::Operation::Unregister) => { AUDIO_FOCUS.abandon(); }
             Some(crate::audiofocus::Operation::Current) => parcel.extend_from_slice(&AUDIO_FOCUS.current().to_ne_bytes()),
+            Some(crate::audiofocus::Operation::SetCapturePolicy) => {
+                // `setAllowedCapturePolicy(int capturePolicy)`: one int32 after
+                // the interface token; the reply is the AudioManager result code.
+                let data = if tr.data_size > 0 && tr.data_ptr != 0 {
+                    std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize)
+                } else { &[] };
+                let policy = after_interface_token(data, "android.media.IAudioService")
+                    .and_then(|args| args.get(..4))
+                    .map(|b| i32::from_ne_bytes(b.try_into().unwrap()))
+                    .unwrap_or(0);
+                let result = CAPTURE_POLICY.set(policy);
+                parcel.extend_from_slice(&result.to_ne_bytes());
+                if trace_enabled() {
+                    diag(&format!("[binder]   -> setAllowedCapturePolicy policy={policy} result={result}\n"));
+                }
+            }
+            Some(crate::audiofocus::Operation::GetCapturePolicy) => {
+                let policy = CAPTURE_POLICY.get();
+                parcel.extend_from_slice(&policy.to_ne_bytes());
+                if trace_enabled() {
+                    diag(&format!("[binder]   -> getAllowedCapturePolicy policy={policy}\n"));
+                }
+            }
             None => return Reply::unknown_transaction(tr, "unimplemented IAudioService method"),
         }
     }
@@ -3075,8 +3138,10 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         if let Err(error) = require_api37() {
             return Reply::unknown_transaction(tr, &error);
         }
-        if !matches!(tr.code, IDEC_STEAL_RECEIVE_CHANNEL | IDEC_SET_VSYNC_RATE | IDEC_REQUEST_NEXT_VSYNC) {
-            return Reply::unknown_transaction(tr, "unimplemented IDisplayEventConnection method (getLatestVsyncEventData is unsupported)");
+        if !matches!(tr.code, IDEC_STEAL_RECEIVE_CHANNEL | IDEC_SET_VSYNC_RATE
+            | IDEC_REQUEST_NEXT_VSYNC | IDEC_GET_LATEST_VSYNC_EVENT_DATA)
+        {
+            return Reply::unknown_transaction(tr, "unimplemented IDisplayEventConnection method");
         }
     }
     if tr.target_handle == handle_for("display_event_connection")
@@ -3107,10 +3172,33 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             }
         }
     }
+    if tr.target_handle == handle_for("display_event_connection")
+        && tr.code == IDEC_GET_LATEST_VSYNC_EVENT_DATA
+    {
+        // `VsyncEventData` wire layout, from `ParcelableVsyncEventData::
+        // writeToParcel`/`readFromParcel` in the shipped libgui.so:
+        // `[presence int][int64][uint32][uint32 count][count x {int64,int64,int64}]`.
+        // The proxy reads it with `Parcel::readParcelable` (presence must be
+        // kNonNullParcelableFlag = 1) after the AIDL status word written above.
+        // Answer with one frame timeline whose deadline is the next 60 Hz pulse,
+        // so `Choreographer` sees a sane vsync instead of garbage.
+        let now = monotonic_ns();
+        let deadline = now + VSYNC_FRAME_INTERVAL_NS;
+        parcel.extend_from_slice(&1u32.to_ne_bytes()); // kNonNullParcelableFlag
+        parcel.extend_from_slice(&0i64.to_ne_bytes()); // preferredFrameTimelineIndex
+        parcel.extend_from_slice(&0u32.to_ne_bytes());
+        parcel.extend_from_slice(&1u32.to_ne_bytes()); // one frame timeline
+        parcel.extend_from_slice(&1i64.to_ne_bytes()); // vsyncId
+        parcel.extend_from_slice(&deadline.to_ne_bytes()); // deadlineTimestamp
+        parcel.extend_from_slice(&deadline.to_ne_bytes()); // expectedPresentationTime
+        if trace_enabled() {
+            diag(&format!("[binder]   -> VsyncEventData deadline={deadline}\n"));
+        }
+    }
     if tr.target_handle == handle_for("display_event_connection") {
         // Only the measured setVsyncRate/requestNextVsync operations are known.
         // Other methods must not receive a fabricated empty success reply.
-        if tr.code != IDEC_STEAL_RECEIVE_CHANNEL {
+        if tr.code != IDEC_STEAL_RECEIVE_CHANNEL && tr.code != IDEC_GET_LATEST_VSYNC_EVENT_DATA {
             parcel.extend_from_slice(&0u32.to_ne_bytes());
         }
         if matches!(tr.code, IDEC_REQUEST_NEXT_VSYNC | IDEC_SET_VSYNC_RATE) {
@@ -4763,6 +4851,42 @@ mod tests {
         }
     }
 
+    /// `getLatestVsyncEventData` (native-only AIDL code 4) answers the
+    /// `VsyncEventData` wire layout measured in the shipped libgui.so:
+    /// status, parcelable presence 1, preferred index 0, one frame timeline
+    /// whose deadline/expected time are the next 60 Hz pulse on
+    /// CLOCK_MONOTONIC. Unlike setVsyncRate/requestNextVsync it must not
+    /// push a vsync event into the stolen channel.
+    #[test]
+    fn display_event_connection_answers_vsync_event_data_without_sending() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let target = handle_for("display_event_connection");
+        let data = service_request("android.gui.IDisplayEventConnection", "");
+        VSYNC_SEND_FDS.lock().unwrap().clear();
+        let before = monotonic_ns();
+        let reply = unsafe { make_reply(&transaction(target, IDEC_GET_LATEST_VSYNC_EVENT_DATA, &data), 1) };
+        let after = monotonic_ns();
+        assert_eq!(reply.flags, 0);
+        assert!(reply.objects.is_empty());
+        assert_eq!(reply.parcel.len(), 48);
+        assert_eq!(&reply.parcel[0..4], &0u32.to_ne_bytes()); // AIDL status OK
+        assert_eq!(&reply.parcel[4..8], &1u32.to_ne_bytes()); // parcelable presence
+        assert_eq!(&reply.parcel[8..16], &0i64.to_ne_bytes()); // preferred index
+        assert_eq!(&reply.parcel[16..20], &0u32.to_ne_bytes());
+        assert_eq!(&reply.parcel[20..24], &1u32.to_ne_bytes()); // one timeline
+        let vsync_id = i64::from_ne_bytes(reply.parcel[24..32].try_into().unwrap());
+        let deadline = i64::from_ne_bytes(reply.parcel[32..40].try_into().unwrap());
+        let expected = i64::from_ne_bytes(reply.parcel[40..48].try_into().unwrap());
+        assert_eq!(vsync_id, 1);
+        assert!(deadline >= before + VSYNC_FRAME_INTERVAL_NS && deadline <= after + VSYNC_FRAME_INTERVAL_NS);
+        assert_eq!(deadline, expected);
+        assert!(VSYNC_SEND_FDS.lock().unwrap().is_empty());
+        // Codes outside the measured set still refuse instead of inventing a reply.
+        for code in [0, 5, 6, 9999] {
+            assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &data), 1) });
+        }
+    }
+
     /// The API-37 C++ `ISurfaceComposer` descriptor shares the SurfaceFlinger
     /// handle with the AIDL one. Its accepted tags answer with an empty body (the
     /// `status_t` travels in the reply header, not in a body status word), which
@@ -5164,18 +5288,18 @@ mod tests {
         let _device_restore = reset_table(&VIRTUAL_INPUT_DEVICE, 0x1234_5678u32.to_ne_bytes().to_vec());
         let target = handle_for("input");
         let data = request(&[-1]);
-        for code in [0, 1, 2, 3, 4, 5, 6, 7, 22, 101, 203, 9999] {
+        for code in [0, 1, 2, 3, 4, 5, 6, 7, 22, 8, 101, 203, 9999] {
             assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &data), 1) });
         }
         // API 37 has no isInputDeviceEnabled method; its zero slot is not a code.
-        let codes = [101, 203, 0, 409, 503, 607, 709, 809];
-        assert!(!unsafe { __pengudroid_binder_set_input_transactions(std::ptr::null(), 8) });
-        for len in [0, 7, 9] {
+        let codes = [101, 203, 0, 409, 503, 607, 709, 809, 909];
+        assert!(!unsafe { __pengudroid_binder_set_input_transactions(std::ptr::null(), 9) });
+        for len in [0, 8, 10] {
             assert!(!unsafe { __pengudroid_binder_set_input_transactions(codes.as_ptr(), len) });
         }
         assert_eq!(*INPUT_TRANSACTION_CODES.lock().unwrap(), None);
         assert!(unsafe { __pengudroid_binder_set_input_transactions(codes.as_ptr(), codes.len()) });
-        for i in 0..8 {
+        for i in 0..9 {
             for invalid in [0, 0x00ff_fffe, 0x00ff_ffff, 0x0100_0000] {
                 if i == 2 && invalid == 0 { continue; }
                 let mut bad = codes;
@@ -5207,7 +5331,14 @@ mod tests {
             assert_eq!(reply.parcel, expected);
             assert!(reply.objects.is_empty());
         }
-        for code in [0, 1, 2, 3, 4, 5, 6, 7, 22, 9999] {
+        // Op 8 (getVelocityTrackerStrategy, code 909) answers a parcelled
+        // "default" string instead of an int; ops beyond the installed table
+        // still refuse.
+        let strategy = unsafe { make_reply(&transaction(target, 909, &request(&[-1])), 1) };
+        let slen = u32::from_le_bytes(strategy.parcel[4..8].try_into().unwrap()) as usize;
+        assert_eq!(slen, 7);
+        assert_eq!(&strategy.parcel[8..8 + slen * 2], b"d\0e\0f\0a\0u\0l\0t\0");
+        for code in [0, 1, 2, 3, 4, 5, 6, 7, 22, 8, 9999] {
             assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &data), 1) });
         }
         for args in [vec![], vec![-1, 0, -1], vec![-1, 0, 769], vec![-1, 0, 1, 29]] {
@@ -5417,12 +5548,13 @@ mod tests {
         let _restore = reset_table(&AUDIO_FOCUS_TRANSACTIONS, None);
         let target = handle_for("audio");
         AUDIO_FOCUS.abandon();
-        for code in [0, 66, 67, 68, 69, 101, 203, 307, 409] {
+        for code in [0, 66, 67, 68, 69, 101, 203, 307, 409, 511, 613] {
             assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &[]), 1) });
         }
-        assert!(__pengudroid_binder_set_audio_focus_transactions(101, 203, 307, 409));
-        assert!(!__pengudroid_binder_set_audio_focus_transactions(0, 203, 307, 409));
-        assert!(!__pengudroid_binder_set_audio_focus_transactions(101, 101, 307, 409));
+        assert!(__pengudroid_binder_set_audio_focus_transactions(101, 203, 307, 409, 511, 613));
+        assert!(!__pengudroid_binder_set_audio_focus_transactions(0, 203, 307, 409, 511, 613));
+        assert!(!__pengudroid_binder_set_audio_focus_transactions(101, 101, 307, 409, 511, 613));
+        assert!(!__pengudroid_binder_set_audio_focus_transactions(101, 203, 307, 409, 101, 613));
         AUDIO_FOCUS.request(3);
         for code in [0, 66, 67, 68, 69, 9999] {
             assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &[]), 1) });
@@ -5444,6 +5576,37 @@ mod tests {
         let reply = unsafe { make_reply(&transaction(target, 101, &[]), 1) };
         assert_eq!(reply.flags, 0);
         assert_eq!(&reply.parcel[4..8], &0i32.to_ne_bytes());
+        // Capture policy: defaults to ALLOW_CAPTURE_BY_ALL (1); a valid
+        // 1..=3 is stored and returns SUCCESS (0), anything else is
+        // ERROR_BAD_VALUE (-2) and leaves the previous policy alone.
+        let restore_policy = CAPTURE_POLICY.set(1);
+        assert_eq!(restore_policy, 0);
+        let reply = unsafe { make_reply(&transaction(target, 613, &[]), 1) };
+        assert_eq!(&reply.parcel[4..8], &1i32.to_ne_bytes());
+        // The policy argument sits after the `android.media.IAudioService`
+        // interface token; a bare-int parcel has no token and is rejected.
+        fn with_policy(policy: i32) -> Vec<u8> {
+            // Real parcels carry only the interface token, then the args.
+            let mut p = Vec::new();
+            p.extend_from_slice(&0x8000_0000u32.to_ne_bytes());
+            p.extend_from_slice(&u32::MAX.to_ne_bytes());
+            p.extend_from_slice(&0x5359_5354u32.to_ne_bytes());
+            p.extend_from_slice(&string16("android.media.IAudioService"));
+            p.extend_from_slice(&policy.to_ne_bytes());
+            p
+        }
+        let reply = unsafe { make_reply(&transaction(target, 511, &with_policy(3)), 1) };
+        assert_eq!(&reply.parcel[4..8], &0i32.to_ne_bytes());
+        let reply = unsafe { make_reply(&transaction(target, 613, &[]), 1) };
+        assert_eq!(&reply.parcel[4..8], &3i32.to_ne_bytes());
+        let reply = unsafe { make_reply(&transaction(target, 511, &with_policy(7)), 1) };
+        assert_eq!(&reply.parcel[4..8], &(-2i32).to_ne_bytes());
+        let reply = unsafe { make_reply(&transaction(target, 613, &[]), 1) };
+        assert_eq!(&reply.parcel[4..8], &3i32.to_ne_bytes());
+        let bare_int = 1i32.to_ne_bytes().to_vec();
+        let reply = unsafe { make_reply(&transaction(target, 511, &bare_int), 1) };
+        assert_eq!(&reply.parcel[4..8], &(-2i32).to_ne_bytes());
+        CAPTURE_POLICY.set(1);
     }
 
     /// `AudioManager.updateAudioPortCache` polls `listAudioPorts` and then

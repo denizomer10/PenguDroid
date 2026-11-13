@@ -2,6 +2,35 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
+## Where we left off — the last three unimplemented binder transactions are now shimmed (2026-11-13)
+
+Pick up here. The three remaining `UNKNOWN_TRANSACTION` sources seen in BBR2
+logs are implemented in `pengudroid-shim` and installed from the real framework
+`TRANSACTION_*` fields at apphost startup:
+
+| Gap | Code | Shim reply |
+|---|---|---|
+| `IAudioService.setAllowedCapturePolicy` / `getAllowedCapturePolicy` | 171 / 172 (read from `IAudioService$Stub`, non-contiguous in API 37) | state held in `audiofocus::CapturePolicy` (default `ALLOW_CAPTURE_BY_ALL`=1); set validates 1..=3 → `SUCCESS`=0, else `ERROR_BAD_VALUE`=-2 and keeps the old value; get returns the current policy. The policy int is read after the `android.media.IAudioService` interface token (`after_interface_token`) |
+| `IInputManager.getVelocityTrackerStrategy` | 1 | parcelled String16 `"default"` — `VelocityTracker.toStrategyId` maps any unrecognized name to DEFAULT, so this is always accepted (input table widened to 9 ops, op 8) |
+| `IDisplayEventConnection.getLatestVsyncEventData` | 4 (native-only AIDL, no Java Stub; declaration order) | `VsyncEventData` wire layout measured in the shipped x86-64 `libgui.so` (`ParcelableVsyncEventData::readFromParcel`): status + presence 1 + preferred index 0 + count 1 + one `{vsyncId=1, deadline, expected}` timeline on `CLOCK_MONOTONIC` at the next 60 Hz pulse. Does **not** push a vsync event into the stolen channel |
+
+Validation on this checkout: `cargo test --offline -p pengudroid-shim` **155
+passed** (+ new contract tests for all three replies), `cargo test --offline
+-p pengudroid-cli` green (94+7+2+3+2), and a 170 s BBR2 smoke run
+(`pengudroid launch <cobalt apkm> --backend auto`) with **zero
+`Fatal signal`/`SIGBUS`/`SIGSEGV` and zero `UNKNOWN_TRANSACTION`**; the apphost
+log shows the real installed codes `audio=[82,83,84,85,171,172]`,
+`input=[2,3,0,4,5,6,7,39,1]`.
+
+### Next concrete task
+
+Re-run the Genshin-adjacent smoke set (BBR2 launch, resize via
+`SetWindowState`, tablet classification) and keep closing whatever the next
+`UNKNOWN_TRANSACTION` turns out to be. The big blocker is unchanged and lives
+outside this repo: image mode needs the ARM64 translator to resume after a
+delivered guest signal (see the uffd section below). `Constructor.getReturnType()`
+stays a logged upstream guest bug — do not shim it.
+
 ## Where we left off — boot image loads, but uffd GC cannot run under the bridge (2026-11-13)
 
 Pick up here. The x86_64 boot image from the Android 17 GSI **validates and
@@ -241,10 +270,11 @@ was before this table existed.
    never reallocated (`720x1280` throughout). What is still untested is a human
    pointer drag; Mutter sent these configures. See [LIMITATIONS.md](LIMITATIONS.md) §4.1–4.2; `pengudroid
    geometry --resize WxH` prints the classification a session would report.
-3. **Service gaps that show up as log noise.** `listAudioPorts` and
-   `listAudioPatches` are now answered (see below); audio code 171 and input
-   code 1 are still unimplemented, and `berberis: trans#`/`dispatch#` DEBUG
-   lines dominate the log.
+3. **Service gaps that show up as log noise.** `listAudioPorts`/`listAudioPatches`,
+   audio code 171/172 (`set/getAllowedCapturePolicy`), input code 1
+   (`getVelocityTrackerStrategy`), and `IDisplayEventConnection` code 4
+   (`getLatestVsyncEventData`) are all answered now (see the top section);
+   `berberis: trans#`/`dispatch#` DEBUG lines still dominate the log.
 4. **A guest JNI bug that is not ours.** BBR2 issues a `GetMethodID` for
    `Constructor.getReturnType()`, which does not exist (verified by parsing
    `core-oj.jar`). It is logged and does not kill the main loop.

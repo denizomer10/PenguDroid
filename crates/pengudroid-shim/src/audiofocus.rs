@@ -5,14 +5,15 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 /// Semantic operations are independent of generated AIDL transaction numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Operation { Request, Abandon, Unregister, Current }
+pub enum Operation { Request, Abandon, Unregister, Current, SetCapturePolicy, GetCapturePolicy }
 
 #[derive(Clone, Copy, Debug)]
-pub struct Transactions([u32; 4]);
+pub struct Transactions([u32; 6]);
 impl Transactions {
     /// Validate codes read from the loaded API-37 IAudioService Stub, in
-    /// request/abandon/unregister/current order. There is no default table.
-    pub fn new(codes: [u32; 4]) -> Option<Self> {
+    /// request/abandon/unregister/current/setAllowedCapturePolicy/
+    /// getAllowedCapturePolicy order. There is no default table.
+    pub fn new(codes: [u32; 6]) -> Option<Self> {
         if codes.iter().any(|&c| c == 0 || c >= 0x00ff_fffe)
             || codes.iter().enumerate().any(|(i, c)| codes[..i].contains(c)) {
             return None;
@@ -22,8 +23,25 @@ impl Transactions {
     pub fn operation(self, code: u32) -> Option<Operation> {
         self.0.iter().position(|&c| c == code).map(|i| [
             Operation::Request, Operation::Abandon, Operation::Unregister, Operation::Current,
+            Operation::SetCapturePolicy, Operation::GetCapturePolicy,
         ][i])
     }
+}
+
+/// The process-wide playback capture policy (`AudioAttributes.ALLOW_CAPTURE_BY_*`).
+/// AudioService defaults it to `ALLOW_CAPTURE_BY_ALL` (1); a hosted process has no
+/// other app to capture it, so accepting and remembering the policy is truthful.
+pub struct CapturePolicy(AtomicI32);
+impl CapturePolicy {
+    pub const fn new() -> Self { Self(AtomicI32::new(1)) } // ALLOW_CAPTURE_BY_ALL
+    /// `AudioManager.SUCCESS` (0) for a valid policy, `ERROR_BAD_VALUE` (-2)
+    /// otherwise, without touching the stored policy.
+    pub fn set(&self, policy: i32) -> i32 {
+        if !(1..=3).contains(&policy) { return -2; }
+        self.0.store(policy, Ordering::Relaxed);
+        0
+    }
+    pub fn get(&self) -> i32 { self.0.load(Ordering::Relaxed) }
 }
 
 pub struct AudioFocus(AtomicI32);
@@ -46,19 +64,31 @@ mod tests {
     use super::*;
     #[test]
     fn remapped_transactions_do_not_dispatch_legacy_numbers() {
-        let table = Transactions::new([101, 203, 307, 409]).unwrap();
+        let table = Transactions::new([101, 203, 307, 409, 511, 613]).unwrap();
         for (code, op) in [(101, Operation::Request), (203, Operation::Abandon),
-            (307, Operation::Unregister), (409, Operation::Current)] {
+            (307, Operation::Unregister), (409, Operation::Current),
+            (511, Operation::SetCapturePolicy), (613, Operation::GetCapturePolicy)] {
             assert_eq!(table.operation(code), Some(op));
         }
         for code in [0, 66, 67, 68, 69] {
             assert_eq!(table.operation(code), None);
         }
-        assert!(Transactions::new([1, 1, 2, 3]).is_none());
-        assert!(Transactions::new([0, 1, 2, 3]).is_none());
-        assert!(Transactions::new([0x00ff_fffe, 1, 2, 3]).is_none());
-        assert!(Transactions::new([0x00ff_ffff, 1, 2, 3]).is_none());
-        assert!(Transactions::new([0x0100_0000, 1, 2, 3]).is_none());
+        assert!(Transactions::new([1, 1, 2, 3, 4, 5]).is_none());
+        assert!(Transactions::new([0, 1, 2, 3, 4, 5]).is_none());
+        assert!(Transactions::new([0x00ff_fffe, 1, 2, 3, 4, 5]).is_none());
+        assert!(Transactions::new([0x00ff_ffff, 1, 2, 3, 4, 5]).is_none());
+        assert!(Transactions::new([0x0100_0000, 1, 2, 3, 4, 5]).is_none());
+    }
+
+    #[test]
+    fn capture_policy_defaults_to_allow_all_and_rejects_out_of_range() {
+        let policy = CapturePolicy::new();
+        assert_eq!(policy.get(), 1); // ALLOW_CAPTURE_BY_ALL
+        assert_eq!(policy.set(3), 0); // ALLOW_CAPTURE_BY_NONE
+        assert_eq!(policy.get(), 3);
+        assert_eq!(policy.set(0), -2);
+        assert_eq!(policy.set(4), -2);
+        assert_eq!(policy.get(), 3);
     }
 
     #[test]

@@ -47,6 +47,12 @@ pub fn reply(code: u32, args: &[u8], device: &[u8]) -> Option<Vec<u8>> {
             let key = int(args, 1)?;
             words.push(if int(args, 0) == Some(-1) && !device.is_empty() && supported(key) { key } else { 0 });
         }
+        8 => {
+            // `getVelocityTrackerStrategy()`. `VelocityTracker.toStrategyId`
+            // maps any unrecognized name to DEFAULT, so "default" is always
+            // accepted; the reply is a parcelled String16, not an int.
+            return Some(crate::binder::string16("default"));
+        }
         _ => return None,
     }
     Some(words.into_iter().flat_map(i32::to_le_bytes).collect())
@@ -87,6 +93,20 @@ mod tests {
         assert_eq!(reply(6, &bytes(&[4, 0x101, 1, 29, 1]), &[10]), Some(bytes(&[0, 1, 0])));
         assert!(reply(6, &bytes(&[-1, 0, i32::MAX]), &[10]).is_none());
         assert!(reply(6, &bytes(&[-1, 0, 1, 29]), &[10]).is_none());
+    }
+
+    #[test]
+    fn velocity_tracker_strategy_is_a_parcelled_default_string() {
+        let reply = reply(8, &[], &[10]).unwrap();
+        let len = u32::from_le_bytes(reply[..4].try_into().unwrap()) as usize;
+        assert_eq!(len, 7); // "default"
+        let text: Vec<u16> = reply[4..4 + len * 2]
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        assert_eq!(String::from_utf16(&text).unwrap(), "default");
+        assert_eq!(&reply[4 + len * 2..4 + len * 2 + 2], &[0, 0]);
+        assert_eq!(reply.len() % 4, 0);
     }
 
     #[test]

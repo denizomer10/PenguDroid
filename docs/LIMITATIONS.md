@@ -540,7 +540,13 @@ the field or its `Rect` cannot be resolved.
 Apps that talk to `SurfaceFlinger` directly (surface control, layer stacks,
 secure layers, `Transaction` queues) will not get faithful behaviour. The
 `SurfaceComposer` stub answers introspection only. Multi-window, overlays, and
-hardware composition are out of scope for the MVP.
+hardware composition are out of scope for the MVP. The `IDisplayEventConnection`
+handle answers `stealReceiveChannel`/`setVsyncRate`/`requestNextVsync` as before,
+and `getLatestVsyncEventData` (native-only AIDL code 4) now returns one frame
+timeline at the next 60 Hz `CLOCK_MONOTONIC` pulse, marshalled in the exact
+`VsyncEventData` wire layout measured in the shipped `libgui.so`; other codes
+still refuse rather than fabricate a reply. `IInputManager.getVelocityTrackerStrategy`
+(code 1) answers the parcelled string `"default"`.
 
 ## 6. Kernel binder may be unavailable
 
@@ -565,9 +571,12 @@ order for a given AOSP release and can shift when methods are inserted.
 The camera reports "zero cameras"; `AudioFlinger` returns empty replies, and the
 audio **policy** service answers `listAudioPorts`/`listAudioPatches` with an
 empty list (the codes are read from the shipped `IAudioPolicyService$Stub`, so
-they are never guessed). Empty is truthful here — audio reaches the host without
-a framework port — but it also means anything that enumerates ports or patches
-to *choose* a route sees none.
+they are never guessed). `IAudioService.setAllowedCapturePolicy`/
+`getAllowedCapturePolicy` (codes 171/172, likewise read from the shipped Stub)
+keep a real policy state defaulting to `ALLOW_CAPTURE_BY_ALL` and validate
+1..=3 exactly like the framework (`SUCCESS`/`ERROR_BAD_VALUE`). Empty is
+truthful here — audio reaches the host without a framework port — but it also
+means anything that enumerates ports or patches to *choose* a route sees none.
 **`AudioTrack` no longer goes through it**: the Java class is hosted at the JNI
 boundary (`crates/pengudroid-shim/src/audiotrack.rs` interposes
 `AndroidRuntime::registerNativeMethods` and replaces the native table

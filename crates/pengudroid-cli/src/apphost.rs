@@ -6899,18 +6899,19 @@ fn install_audio_policy_transactions(env: &JniEnv) -> Option<()> {
 fn install_audio_focus_transactions(env: &JniEnv) -> Option<()> {
     let _frame = env.local_frame(16)?;
     let stub = env.find_class("android/media/IAudioService$Stub")?;
-    let mut codes = [0u32; 4];
+    let mut codes = [0u32; 6];
     for (out, name) in codes.iter_mut().zip([
         "TRANSACTION_requestAudioFocus", "TRANSACTION_abandonAudioFocus",
         "TRANSACTION_unregisterAudioFocusClient", "TRANSACTION_getCurrentAudioFocus",
+        "TRANSACTION_setAllowedCapturePolicy", "TRANSACTION_getAllowedCapturePolicy",
     ]) {
         let field = env.static_field_id(stub, name, "I")?;
         *out = u32::try_from(env.static_int_field(stub, field)).ok()?;
     }
     let setter = shim_symbol("__pengudroid_binder_set_audio_focus_transactions")?;
-    let setter: unsafe extern "C" fn(u32, u32, u32, u32) -> bool =
+    let setter: unsafe extern "C" fn(u32, u32, u32, u32, u32, u32) -> bool =
         unsafe { std::mem::transmute(setter) };
-    if !unsafe { setter(codes[0], codes[1], codes[2], codes[3]) } { return None; }
+    if !unsafe { setter(codes[0], codes[1], codes[2], codes[3], codes[4], codes[5]) } { return None; }
     println!("audio: framework focus transaction codes = {codes:?}");
     Some(())
 }
@@ -7161,7 +7162,8 @@ fn install_virtual_keyboard(env: &JniEnv) -> Option<()> {
     let input_stub = env.find_class("android/hardware/input/IInputManager$Stub")?;
     let mut input_codes = Vec::new();
     for name in ["getInputDevice", "getInputDeviceIds", "isInputDeviceEnabled", "enableInputDevice",
-        "disableInputDevice", "hasKeys", "getKeyCodeForKeyLocation", "registerInputDevicesChangedListener"] {
+        "disableInputDevice", "hasKeys", "getKeyCodeForKeyLocation", "registerInputDevicesChangedListener",
+        "getVelocityTrackerStrategy"] {
         // API 37 moved enabled state into InputDevice itself.
         if name == "isInputDeviceEnabled" { input_codes.push(0); continue; }
         let field = env.static_field_id(input_stub, &format!("TRANSACTION_{name}"), "I")?;
