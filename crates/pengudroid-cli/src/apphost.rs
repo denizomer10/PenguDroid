@@ -878,6 +878,10 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         eprintln!("apphost: cannot resolve framework audio focus transactions");
         return false;
     }
+    if install_audio_player_transactions(env).is_none() {
+        eprintln!("apphost: cannot resolve framework audio player transactions");
+        return false;
+    }
     // Non-fatal: an empty audio-port cache only costs log noise, so a
     // framework revision that renames the field must not block the launch.
     if install_audio_policy_transactions(env).is_none() {
@@ -6967,6 +6971,31 @@ fn install_audio_focus_transactions(env: &JniEnv) -> Option<()> {
     Some(())
 }
 
+/// `AudioTrack`/`AudioRecord` open a stream with `trackPlayer`/`trackRecorder`
+/// and read the int player id from the reply; `playerEvent`/`recorderEvent` and
+/// the release methods are void. BBR2's FMOD bring-up hit codes 2 and 4
+/// (`trackPlayer`/`playerEvent`) as UNKNOWN_TRANSACTION until these were
+/// installed.
+fn install_audio_player_transactions(env: &JniEnv) -> Option<()> {
+    let _frame = env.local_frame(16)?;
+    let stub = env.find_class("android/media/IAudioService$Stub")?;
+    let mut codes = [0u32; 7];
+    for (out, name) in codes.iter_mut().zip([
+        "TRANSACTION_trackPlayer", "TRANSACTION_playerAttributes", "TRANSACTION_playerEvent",
+        "TRANSACTION_releasePlayer", "TRANSACTION_trackRecorder", "TRANSACTION_recorderEvent",
+        "TRANSACTION_releaseRecorder",
+    ]) {
+        let field = env.static_field_id(stub, name, "I")?;
+        *out = u32::try_from(env.static_int_field(stub, field)).ok()?;
+    }
+    let setter = shim_symbol("__pengudroid_binder_set_audio_player_transactions")?;
+    let setter: unsafe extern "C" fn(u32, u32, u32, u32, u32, u32, u32) -> bool =
+        unsafe { std::mem::transmute(setter) };
+    if !unsafe { setter(codes[0], codes[1], codes[2], codes[3], codes[4], codes[5], codes[6]) } { return None; }
+    println!("audio: framework player transaction codes = {codes:?}");
+    Some(())
+}
+
 /// Drive the real AIDL proxy so focus tests cover request argument parsing,
 /// rather than only the hosted policy's Rust state machine.
 pub fn probe_audio_focus(env: &JniEnv) -> bool {
@@ -7990,6 +8019,10 @@ const SETTINGS_VALUES: &[(&str, &str)] = &[
     ("adb_enabled", "0"),
     ("device_provisioned", "1"),
     ("user_setup_complete", "1"),
+    // Ad SDKs (AppLovin/FBAudienceNetwork) read `Settings.Secure.getInt(
+    // "limit_ad_tracking")`; a null value throws `SettingNotFoundException`
+    // inside `parseIntSetting` and kills the collector thread.
+    ("limit_ad_tracking", "0"),
 ];
 
 /// Install one marshalled `Bundle` per `Settings` key.

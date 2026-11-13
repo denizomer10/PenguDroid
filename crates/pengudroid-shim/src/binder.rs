@@ -1099,6 +1099,19 @@ static CAPTURE_POLICY: crate::audiofocus::CapturePolicy = crate::audiofocus::Cap
 static AUDIO_FOCUS_TRANSACTIONS: Mutex<Option<crate::audiofocus::Transactions>> =
     Mutex::new(None);
 
+/// `IAudioService` player/recorder lifecycle codes in Stub order:
+/// trackPlayer, playerAttributes, playerEvent, releasePlayer, trackRecorder,
+/// recorderEvent, releaseRecorder. `AudioTrack`/`AudioRecord` call
+/// `trackPlayer`/`trackRecorder` when a stream is opened and get an int
+/// player id back; the remaining methods are void. A status-only fallthrough
+/// decodes the id as 0, which `PlayerBase` rejects, so the two track methods
+/// must answer a real id.
+static AUDIO_PLAYER_TRANSACTIONS: Mutex<Option<[u32; 7]>> = Mutex::new(None);
+
+/// Player/recorder ids handed out by the track methods, starting at 1.
+static AUDIO_PLAYER_NEXT_ID: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(1);
+
 /// Per-service tables of transaction codes that answer with an empty
 /// `ParceledListSlice` (`shortcut` and `jobscheduler`). A status-only
 /// fallthrough decodes as presence 0 = null slice, and the caller then NPEs
@@ -1180,6 +1193,27 @@ pub extern "C" fn __pengudroid_binder_set_audio_focus_transactions(
         return false;
     };
     *AUDIO_FOCUS_TRANSACTIONS.lock().unwrap_or_else(|e| e.into_inner()) = Some(table);
+    true
+}
+
+/// Install trackPlayer/playerAttributes/playerEvent/releasePlayer/
+/// trackRecorder/recorderEvent/releaseRecorder codes from the loaded Stub.
+/// All must be nonzero, distinct user codes; false preserves the previous
+/// table. Until installation none of these methods dispatch.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_audio_player_transactions(
+    track_player: u32, player_attributes: u32, player_event: u32, release_player: u32,
+    track_recorder: u32, recorder_event: u32, release_recorder: u32,
+) -> bool {
+    let codes = [
+        track_player, player_attributes, player_event, release_player,
+        track_recorder, recorder_event, release_recorder,
+    ];
+    if codes.iter().any(|&c| c == 0 || c >= 0x00ff_fffe)
+        || codes.iter().enumerate().any(|(i, c)| codes[..i].contains(c)) {
+        return false;
+    }
+    *AUDIO_PLAYER_TRANSACTIONS.lock().unwrap_or_else(|e| e.into_inner()) = Some(codes);
     true
 }
 
@@ -3115,7 +3149,23 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
                     diag(&format!("[binder]   -> getAllowedCapturePolicy policy={policy}\n"));
                 }
             }
-            None => return Reply::unknown_transaction(tr, "unimplemented IAudioService method"),
+            None => {
+                // Player/recorder lifecycle: trackPlayer (index 0) and
+                // trackRecorder (index 4) return an int id; the rest are void
+                // and keep the status-only reply.
+                let players = *AUDIO_PLAYER_TRANSACTIONS.lock().unwrap_or_else(|e| e.into_inner());
+                match players.and_then(|p| p.iter().position(|&c| c == tr.code)) {
+                    Some(0) | Some(4) => {
+                        let id = AUDIO_PLAYER_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        parcel.extend_from_slice(&id.to_ne_bytes());
+                        if trace_enabled() {
+                            diag(&format!("[binder]   -> audio player id={id}\n"));
+                        }
+                    }
+                    Some(_) => {}
+                    None => return Reply::unknown_transaction(tr, "unimplemented IAudioService method"),
+                }
+            }
         }
     }
     if tr.target_handle == handle_for("input") {
@@ -5839,6 +5889,45 @@ mod tests {
         let reply = unsafe { make_reply(&transaction(target, 511, &bare_int), 1) };
         assert_eq!(&reply.parcel[4..8], &(-2i32).to_ne_bytes());
         CAPTURE_POLICY.set(1);
+    }
+
+    /// `AudioTrack` opens a stream through `trackPlayer` and reads an int
+    /// player id from the reply (0 is rejected by `PlayerBase`); the event and
+    /// release methods are void. Only the installed codes may answer, and the
+    /// track methods must return distinct positive ids.
+    #[test]
+    fn audio_player_track_methods_return_fresh_ids_only_for_installed_codes() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = reset_table(&AUDIO_PLAYER_TRANSACTIONS, None);
+        let target = handle_for("audio");
+        // Focus table must exist for the audio branch to run at all.
+        let _focus = reset_table(&AUDIO_FOCUS_TRANSACTIONS, None);
+        assert!(__pengudroid_binder_set_audio_focus_transactions(101, 203, 307, 409, 511, 613));
+        for code in [0, 2, 3, 4, 5, 6, 7, 8, 9999] {
+            assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &[]), 1) });
+        }
+        // trackPlayer=2, playerAttributes=3, playerEvent=4, releasePlayer=5,
+        // trackRecorder=6, recorderEvent=7, releaseRecorder=8.
+        assert!(unsafe { __pengudroid_binder_set_audio_player_transactions(2, 3, 4, 5, 6, 7, 8) });
+        assert!(!unsafe { __pengudroid_binder_set_audio_player_transactions(2, 2, 4, 5, 6, 7, 8) });
+        assert!(!unsafe { __pengudroid_binder_set_audio_player_transactions(0, 3, 4, 5, 6, 7, 8) });
+        let reply = unsafe { make_reply(&transaction(target, 2, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        let first: i32 = i32::from_ne_bytes(reply.parcel[4..8].try_into().unwrap());
+        assert!(first > 0, "trackPlayer must not answer id 0: {first}");
+        let reply = unsafe { make_reply(&transaction(target, 6, &[]), 1) };
+        let second: i32 = i32::from_ne_bytes(reply.parcel[4..8].try_into().unwrap());
+        assert!(second > 0 && second != first, "trackRecorder id {second} must differ from {first}");
+        // Void methods answer status-only (the reply is the 4-byte status plus
+        // 8-byte-alignment padding).
+        for code in [3, 4, 5, 7, 8] {
+            let reply = unsafe { make_reply(&transaction(target, code, &[]), 1) };
+            assert_eq!(reply.flags, 0);
+            assert_eq!(reply.parcel.len(), 8, "code {code} must be void");
+            assert_eq!(&reply.parcel[4..8], &0u32.to_ne_bytes());
+        }
+        // Unknown codes still fall through.
+        assert_unknown_transaction(unsafe { make_reply(&transaction(target, 9, &[]), 1) });
     }
 
     /// `AudioManager.updateAudioPortCache` polls `listAudioPorts` and then
