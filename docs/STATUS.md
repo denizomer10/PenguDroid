@@ -2,6 +2,59 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
+## Where we left off — bridged BBR2 reaches SDL_main + FMOD; audio player transactions shimmed (2026-11-13)
+
+Pick up here. The **ARM64 native bridge is the real launch path for arm64-only
+games**: without `PENGUDROID_NATIVE_BRIDGE_LIB`/`PENGUDROID_ARM64_GUEST_ROOT`
+the sysroot picks `native_abi=x86_64`, extracts zero libs, and arm64-only
+APKMs die on `libSDL3.so`/`libfmod.so` "cannot open shared object file". With
+the verified bridge env (see `docs/NATIVE_BRIDGE.md` §~360):
+`PENGUDROID_NATIVE_BRIDGE_LIB=.toolchain/nativebridge-stage
+PENGUDROID_ARM64_GUEST_ROOT=.toolchain/guest-arm64-bridge
+PENGUDROID_BRIDGE_TLS=1 BERBERIS_FLAGS=glibc-host-thread-id-handoff`,
+the 600 s bridged BBR2 smoke (`/tmp/bbr2-bridge5.log`) runs the whole path:
+guest linker handshake → Berberis aarch64 → arm64 `libmain.so` loaded from
+`/tmp/pengudroid-libs/.../lib/arm64-v8a/` → `SDL_main` → `surfaceCreated()` →
+FMOD `AudioDevice::init`, **0 fatal signals**. Its only new actionable gap was
+`UNKNOWN_TRANSACTION target=10 (audio) code=2/4` — `IAudioService.trackPlayer`
+(must return a nonzero int player id; `PlayerBase` rejects 0) and
+`playerEvent` (void) — now shimmed in commit `7c7c7cb`:
+
+| Gap | Codes | Shim reply |
+|---|---|---|
+| `IAudioService` trackPlayer/playerAttributes/playerEvent/releasePlayer/trackRecorder/recorderEvent/releaseRecorder | 7 codes read from `IAudioService$Stub` `TRANSACTION_*` fields | trackPlayer (idx 0) / trackRecorder (idx 4) reply status + incrementing int32 id (from 1); the other five reply status-only (void) |
+
+Also in `7c7c7cb`: `Settings.Global limit_ad_tracking=0` added to
+`SETTINGS_VALUES` (AppLovin `collectFireOSAdvertisingInfo` no longer throws
+`SettingNotFoundException`). Validation: shim lib **158 passed**, cli green
+(94+7+2+3+2), pushed to `denizomer10-genshin-arm64-launch` at `7c7c7cb`.
+
+**Bridged smoke #6 (`/tmp/bbr2-bridge6.log`, 600 s) is fully clean: 0 fatal
+signals, 0 `UNKNOWN_TRANSACTION`.** The game booted end-to-end on the bridge:
+SDL_main ran the whole window, `surfaceCreated()` + BLAST surface handed out
+at 720x1280, FMOD `AudioDevice::init` OK and `AudioTrack sink restarted (1/5)`
+(the new player-id replies are accepted), TLS to the real game backend
+`free2play.cobalt.vectorunit.com:443` succeeded, Tenjin analytics sent with
+`limit_ad_tracking=false`. The only remaining NPE was
+`Bundle.getBoolean on null` in `BillingClient$Builder.build` —
+`ApplicationInfo.metaData` was null; fixed by installing an empty
+`android.os.Bundle` as `metaData` in `build_app_info` (uncommitted at handoff
+time). Remaining noise is benign (billing "Service not registered",
+PlayGames/GMS absence, `classes.dex` entry misses).
+
+### Next concrete task
+
+Commit the `metaData` fix, then run a longer bridged smoke (900 s) and watch
+how far BBR2 gets toward gameplay (menu/race, frame presents). Iterate any new
+gap the same way: root-cause from the log + API-37 dex, shim in
+`pengudroid-shim`, install codes from the real `TRANSACTION_*` fields in
+`apphost`, tests, bridged smoke. Genshin launch path uses the same bridge env
+(the Genshin APKM itself is never executed; image mode stays blocked on the
+translator signal-resume issue — document, don't chase). Non-bridged BBR2
+smokes stay fully clean (`/tmp/bbr2-smoke3/4.log`). Resize (protocol v5) was
+re-verified after the shim segment: `2560x1373`→tablet, `2176x1167`/`668x1189`
+→phone, guest buffer `720x1280`.
+
 ## Where we left off — the last null-reply NPE classes are shimmed (2026-11-13)
 
 Pick up here. A 280 s BBR2 smoke (`/tmp/bbr2-smoke3.log`) showed three remaining

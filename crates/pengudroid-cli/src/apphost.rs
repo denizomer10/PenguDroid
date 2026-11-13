@@ -212,6 +212,17 @@ fn build_app_info(env: &JniEnv, spec: &AppSpec<'_>) -> Option<JObject> {
     // ever drawn. `FLAG_HAS_CODE` (0x4) and `FLAG_SUPPORTS_SCREEN_DENSITIES`
     // (0x2000) are what a normal APK declares.
     set_int("flags", 0x1000_0000 | 0x2000 | 0x4);
+    // `BillingClient$Builder.build()` calls `metaData.getBoolean(...)` straight
+    // off ApplicationInfo; a null metaData NPEs there (seen in BBR2's
+    // VuBillingHelper). An empty Bundle is the honest answer: the manifest
+    // declares no billing metadata.
+    if let Some(id) = env.field_id(class, "metaData", "Landroid/os/Bundle;") {
+        if let Some((_, bundle)) = new_instance(env, "android/os/Bundle") {
+            env.set_object_field(info, id, bundle);
+        } else {
+            eprintln!("apphost: could not instantiate metaData Bundle");
+        }
+    }
     // Read back the fields `LoadedApk` depends on: a silently failed write here
     // shows up much later as "No data directory found for package".
     if let Some(id) = env.field_id(class, "dataDir", "Ljava/lang/String;") {
