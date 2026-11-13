@@ -2,6 +2,47 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
+## Where we left off — the last null-reply NPE classes are shimmed (2026-11-13)
+
+Pick up here. A 280 s BBR2 smoke (`/tmp/bbr2-smoke3.log`) showed three remaining
+NPE classes, all caused by status-only fallthrough replies decoding as null:
+all are now shimmed in `pengudroid-shim` and installed from the real framework
+`TRANSACTION_*` fields at apphost startup:
+
+| Gap | Codes | Shim reply |
+|---|---|---|
+| `shortcut` `getShortcuts`/`getShareTargets` (NPE in `ShortcutManager.getDynamicShortcuts` on `ParceledListSlice.getList()`) | 23 / 20 (read from `IShortcutService$Stub`) | status + `[presence=1][count=0]` — empty `ParceledListSlice` |
+| `jobscheduler` `getAllPendingJobsInNamespace`/`getAllJobSnapshots` (NPE in `JobSchedulerImpl.getAllPendingJobs`) | 8 / 17 (read from `IJobScheduler$Stub`) | same empty-slice shape |
+| `graphicsstats` `requestBufferForProcess` (NPE in `HardwareRenderer` on `ParcelFileDescriptor.getFd()`) | 1 (read from `IGraphicsStats$Stub`) | status + `[presence=1][hasComm=0][flat BINDER_TYPE_FD]` wrapping a fresh zeroed ashmem memfd of `0x248` bytes — `nGetAshmemSize()` in the shipped `libhwui.so` returns exactly `0x248`, and the client rejects smaller regions ("Ashmem region is too small") |
+
+Wire formats were verified against the API 37 dex/libhwui: Proxy calls
+`readException()` + `readTypedObject(PFD.CREATOR)`; `ParcelFileDescriptor.writeToParcel`
+writes `[hasComm][writeFileDescriptor]`; `ParceledListSlice.writeToParcel` is
+`writeTypedList` = `[count]`.
+
+Validation on this checkout: `cargo test --offline -p pengudroid-shim` **157
+passed**, `cargo test --offline -p pengudroid-cli` green (94+7+2+3+2), and the
+280 s BBR2 smoke with **zero `Fatal signal`/`SIGBUS`/`SIGSEGV`, zero
+`UNKNOWN_TRANSACTION`, zero `ParceledListSlice.getList()` NPEs and zero
+"Could not acquire gfx stats buffer" NPEs**; apphost logs
+`empty-list shortcut=[23,20]`, `empty-list jobscheduler=[8,17]`,
+`fd-reply graphicsstats=[1]`. Remaining noise is benign (aconfig mmap WARNs,
+`classes.dex` entry misses, GMS/Tenjin ads SDK complaints, 2x
+`libbinder.Parcel: Expecting binder but got null!` after app-thread capture on
+handle 17, "Failed to load FMOD libs").
+
+### Next concrete task
+
+Hunt the next gap from fresh BBR2 smoke logs (candidates: the two
+"Expecting binder but got null!" warnings around handle 17 — likely a service
+whose reply must carry a binder object; `Settings$SettingNotFoundException:
+limit_ad_tracking`; FMOD native lib loading). Then re-run the smoke set
+(BBR2 launch, resize via `SetWindowState`, tablet classification). The big
+blocker is unchanged and lives outside this repo: image mode needs the ARM64
+translator to resume after a delivered guest signal (see the uffd section
+below). `Constructor.getReturnType()` stays a logged upstream guest bug — do
+not shim it.
+
 ## Where we left off — the last three unimplemented binder transactions are now shimmed (2026-11-13)
 
 Pick up here. The three remaining `UNKNOWN_TRANSACTION` sources seen in BBR2
@@ -272,8 +313,10 @@ was before this table existed.
    geometry --resize WxH` prints the classification a session would report.
 3. **Service gaps that show up as log noise.** `listAudioPorts`/`listAudioPatches`,
    audio code 171/172 (`set/getAllowedCapturePolicy`), input code 1
-   (`getVelocityTrackerStrategy`), and `IDisplayEventConnection` code 4
-   (`getLatestVsyncEventData`) are all answered now (see the top section);
+   (`getVelocityTrackerStrategy`), `IDisplayEventConnection` code 4
+   (`getLatestVsyncEventData`), the `shortcut`/`jobscheduler` empty
+   `ParceledListSlice` replies, and `graphicsstats.requestBufferForProcess`'s
+   ashmem PFD are all answered now (see the top section);
    `berberis: trans#`/`dispatch#` DEBUG lines still dominate the log.
 4. **A guest JNI bug that is not ours.** BBR2 issues a `GetMethodID` for
    `Constructor.getReturnType()`, which does not exist (verified by parsing
@@ -737,10 +780,14 @@ and `code=1598968902` refusals **1 → 0**.
 Validation on this checkout: `cargo test --workspace --offline` **373 passed, 0
 failed**; `tools` unittest **214 passed**; `git diff --check` clean.
 
-Still open and unchanged: the `HardwareRenderer` graphics-stats buffer
-(`requestBuffer` returns no `ParcelFileDescriptor`: the unhosted `graphicsstats`
-service falls through to an empty success reply), the `ParceledListSlice` NPE on
-shortcuts, `IAudioService` code 171, and the `listAudioPorts` loop.
+Still open and unchanged: the two `libbinder.Parcel: Expecting binder but got
+null!` warnings (a service reply that must carry a binder object), the
+`Settings$SettingNotFoundException: limit_ad_tracking`, and BBR2's FMOD native
+lib load. Closed since this note: the `HardwareRenderer` graphics-stats buffer
+(`graphicsstats.requestBufferForProcess` now returns a real `0x248`-byte ashmem
+PFD), the `ParceledListSlice` NPEs on `shortcut`/`jobscheduler` (empty-slice
+replies), `IAudioService` code 171/172, and the `listAudioPorts` loop — see the
+top section.
 
 ## Previous handoff — activity roundtrip and video crop verified; ARM64 guest runtime still blocked (2026-10-31)
 

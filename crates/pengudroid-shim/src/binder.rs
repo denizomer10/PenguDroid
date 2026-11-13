@@ -1099,6 +1099,72 @@ static CAPTURE_POLICY: crate::audiofocus::CapturePolicy = crate::audiofocus::Cap
 static AUDIO_FOCUS_TRANSACTIONS: Mutex<Option<crate::audiofocus::Transactions>> =
     Mutex::new(None);
 
+/// Per-service tables of transaction codes that answer with an empty
+/// `ParceledListSlice` (`shortcut` and `jobscheduler`). A status-only
+/// fallthrough decodes as presence 0 = null slice, and the caller then NPEs
+/// on `ParceledListSlice.getList()` (seen for `ShortcutManager.getDynamicShortcuts`
+/// and `JobSchedulerImpl.getAllPendingJobs`).
+static EMPTY_LIST_SERVICES: Mutex<std::collections::BTreeMap<u32, Vec<u32>>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// Install `service`'s empty-`ParceledListSlice` codes from the loaded Stub.
+/// Codes must be nonzero, distinct user transaction codes; false preserves
+/// the previous table. Until installation the service keeps falling through.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_empty_list_transactions(
+    service: *const std::ffi::c_char, codes: *const u32, len: usize,
+) -> bool {
+    if service.is_null() || codes.is_null() || len == 0 { return false; }
+    let Ok(name) = (unsafe { std::ffi::CStr::from_ptr(service) }).to_str() else { return false };
+    let slice = unsafe { std::slice::from_raw_parts(codes, len) };
+    if slice.iter().any(|&c| c == 0 || c >= 0x00ff_fffe)
+        || slice.iter().enumerate().any(|(i, c)| slice[..i].contains(c))
+    { return false; }
+    EMPTY_LIST_SERVICES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(handle_for(name), slice.to_vec());
+    true
+}
+
+/// Per-service tables of transaction codes that answer with a
+/// `ParcelFileDescriptor` wrapping a fresh zeroed ashmem region
+/// (`graphicsstats`' `requestBufferForProcess`). A status-only fallthrough
+/// decodes as presence 0 = null PFD, and the caller then NPEs on
+/// `ParcelFileDescriptor.getFd()` (seen for `HardwareRenderer`'s gfx stats
+/// buffer).
+static FD_SERVICES: Mutex<std::collections::BTreeMap<u32, Vec<u32>>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// FDs handed out through `FD_SERVICES` replies, kept open for process
+/// lifetime: the client mmaps them after the transaction completes.
+static FD_REPLY_FDS: Mutex<Vec<RawFd>> = Mutex::new(Vec::new());
+
+/// `nGetAshmemSize()` in the shipped `libhwui.so` (API 37) returns `0x248`;
+/// the client rejects smaller regions with "Ashmem region is too small".
+const GFXSTATS_ASHMEM_SIZE: usize = 0x248;
+
+/// Install `service`'s ParcelFileDescriptor-returning codes from the loaded
+/// Stub. Codes must be nonzero, distinct user transaction codes; false
+/// preserves the previous table. Until installation the service keeps
+/// falling through.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_fd_transactions(
+    service: *const std::ffi::c_char, codes: *const u32, len: usize,
+) -> bool {
+    if service.is_null() || codes.is_null() || len == 0 { return false; }
+    let Ok(name) = (unsafe { std::ffi::CStr::from_ptr(service) }).to_str() else { return false };
+    let slice = unsafe { std::slice::from_raw_parts(codes, len) };
+    if slice.iter().any(|&c| c == 0 || c >= 0x00ff_fffe)
+        || slice.iter().enumerate().any(|(i, c)| slice[..i].contains(c))
+    { return false; }
+    FD_SERVICES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(handle_for(name), slice.to_vec());
+    true
+}
+
 /// Install request/abandon/unregister/current/setAllowedCapturePolicy/
 /// getAllowedCapturePolicy codes from the loaded Stub. All must be nonzero,
 /// distinct user codes; false preserves the previous table.
@@ -3422,6 +3488,55 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             diag(&format!("[binder]   -> thermal code {} operation={operation}\n", tr.code));
         }
     }
+    {
+        let empty_lists = EMPTY_LIST_SERVICES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(codes) = empty_lists.get(&tr.target_handle) {
+            if !codes.contains(&tr.code) {
+                return Reply::unknown_transaction(tr, "unimplemented empty-list service method");
+            }
+            // AIDL Parcelable return: `[presence=1]` then
+            // `ParceledListSlice.writeToParcel` = `writeTypedList` =
+            // `[count=0]`. The status word is already in the reply.
+            parcel.extend_from_slice(&1u32.to_ne_bytes());
+            parcel.extend_from_slice(&0u32.to_ne_bytes());
+            if trace_enabled() {
+                diag(&format!(
+                    "[binder]   -> empty ParceledListSlice for {} code {}\n",
+                    name_for_handle(tr.target_handle).unwrap_or_default(), tr.code
+                ));
+            }
+        }
+    }
+    {
+        let fd_services = FD_SERVICES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(codes) = fd_services.get(&tr.target_handle) {
+            if !codes.contains(&tr.code) {
+                return Reply::unknown_transaction(tr, "unimplemented fd service method");
+            }
+            drop(fd_services);
+            // AIDL Parcelable return: `[presence=1]` then
+            // `ParcelFileDescriptor.writeToParcel` = `[hasComm=0]` +
+            // `Parcel::writeFileDescriptor` flat object. The status word is
+            // already in the reply.
+            let fd = match crate::create_ashmem("pengudroid-gfxstats", GFXSTATS_ASHMEM_SIZE) {
+                Ok(fd) => fd,
+                Err(_) => return Reply::unknown_transaction(tr, "ashmem alloc failed"),
+            };
+            FD_REPLY_FDS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(fd);
+            parcel.extend_from_slice(&1u32.to_ne_bytes()); // presence
+            parcel.extend_from_slice(&0u32.to_ne_bytes()); // hasComm
+            push_flat_fd(&mut parcel, &mut objects, fd);
+            if trace_enabled() {
+                diag(&format!(
+                    "[binder]   -> ParcelFileDescriptor fd={fd} for {} code {}\n",
+                    name_for_handle(tr.target_handle).unwrap_or_default(), tr.code
+                ));
+            }
+        }
+    }
     if tr.target_handle == handle_for("package") && tr.code == IPM_GET_PROVIDER_INFO {
         // The request is `[interface token][ComponentName][flags][userId]`, so
         // the class name is not the last thing in the parcel. Match the parcel
@@ -5271,6 +5386,123 @@ mod tests {
         }
         for code in (0..=11).chain([9999]) {
             assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &[]), 1) });
+        }
+    }
+
+    /// `shortcut`/`jobscheduler` methods returning `ParceledListSlice` must
+    /// answer `[presence=1][count=0]` once their codes are installed; before
+    /// installation, and for any other code, they refuse instead of letting a
+    /// status-only fallthrough decode as a null slice (the caller NPEs on
+    /// `getList()`).
+    #[test]
+    fn empty_list_services_answer_presence_one_count_zero_only_for_installed_codes() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let target = handle_for("shortcut");
+        let jobsched = handle_for("jobscheduler");
+        {
+            let mut table = EMPTY_LIST_SERVICES.lock().unwrap_or_else(|e| e.into_inner());
+            table.remove(&target);
+            table.remove(&jobsched);
+        }
+        let name = std::ffi::CString::new("shortcut").unwrap();
+        let codes = [23u32, 20];
+        // Uninstalled: the bare status-only fallthrough (presence decodes as
+        // 0 = null slice — the NPE the installation exists to prevent).
+        for code in codes {
+            let reply = unsafe { make_reply(&transaction(target, code, &[]), 1) };
+            assert_eq!(reply.flags, 0);
+            assert_eq!(reply.parcel.len(), 8);
+            assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes());
+        }
+        assert!(!unsafe { __pengudroid_binder_set_empty_list_transactions(std::ptr::null(), codes.as_ptr(), 2) });
+        assert!(!unsafe { __pengudroid_binder_set_empty_list_transactions(name.as_ptr(), std::ptr::null(), 2) });
+        assert!(!unsafe { __pengudroid_binder_set_empty_list_transactions(name.as_ptr(), codes.as_ptr(), 0) });
+        assert!(!unsafe { __pengudroid_binder_set_empty_list_transactions(name.as_ptr(), [0, 20].as_ptr(), 2) });
+        assert!(!unsafe { __pengudroid_binder_set_empty_list_transactions(name.as_ptr(), [23, 23].as_ptr(), 2) });
+        assert!(unsafe { __pengudroid_binder_set_empty_list_transactions(name.as_ptr(), codes.as_ptr(), 2) });
+        for code in codes {
+            let reply = unsafe { make_reply(&transaction(target, code, &[]), 1) };
+            assert_eq!(reply.flags, 0);
+            let mut expected: Vec<u8> = [0u32, 1, 0].into_iter().flat_map(u32::to_ne_bytes).collect();
+            expected.resize((expected.len() + 7) & !7, 0);
+            assert_eq!(reply.parcel, expected);
+            assert!(reply.objects.is_empty());
+        }
+        for code in [0, 1, 21, 9999] {
+            assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &[]), 1) });
+        }
+        // The other service is untouched until its own installation.
+        let reply = unsafe { make_reply(&transaction(jobsched, 8, &[]), 1) };
+        assert_eq!(reply.parcel.len(), 8);
+        assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes());
+        let name = std::ffi::CString::new("jobscheduler").unwrap();
+        assert!(unsafe { __pengudroid_binder_set_empty_list_transactions(name.as_ptr(), [8, 17].as_ptr(), 2) });
+        let reply = unsafe { make_reply(&transaction(jobsched, 8, &[]), 1) };
+        let mut expected: Vec<u8> = [0u32, 1, 0].into_iter().flat_map(u32::to_ne_bytes).collect();
+        expected.resize((expected.len() + 7) & !7, 0);
+        assert_eq!(reply.parcel, expected);
+        {
+            let mut table = EMPTY_LIST_SERVICES.lock().unwrap_or_else(|e| e.into_inner());
+            table.remove(&target);
+            table.remove(&jobsched);
+        }
+    }
+
+    /// `graphicsstats.requestBufferForProcess` must answer with a present
+    /// `ParcelFileDescriptor` (`[presence=1][hasComm=0][flat fd]`) so
+    /// `HardwareRenderer` does not NPE on `getFd()`; the fd must name a real
+    /// ashmem-sized region because the client checks
+    /// "Ashmem region is too small".
+    #[test]
+    fn fd_services_answer_presence_one_hascomm_zero_flat_fd_only_for_installed_codes() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let target = handle_for("graphicsstats");
+        {
+            let mut table = FD_SERVICES.lock().unwrap_or_else(|e| e.into_inner());
+            table.remove(&target);
+        }
+        let fds_before = FD_REPLY_FDS.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let name = std::ffi::CString::new("graphicsstats").unwrap();
+        let codes = [1u32];
+        // Uninstalled: bare status-only fallthrough (presence decodes as 0).
+        let reply = unsafe { make_reply(&transaction(target, 1, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(reply.parcel.len(), 8);
+        assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes());
+        assert!(reply.objects.is_empty());
+        assert!(!unsafe { __pengudroid_binder_set_fd_transactions(std::ptr::null(), codes.as_ptr(), 1) });
+        assert!(!unsafe { __pengudroid_binder_set_fd_transactions(name.as_ptr(), std::ptr::null(), 1) });
+        assert!(!unsafe { __pengudroid_binder_set_fd_transactions(name.as_ptr(), codes.as_ptr(), 0) });
+        assert!(!unsafe { __pengudroid_binder_set_fd_transactions(name.as_ptr(), [0].as_ptr(), 1) });
+        assert!(unsafe { __pengudroid_binder_set_fd_transactions(name.as_ptr(), codes.as_ptr(), 1) });
+        let reply = unsafe { make_reply(&transaction(target, 1, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(reply.objects.len(), 1);
+        let mut expected: Vec<u8> = [0u32, 1, 0].into_iter().flat_map(u32::to_ne_bytes).collect();
+        // status + presence + hasComm, then the flat fd object (24 bytes).
+        let flat_off = expected.len();
+        expected.extend_from_slice(&BINDER_TYPE_FD.to_ne_bytes());
+        expected.extend_from_slice(&0x7fu32.to_ne_bytes());
+        let fd = {
+            let fds = FD_REPLY_FDS.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(fds.len(), fds_before + 1);
+            *fds.last().unwrap()
+        };
+        expected.extend_from_slice(&(fd as u32).to_ne_bytes());
+        expected.extend_from_slice(&0u32.to_ne_bytes());
+        expected.extend_from_slice(&0u64.to_ne_bytes());
+        expected.resize((expected.len() + 7) & !7, 0);
+        assert_eq!(reply.parcel, expected);
+        assert_eq!(reply.objects, vec![flat_off as u64]);
+        // The handed-out fd is a real region of nGetAshmemSize() bytes.
+        let size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
+        assert_eq!(size, GFXSTATS_ASHMEM_SIZE as i64);
+        for code in [0, 2, 9999] {
+            assert_unknown_transaction(unsafe { make_reply(&transaction(target, code, &[]), 1) });
+        }
+        {
+            let mut table = FD_SERVICES.lock().unwrap_or_else(|e| e.into_inner());
+            table.remove(&target);
         }
     }
 

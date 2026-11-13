@@ -6810,7 +6810,58 @@ fn install_user_thermal_transactions(env: &JniEnv) -> Option<()> {
             "unregisterThermalEventListener", "getCurrentTemperatures", "getCurrentTemperaturesWithType",
             "registerThermalStatusListener", "unregisterThermalStatusListener", "getCurrentThermalStatus",
             "getCurrentCoolingDevices", "getCurrentCoolingDevicesWithType", "getThermalHeadroom",
-        ])
+        ])?;
+    install_empty_list_transactions(env, "shortcut", "android/content/pm/IShortcutService$Stub",
+        &["getShortcuts", "getShareTargets"])?;
+    install_empty_list_transactions(env, "jobscheduler", "android/app/job/IJobScheduler$Stub",
+        &["getAllPendingJobsInNamespace", "getAllJobSnapshots"])?;
+    install_fd_transactions(env, "graphicsstats", "android/view/IGraphicsStats$Stub",
+        &["requestBufferForProcess"])
+}
+
+/// Register a service whose listed methods answer a `ParcelFileDescriptor`
+/// over a fresh ashmem region. A status-only fallthrough decodes as a null
+/// PFD and the framework NPEs on `ParcelFileDescriptor.getFd()`
+/// (`HardwareRenderer` gfx stats buffer).
+fn install_fd_transactions(
+    env: &JniEnv, service: &str, stub_class: &str, methods: &[&str],
+) -> Option<()> {
+    let _frame = env.local_frame(8)?;
+    let stub = env.find_class(stub_class)?;
+    let mut codes = Vec::with_capacity(methods.len());
+    for method in methods {
+        let field = env.static_field_id(stub, &format!("TRANSACTION_{method}"), "I")?;
+        codes.push(u32::try_from(env.static_int_field(stub, field)).ok()?);
+    }
+    let setter = shim_symbol("__pengudroid_binder_set_fd_transactions")?;
+    let setter: unsafe extern "C" fn(*const std::ffi::c_char, *const u32, usize) -> bool =
+        unsafe { std::mem::transmute(setter) };
+    let name = std::ffi::CString::new(service).ok()?;
+    if !unsafe { setter(name.as_ptr(), codes.as_ptr(), codes.len()) } { return None; }
+    println!("binder: fd-reply {service} transaction codes = {codes:?}");
+    Some(())
+}
+
+/// Register a service whose listed methods answer an empty `ParceledListSlice`.
+/// A status-only fallthrough decodes as a null slice and the framework NPEs on
+/// `ParceledListSlice.getList()` (`ShortcutManager`, `JobSchedulerImpl`).
+fn install_empty_list_transactions(
+    env: &JniEnv, service: &str, stub_class: &str, methods: &[&str],
+) -> Option<()> {
+    let _frame = env.local_frame(8)?;
+    let stub = env.find_class(stub_class)?;
+    let mut codes = Vec::with_capacity(methods.len());
+    for method in methods {
+        let field = env.static_field_id(stub, &format!("TRANSACTION_{method}"), "I")?;
+        codes.push(u32::try_from(env.static_int_field(stub, field)).ok()?);
+    }
+    let setter = shim_symbol("__pengudroid_binder_set_empty_list_transactions")?;
+    let setter: unsafe extern "C" fn(*const std::ffi::c_char, *const u32, usize) -> bool =
+        unsafe { std::mem::transmute(setter) };
+    let name = std::ffi::CString::new(service).ok()?;
+    if !unsafe { setter(name.as_ptr(), codes.as_ptr(), codes.len()) } { return None; }
+    println!("binder: empty-list {service} transaction codes = {codes:?}");
+    Some(())
 }
 
 fn install_media_transactions(env: &JniEnv) -> Option<()> {
