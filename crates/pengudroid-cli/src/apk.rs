@@ -16,8 +16,14 @@ pub enum MetaValue {
     Str(String),
     Int(i32),
     Bool(bool),
-    /// `android:resource` — a resource id.
+    /// `android:resource` — a resource id (stays an id, e.g. FileProvider's
+    /// `@xml` meta-data is loaded with `Resources.getXml(resId)`).
     Ref(u32),
+    /// `android:value="@..."` — a *value* reference. On a real device the
+    /// package parser resolves these to the literal value the app's
+    /// resources.arsc defines (e.g. `@integer/google_play_services_version`
+    /// becomes `12451000`, not the `0x7f...` id).
+    ValueRef(u32),
 }
 
 /// A declared Android component (`activity`, `service`, ...).
@@ -477,6 +483,10 @@ fn attr_meta_value(pool: &[String], attrs: &[Attr]) -> Option<MetaValue> {
             TYPE_STRING => MetaValue::Str(pool_get(pool, a.typed_data).unwrap_or_default()),
             TYPE_INT_DEC | TYPE_INT_HEX => MetaValue::Int(a.typed_data as i32),
             TYPE_INT_BOOLEAN => MetaValue::Bool(a.typed_data != 0),
+            // `android:value="@integer/google_play_services_version"` compiles
+            // to a value reference; the literal int must be resolved from
+            // resources.arsc (`Bundle.getInt` needs 12451000, not the id).
+            TYPE_REFERENCE => MetaValue::ValueRef(a.typed_data),
             _ => match &a.raw {
                 Some(raw) => MetaValue::Str(raw.clone()),
                 None => MetaValue::Str(pool_get(pool, a.typed_data).unwrap_or_default()),
@@ -822,6 +832,71 @@ pub fn parse_axml(data: &[u8]) -> Result<ApkInfo, String> {
     Ok(info)
 }
 
+/// Resolve a `TYPE_REFERENCE` used as a meta-data *value* (`android:value="@integer/..."`)
+/// to the literal value defined for `res_id` in the APK's `resources.arsc`.
+/// Only integer entries resolve; anything else returns `None` so the caller
+/// can fall back to the raw resource id.
+pub fn resolve_value_reference(arsc: &[u8], res_id: u32) -> Option<i32> {
+    let pkg_id = ((res_id >> 24) & 0xff) as u32;
+    let type_id = ((res_id >> 16) & 0xff) as usize; // 1-based index into typeStrings
+    let entry_idx = (res_id & 0xffff) as usize;
+    if arsc.len() < 12 || le_u16(arsc, 0).ok()? != 0x0002 {
+        return None; // not a RES_TABLE_TYPE chunk
+    }
+    let hsize = le_u16(arsc, 2).ok()? as usize;
+    let tsize = le_u32(arsc, 4).ok()? as usize;
+    let end = tsize.min(arsc.len());
+    let mut off = hsize;
+    while off + 8 <= end {
+        let cty = le_u16(arsc, off).ok()?;
+        let chsize = le_u16(arsc, off + 2).ok()? as usize;
+        let csize = le_u32(arsc, off + 4).ok()? as usize;
+        if cty == 0x0200 && csize >= 288 {
+            // ResTable_package
+            if le_u32(arsc, off + 8).ok()? & 0xff == pkg_id {
+                let type_strings = le_u32(arsc, off + 268).ok()? as usize;
+                let type_pool = parse_string_pool(arsc, off + type_strings).ok()?;
+                if type_id == 0 || type_id > type_pool.len() || type_pool[type_id - 1] != "integer"
+                {
+                    return None;
+                }
+                let cend = (off + csize).min(arsc.len());
+                let mut io = off + chsize;
+                while io + 20 <= cend {
+                    let ity = le_u16(arsc, io).ok()?;
+                    let ihsize = le_u16(arsc, io + 2).ok()? as usize;
+                    let isize = le_u32(arsc, io + 4).ok()? as usize;
+                    if ity == 0x0201 && arsc.get(io + 8).copied()? as usize == type_id {
+                        // ResTable_type
+                        let entry_count = le_u32(arsc, io + 12).ok()? as usize;
+                        let entries_start = le_u32(arsc, io + 16).ok()? as usize;
+                        if entry_idx < entry_count {
+                            // The u32 offset array sits right after the chunk
+                            // header; each offset is relative to entriesStart.
+                            let eo = le_u32(arsc, io + ihsize + entry_idx * 4).ok()?;
+                            if eo != 0xFFFF_FFFF {
+                                let eo = io + entries_start + eo as usize;
+                                let eflags = le_u16(arsc, eo + 2).ok()?;
+                                if eflags & 0x0001 == 0 {
+                                    // ResTable_entry (8 bytes) then Res_value
+                                    let vtype = arsc.get(eo + 8 + 3).copied()?;
+                                    let vdata = le_u32(arsc, eo + 8 + 4).ok()?;
+                                    if vtype == TYPE_INT_DEC || vtype == TYPE_INT_HEX {
+                                        return Some(vdata as i32);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    io += isize.max(8) as usize;
+                }
+            }
+        }
+        off += csize.max(8) as usize;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -832,6 +907,31 @@ mod tests {
         assert_eq!(info.resolve(".Main"), "com.example.app.Main");
         assert_eq!(info.resolve("Main"), "com.example.app.Main");
         assert_eq!(info.resolve("a.b.C"), "a.b.C");
+    }
+
+    // Env-gated smoke against a real APK: resolves the GMS version meta-data
+    // reference the same way `build_app_info` does at launch time.
+    #[test]
+    fn resolve_value_reference_against_real_apk() {
+        let Ok(apk) = std::env::var("PENGUDROID_TEST_APK") else {
+            return;
+        };
+        let arsc = extract_named(&apk, "resources.arsc").expect("resources.arsc");
+        let manifest = extract_named(&apk, "AndroidManifest.xml").expect("manifest");
+        let info = parse_axml(&manifest).expect("parse");
+        let gms = info
+            .application_meta
+            .iter()
+            .find(|(k, _)| k == "com.google.android.gms.version")
+            .expect("gms meta-data present");
+        let MetaValue::ValueRef(r) = gms.1 else {
+            panic!("gms meta-data should be a value reference, got {:?}", gms.1);
+        };
+        assert_eq!(
+            resolve_value_reference(&arsc, r),
+            Some(12451000),
+            "gms version ref 0x{r:08x} must resolve to 12451000"
+        );
     }
 
     // -- AXML builder --------------------------------------------------------

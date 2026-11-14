@@ -2431,6 +2431,7 @@ fn bind_application_now(env: &crate::jni::JniEnv, classpath: &[String]) -> bool 
         uid: 10_000,
         version_name: info.version_name.as_deref(),
         version_code: info.version_code.unwrap_or(1),
+        application_meta: &info.application_meta,
     };
     crate::apphost::bind_application(env, thread, &spec)
 }

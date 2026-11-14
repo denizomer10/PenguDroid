@@ -555,6 +555,19 @@ const IPM_GET_ACTIVITY_INFO: u32 = 11;
 /// with the entry the host marshalled for that class.
 const IPM_GET_PROVIDER_INFO: u32 = 15;
 
+/// `IPackageManager` transaction code for `resolveContentProvider`.
+///
+/// `androidx.core.content.FileProvider` resolves its authority through
+/// `PackageManager.resolveContentProvider(authority, GET_META_DATA)` while
+/// attaching, and reads `metaData["android.support.FILE_PROVIDER_PATHS"]` off
+/// the result. The request is `[token][authority][flags:long][userId]`, so the
+/// authority is matched as a substring; the reply is a single `ProviderInfo`
+/// read with `readTypedObject` (presence word + marshalled body). Confirmed by
+/// disassembling `ApplicationPackageManager.resolveContentProviderAsUser` in
+/// the API-37 framework: it invokes `IPackageManager.resolveContentProvider`
+/// as code 41.
+const IPM_RESOLVE_CONTENT_PROVIDER: u32 = 41;
+
 /// `IActivityTaskManager` transaction code for `getActivityClientController`.
 ///
 /// `ActivityClient.getDisplayId` calls it through a `Singleton`; with no system
@@ -1368,7 +1381,8 @@ static APPLICATION_INFO: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
 static ACTIVITY_INFO: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
-/// Marshalled `ProviderInfo`s, keyed by class name.
+/// Marshalled `ProviderInfo`s, keyed by class name, plus `auth:`-prefixed
+/// entries keyed by authority for `resolveContentProvider` (code 41).
 static PROVIDER_ENTRIES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
@@ -2227,6 +2241,16 @@ fn vsync_channel() -> Option<(RawFd, RawFd)> {
 fn parcel_contains_utf16(data: &[u8], s: &str) -> bool {
     let needle: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
     !needle.is_empty() && data.windows(needle.len()).any(|w| w == needle.as_slice())
+}
+
+/// Substring match in either Parcel string encoding: String16 (UTF-16LE) or
+/// String8 (8-bit ASCII). API-37 callers may marshal either, so keyed lookups
+/// have to check both (same reason as the vending `queryIntentServices` branch).
+fn parcel_contains_either(data: &[u8], s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    parcel_contains_utf16(data, s) || data.windows(s.len()).any(|w| w == s.as_bytes())
 }
 
 /// Match a whole, aligned Parcel String16 field, not a substring of a key.
@@ -3828,10 +3852,17 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             }
         }
     }
-    if tr.target_handle == handle_for("package") && tr.code == IPM_GET_PROVIDER_INFO {
-        // The request is `[interface token][ComponentName][flags][userId]`, so
-        // the class name is not the last thing in the parcel. Match the parcel
-        // against the names we installed instead of trying to parse it.
+    if tr.target_handle == handle_for("package")
+        && (tr.code == IPM_GET_PROVIDER_INFO || tr.code == IPM_RESOLVE_CONTENT_PROVIDER)
+    {
+        // The request is `[interface token][ComponentName or authority][flags][userId]`,
+        // so the key is not the last thing in the parcel. Match the parcel
+        // against the keys we installed instead of trying to parse it. Keys are
+        // plain class names for `getProviderInfo` (code 15) and `auth:`-prefixed
+        // authorities for `resolveContentProvider` (code 41); the host installs
+        // both, and the prefix keeps a class name that happens to be a
+        // substring of an authority from matching the wrong transaction.
+        let want_authority = tr.code == IPM_RESOLVE_CONTENT_PROVIDER;
         let data = if tr.data_size > 0 && tr.data_ptr != 0 {
             Some(std::slice::from_raw_parts(
                 tr.data_ptr as *const u8,
@@ -3844,14 +3875,26 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
             let entries = PROVIDER_ENTRIES.lock().unwrap_or_else(|e| e.into_inner());
             entries
                 .iter()
-                .find(|(name, _)| parcel_contains_utf16(data, name))
+                .find(|(name, _)| {
+                    if let Some(auth) = name.strip_prefix("auth:") {
+                        want_authority && parcel_contains_either(data, auth)
+                    } else {
+                        !want_authority && parcel_contains_either(data, name)
+                    }
+                })
                 .map(|(_, bytes)| bytes.clone())
         });
         if let Some(bytes) = entry {
+            // `readTypedObject` on the caller side: presence word, then the
+            // marshalled `ProviderInfo` body.
             parcel.extend_from_slice(&1u32.to_ne_bytes());
             parcel.extend_from_slice(&bytes);
             if trace_enabled() {
-                diag(&format!("[binder]   -> ProviderInfo ({} bytes)\n", bytes.len()));
+                diag(&format!(
+                    "[binder]   -> ProviderInfo code={} ({} bytes)\n",
+                    tr.code,
+                    bytes.len()
+                ));
             }
         }
     }
@@ -4498,6 +4541,9 @@ pub unsafe extern "C" fn __pengudroid_binder_set_application_info(ptr: *const u8
 
 /// `void __pengudroid_binder_set_provider_entry(const char *name, size_t name_len,
 ///                                            const uint8_t *bytes, size_t len)`
+///
+/// `name` is a class name, or an `auth:`-prefixed authority when the entry is
+/// meant for `resolveContentProvider` (IPM code 41).
 ///
 /// # Safety
 /// Both pointers must be readable for their stated lengths.
@@ -5907,6 +5953,107 @@ mod tests {
         // Without an installed reply the vending probe also falls through.
         let reply = unsafe { make_reply(&transaction(target, 34, &data), 1) };
         assert_eq!(reply.parcel.len(), 8);
+    }
+
+    /// `IPackageManager.resolveContentProvider` (code 41) answers with the
+    /// installed `ProviderInfo` behind `[status][presence]` when the request
+    /// parcel names an installed `auth:` authority, in either string encoding;
+    /// class-name keys must NOT match code 41 and authority keys must NOT
+    /// match `getProviderInfo` (code 15).
+    #[test]
+    fn package_service_answers_resolve_content_provider_by_authority() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let target = handle_for("package");
+        PROVIDER_ENTRIES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let body: Vec<u8> = vec![9, 8, 7, 6, 5, 4, 3, 2, 1];
+        let class_key = "com.combosdk.module.share.sora.ShareProvider";
+        let auth_key = "auth:com.miHoYo.GenshinImpact.combosdk.ShareProvider";
+        unsafe {
+            __pengudroid_binder_set_provider_entry(
+                class_key.as_ptr(),
+                class_key.len(),
+                body.as_ptr(),
+                body.len(),
+            )
+        };
+        unsafe {
+            __pengudroid_binder_set_provider_entry(
+                auth_key.as_ptr(),
+                auth_key.len(),
+                body.as_ptr(),
+                body.len(),
+            )
+        };
+        // Request parcel: [token][authority String16][flags:long][userId].
+        let authority = "com.miHoYo.GenshinImpact.combosdk.ShareProvider";
+        let mut data = Vec::new();
+        data.extend_from_slice(&35u32.to_ne_bytes());
+        let token = "android.content.pm.IPackageManager";
+        for unit in token.encode_utf16() {
+            data.extend_from_slice(&unit.to_ne_bytes());
+        }
+        data.extend_from_slice(&[0, 0]);
+        while data.len() % 4 != 0 {
+            data.push(0);
+        }
+        data.extend_from_slice(&(authority.len() as u32).to_ne_bytes());
+        for unit in authority.encode_utf16() {
+            data.extend_from_slice(&unit.to_ne_bytes());
+        }
+        data.extend_from_slice(&[0, 0]);
+        while data.len() % 4 != 0 {
+            data.push(0);
+        }
+        data.extend_from_slice(&0x8000u64.to_ne_bytes()); // GET_META_DATA
+        data.extend_from_slice(&0u32.to_ne_bytes()); // userId
+        let reply = unsafe { make_reply(&transaction(target, 41, &data), 1) };
+        let mut expected: Vec<u8> = 0u32.to_ne_bytes().to_vec();
+        expected.extend_from_slice(&1u32.to_ne_bytes());
+        expected.extend_from_slice(&body);
+        expected.resize((expected.len() + 7) & !7, 0);
+        assert_eq!(reply.parcel, expected);
+        // Same authority marshalled as String8 (8-bit) also matches.
+        let mut data8 = Vec::new();
+        data8.extend_from_slice(&(authority.len() as u32).to_ne_bytes());
+        data8.extend_from_slice(authority.as_bytes());
+        data8.push(0);
+        while data8.len() % 4 != 0 {
+            data8.push(0);
+        }
+        data8.extend_from_slice(&0x8000u64.to_ne_bytes());
+        data8.extend_from_slice(&0u32.to_ne_bytes());
+        let reply = unsafe { make_reply(&transaction(target, 41, &data8), 1) };
+        assert_eq!(reply.parcel, expected);
+        // getProviderInfo (code 15) with a ComponentName must NOT match the
+        // authority key, and code 41 must NOT match the class-name key.
+        let mut cn = Vec::new();
+        let pkg = "com.miHoYo.GenshinImpact";
+        cn.extend_from_slice(&(pkg.len() as u32).to_ne_bytes());
+        for unit in pkg.encode_utf16() {
+            cn.extend_from_slice(&unit.to_ne_bytes());
+        }
+        cn.extend_from_slice(&[0, 0]);
+        while cn.len() % 4 != 0 {
+            cn.push(0);
+        }
+        cn.extend_from_slice(&(class_key.len() as u32).to_ne_bytes());
+        for unit in class_key.encode_utf16() {
+            cn.extend_from_slice(&unit.to_ne_bytes());
+        }
+        cn.extend_from_slice(&[0, 0]);
+        while cn.len() % 4 != 0 {
+            cn.push(0);
+        }
+        cn.extend_from_slice(&0x8000u64.to_ne_bytes());
+        cn.extend_from_slice(&0u32.to_ne_bytes());
+        let reply = unsafe { make_reply(&transaction(target, 15, &cn), 1) };
+        assert_eq!(reply.parcel, expected); // class-name key still matches code 15
+        // Code 41 with a parcel that names only the class name (no authority
+        // key present) falls through: class keys are excluded for code 41.
+        let reply = unsafe { make_reply(&transaction(target, 41, &cn), 1) };
+        assert_eq!(reply.parcel.len(), 8);
+        assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes());
+        PROVIDER_ENTRIES.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// `graphicsstats.requestBufferForProcess` must answer with a present

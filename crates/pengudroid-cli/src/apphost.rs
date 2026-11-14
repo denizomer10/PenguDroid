@@ -129,6 +129,15 @@ pub struct AppSpec<'a> {
     pub version_name: Option<&'a str>,
     /// `android:versionCode` from the manifest.
     pub version_code: u32,
+    /// The manifest's `<application>` `<meta-data>` children.
+    ///
+    /// `ApplicationInfo.metaData` must carry them: GMS's
+    /// `GooglePlayServicesUtilLight` throws
+    /// `GooglePlayServicesMissingManifestValueException` when
+    /// `com.google.android.gms.version` is absent, which kills every provider
+    /// whose `attachInfo` asks for the AppSet id (seen in Genshin's
+    /// `OSParamsProvider`).
+    pub application_meta: &'a [(String, crate::apk::MetaValue)],
 }
 
 fn new_instance(env: &JniEnv, class_name: &str) -> Option<(JClass, JObject)> {
@@ -214,13 +223,36 @@ fn build_app_info(env: &JniEnv, spec: &AppSpec<'_>) -> Option<JObject> {
     set_int("flags", 0x1000_0000 | 0x2000 | 0x4);
     // `BillingClient$Builder.build()` calls `metaData.getBoolean(...)` straight
     // off ApplicationInfo; a null metaData NPEs there (seen in BBR2's
-    // VuBillingHelper). An empty Bundle is the honest answer: the manifest
-    // declares no billing metadata.
+    // VuBillingHelper). Fill it from the manifest's `<application>` meta-data:
+    // GMS reads `com.google.android.gms.version` out of it and throws when the
+    // tag is missing entirely (seen in Genshin's `OSParamsProvider.attachInfo`).
     if let Some(id) = env.field_id(class, "metaData", "Landroid/os/Bundle;") {
-        if let Some((_, bundle)) = new_instance(env, "android/os/Bundle") {
-            env.set_object_field(info, id, bundle);
-        } else {
-            eprintln!("apphost: could not instantiate metaData Bundle");
+        // `android:value="@integer/..."` references must land in the Bundle as
+        // the resolved literal (GMS compares against 12451000, not the 0x7f id),
+        // while `android:resource` ids stay raw. Resolve value references
+        // through the APK's own resources.arsc here; provider meta-data is
+        // built separately and keeps its ids.
+        let arsc = crate::apk::extract_named(&spec.apk.display().to_string(), "resources.arsc").ok();
+        let resolved: Vec<(String, crate::apk::MetaValue)> = spec
+            .application_meta
+            .iter()
+            .map(|(k, v)| {
+                let v = match (v, &arsc) {
+                    (crate::apk::MetaValue::ValueRef(r), Some(data)) => {
+                        crate::apk::resolve_value_reference(data, *r)
+                            .map(crate::apk::MetaValue::Int)
+                            .unwrap_or(crate::apk::MetaValue::Ref(*r))
+                    }
+                    _ => v.clone(),
+                };
+                (k.clone(), v)
+            })
+            .collect();
+        let bundle = build_meta_bundle(env, &resolved)
+            .or_else(|| new_instance(env, "android/os/Bundle").map(|(_, b)| b));
+        match bundle {
+            Some(bundle) => env.set_object_field(info, id, bundle),
+            None => eprintln!("apphost: could not instantiate metaData Bundle"),
         }
     }
     // Read back the fields `LoadedApk` depends on: a silently failed write here
@@ -8163,10 +8195,16 @@ fn install_provider_list(env: &JniEnv, list: JObject, app_info: JObject, spec: &
             }
         }
         // `androidx.startup.InitializationProvider.onCreate` asks the package
-        // manager for its own `ProviderInfo` to read the initializer list out of
-        // `metaData`; publish the same object under the class name.
+        // manager for its own `ProviderInfo` (IPM code 15) by ComponentName, so
+        // publish the object under the class name. `FileProvider` instead calls
+        // `resolveContentProvider(authority, GET_META_DATA)` (IPM code 41) and
+        // reads `metaData["android.support.FILE_PROVIDER_PATHS"]` off the result,
+        // so publish the same object under the authority too.
         if let Some(bytes) = marshal_object(env, info, "android/content/pm/ProviderInfo") {
             install_provider_entry(&provider.name, &bytes);
+            if let Some(authority) = &provider.authority {
+                install_provider_entry(&format!("auth:{authority}"), &bytes);
+            }
         }
         if env.call_boolean(list, add, &[JValue { l: info }]) == Some(true) {
             added += 1;
@@ -8209,7 +8247,7 @@ fn build_meta_bundle(
                     env.call_void(bundle, m, &[JValue { l: k }, JValue { z: *b as u8 }]);
                 }
             }
-            crate::apk::MetaValue::Ref(r) => {
+            crate::apk::MetaValue::Ref(r) | crate::apk::MetaValue::ValueRef(r) => {
                 if let Some(m) = put_int {
                     env.call_void(bundle, m, &[JValue { l: k }, JValue { i: *r as i32 }]);
                 }
