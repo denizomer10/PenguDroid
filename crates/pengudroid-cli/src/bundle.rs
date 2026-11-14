@@ -106,6 +106,62 @@ pub fn is_bundle(path: &Path) -> bool {
     matches!(Kind::detect(path), Kind::Apkm | Kind::Xapk | Kind::Apks)
 }
 
+/// Read the string value of `key` in `text`, searching from byte `from`.
+///
+/// Returns the value and the offset just past the closing quote. This is a
+/// scanner, not a parser: XAPK `manifest.json` is machine-generated, so the
+/// keys we need are plain `"key": "value"` pairs.
+fn json_string_after(text: &str, key: &str, from: usize) -> Option<(String, usize)> {
+    let pat = format!("\"{key}\"");
+    let at = text.get(from..)?.find(&pat)? + from;
+    let bytes = text.as_bytes();
+    let mut i = at + pat.len();
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b':') {
+        return None;
+    }
+    i += 1;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'"') {
+        return None;
+    }
+    i += 1;
+    let start = i;
+    while i < bytes.len() && bytes[i] != b'"' && bytes[i] != b'\\' {
+        i += 1;
+    }
+    Some((text[start..i].to_string(), i))
+}
+
+/// The base APK's `file` entry in an XAPK `manifest.json`.
+///
+/// APKPure XAPKs name the base member after the app (e.g.
+/// `Beach Buggy Racing 2.apk`), not `base.apk`, and list the splits in
+/// `split_apks[]` with `"id": "base"`. Picking the first `.apk` member only
+/// works while that member happens to be listed first.
+fn xapk_base_file(manifest: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(manifest).ok()?;
+    let mut pos = text.find("\"split_apks\"")?;
+    while let Some((id, after_id)) = json_string_after(text, "id", pos) {
+        if id == "base" {
+            // Only accept a `file` key that belongs to the same object, i.e.
+            // before the next closing brace.
+            let object_end = after_id + text.get(after_id..)?.find('}')?;
+            let (file, after_file) = json_string_after(text, "file", after_id)?;
+            if after_file <= object_end {
+                return Some(file);
+            }
+            return None;
+        }
+        pos = after_id;
+    }
+    None
+}
+
 impl Bundle {
     /// Open a container and classify its members.
     pub fn open(path: &Path) -> Result<Bundle, String> {
@@ -140,8 +196,10 @@ impl Bundle {
         }
 
         // The base APK is the one Play calls `base.apk`; bundletool writes
-        // `splits/base-master.apk`. Otherwise take the largest member, which is
-        // the base in every wrapper seen in practice.
+        // `splits/base-master.apk`. An XAPK names its members after the app and
+        // declares the base in `manifest.json`'s `split_apks[]`, so read that
+        // first. Otherwise take the first member, which is the base in every
+        // wrapper seen in practice.
         let base = apk_members
             .iter()
             .find(|n| {
@@ -152,6 +210,16 @@ impl Bundle {
                     || n == "base-master.apk"
             })
             .cloned()
+            .or_else(|| {
+                if kind == Kind::Xapk {
+                    apk::extract_named_bytes(&data, "manifest.json")
+                        .ok()
+                        .and_then(|m| xapk_base_file(&m))
+                        .filter(|name| apk_members.contains(name))
+                } else {
+                    None
+                }
+            })
             .unwrap_or_else(|| apk_members.remove(0));
 
         let mut splits = Vec::new();
@@ -424,6 +492,50 @@ mod tests {
         assert!(!names.contains(&"split_config.armeabi_v7a.apk".to_string()));
         assert!(names.contains(&"split_config.hdpi.apk".to_string()));
         assert!(out.join("Android/obb/com.x/game.obb").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn xapk_manifest_selects_the_declared_base() {
+        let dir = std::env::temp_dir().join(format!("pd-xapk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("game.xapk");
+        let manifest = br#"{
+            "xapk_version": 2,
+            "split_apks": [
+                {"id": "config.arm64_v8a", "file": "split_config.arm64_v8a.apk", "size": 100},
+                {"id": "base", "file": "Beach Buggy Racing 2.apk", "size": 200}
+            ]
+        }"#;
+        std::fs::write(
+            &path,
+            make_zip(&[
+                ("manifest.json", manifest),
+                ("split_config.arm64_v8a.apk", b"ARM64"),
+                ("Beach Buggy Racing 2.apk", b"BASE"),
+            ]),
+        )
+        .unwrap();
+        let b = Bundle::open(&path).unwrap();
+        assert_eq!(b.kind, Kind::Xapk);
+        assert_eq!(b.base, "Beach Buggy Racing 2.apk");
+        assert_eq!(b.base_bytes().unwrap(), b"BASE");
+        assert_eq!(b.abis, vec!["arm64-v8a"]);
+        assert_eq!(b.splits.len(), 1);
+        assert_eq!(b.splits[0].name, "split_config.arm64_v8a.apk");
+        // Without a manifest the first member is still the fallback.
+        let path2 = dir.join("game2.xapk");
+        std::fs::write(
+            &path2,
+            make_zip(&[
+                ("aaa.apk", b"FIRST"),
+                ("bbb.apk", b"SECOND"),
+            ]),
+        )
+        .unwrap();
+        let b2 = Bundle::open(&path2).unwrap();
+        assert_eq!(b2.base, "aaa.apk");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

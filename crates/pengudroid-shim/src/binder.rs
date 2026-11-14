@@ -1207,6 +1207,108 @@ pub unsafe extern "C" fn __pengudroid_binder_set_fd_transactions(
 /// getAllowedCapturePolicy codes from the loaded Stub. All must be nonzero,
 /// distinct user codes; false preserves the previous table.
 /// Until installation, no focus operation dispatches.
+/// The Play Billing service name games bind to (`com.android.vending`). There
+/// is no vending process here, so the broker hosts the classic
+/// `IInAppBillingService` interface itself and answers from installed tables.
+const BILLING_SERVICE: &str = "com.android.vending.billing.IInAppBillingService";
+
+/// One installed reply for a hosted billing transaction code.
+enum BillingReply {
+    /// An int-returning method (isBillingSupported, consumePurchase, …).
+    Int(i32),
+    /// A Bundle-returning method (getSkuDetails, getBuyIntent, getPurchases,
+    /// …). The payload is the framework-marshalled `Bundle.writeToParcel`
+    /// bytes *without* the leading status word: Java AIDL reads a Bundle
+    /// return with `Parcel.readBundle()`, which consumes exactly those bytes
+    /// after the status word `make_reply` already wrote.
+    Bundle(Vec<u8>),
+}
+
+/// Per-code replies for the hosted billing interface. Codes arrive from the
+/// host, which knows the bundled Play Billing library's AIDL order (the
+/// interface's transaction codes are sequential from 1 in declaration order).
+static BILLING_REPLIES: Mutex<std::collections::BTreeMap<u32, BillingReply>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// The `isBillingSupported` code; its reply echoes the requested apiVersion,
+/// which the shim reads out of the request parcel. Zero means not installed.
+static BILLING_IS_SUPPORTED: Mutex<u32> = Mutex::new(0);
+
+/// Install the `isBillingSupported` transaction code. The reply is the
+/// request's own apiVersion (clamped to what this host supports), matching
+/// what vending returns for a supported `inapp`/`subs` query.
+#[no_mangle]
+pub extern "C" fn __pengudroid_binder_set_billing_is_supported(code: u32) -> bool {
+    if code == 0 || code >= 0x00ff_fffe {
+        return false;
+    }
+    *BILLING_IS_SUPPORTED.lock().unwrap_or_else(|e| e.into_inner()) = code;
+    true
+}
+
+/// Install an int reply for a billing transaction code.
+#[no_mangle]
+pub extern "C" fn __pengudroid_binder_set_billing_int(code: u32, value: i32) -> bool {
+    if code == 0 || code >= 0x00ff_fffe {
+        return false;
+    }
+    BILLING_REPLIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(code, BillingReply::Int(value));
+    true
+}
+
+/// Install a marshalled-`Bundle` reply for a billing transaction code.
+///
+/// # Safety
+/// For a non-null `bytes`, it must point to `len` readable bytes; they are
+/// copied and the pointer is not retained.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_billing_bundle(
+    code: u32,
+    bytes: *const u8,
+    len: usize,
+) -> bool {
+    if code == 0 || code >= 0x00ff_fffe || bytes.is_null() {
+        return false;
+    }
+    let data = unsafe { std::slice::from_raw_parts(bytes, len) }.to_vec();
+    BILLING_REPLIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(code, BillingReply::Bundle(data));
+    true
+}
+
+/// The `IPackageManager.queryIntentServices` code (read from the loaded
+/// framework Stub by the host) plus the marshalled `ParceledListSlice` body
+/// (presence word *not* included) that answers it when the request's Intent
+/// targets `com.android.vending`. Play Billing probes the billing service
+/// with `PackageManager.queryIntentServices` before binding; an empty answer
+/// is what makes `BillingClient` report "Billing service unavailable" and
+/// retry forever.
+static VENDING_QUERY: Mutex<Option<(u32, Vec<u8>)>> = Mutex::new(None);
+
+/// Install the `queryIntentServices` reply for vending-targeted requests.
+///
+/// # Safety
+/// For a non-null `bytes`, it must point to `len` readable bytes; they are
+/// copied and the pointer is not retained.
+#[no_mangle]
+pub unsafe extern "C" fn __pengudroid_binder_set_vending_query_reply(
+    code: u32,
+    bytes: *const u8,
+    len: usize,
+) -> bool {
+    if code == 0 || code >= 0x00ff_fffe || bytes.is_null() || len == 0 {
+        return false;
+    }
+    let data = unsafe { std::slice::from_raw_parts(bytes, len) }.to_vec();
+    *VENDING_QUERY.lock().unwrap_or_else(|e| e.into_inner()) = Some((code, data));
+    true
+}
+
 #[no_mangle]
 pub extern "C" fn __pengudroid_binder_set_audio_focus_transactions(
     request: u32, abandon: u32, unregister: u32, current: u32,
@@ -2171,6 +2273,7 @@ fn hosted_interface_descriptor(handle: u32) -> Option<&'static str> {
         "surface_composer_client" => Some("android.gui.ISurfaceComposerClient"),
         "display_event_connection" => Some("android.gui.IDisplayEventConnection"),
         "pengudroid.activity_host" => Some(ACTIVITY_HOST_DESCRIPTOR),
+        BILLING_SERVICE => Some("com.android.vending.billing.IInAppBillingService"),
         _ => None,
     }
 }
@@ -2752,6 +2855,95 @@ unsafe fn make_reply(tr: &TransactionData, pid: i32) -> Reply {
         // Any other audio-policy method keeps the fallthrough it had before
         // this table existed; inventing a reply for e.g. getOutputForAttr would
         // hand the framework a handle to a device we do not have.
+    }
+    if name_for_handle(tr.target_handle).as_deref() == Some(BILLING_SERVICE) {
+        // Hosted Play Billing: the status word was already written above, so
+        // the body is an int or a marshalled Bundle depending on the code.
+        let data = if tr.data_size > 0 && tr.data_ptr != 0 {
+            unsafe { std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize) }
+        } else {
+            &[]
+        };
+        let descriptor = hosted_interface_descriptor(tr.target_handle).unwrap_or("");
+        let body = after_interface_token(data, descriptor).unwrap_or(&[]);
+        let is_supported_code = *BILLING_IS_SUPPORTED.lock().unwrap_or_else(|e| e.into_inner());
+        if tr.code == is_supported_code && is_supported_code != 0 {
+            // isBillingSupported(apiVersion, packageName, type): the first
+            // int after the interface token is apiVersion; vending echoes it
+            // back as RESPONSE_OK for a supported type.
+            let api_version = body
+                .get(..4)
+                .map(|b| i32::from_ne_bytes(b.try_into().unwrap()))
+                .unwrap_or(3);
+            parcel.extend_from_slice(&api_version.to_ne_bytes());
+            if trace_enabled() {
+                diag(&format!("[binder]   -> billing isBillingSupported code={} apiVersion={api_version}\n", tr.code));
+            }
+        } else if let Some(reply) = BILLING_REPLIES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&tr.code)
+        {
+            match reply {
+                BillingReply::Int(value) => parcel.extend_from_slice(&value.to_ne_bytes()),
+                BillingReply::Bundle(bytes) => parcel.extend_from_slice(bytes),
+            }
+            if trace_enabled() {
+                diag(&format!(
+                    "[binder]   -> billing code={} reply={} total={} bytes\n",
+                    tr.code,
+                    match reply { BillingReply::Int(_) => "int", BillingReply::Bundle(_) => "bundle" },
+                    parcel.len()
+                ));
+            }
+        } else if trace_enabled() {
+            diag(&format!(
+                "[binder]   -> billing code={} has no installed reply (status-only fallthrough)\n",
+                tr.code
+            ));
+        }
+    }
+    if tr.target_handle == handle_for("package") {
+        let installed = VENDING_QUERY.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some((code, body)) = installed {
+            if tr.code == code {
+                let data = if tr.data_size > 0 && tr.data_ptr != 0 {
+                    unsafe { std::slice::from_raw_parts(tr.data_ptr as *const u8, tr.data_size as usize) }
+                } else {
+                    &[]
+                };
+                // Substring search on the raw payload in both string
+                // encodings: some callers marshal String16 (UTF-16LE), API-37
+                // can marshal String8 (ASCII) — the action string itself
+                // embeds the package name either way.
+                let needle16: Vec<u8> = "com.android.vending"
+                    .encode_utf16()
+                    .flat_map(|u| u.to_ne_bytes())
+                    .collect();
+                let needle8 = b"com.android.vending".to_vec();
+                let targets_vending = (data.len() >= needle16.len()
+                    && data.windows(needle16.len()).any(|w| w == needle16.as_slice()))
+                    || (data.len() >= needle8.len()
+                        && data.windows(needle8.len()).any(|w| w == needle8.as_slice()));
+                if targets_vending {
+                    // `queryIntentServices` returns a `ParceledListSlice`
+                    // read with `readTypedObject`: presence word, then the
+                    // marshalled slice body the host installed. The status
+                    // word was already written above. The reply only applies
+                    // to vending-targeted probes; every other
+                    // queryIntentServices call keeps its fallthrough.
+                    parcel.extend_from_slice(&1u32.to_ne_bytes());
+                    parcel.extend_from_slice(&body);
+                    if trace_enabled() {
+                        diag(&format!(
+                            "[binder]   -> queryIntentServices code={} vending ResolveInfo list ({} bytes)\n",
+                            tr.code,
+                            body.len()
+                        ));
+                    }
+                }
+            }
+        }
     }
     // Any transaction that carries a local binder object is a client handing us
     // a node it wants called back on. `attachApplication` is the one that
@@ -5545,6 +5737,176 @@ mod tests {
             table.remove(&target);
             table.remove(&jobsched);
         }
+    }
+
+    /// The hosted Play Billing interface answers installed codes with their
+    /// int or marshalled-Bundle body behind the status word, echoes the
+    /// request's apiVersion for `isBillingSupported`, and leaves unknown
+    /// codes as a status-only fallthrough (traced, never UNKNOWN_TRANSACTION:
+    /// BillingClient retries forever on a transport error).
+    #[test]
+    fn billing_service_answers_installed_codes_and_echoes_api_version() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let target = handle_for(BILLING_SERVICE);
+        {
+            BILLING_REPLIES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            *BILLING_IS_SUPPORTED.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+        }
+        // The interface descriptor answers the INTERFACE_TRANSACTION.
+        let reply = unsafe { make_reply(&transaction(target, IBINDER_INTERFACE_TRANSACTION, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        let descriptor = "com.android.vending.billing.IInAppBillingService";
+        let mut expected = (descriptor.len() as u32).to_ne_bytes().to_vec();
+        for unit in descriptor.encode_utf16() {
+            expected.extend_from_slice(&unit.to_ne_bytes());
+        }
+        expected.extend_from_slice(&[0, 0]);
+        expected.resize((expected.len() + 3) & !3, 0);
+        assert_eq!(reply.parcel, expected);
+        // Unknown code with nothing installed: status-only fallthrough.
+        let reply = unsafe { make_reply(&transaction(target, 3, &[]), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(reply.parcel.len(), 8);
+        assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes());
+        // Install isBillingSupported (code 1) plus an int (5) and a Bundle (2).
+        assert!(__pengudroid_binder_set_billing_is_supported(1));
+        assert!(__pengudroid_binder_set_billing_int(5, 0));
+        let bundle: Vec<u8> = vec![0x0a, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04];
+        assert!(unsafe { __pengudroid_binder_set_billing_bundle(2, bundle.as_ptr(), bundle.len()) });
+        assert!(!__pengudroid_binder_set_billing_is_supported(0));
+        assert!(!__pengudroid_binder_set_billing_int(0, 0));
+        assert!(unsafe { !__pengudroid_binder_set_billing_bundle(2, std::ptr::null(), 4) });
+        // Build a request parcel: [len][token utf16][NUL][pad][apiVersion=3]…
+        let descriptor = "com.android.vending.billing.IInAppBillingService";
+        let mut data = Vec::new();
+        data.extend_from_slice(&(descriptor.len() as u32).to_ne_bytes());
+        for unit in descriptor.encode_utf16() {
+            data.extend_from_slice(&unit.to_ne_bytes());
+        }
+        data.extend_from_slice(&[0, 0]);
+        while data.len() % 4 != 0 {
+            data.push(0);
+        }
+        data.extend_from_slice(&3i32.to_ne_bytes());
+        data.extend_from_slice(b"com.example.game\0\0");
+        data.extend_from_slice(b"inapp\0\0\0");
+        let reply = unsafe { make_reply(&transaction(target, 1, &data), 1) };
+        assert_eq!(reply.flags, 0);
+        let mut expected: Vec<u8> = [0u32, 3u32].into_iter().flat_map(u32::to_ne_bytes).collect();
+        expected.resize((expected.len() + 7) & !7, 0);
+        assert_eq!(reply.parcel, expected);
+        // Int reply: status word then the installed int.
+        let reply = unsafe { make_reply(&transaction(target, 5, &data), 1) };
+        let mut expected: Vec<u8> = [0u32, 0u32].into_iter().flat_map(u32::to_ne_bytes).collect();
+        expected.resize((expected.len() + 7) & !7, 0);
+        assert_eq!(reply.parcel, expected);
+        // Bundle reply: status word then the marshalled bytes verbatim.
+        let reply = unsafe { make_reply(&transaction(target, 2, &data), 1) };
+        let mut expected: Vec<u8> = 0u32.to_ne_bytes().to_vec();
+        expected.extend_from_slice(&bundle);
+        expected.resize((expected.len() + 7) & !7, 0);
+        assert_eq!(reply.parcel, expected);
+        // A code with no installed reply stays a status-only fallthrough.
+        let reply = unsafe { make_reply(&transaction(target, 9, &data), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(reply.parcel.len(), 8);
+        {
+            BILLING_REPLIES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            *BILLING_IS_SUPPORTED.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+        }
+    }
+
+    /// `IPackageManager.queryIntentServices` answers vending-targeted probes
+    /// with the installed `ParceledListSlice` body behind `[status][presence]`,
+    /// but only when the request parcel names `com.android.vending`; other
+    /// queries on the same code keep the status-only fallthrough.
+    #[test]
+    fn package_service_answers_vending_query_with_installed_slice() {
+        let _serial = CONTRACT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let target = handle_for("package");
+        *VENDING_QUERY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // Setter validation: code 0 and null/empty payloads are rejected.
+        let body: Vec<u8> = vec![1, 0, 0, 0, 2, 3, 4, 5];
+        assert!(!unsafe { __pengudroid_binder_set_vending_query_reply(0, body.as_ptr(), body.len()) });
+        assert!(unsafe { !__pengudroid_binder_set_vending_query_reply(34, std::ptr::null(), 4) });
+        assert!(unsafe { !__pengudroid_binder_set_vending_query_reply(34, body.as_ptr(), 0) });
+        assert!(unsafe { __pengudroid_binder_set_vending_query_reply(34, body.as_ptr(), body.len()) });
+        // A request parcel whose Intent carries package com.android.vending.
+        let mut data = Vec::new();
+        data.extend_from_slice(&3i32.to_ne_bytes()); // interface token length placeholder
+        let action = "com.android.vending.billing.IInAppBillingService.BIND";
+        data.extend_from_slice(&(action.len() as u32).to_ne_bytes());
+        for unit in action.encode_utf16() {
+            data.extend_from_slice(&unit.to_ne_bytes());
+        }
+        data.extend_from_slice(&[0, 0]);
+        while data.len() % 4 != 0 {
+            data.push(0);
+        }
+        let pkg = "com.android.vending";
+        data.extend_from_slice(&(pkg.len() as u32).to_ne_bytes());
+        for unit in pkg.encode_utf16() {
+            data.extend_from_slice(&unit.to_ne_bytes());
+        }
+        data.extend_from_slice(&[0, 0]);
+        while data.len() % 4 != 0 {
+            data.push(0);
+        }
+        let reply = unsafe { make_reply(&transaction(target, 34, &data), 1) };
+        assert_eq!(reply.flags, 0);
+        let mut expected: Vec<u8> = 0u32.to_ne_bytes().to_vec();
+        expected.extend_from_slice(&1u32.to_ne_bytes());
+        expected.extend_from_slice(&body);
+        expected.resize((expected.len() + 7) & !7, 0);
+        assert_eq!(reply.parcel, expected);
+        // Same code but a different package in the Intent: fallthrough only.
+        let other_action = "com.example.other.billing.IInAppBillingService.BIND";
+        let mut other = Vec::new();
+        other.extend_from_slice(&(other_action.len() as u32).to_ne_bytes());
+        for unit in other_action.encode_utf16() {
+            other.extend_from_slice(&unit.to_ne_bytes());
+        }
+        other.extend_from_slice(&[0, 0]);
+        while other.len() % 4 != 0 {
+            other.push(0);
+        }
+        let pkg = "com.example.other";
+        other.extend_from_slice(&(pkg.len() as u32).to_ne_bytes());
+        for unit in pkg.encode_utf16() {
+            other.extend_from_slice(&unit.to_ne_bytes());
+        }
+        other.extend_from_slice(&[0, 0]);
+        while other.len() % 4 != 0 {
+            other.push(0);
+        }
+        let reply = unsafe { make_reply(&transaction(target, 34, &other), 1) };
+        assert_eq!(reply.flags, 0);
+        assert_eq!(reply.parcel.len(), 8);
+        assert_eq!(&reply.parcel[..4], &0u32.to_ne_bytes());
+        // The same probe marshalled with 8-bit strings also matches.
+        let mut data8 = Vec::new();
+        data8.extend_from_slice(&(action.len() as u32).to_ne_bytes());
+        data8.extend_from_slice(action.as_bytes());
+        data8.push(0);
+        while data8.len() % 4 != 0 {
+            data8.push(0);
+        }
+        data8.extend_from_slice(&(pkg.len() as u32).to_ne_bytes());
+        data8.extend_from_slice(pkg.as_bytes());
+        data8.push(0);
+        while data8.len() % 4 != 0 {
+            data8.push(0);
+        }
+        assert!(unsafe { __pengudroid_binder_set_vending_query_reply(34, body.as_ptr(), body.len()) });
+        let reply = unsafe { make_reply(&transaction(target, 34, &data8), 1) };
+        assert_eq!(reply.parcel.len(), 8 + body.len().div_ceil(8) * 8);
+        // A different code on the package handle is untouched too.
+        let reply = unsafe { make_reply(&transaction(target, 36, &data), 1) };
+        assert_eq!(reply.parcel.len(), 8);
+        *VENDING_QUERY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // Without an installed reply the vending probe also falls through.
+        let reply = unsafe { make_reply(&transaction(target, 34, &data), 1) };
+        assert_eq!(reply.parcel.len(), 8);
     }
 
     /// `graphicsstats.requestBufferForProcess` must answer with a present

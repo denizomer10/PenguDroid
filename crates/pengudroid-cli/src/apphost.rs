@@ -885,6 +885,14 @@ pub fn bind_application(env: &JniEnv, thread: JObject, spec: &AppSpec<'_>) -> bo
         eprintln!("apphost: cannot resolve Android 17 user/thermal service transactions");
         return false;
     }
+    // Non-fatal: without it BillingClient retries its bind forever, but a
+    // framework revision without the broker symbols must not block the launch.
+    if install_billing(env).is_none() {
+        eprintln!("apphost: hosted Play Billing replies unavailable; billing binds will stall");
+    }
+    if install_vending_query_reply(env).is_none() {
+        eprintln!("apphost: vending queryIntentServices reply unavailable; the billing probe will stall");
+    }
     if install_audio_focus_transactions(env).is_none() {
         eprintln!("apphost: cannot resolve framework audio focus transactions");
         return false;
@@ -4048,6 +4056,19 @@ impl ServiceHost {
     }
 
     fn dispatch(&mut self, request: ServiceRequest) {
+        // Play Billing binds with `Intent.setPackage("com.android.vending")`
+        // and no component, so there is no in-app Service to create. Answer
+        // with the broker-hosted IInAppBillingService binder instead.
+        if request.package == "com.android.vending" {
+            match self.service_manager_binder(BILLING_SERVICE_NAME) {
+                Some(binder) if !binder.is_null() => {
+                    println!("service: answering com.android.vending bind with the hosted billing binder");
+                    self.connect_dispatchers(&request, binder);
+                }
+                _ => eprintln!("service: hosted billing binder unavailable for {}", request.class),
+            }
+            return;
+        }
         let Some(intent) = self.request_intent(&request) else {
             return;
         };
@@ -4396,6 +4417,19 @@ impl ServiceHost {
             return None;
         }
         Some(intent)
+    }
+
+    /// Resolve a broker-hosted service through the framework's
+    /// `ServiceManager.getService`, which lands on the shim's handle-0
+    /// `IServiceManager.getService` and comes back as a `BinderProxy` for the
+    /// hosted handle.
+    fn service_manager_binder(&self, name: &str) -> Option<JObject> {
+        let sm = self.env.find_class("android/os/ServiceManager")?;
+        let get = self
+            .env
+            .static_method_id(sm, "getService", "(Ljava/lang/String;)Landroid/os/IBinder;")?;
+        self.env
+            .call_static_object(sm, get, &[JValue { l: self.env.new_string(name) }])
     }
 
     fn component_name(&self, request: &ServiceRequest) -> Option<JObject> {
@@ -6878,6 +6912,195 @@ fn install_empty_list_transactions(
     let name = std::ffi::CString::new(service).ok()?;
     if !unsafe { setter(name.as_ptr(), codes.as_ptr(), codes.len()) } { return None; }
     println!("binder: empty-list {service} transaction codes = {codes:?}");
+    Some(())
+}
+
+/// The Play Billing service games bind to. There is no vending process, so
+/// the binder broker hosts `IInAppBillingService` itself; the transaction
+/// codes are the interface's declaration order from FIRST_CALL_TRANSACTION=1
+/// (the bundled Play Billing library obfuscates its own Stub, so the codes
+/// are hardcoded here and any mismatch shows up as a traced unknown code).
+const BILLING_SERVICE_NAME: &str = "com.android.vending.billing.IInAppBillingService";
+
+/// Install the hosted Play Billing replies into the binder broker.
+///
+/// Codes (AIDL declaration order): 1 isBillingSupported, 2 getSkuDetails,
+/// 3 getBuyIntent, 4 getPurchases, 5 consumePurchase, 6 getBuyIntentToReplaceSkus,
+/// 7 getBuyIntentExtraParams, 8 consumePurchaseExtraParams, 9 getBillingConfig,
+/// 10 isAlternativeBillingOnlyAvailable, 11 createAlternativeBillingOnlyToken,
+/// 12 getAlternativeBillingOnlyDialogIntent, 13 isExternalPaymentAvailable,
+/// 14 getExternalPaymentDialogIntent, 15 createExternalPaymentReportingDetails.
+///
+/// Purchase flows are answered with `RESPONSE_CODE=6` (ERROR) so BillingClient
+/// never opens a purchase UI; queries answer OK with empty results, which is
+/// what a logged-out, purchase-free account looks like.
+fn install_billing(env: &JniEnv) -> Option<()> {
+    let _frame = env.local_frame(64)?;
+    let is_supported_setter: unsafe extern "C" fn(u32) -> bool =
+        unsafe { std::mem::transmute(shim_symbol("__pengudroid_binder_set_billing_is_supported")?) };
+    let int_setter: unsafe extern "C" fn(u32, i32) -> bool =
+        unsafe { std::mem::transmute(shim_symbol("__pengudroid_binder_set_billing_int")?) };
+    let bundle_setter: unsafe extern "C" fn(u32, *const u8, usize) -> bool =
+        unsafe { std::mem::transmute(shim_symbol("__pengudroid_binder_set_billing_bundle")?) };
+    if !unsafe { is_supported_setter(1) } {
+        return None;
+    }
+    // Int-returning methods: consumePurchase(5), consumePurchaseExtraParams(8),
+    // isAlternativeBillingOnlyAvailable(10), isExternalPaymentAvailable(13)
+    // all answer RESPONSE_OK (0).
+    for code in [5u32, 8, 10, 13] {
+        if !unsafe { int_setter(code, 0) } {
+            return None;
+        }
+    }
+    let bundle_class = env.find_class("android/os/Bundle")?;
+    let put_int = env.method_id(bundle_class, "putInt", "(Ljava/lang/String;I)V")?;
+    let put_string = env.method_id(bundle_class, "putString", "(Ljava/lang/String;Ljava/lang/String;)V")?;
+    let put_string_list = env.method_id(
+        bundle_class,
+        "putStringArrayList",
+        "(Ljava/lang/String;Ljava/util/ArrayList;)V",
+    )?;
+    let (list_class, empty_list) = new_instance(env, "java/util/ArrayList")?;
+    let _ = list_class;
+    let bundle_with = |env: &JniEnv, response_code: i32| -> Option<JObject> {
+        let (_, bundle) = new_instance(env, "android/os/Bundle")?;
+        if !env.call_void(bundle, put_int, &[
+            JValue { l: env.new_string("RESPONSE_CODE") },
+            JValue { i: response_code },
+        ]) {
+            return None;
+        }
+        Some(bundle)
+    };
+    let mut install = |env: &JniEnv, code: u32, bundle: JObject| -> Option<()> {
+        let bytes = marshal_object(env, bundle, "android/os/Bundle")?;
+        if !unsafe { bundle_setter(code, bytes.as_ptr(), bytes.len()) } {
+            return None;
+        }
+        Some(())
+    };
+    // getSkuDetails(2): OK with an empty details list.
+    {
+        let bundle = bundle_with(env, 0)?;
+        if !env.call_void(bundle, put_string_list, &[
+            JValue { l: env.new_string("DETAILS_LIST") },
+            JValue { l: empty_list },
+        ]) {
+            return None;
+        }
+        install(env, 2, bundle)?;
+    }
+    // getPurchases(4): OK with empty purchase lists and no continuation token.
+    {
+        let bundle = bundle_with(env, 0)?;
+        for key in [
+            "INAPP_PURCHASE_ITEM_LIST",
+            "INAPP_PURCHASE_DATA_LIST",
+            "INAPP_DATA_SIGNATURE_LIST",
+        ] {
+            if !env.call_void(bundle, put_string_list, &[
+                JValue { l: env.new_string(key) },
+                JValue { l: empty_list },
+            ]) {
+                return None;
+            }
+        }
+        if !env.call_void(bundle, put_string, &[
+            JValue { l: env.new_string("INAPP_CONTINUATION_TOKEN") },
+            JValue { l: env.new_string("") },
+        ]) {
+            return None;
+        }
+        install(env, 4, bundle)?;
+    }
+    // Buy-intent methods (3, 6, 7, 12, 14): RESPONSE_CODE=6 (ERROR) so the
+    // client reports failure instead of showing a purchase dialog.
+    for code in [3u32, 6, 7, 12, 14] {
+        install(env, code, bundle_with(env, 6)?)?;
+    }
+    // getBillingConfig(9), createAlternativeBillingOnlyToken(11),
+    // createExternalPaymentReportingDetails(15): OK.
+    for code in [9u32, 11, 15] {
+        install(env, code, bundle_with(env, 0)?)?;
+    }
+    println!("binder: hosted Play Billing {BILLING_SERVICE_NAME} transaction codes 1..15 installed");
+    Some(())
+}
+
+/// Answer `IPackageManager.queryIntentServices` for the Play Billing probe.
+///
+/// `BillingClient` checks the billing service with
+/// `PackageManager.queryIntentServices` before binding; on this framework
+/// revision that lands on the `package` handle as
+/// `IPackageManager$Stub.TRANSACTION_queryIntentServices`. An empty answer
+/// makes it report "Billing service unavailable" and retry forever, so the
+/// reply is a one-element `ParceledListSlice` whose `ResolveInfo` points at
+/// the vending package. The shim only uses it when the request's Intent names
+/// `com.android.vending`, so unrelated service queries are unaffected.
+fn install_vending_query_reply(env: &JniEnv) -> Option<()> {
+    let _frame = env.local_frame(32)?;
+    let step = |env: &JniEnv, s: &str| {
+        if env.exception_check() {
+            eprintln!("apphost: install_vending_query_reply ok through {s}");
+            Some(())
+        } else {
+            eprintln!("apphost: install_vending_query_reply FAILED at {s}");
+            None
+        }
+    };
+    let stub = env.find_class("android/content/pm/IPackageManager$Stub")?;
+    step(env, "find IPackageManager$Stub")?;
+    let field = env.static_field_id(stub, "TRANSACTION_queryIntentServices", "I")?;
+    step(env, "static field TRANSACTION_queryIntentServices")?;
+    let code = u32::try_from(env.static_int_field(stub, field)).ok()?;
+    if code == 0 {
+        return None;
+    }
+    eprintln!("apphost: TRANSACTION_queryIntentServices = {code}");
+    let (ri_class, ri) = new_instance(env, "android/content/pm/ResolveInfo")?;
+    step(env, "new ResolveInfo")?;
+    let (si_class, si) = new_instance(env, "android/content/pm/ServiceInfo")?;
+    step(env, "new ServiceInfo")?;
+    let set_str = |class: JClass, obj: JObject, field: &str, value: &str| {
+        if let Some(id) = env.field_id(class, field, "Ljava/lang/String;") {
+            env.set_object_field(obj, id, env.new_string(value));
+        }
+    };
+    set_str(si_class, si, "packageName", "com.android.vending");
+    set_str(si_class, si, "name", "com.android.vending.billing.IInAppBillingService");
+    // ComponentInfo.writeToParcel NPEs without an ApplicationInfo.
+    let (ai_class, ai) = new_instance(env, "android/content/pm/ApplicationInfo")?;
+    set_str(ai_class, ai, "packageName", "com.android.vending");
+    if let Some(id) = env.field_id(si_class, "applicationInfo", "Landroid/content/pm/ApplicationInfo;") {
+        env.set_object_field(si, id, ai);
+    }
+    if let Some(id) = env.field_id(ri_class, "serviceInfo", "Landroid/content/pm/ServiceInfo;") {
+        env.set_object_field(ri, id, si);
+    }
+    let (list_class, list) = new_instance(env, "java/util/ArrayList")?;
+    step(env, "new ArrayList")?;
+    let add = env.method_id(list_class, "add", "(Ljava/lang/Object;)Z")?;
+    if env.call_boolean(list, add, &[JValue { l: ri }]) != Some(true) {
+        eprintln!("apphost: install_vending_query_reply: ArrayList.add failed");
+        return None;
+    }
+    step(env, "list.add")?;
+    let pls_class = env.find_class("android/content/pm/ParceledListSlice")?;
+    let ctor = env.method_id(pls_class, "<init>", "(Ljava/util/List;)V")?;
+    let pls = env.new_object(pls_class, ctor, &[JValue { l: list }])?;
+    step(env, "new ParceledListSlice")?;
+    let bytes = marshal_object(env, pls, "android/content/pm/ParceledListSlice")?;
+    step(env, "marshal ParceledListSlice")?;
+    let sym = shim_symbol("__pengudroid_binder_set_vending_query_reply")?;
+    let setter: unsafe extern "C" fn(u32, *const u8, usize) -> bool =
+        unsafe { std::mem::transmute(sym) };
+    if !unsafe { setter(code, bytes.as_ptr(), bytes.len()) } {
+        eprintln!("apphost: install_vending_query_reply: shim setter rejected the reply");
+        return None;
+    }
+    step(env, "shim setter")?;
+    println!("binder: vending queryIntentServices code={code} answered with a 1-entry ResolveInfo slice ({} bytes)", bytes.len());
     Some(())
 }
 

@@ -2,6 +2,53 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
+## Where we left off — new BBR2 XAPK boots past login; Play Billing probe shimmed (2026-11-13)
+
+Pick up here. The **new BBR2 XAPK** (`~/Downloads/Beach+Buggy+Racing+2_2026.10.26_APKPure.xapk`,
+versionCode 502, `xapk_version:2`) is supported: `bundle.rs` reads `manifest.json`,
+picks the split whose `id == "base"`, and extracts `Beach Buggy Racing 2.apk` —
+no `--sysroot` needed, same bridge env as before.
+
+The last blocker was the `BillingClient` infinite retry:
+`IPackageManager.queryIntentServices` (code 34, read from
+`IPackageManager$Stub.TRANSACTION_queryIntentServices` — **not hardcoded**) on the
+`package` handle returned an empty list, so `BillingClient` reported "Billing
+service unavailable" forever. Fixed end to end:
+
+- apphost `install_vending_query_reply` builds a real
+  `android/content/pm/ParceledListSlice` with one `ResolveInfo`
+  (`ServiceInfo` packageName `com.android.vending`, name
+  `com.android.vending.billing.IInAppBillingService`, plus a non-null
+  `applicationInfo` — `ComponentInfo.writeToParcel` NPEs without it), marshals it
+  via `Parcel.obtain`/`writeToParcel`/`marshall`, and hands the bytes to the shim
+  through `__pengudroid_binder_set_vending_query_reply`. Note the class is
+  `android/content/pm/ParceledListSlice` (there is no `android/os/` one).
+- shim `make_reply` answers `package`-handle code 34 with
+  `[status][presence=1][slice body]` **only when the request parcel contains
+  "com.android.vending"** — matched as a raw substring in both UTF-16LE and 8-bit
+  (String8) encodings, because API-37 callers marshal the Intent action as String8.
+  All other queryIntentServices calls keep the status-only fallthrough.
+- with the probe answered, the framework proceeds to `ActivityManager.bindService`
+  (`note_service_request` → apphost vending dispatch) and the hosted
+  `IInAppBillingService` answers codes 1..15 (`isBillingSupported` echoes the
+  requested apiVersion; buy-intent codes return RESPONSE_CODE 6).
+
+Validation: shim **161 passed** (new
+`package_service_answers_vending_query_with_installed_slice` covers UTF-16 and
+String8 matching, fallthrough, and setter validation), workspace tests green.
+Traced smoke `/tmp/bbr2-xapk-trace7.log` (420 s): 11 vending replies, bindService
+dispatch fired, `Billing service connected`, apiVersion negotiated 27→3.
+Full smoke #14 `/tmp/bbr2-smoke14.log` (900 s, daemon): **0 UNKNOWN_TRANSACTION**,
+`POST /v8/login` → 200, then analytics/News/tournaments/leaderboards/save-game,
+SDL 720x1280, `Finished main function`. The remaining "Billing service
+unavailable" lines are the normal async bind race (each is followed by
+"Billing service connected" ~10 ms later), not the stall.
+
+Next: drive smoke #14's daemon with `pengudroid tap`/`key` to reach gameplay;
+then the Genshin launch path on the same bridge (image mode still blocked on the
+translator signal-resume issue — documented only). Resize/tablet-mode (protocol
+v5) already verified dynamic.
+
 ## Where we left off — bridged BBR2 reaches SDL_main + FMOD; audio player transactions shimmed (2026-11-13)
 
 Pick up here. The **ARM64 native bridge is the real launch path for arm64-only
