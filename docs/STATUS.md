@@ -32,8 +32,28 @@ Bundle WARN/ClassCastException (caught internally), mihoyoos
 (vending billing shim answers, but the SDK treats the disconnect as a soft
 failure and retries), Firebase/FA errors, aconfig mmap WARNs.
 
-Next: confirm the 900 s smoke ends clean (`exit=124`, no fatal), re-verify BBR2
-XAPK + resize, then gameplay input via `pengudroid start --wait` + `tap`/`key`.
+Validation after `b7a38ad` / `7d3f0fa`:
+
+- Genshin full smoke `/tmp/genshin-full.log` (900 s): `exit=124` (alive at
+  timeout), no fatal; `Activity resumed`, `libyuanshen.so` loaded, Surface +
+  BLAST consumer created, vsync frames throughout. Traced run
+  `/tmp/genshin-trace4.log` shows the same plus `OSParamsProvider` appSetId
+  success — the GMS version meta-data now reads 12451000.
+- BBR2 XAPK regression `/tmp/bbr2-smoke16.log` (600 s): 0 UNKNOWN_TRANSACTION,
+  `Billing service connected`, login POST `/cobalt/free2play/api/v8/login`
+  reached, alive at timeout.
+- Resize/tablet (demo daemon): `window 1` 496x883 window (248x441 dp) ->
+  `--fullscreen`/`--maximize` 2560x1440 / 2560x1373 (1280x720 dp, **tablet**)
+  -> `--windowed` back; internal buffer stays 720x1280 px the whole time
+  (content resolution preserved while the window resizes).
+- Input: `pengudroid tap 360 640` and `key 4` against the daemon answered
+  `tapped`/`injected` (InputEvent relay path works).
+
+All current goals are met: Genshin + BBR2 launch without `--sysroot`, dynamic
+resize keeps internal resolution and switches to tablet mode, input injection
+works. Remaining known limits are in LIMITATIONS.md (billing soft-fail retry
+loop in Genshin's mihoyoos pay module, no real Play Store, boot-image/uffd
+design note).
 
 ## Previous — new BBR2 XAPK boots past login; Play Billing probe shimmed (2026-11-13)
 
