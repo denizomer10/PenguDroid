@@ -2,7 +2,40 @@
 
 This is the current handoff note. It records verified behavior, known limits, and the next concrete task. See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details and [LIMITATIONS.md](LIMITATIONS.md) for broader compatibility gaps.
 
-## Where we left off — new BBR2 XAPK boots past login; Play Billing probe shimmed (2026-11-13)
+## Where we left off — Genshin Impact 7.2.0 boots to a rendering main activity (2026-11-14)
+
+Pick up here. Genshin (`/tmp/genshin.apks`, repacked from `~/Downloads` APKM,
+base at `/tmp/genshin-apkm/base.apk`) now launches without `--sysroot`:
+`handleBindApplication` completes, the launch activity resumes, `libyuanshen.so`
+loads, a Surface is created and vsync frames flow for the whole run
+(`/tmp/genshin-trace4.log`, 420 s, no crash; full 900 s smoke in
+`/tmp/genshin-full.log`). The last three blockers were fixed in `b7a38ad`:
+
+- `IPackageManager` code 41 = `resolveContentProvider` (confirmed by
+  disassembling API-37 `classes.dex`): answered with a marshalled `ProviderInfo`
+  keyed by `auth:{authority}` — this is what let `FileProvider.attachInfo` pass.
+- Application meta-data: `ApplicationInfo.metaData` is now built from the
+  manifest's `<application><meta-data>` (was an empty Bundle, which made GMS's
+  `OSParamsProvider` throw `...MissingManifestValueException`).
+- `android:value="@integer/google_play_services_version"` compiles to a
+  **value reference**; GMS compares the resolved literal (`12451000`), not the
+  `0x7f090004` id. `apk.rs` now tags these as `MetaValue::ValueRef` (distinct
+  from `android:resource` `Ref`, which must stay an id — FileProvider loads it
+  with `Resources.getXml`) and `resolve_value_reference` parses
+  `resources.arsc` (offsets array sits at chunk `headerSize`, entry offsets are
+  relative to `entriesStart`) to resolve integer entries; verified against the
+  real base.apk in an env-gated test (`PENGUDROID_TEST_APK`).
+
+Known benign noise in Genshin smokes: `com.google.android.gms.games.APP_ID`
+Bundle WARN/ClassCastException (caught internally), mihoyoos
+`GoogleQueryPurchase` "Service connection is disconnected" retry loop
+(vending billing shim answers, but the SDK treats the disconnect as a soft
+failure and retries), Firebase/FA errors, aconfig mmap WARNs.
+
+Next: confirm the 900 s smoke ends clean (`exit=124`, no fatal), re-verify BBR2
+XAPK + resize, then gameplay input via `pengudroid start --wait` + `tap`/`key`.
+
+## Previous — new BBR2 XAPK boots past login; Play Billing probe shimmed (2026-11-13)
 
 Pick up here. The **new BBR2 XAPK** (`~/Downloads/Beach+Buggy+Racing+2_2026.10.26_APKPure.xapk`,
 versionCode 502, `xapk_version:2`) is supported: `bundle.rs` reads `manifest.json`,
