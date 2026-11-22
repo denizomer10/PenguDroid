@@ -1,0 +1,10 @@
+---
+interface Props {
+  status: 'passed' | 'partial' | 'missing';
+}
+
+const { status } = Astro.props;
+const label = status === 'passed' ? 'Passed' : status === 'partial' ? 'Partial' : 'Missing';
+---
+
+<span class:list={['pill', `pill--${status}`]}>{label}</span>

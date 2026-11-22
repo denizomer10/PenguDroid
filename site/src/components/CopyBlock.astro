@@ -1,0 +1,23 @@
+---
+import Icon from './Icon.astro';
+
+interface Props {
+  label?: string;
+  code: string;
+  copyLabel?: string;
+  id?: string;
+}
+
+const { label = 'Shell', code, copyLabel = 'Copy', id } = Astro.props;
+---
+
+<div class="code-block" data-code id={id}>
+  <div class="code-block__head">
+    <span class="code-block__label">{label}</span>
+    <button class="copy-btn" type="button" data-copy aria-label={`Copy ${label} commands`}>
+      <Icon name="copy" size={13} />
+      <span data-copy-label>{copyLabel}</span>
+    </button>
+  </div>
+  <pre><code data-code-text set:html={code}></code></pre>
+</div>

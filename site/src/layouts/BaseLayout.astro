@@ -1,0 +1,170 @@
+---
+import '@fontsource-variable/inter-tight';
+import '@fontsource/instrument-serif';
+import '@fontsource/instrument-serif/400-italic.css';
+import '../styles/global.css';
+import Icon from '../components/Icon.astro';
+import { logo } from '../lib/images';
+import { withBase } from '../lib/paths';
+import { navLinks, site } from '../lib/site';
+
+interface Props {
+  title: string;
+  description?: string;
+  page?: 'overview' | 'compatibility' | 'install' | 'docs' | '404';
+}
+
+const { title, description = site.description, page } = Astro.props;
+const canonical = new URL(Astro.url.pathname, Astro.site);
+const ogImage = new URL(withBase('/og.png'), Astro.site);
+const pageTitle = page === 'overview' ? `${site.name} — ${site.tagline}` : `${title} — ${site.name}`;
+const activeHref = navLinks.find((link) => link.label.toLowerCase() === page)?.href;
+---
+
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{pageTitle}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonical} />
+    <meta name="theme-color" content="#070a09" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="generator" content={Astro.generator} />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content={site.name} />
+    <meta property="og:title" content={pageTitle} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:image" content={ogImage} />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="PenguDroid — Android apps and ARM64 games on a Linux desktop." />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={pageTitle} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={ogImage} />
+
+    <link rel="icon" type="image/png" href={withBase('/favicon.png')} />
+    <link rel="apple-touch-icon" href={withBase('/apple-touch-icon.png')} />
+
+    <script is:inline>
+      (function () {
+        var root = document.documentElement;
+        root.classList.add('js');
+        var stored = null;
+        try {
+          stored = localStorage.getItem('pengudroid-theme');
+        } catch (error) {
+          stored = null;
+        }
+        var prefersLight = window.matchMedia('(prefers-color-scheme: light)').matches;
+        root.dataset.theme = stored === 'light' || stored === 'dark' ? stored : prefersLight ? 'light' : 'dark';
+      })();
+    </script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <div class="ambient" aria-hidden="true"></div>
+    <div class="grain" aria-hidden="true"></div>
+
+    <header class="nav">
+      <div class="shell">
+        <div class="nav__inner">
+          <a class="brand" href={withBase('/')} aria-label="PenguDroid home">
+            <img src={logo.src} width="28" height="28" alt="" decoding="async" />
+            <span>PenguDroid</span>
+          </a>
+
+          <nav class="nav__links" aria-label="Primary">
+            {navLinks.map((link) => (
+              <a
+                href={withBase(link.href)}
+                aria-current={activeHref === link.href ? 'page' : undefined}
+              >
+                {link.label}
+              </a>
+            ))}
+          </nav>
+
+          <div class="nav__actions">
+            <a class="nav__github" href={site.repo} rel="noopener">
+              <Icon name="github" size={16} />
+              <span>GitHub</span>
+            </a>
+            <button
+              class="icon-btn theme-toggle"
+              type="button"
+              data-theme-toggle
+              aria-label="Switch to light theme"
+              aria-pressed="false"
+            >
+              <Icon name="moon" size={17} />
+              <Icon name="sun" size={17} />
+            </button>
+            <button
+              class="icon-btn nav__menu-toggle"
+              type="button"
+              data-menu-toggle
+              aria-label="Open menu"
+              aria-expanded="false"
+              aria-controls="mobile-menu"
+            >
+              <Icon name="menu" size={18} />
+            </button>
+          </div>
+        </div>
+
+        <nav class="nav__mobile" id="mobile-menu" data-menu hidden aria-label="Mobile">
+          {navLinks.map((link) => (
+            <a href={withBase(link.href)} aria-current={activeHref === link.href ? 'page' : undefined}>
+              {link.label}
+            </a>
+          ))}
+          <a href={site.repo} rel="noopener">
+            GitHub
+          </a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main">
+      <slot />
+    </main>
+
+    <footer class="footer">
+      <div class="shell">
+        <div class="footer__grid">
+          <div>
+            <a class="footer__brand" href={withBase('/')}>
+              <img src={logo.src} width="26" height="26" alt="" decoding="async" loading="lazy" />
+              <span>PenguDroid</span>
+            </a>
+            <p class="footer__tagline">Android apps and ARM64 games on an x86_64 Linux desktop.</p>
+          </div>
+          <nav class="footer__nav" aria-label="Footer">
+            <a href={withBase('/')}>Overview</a>
+            <a href={withBase('/compatibility')}>Compatibility</a>
+            <a href={withBase('/install')}>Install</a>
+            <a href={withBase('/docs')}>Docs</a>
+            <a href={site.repo} rel="noopener">GitHub</a>
+            <a href={site.releases} rel="noopener">Releases</a>
+          </nav>
+        </div>
+        <div class="footer__bottom">
+          <p>
+            Apache-2.0 licensed · © 2026 PenguDroid contributors · Not affiliated with Google, Android, NVIDIA or any
+            app publisher. Third-party marks belong to their owners.
+          </p>
+          <p>Screenshots show specific test runs; they are not endorsements.</p>
+        </div>
+      </div>
+    </footer>
+
+    <script>
+      import '../scripts/main.ts';
+    </script>
+  </body>
+</html>

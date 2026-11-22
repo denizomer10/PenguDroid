@@ -1,0 +1,25 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Icon from '../components/Icon.astro';
+import { withBase } from '../lib/paths';
+---
+
+<BaseLayout page="404" title="Page not found" description="This page does not exist on the PenguDroid site.">
+  <section class="shell notfound">
+    <div class="glass notfound__card">
+      <p class="notfound__code">404</p>
+      <h1 class="h2">This window closed.</h1>
+      <p>
+        The page you asked for is not here. The overview, compatibility audit and documentation are all one click
+        away.
+      </p>
+      <div class="btn-row">
+        <a class="btn btn--primary" href={withBase('/')}>
+          <Icon name="arrow-right" size={15} />
+          Back to overview
+        </a>
+        <a class="btn btn--ghost" href={withBase('/docs')}>Browse docs</a>
+      </div>
+    </div>
+  </section>
+</BaseLayout>

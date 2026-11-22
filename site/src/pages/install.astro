@@ -1,0 +1,318 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import CopyBlock from '../components/CopyBlock.astro';
+import Icon from '../components/Icon.astro';
+import { getLatestRelease } from '../lib/queries';
+import { withBase } from '../lib/paths';
+import { site } from '../lib/site';
+
+const latest = await getLatestRelease();
+const { asset } = site;
+
+const requirements = [
+  {
+    icon: 'cpu' as const,
+    title: 'x86_64 Linux',
+    text: 'A 64-bit x86 host with a compatible kernel. ARM hosts are not supported.',
+  },
+  {
+    icon: 'monitor' as const,
+    title: 'Wayland session',
+    text: 'A running Wayland compositor. The app surfaces are Wayland windows.',
+  },
+  {
+    icon: 'gpu' as const,
+    title: 'Host GPU drivers',
+    text: 'Working Mesa or vendor drivers for EGL, GLES and Vulkan. No GPU passthrough.',
+  },
+  {
+    icon: 'disk' as const,
+    title: '5 GiB free',
+    text: 'First-run setup unpacks runtime components into your user data directory.',
+  },
+];
+---
+
+<BaseLayout
+  page="install"
+  title="Install"
+  description="Install PenguDroid 0.3.0 on x86_64 Linux with a Wayland session: download, verify, first-run setup and install an APK."
+>
+  <section class="section shell" style="padding-bottom:0">
+    <div style="max-width:50rem">
+      <p class="eyebrow">Install</p>
+      <h1 class="display display--page" style="margin-top:1rem">From download to <em>first window</em>.</h1>
+      <p class="lede" style="margin-top:1.25rem">
+        The 0.3.0 AppImage is a single file with a CLI and a manager. Setup is per-user: no root, no package manager, no
+        booted Android system.
+      </p>
+      <div class="btn-row" style="margin-top:1.75rem">
+        <a class="btn btn--primary" href={site.releases} rel="noopener">
+          <Icon name="download" size={15} />
+          Download {latest?.version ?? site.latestVersion}
+        </a>
+        <a class="btn btn--ghost" href={`${site.repo}/blob/main/docs/RELEASE-0.3.0.md`} rel="noopener">
+          Release notes
+          <Icon name="arrow-up-right" size={15} />
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <section class="shell section--tight" aria-label="Requirements">
+    <div class="req-grid">
+      {requirements.map((requirement) => (
+        <div class="glass glass--soft req sheen reveal">
+          <span class="req__icon"><Icon name={requirement.icon} size={15} /></span>
+          <h3>{requirement.title}</h3>
+          <p>{requirement.text}</p>
+        </div>
+      ))}
+    </div>
+    <p class="micro" style="margin-top:1rem;max-width:80ch">
+      No booted Android VM, container, root access or Android kernel is needed. FUSE and fusermount are not required.
+      Play services, billing, DRM and cameras are not full implementations.
+    </p>
+  </section>
+
+  <section class="section shell" id="steps">
+    <div class="section-head">
+      <div>
+        <p class="eyebrow">Step by step</p>
+        <h2 class="h2">Five commands, <em>in order</em>.</h2>
+      </div>
+      <p class="lede">
+        Commands assume the AppImage is in your current directory. Substitute the version if you are on a newer
+        release.
+      </p>
+    </div>
+
+    <div class="install-steps">
+      <div class="glass install-step reveal">
+        <div class="install-step__head">
+          <span class="install-step__num">1</span>
+          <h3>Download the AppImage</h3>
+        </div>
+        <p>Take the asset from the latest GitHub release. It is about 468 MB.</p>
+        <CopyBlock
+          label="Download"
+          code={`wget https://github.com/denizomer10/PenguDroid/releases/latest/download/${asset.appimage}`}
+        />
+      </div>
+
+      <div class="glass install-step reveal" style="--reveal-delay:60ms">
+        <div class="install-step__head">
+          <span class="install-step__num">2</span>
+          <h3>Verify the checksum</h3>
+        </div>
+        <p>Compare against the published <code>SHA256SUMS</code> before running anything.</p>
+        <CopyBlock
+          label="Verify"
+          code={`wget https://github.com/denizomer10/PenguDroid/releases/latest/download/SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS`}
+        />
+        <p class="micro" style="margin-top:0.75rem">
+          Expected for 0.3.0: <code>{asset.sha256}</code>
+        </p>
+      </div>
+
+      <div class="glass install-step reveal" style="--reveal-delay:120ms">
+        <div class="install-step__head">
+          <span class="install-step__num">3</span>
+          <h3>Make it executable and run setup</h3>
+        </div>
+        <p>
+          First-run setup prepares runtime components offline. It took 83 s on the reference machine and needs at least
+          5 GiB free.
+        </p>
+        <CopyBlock
+          label="First run"
+          code={`chmod +x ${asset.appimage}
+./${asset.appimage} --cli runtime`}
+        />
+      </div>
+
+      <div class="glass install-step reveal" style="--reveal-delay:180ms">
+        <div class="install-step__head">
+          <span class="install-step__num">4</span>
+          <h3>Open the manager</h3>
+        </div>
+        <p>Launch the desktop window, or keep using the CLI if you prefer.</p>
+        <CopyBlock label="Manager" code={`./${asset.appimage}`} />
+      </div>
+
+      <div class="glass install-step reveal" style="--reveal-delay:240ms">
+        <div class="install-step__head">
+          <span class="install-step__num">5</span>
+          <h3>Install your own APK and launch it</h3>
+        </div>
+        <p>
+          PenguDroid does not ship or link APK files. Point it at an APK you obtained legally for your own use.
+        </p>
+        <CopyBlock
+          label="Launch an APK"
+          code={`./${asset.appimage} --cli launch /path/to/app.apk`}
+        />
+      </div>
+    </div>
+  </section>
+
+  <section class="section section-rule shell" id="cli">
+    <div class="section-head">
+      <div>
+        <p class="eyebrow">Command line</p>
+        <h2 class="h2">Everyday <em>CLI calls</em>.</h2>
+      </div>
+      <p class="lede">
+        The AppImage exposes the same CLI as a source build. Add <code>--cli</code> before the command so no window
+        opens.
+      </p>
+    </div>
+
+    <div class="cli-grid">
+      <CopyBlock label="Version" code={`pengudroid --cli --version`} />
+      <CopyBlock label="Runtime components" code={`pengudroid --cli runtime`} />
+      <CopyBlock label="System info" code={`pengudroid --cli info`} />
+      <CopyBlock label="Launch" code={`pengudroid --cli launch /path/to/app.apk`} />
+      <CopyBlock label="List running apps" code={`pengudroid --cli ps`} />
+      <CopyBlock label="Stop an app" code={`pengudroid --cli stop <package>`} />
+    </div>
+    <p style="margin-top:1.25rem">
+      <a class="text-link" href={`${site.repo}/blob/main/docs/API.md`} rel="noopener">
+        Full CLI and protocol reference
+        <Icon name="arrow-up-right" size={14} />
+      </a>
+    </p>
+  </section>
+
+  <section class="section section-rule shell" id="independent">
+    <div class="split">
+      <div class="split__copy">
+        <p class="eyebrow">Independent profile</p>
+        <h2 class="h2">The ART-free <em>build</em>.</h2>
+        <p>
+          The published AppImage is the ART compatibility profile. To run the independent Pengu profile you build it
+          from source with the packaged helper, or run the binary directly with <code>--backend pengu</code>.
+        </p>
+        <p class="small faint">
+          ARM64 guest code needs a native bridge build with guest and host C++ support — 21 payload files, about 13 MB
+          of closure. Expect experimental behavior.
+        </p>
+      </div>
+      <div>
+        <CopyBlock
+          label="Build the independent profile"
+          code={`tools/build-appimage.sh <span class="c-accent">--pengu</span> --portable`}
+        />
+        <div style="margin-top:0.75rem">
+          <CopyBlock
+            label="Run it"
+            code={`<span class="c-accent">PENGUDROID_INDEPENDENT=1</span> ./target/release/pengudroid launch /path/to/app.apk <span class="c-accent">--backend pengu</span>`}
+          />
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section-rule shell" id="source">
+    <div class="section-head">
+      <div>
+        <p class="eyebrow">From source</p>
+        <h2 class="h2">Build and <em>validate</em>.</h2>
+      </div>
+      <p class="lede">
+        A source build gives you the workspace tests and the compatibility checks. These commands do not require an
+        Android system tree.
+      </p>
+    </div>
+    <CopyBlock
+      label="Build and test"
+      code={`<span class="c-comment"># workspace build</span>
+cargo build --release
+
+<span class="c-comment"># Rust workspace tests</span>
+cargo test --workspace
+
+<span class="c-comment"># Python integration and compatibility checks</span>
+python -m pytest tests -q
+
+<span class="c-comment"># packaged artifact with the component profile</span>
+tools/build-appimage.sh --portable`}
+    />
+    <p class="micro" style="margin-top:0.85rem">
+      0.3.0 was validated with 470 Rust tests, 275 Python tests (265 passed, 10 optional skipped) and 7 CheckJNI
+      probes. Those counts describe that release, not your build.
+    </p>
+  </section>
+
+  <section class="section section-rule shell" id="release">
+    <div class="glass release-card reveal">
+      <div>
+        <div class="release-card__meta">
+          <span class="pill pill--passed">{latest?.status ?? 'latest'}</span>
+          <span class="micro mono">v{latest?.version ?? site.latestVersion}</span>
+          {latest?.date && <span class="micro mono">{latest.date}</span>}
+        </div>
+        <h2 class="h2">{latest?.name ?? 'Component runtime'}</h2>
+        <p>{latest?.summary}</p>
+        <p class="release-card__hash">SHA-256 · {asset.sha256}</p>
+      </div>
+      <div class="btn-row">
+        <a class="btn btn--primary" href={latest?.href ?? site.releases} rel="noopener">
+          <Icon name="download" size={15} />
+          GitHub release
+        </a>
+        <a class="btn btn--ghost" href={`${site.repo}/blob/main/docs/RELEASE-0.3.0.md`} rel="noopener">
+          Notes
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section-rule shell">
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(260px,1fr))">
+      <div class="glass glass--soft card sheen">
+        <p class="eyebrow">Known boundaries</p>
+        <h3 class="h3" style="margin-top:0.7rem">What still does not work</h3>
+        <p class="small muted" style="margin-top:0.6rem">
+          No independent WebView or Android HTTP/TLS stack, incomplete GC and monitor semantics, no general Android
+          resource/layout replacement, and rendering artifacts remain in some games.
+        </p>
+        <p style="margin-top:1rem">
+          <a class="text-link" href={`${site.repo}/blob/main/docs/LIMITATIONS.md`} rel="noopener">
+            LIMITATIONS.md
+            <Icon name="arrow-up-right" size={14} />
+          </a>
+        </p>
+      </div>
+      <div class="glass glass--soft card sheen">
+        <p class="eyebrow">Troubleshooting</p>
+        <h3 class="h3" style="margin-top:0.7rem">Check the runtime first</h3>
+        <p class="small muted" style="margin-top:0.6rem">
+          Start with <code>--cli info</code> and <code>--cli runtime</code>. For launch failures, capture the daemon log
+          before filing an issue so the report includes the failing stage.
+        </p>
+        <p style="margin-top:1rem">
+          <a class="text-link" href={site.issues} rel="noopener">
+            GitHub issues
+            <Icon name="arrow-up-right" size={14} />
+          </a>
+        </p>
+      </div>
+      <div class="glass glass--soft card sheen">
+        <p class="eyebrow">Before you ask</p>
+        <h3 class="h3" style="margin-top:0.7rem">Read the scope</h3>
+        <p class="small muted" style="margin-top:0.6rem">
+          Compatibility numbers describe a fixed checklist, not your app. Check the audit status for the feature area
+          you care about.
+        </p>
+        <p style="margin-top:1rem">
+          <a class="text-link" href={withBase('/compatibility')}>
+            Compatibility audit
+            <Icon name="arrow-right" size={14} />
+          </a>
+        </p>
+      </div>
+    </div>
+  </section>
+</BaseLayout>

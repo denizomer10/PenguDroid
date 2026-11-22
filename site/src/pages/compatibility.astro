@@ -1,0 +1,211 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Icon from '../components/Icon.astro';
+import StatusPill from '../components/StatusPill.astro';
+import { getMissingCalls, getScenarios, getStats } from '../lib/queries';
+import { withBase } from '../lib/paths';
+import { site } from '../lib/site';
+
+const [scenarios, missingCalls, stats] = await Promise.all([getScenarios(), getMissingCalls(), getStats()]);
+
+const counts = {
+  all: scenarios.length,
+  passed: scenarios.filter((s) => s.status === 'passed').length,
+  partial: scenarios.filter((s) => s.status === 'partial').length,
+  missing: scenarios.filter((s) => s.status === 'missing').length,
+};
+
+const jniSlots = Number(stats.find((s) => s.key === 'jni-slots')?.value ?? 229);
+const jniWired = Number(stats.find((s) => s.key === 'jni-wired')?.value ?? 144);
+const jniPlaceholders = Number(stats.find((s) => s.key === 'jni-placeholders')?.value ?? 85);
+const wiredPercent = Math.round((jniWired / jniSlots) * 1000) / 10;
+const auditDate = '2026-11-16';
+
+const tiles = [
+  { value: String(jniSlots), label: 'JNI function slots', note: '4 reserved entries excluded' },
+  { value: String(jniWired), label: 'Wired handlers', note: `${jniPlaceholders} placeholders remain` },
+  { value: String(counts.all), label: 'Audited scenarios', note: `${counts.passed} passed · ${counts.partial} partial · ${counts.missing} missing` },
+  { value: String(missingCalls.length), label: 'Observed missing signatures', note: 'lower bound, not exhaustive' },
+];
+---
+
+<BaseLayout
+  page="compatibility"
+  title="Compatibility"
+  description="A scoped PenguDroid audit: JNI wiring plus a fixed 14-scenario foundation checklist, with every missing signature listed. Not a whole-Android completion percentage."
+>
+  <section class="section shell" style="padding-bottom:0">
+    <div style="max-width:52rem">
+      <p class="eyebrow">Compatibility</p>
+      <h1 class="display display--page" style="margin-top:1rem">An audit you can <em>read line by line</em>.</h1>
+      <p class="lede" style="margin-top:1.25rem">
+        PenguDroid publishes its gaps instead of a score. Below is the complete checklist from the 0.3.0 independent
+        runtime audit, every observed missing signature, and the numbers that are easy to misread.
+      </p>
+    </div>
+  </section>
+
+  <section class="shell section--tight" aria-label="Scope warning">
+    <div class="warning" role="note">
+      <span class="warning__icon"><Icon name="warning" size={15} /></span>
+      <div>
+        <h2>Read this before quoting any number on this page</h2>
+        <p>
+          This is a scoped audit of JNI wiring plus a fixed 14-scenario foundation checklist — not a whole-Android
+          completion percentage. The audit index leaves <code>whole_android_compatibility_percent</code> null, and a
+          passed scenario covers only its named regression test. Wired handlers may still be partial or no-ops.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section class="shell section--tight">
+    <div class="stat-tiles">
+      {tiles.map((tile) => (
+        <div class="glass glass--soft stat-tile sheen reveal">
+          <span class="stat-tile__value">{tile.value}</span>
+          <span class="stat-tile__label">{tile.label}</span>
+          <span class="stat-tile__note">{tile.note}</span>
+        </div>
+      ))}
+    </div>
+
+    <div class="glass wiring" style="margin-top:1rem">
+      <div class="wiring__head">
+        <div>
+          <span class="eyebrow">JNI wiring</span>
+          <p class="h3" style="margin-top:0.6rem">
+            <span class="accent">{jniWired}</span> of {jniSlots} function slots have a handler
+          </p>
+        </div>
+        <span class="pill pill--quiet">Wiring, not conformance</span>
+      </div>
+      <div
+        class="wiring__track"
+        role="img"
+        aria-label={`${jniWired} of ${jniSlots} JNI function slots wired, ${jniPlaceholders} placeholders`}
+      >
+        <div class="wiring__fill" style={`width:${wiredPercent}%`}></div>
+      </div>
+      <div class="wiring__legend">
+        <span><span class="legend-dot legend-dot--wired"></span>{jniWired} wired ({wiredPercent}%)</span>
+        <span><span class="legend-dot legend-dot--placeholder"></span>{jniPlaceholders} placeholders</span>
+        <span>0 missing JNI slots in the audited traces</span>
+      </div>
+      <p class="micro" style="margin-top:0.9rem">
+        A slot is wired when a handler is installed. That says nothing about whether the handler implements the full
+        semantics; placeholders may be partial or no-ops.
+      </p>
+    </div>
+  </section>
+
+  <section class="section shell" id="scenarios">
+    <div class="section-head">
+      <div>
+        <p class="eyebrow">Foundation checklist</p>
+        <h2 class="h2">14 scenarios, <em>status as observed</em>.</h2>
+      </div>
+      <div class="filters" role="group" aria-label="Filter scenarios by status">
+        <button class="filter-btn" type="button" data-filter="all" aria-pressed="true">
+          All <span class="filter-btn__count">{counts.all}</span>
+        </button>
+        <button class="filter-btn" type="button" data-filter="passed" aria-pressed="false">
+          Passed <span class="filter-btn__count">{counts.passed}</span>
+        </button>
+        <button class="filter-btn" type="button" data-filter="partial" aria-pressed="false">
+          Partial <span class="filter-btn__count">{counts.partial}</span>
+        </button>
+        <button class="filter-btn" type="button" data-filter="missing" aria-pressed="false">
+          Missing <span class="filter-btn__count">{counts.missing}</span>
+        </button>
+      </div>
+    </div>
+
+    <p class="micro" data-filter-status style="margin-bottom:1rem">
+      Showing {counts.all} of {counts.all} audited scenarios
+    </p>
+
+    <div class="scenarios">
+      {scenarios.map((scenario) => (
+        <article class="glass glass--soft scenario" data-status={scenario.status}>
+          <div class="scenario__head">
+            <h3>{scenario.name}</h3>
+            <StatusPill status={scenario.status as 'passed' | 'partial' | 'missing'} />
+          </div>
+          <p class="scenario__evidence">{scenario.evidence}</p>
+          <p class="scenario__note">
+            {scenario.status === 'passed'
+              ? 'Named regression only — does not imply coverage of the wider API.'
+              : scenario.status === 'partial'
+                ? 'Partial: some behavior observed, coverage incomplete.'
+                : 'Missing: no implementation observed for this scenario.'}
+          </p>
+        </article>
+      ))}
+    </div>
+
+    <p class="micro" style="margin-top:1.25rem">
+      Audit recorded {auditDate} · backend <code>pengu</code> · source JSON version 0.3.0.
+    </p>
+  </section>
+
+  <section class="section section-rule shell" id="missing">
+    <div class="section-head">
+      <div>
+        <p class="eyebrow">Missing Java surface</p>
+        <h2 class="h2">{missingCalls.length} observed signatures, <em>listed</em>.</h2>
+      </div>
+      <p class="lede">
+        Collected from traced calls during the audit. This is a lower bound: the real missing surface is at least this
+        large, and it is not a list of the only things that can fail.
+      </p>
+    </div>
+
+    <details class="disclosure">
+      <summary>
+        <span>Show all {missingCalls.length} observed missing Java signatures</span>
+        <svg class="chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
+          <path d="m4 6 4 4 4-4" stroke-linecap="round" stroke-linejoin="round"></path>
+        </svg>
+      </summary>
+      <div class="disclosure__body">
+        <p class="micro" style="margin-bottom:0.9rem">
+          Lower bound · copied from <code>observations.unimplemented_methods</code> in the machine-readable index.
+        </p>
+        <div class="sig-list">
+          {missingCalls.map((call) => <code class="sig">{call.signature}</code>)}
+        </div>
+      </div>
+    </details>
+
+    <div class="btn-row" style="margin-top:1.25rem">
+      <a class="btn btn--ghost btn--small" href={`${site.repo}/blob/main/docs/compatibility/index.json`} rel="noopener">
+        <Icon name="arrow-up-right" size={14} />
+        Machine-readable index.json
+      </a>
+      <a class="btn btn--ghost btn--small" href={`${site.repo}/blob/main/docs/LIMITATIONS.md`} rel="noopener">
+        <Icon name="arrow-up-right" size={14} />
+        LIMITATIONS.md
+      </a>
+    </div>
+  </section>
+
+  <section class="section section-rule shell">
+    <div class="glass card" style="padding:clamp(1.5rem,3vw,2.25rem)">
+      <p class="eyebrow">What this does not mean</p>
+      <h2 class="h2" style="margin-top:0.75rem;max-width:24ch">Five readings that would be wrong.</h2>
+      <ul class="callout-list" style="margin-top:1.5rem">
+        <li>It is not a percentage of Android that works.</li>
+        <li>A wired JNI slot does not mean a conforming implementation.</li>
+        <li>A passed scenario does not mean the feature area is complete.</li>
+        <li><strong>71</strong> is a lower bound from traced calls, not the full gap.</li>
+        <li>Results came from specific apps, GPUs and distributions — not your machine.</li>
+      </ul>
+      <p class="small muted" style="margin-top:1.5rem;max-width:70ch">
+        For the independent profile, the JNI wiring count describes the runtime that ships it, not the published ART
+        compatibility AppImage. See
+        <a class="text-link" href={withBase('/docs')} style="margin-left:0.25rem">the docs</a> for both paths.
+      </p>
+    </div>
+  </section>
+</BaseLayout>

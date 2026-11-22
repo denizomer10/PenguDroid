@@ -1,0 +1,479 @@
+---
+import { Image } from 'astro:assets';
+import BaseLayout from '../layouts/BaseLayout.astro';
+import ArchitectureDiagram from '../components/ArchitectureDiagram.astro';
+import CopyBlock from '../components/CopyBlock.astro';
+import EvidenceCard from '../components/EvidenceCard.astro';
+import FaqList from '../components/FaqList.astro';
+import Icon from '../components/Icon.astro';
+import StatStrip from '../components/StatStrip.astro';
+import manager from '../assets/manager.png';
+import { getDocuments, getEvidence, getFaqs, getFeaturedStats, getLatestRelease, getScenarios } from '../lib/queries';
+import { withBase } from '../lib/paths';
+import { site } from '../lib/site';
+
+const [featuredStats, evidence, documents, faqs, scenarios, latest] = await Promise.all([
+  getFeaturedStats(['jni-slots', 'jni-wired', 'scenarios', 'missing-calls']),
+  getEvidence(),
+  getDocuments(),
+  getFaqs(),
+  getScenarios(),
+  getLatestRelease(),
+]);
+
+const counts = {
+  passed: scenarios.filter((s) => s.status === 'passed').length,
+  partial: scenarios.filter((s) => s.status === 'partial').length,
+  missing: scenarios.filter((s) => s.status === 'missing').length,
+};
+
+const previewDocs = documents.slice(0, 6);
+const previewFaqs = faqs.slice(0, 4);
+---
+
+<BaseLayout page="overview" title="Overview">
+  <section class="hero">
+    <div class="shell hero__grid">
+      <div class="hero__copy">
+        <p class="eyebrow">Android 17 / API 37 · x86_64 Linux</p>
+        <h1 class="display">Android apps and ARM64 games on a <em>Linux desktop</em>.</h1>
+        <p class="lede">
+          PenguDroid opens Android apps and ARM64 games as ordinary windows on your desktop. No booted Android VM,
+          container, root access or Android kernel — just a per-user service, host graphics and the compositor you
+          already run.
+        </p>
+        <p class="hero__note">
+          <Icon name="shield" size={14} />
+          Wayland session and working host GPU drivers required.
+        </p>
+        <div class="btn-row hero__actions">
+          <a class="btn btn--primary" href={site.releases} rel="noopener">
+            <Icon name="download" size={15} />
+            Download {latest?.version ?? site.latestVersion}
+          </a>
+          <a class="btn btn--ghost" href={withBase('/compatibility')}>
+            Explore compatibility
+            <Icon name="arrow-right" size={15} />
+          </a>
+        </div>
+        <div class="hero__meta">
+          <span class="chip"><Icon name="cpu" size={13} /> x86_64 Linux</span>
+          <span class="chip"><Icon name="monitor" size={13} /> Wayland</span>
+          <span class="chip"><Icon name="layers" size={13} /> API 37</span>
+          <span class="chip"><Icon name="disk" size={13} /> 5 GiB free</span>
+        </div>
+      </div>
+
+      <div class="hero__visual">
+        <div class="window">
+          <div class="window__bar" aria-hidden="true">
+            <span class="window__dot"></span>
+            <span class="window__dot"></span>
+            <span class="window__dot"></span>
+            <span class="window__title">pengudroid · manager</span>
+          </div>
+          <Image
+            src={manager}
+            alt="PenguDroid manager window listing installed apps, runtime status and launch controls."
+            widths={[520, 760, 1120]}
+            sizes="(max-width: 960px) 92vw, 540px"
+            format="webp"
+            quality={86}
+            priority
+          />
+        </div>
+        <div class="float-chip float-chip--tr">
+          <span class="float-chip__dot"></span>
+          <div>
+            <strong>5,911 presents</strong>
+            <span>BBR2 · 160 s run</span>
+          </div>
+        </div>
+        <div class="float-chip float-chip--bl">
+          <div>
+            <strong>144 / 229</strong>
+            <span>JNI slots wired</span>
+          </div>
+        </div>
+        <div class="float-chip float-chip--br">
+          <div>
+            <strong>7 · 4 · 3</strong>
+            <span>scenarios passed / partial / missing</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="shell section--tight" aria-label="Audit at a glance">
+    <StatStrip stats={featuredStats} />
+  </section>
+
+  <section class="section shell" id="paths">
+    <div class="section-head reveal">
+      <div>
+        <p class="eyebrow">Two execution paths</p>
+        <h2 class="h2">One shell, <em>two runtimes</em>.</h2>
+      </div>
+      <p class="lede">
+        Both paths present the same way: an app window on your desktop. What sits underneath is deliberately different.
+      </p>
+    </div>
+
+    <div class="paths">
+      <article class="glass path path--pengu sheen reveal">
+        <div class="path__glow" aria-hidden="true"></div>
+        <p class="path__tag">
+          <Icon name="layers" size={13} /> Independent profile
+        </p>
+        <h3 class="h3">Pengu</h3>
+        <p>
+          PenguDroid's own DEX interpreter, JNI layer and builtins. No ART, no framework binaries — the runtime is
+          audited against a fixed checklist of foundation scenarios instead.
+        </p>
+        <ul class="card-list">
+          <li>Experimental; substantial gaps remain.</li>
+          <li>No real worker-thread VM execution, GC or monitor semantics yet.</li>
+          <li>Built separately with <code>--pengu</code>; not the published AppImage.</li>
+        </ul>
+        <div class="path__foot">
+          <span class="pill pill--quiet">Experimental</span>
+          <a class="text-link" href={withBase('/compatibility')}>Audit detail</a>
+        </div>
+      </article>
+
+      <article class="glass path path--art sheen reveal" style="--reveal-delay:90ms">
+        <div class="path__glow" aria-hidden="true"></div>
+        <p class="path__tag">
+          <Icon name="shield" size={13} /> Optional compatibility profile
+        </p>
+        <h3 class="h3">Hosted ART</h3>
+        <p>
+          Real Android 17 / API 37 ART and framework components, shipped as runtime components. This is the path with
+          packaged app evidence in 0.3.0.
+        </p>
+        <ul class="card-list">
+          <li>ART and framework binaries stay runtime components, not host installs.</li>
+          <li>Carries the BBR2 and NewPipe evidence on this site.</li>
+          <li>No system image, APEX or <code>build.prop</code> is used.</li>
+        </ul>
+        <div class="path__foot">
+          <span class="pill pill--passed">Supported profile</span>
+          <a class="text-link" href={`${site.repo}/blob/main/docs/MODULAR_RUNTIME.md`} rel="noopener">How it works</a>
+        </div>
+      </article>
+    </div>
+  </section>
+
+  <section class="section section-rule shell" id="evidence">
+    <div class="section-head reveal">
+      <div>
+        <p class="eyebrow">Evidence, with its boundaries</p>
+        <h2 class="h2">What was actually <em>captured</em>.</h2>
+      </div>
+      <p class="lede">
+        Each card names its execution path and the limits of the run. A screenshot is a record of one test, not a
+        promise for your hardware.
+      </p>
+    </div>
+
+    <div class="evidence">
+      {evidence.map((item) => (
+        <EvidenceCard
+          app={item.app}
+          version={item.version}
+          headline={item.headline}
+          summary={item.summary}
+          caveat={item.caveat}
+          imageFile={item.imageFile}
+          imageAlt={item.imageAlt}
+          pathLabel={item.pathLabel}
+          docsHref={item.docsHref}
+          portrait={item.slug === 'newpipe'}
+        />
+      ))}
+    </div>
+  </section>
+
+  <section class="section section-rule shell" id="underneath">
+    <div class="section-head reveal">
+      <div>
+        <p class="eyebrow">What runs underneath</p>
+        <h2 class="h2">A guest runtime, <em>not a VM</em>.</h2>
+      </div>
+      <p class="lede">
+        The APK stays a guest. Graphics, input and audio leave through a single per-user daemon that talks to your
+        compositor.
+      </p>
+    </div>
+
+    <div class="reveal">
+      <ArchitectureDiagram />
+    </div>
+
+    <ul class="diagram-foot">
+      <li>
+        <strong>Host services only</strong>
+        Wayland surfaces, PipeWire audio, evdev controllers and the GPU driver you already have.
+      </li>
+      <li>
+        <strong>Isolated by profile</strong>
+        The independent Pengu profile excludes ART and framework binaries; the component profile includes them.
+      </li>
+      <li>
+        <strong>No Android kernel</strong>
+        Bionic and Android shims run as guest-side components, not as a booted system.
+      </li>
+      <li>
+        <strong>Unprivileged</strong>
+        A per-user daemon with a mode 0600 socket — no root, no VM, no container.
+      </li>
+    </ul>
+
+    <p style="margin-top:1.5rem">
+      <a class="text-link" href={`${site.repo}/blob/main/docs/ARCHITECTURE.md`} rel="noopener">
+        Read the architecture document
+        <Icon name="arrow-up-right" size={14} />
+      </a>
+    </p>
+  </section>
+
+  <section class="section section-rule shell" id="independent">
+    <div class="split">
+      <div class="split__copy reveal">
+        <p class="eyebrow">Independent profile</p>
+        <h2 class="h2">Try the runtime <em>without ART</em>.</h2>
+        <p>
+          The independent profile runs apps on PenguDroid's own interpreter. It needs a native bridge build for ARM64
+          guest code and it is still experimental — expect missing framework behavior.
+        </p>
+        <p class="small faint">
+          The published 0.3.0 AppImage is the ART compatibility profile, so this path is built from source.
+        </p>
+        <p style="margin-top:1.25rem">
+          <a class="text-link" href={`${site.repo}/blob/main/docs/INDEPENDENT_RUNTIME.md`} rel="noopener">
+            Independent runtime notes
+            <Icon name="arrow-up-right" size={14} />
+          </a>
+        </p>
+      </div>
+
+      <div class="reveal" style="--reveal-delay:80ms">
+        <CopyBlock
+          label="Launch with the independent profile"
+          code={`<span class="c-comment"># explicit backend</span>
+./target/release/pengudroid launch /path/to/app.apk <span class="c-accent">--backend pengu</span>
+
+<span class="c-comment"># or via environment</span>
+<span class="c-accent">PENGUDROID_BACKEND=pengu</span> ./target/release/pengudroid launch /path/to/app.apk`}
+        />
+        <p class="micro" style="margin-top:0.85rem">
+          <code>PENGUDROID_INDEPENDENT=1</code> marks the independent profile at build and runtime.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section-rule shell" id="compatibility">
+    <div class="section-head reveal">
+      <div>
+        <p class="eyebrow">Compatibility snapshot</p>
+        <h2 class="h2">A scoped <em>foundation audit</em>.</h2>
+      </div>
+      <p class="lede">
+        Fourteen named scenarios and a JNI wiring count. Neither is a percentage of Android, and a passed scenario
+        covers only its named regression test.
+      </p>
+    </div>
+
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(260px,1fr))">
+      <div class="glass card sheen reveal">
+        <div class="card-head">
+          <span class="eyebrow">Scenario checklist</span>
+          <span class="pill pill--quiet">14 audited</span>
+        </div>
+        <div style="display:flex;gap:1.5rem;align-items:flex-end;margin-top:0.35rem">
+          <div>
+            <span class="stat__value accent">{counts.passed}</span>
+            <span class="stat__note">passed</span>
+          </div>
+          <div>
+            <span class="stat__value">{counts.partial}</span>
+            <span class="stat__note">partial</span>
+          </div>
+          <div>
+            <span class="stat__value">{counts.missing}</span>
+            <span class="stat__note">missing</span>
+          </div>
+        </div>
+        <p class="small muted" style="margin-top:1rem">
+          Partial and missing scenarios are published as-is, including the HandlerThread, WebView and GC gaps.
+        </p>
+      </div>
+
+      <div class="glass card sheen reveal" style="--reveal-delay:70ms">
+        <div class="card-head">
+          <span class="eyebrow">JNI wiring</span>
+          <span class="pill pill--quiet">wiring, not conformance</span>
+        </div>
+        <p class="h3" style="margin-top:0.2rem">
+          <span class="accent">144</span> of 229 function slots wired
+        </p>
+        <div class="wiring__track" role="img" aria-label="144 of 229 JNI function slots are wired">
+          <div class="wiring__fill"></div>
+        </div>
+        <p class="small muted" style="margin-top:0.9rem">
+          85 placeholders remain, and wired handlers may still be partial or no-ops. Zero missing JNI slots were
+          observed in the audited traces.
+        </p>
+      </div>
+
+      <div class="glass card sheen reveal" style="--reveal-delay:140ms">
+        <div class="card-head">
+          <span class="eyebrow">Observed gaps</span>
+          <span class="pill pill--quiet">lower bound</span>
+        </div>
+        <p class="h3" style="margin-top:0.2rem">
+          <span class="accent">71</span> missing Java signatures
+        </p>
+        <p class="small muted" style="margin-top:0.9rem">
+          Collected from traced calls only. The real gap is at least this large, not exactly this large — every
+          signature is listed with the audit.
+        </p>
+        <p style="margin-top:1rem">
+          <a class="text-link" href={withBase('/compatibility')}>
+            See all 71 and the scope warning
+            <Icon name="arrow-right" size={14} />
+          </a>
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section-rule shell" id="install">
+    <div class="split">
+      <div class="split__copy reveal">
+        <p class="eyebrow">Install</p>
+        <h2 class="h2">Three steps to a <em>first window</em>.</h2>
+        <p>
+          The 0.3.0 AppImage is self-contained. First-run setup prepares runtime components offline and needs at least
+          5 GiB free; FUSE and fusermount are not required.
+        </p>
+        <div class="hero__meta" style="margin-top:1.25rem">
+          <span class="chip"><Icon name="cpu" size={13} /> x86_64</span>
+          <span class="chip"><Icon name="monitor" size={13} /> Wayland session</span>
+          <span class="chip"><Icon name="gpu" size={13} /> Host GPU drivers</span>
+          <span class="chip"><Icon name="disk" size={13} /> 5 GiB free</span>
+        </div>
+        <div class="btn-row" style="margin-top:1.75rem">
+          <a class="btn btn--primary" href={withBase('/install')}>
+            Installation guide
+            <Icon name="arrow-right" size={15} />
+          </a>
+        </div>
+      </div>
+
+      <div class="steps reveal" style="--reveal-delay:80ms">
+        <div class="glass step">
+          <span class="step__num">1</span>
+          <div>
+            <h3>Download and verify</h3>
+            <p>Grab the AppImage from GitHub Releases and check it against <code>SHA256SUMS</code>.</p>
+          </div>
+        </div>
+        <div class="glass step">
+          <span class="step__num">2</span>
+          <div>
+            <h3>First-run setup</h3>
+            <p>Make it executable and let setup unpack the runtime components locally. No root step.</p>
+          </div>
+        </div>
+        <div class="glass step">
+          <span class="step__num">3</span>
+          <div>
+            <h3>Install an APK</h3>
+            <p>Add your own APK through the CLI or the manager, then launch it as a desktop window.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section-rule shell">
+    <div class="glass status-callout reveal">
+      <div class="status-callout__body">
+        <span class="pill pill--partial">Not working independently</span>
+        <h2 class="h2">Zenless Zone Zero 3.3.0 is <em>not there yet</em>.</h2>
+        <p>
+          ZZZ loads five DEX files and the ARM64 <code>libmain</code> / <code>libil2cpp</code> pair, then blocks on
+          HandlerThread and Looper execution. On the ART path it reaches the login background, but the SDK window
+          stays blank and transparent. Login, UI and gameplay are unverified.
+        </p>
+        <p class="micro" style="margin-top:0.85rem">
+          Treat blank or transparent SDK windows as unresolved behavior — do not dismiss them blindly.
+        </p>
+      </div>
+      <div class="status-callout__action">
+        <a
+          class="btn btn--ghost"
+          href={`${site.repo}/blob/main/docs/INDEPENDENT_RUNTIME.md#zzz-330-result-and-remaining-work`}
+          rel="noopener"
+        >
+          Read the ZZZ result
+          <Icon name="arrow-up-right" size={15} />
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section-rule shell" id="docs">
+    <div class="section-head reveal">
+      <div>
+        <p class="eyebrow">Documentation</p>
+        <h2 class="h2">The details are <em>written down</em>.</h2>
+      </div>
+      <div class="btn-row">
+        <a class="text-link" href={withBase('/docs')}>
+          All {documents.length} documents
+          <Icon name="arrow-right" size={14} />
+        </a>
+      </div>
+    </div>
+
+    <div class="doc-grid">
+      {previewDocs.map((doc, i) => (
+        <a
+          class="glass glass--soft doc-card reveal"
+          href={doc.href}
+          rel="noopener"
+          style={`--reveal-delay:${Math.min(i, 5) * 45}ms`}
+        >
+          <div class="doc-card__title">
+            <h3>{doc.title}</h3>
+            <Icon name="arrow-up-right" size={14} />
+          </div>
+          <p>{doc.summary}</p>
+          <span class="micro">{doc.category}</span>
+        </a>
+      ))}
+    </div>
+
+    <div class="section-head" style="margin-top:clamp(2.5rem,5vw,4rem)">
+      <div>
+        <p class="eyebrow">Questions</p>
+        <h2 class="h2">Short answers.</h2>
+      </div>
+      <p class="lede">
+        The full FAQ lives with the docs. Anything unresolved belongs in GitHub issues rather than a promise on this
+        page.
+      </p>
+    </div>
+    <FaqList faqs={previewFaqs} />
+    <p style="margin-top:1.5rem">
+      <a class="text-link" href={withBase('/docs')}>
+        More questions and documents
+        <Icon name="arrow-right" size={14} />
+      </a>
+    </p>
+  </section>
+</BaseLayout>

@@ -1,0 +1,109 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import FaqList from '../components/FaqList.astro';
+import Icon from '../components/Icon.astro';
+import { getDocuments, getFaqs } from '../lib/queries';
+import { site } from '../lib/site';
+
+const [documents, faqs] = await Promise.all([getDocuments(), getFaqs()]);
+
+const categoryOrder = ['Start here', 'Runtime', 'Evidence', 'Engineering'];
+const groups = categoryOrder.map((category) => ({
+  category,
+  docs: documents.filter((doc) => doc.category === category),
+}));
+---
+
+<BaseLayout
+  page="docs"
+  title="Docs"
+  description="All PenguDroid documentation: status, architecture, independent runtime, native bridge, evidence and engineering notes."
+>
+  <section class="section shell" style="padding-bottom:0">
+    <div style="max-width:50rem">
+      <p class="eyebrow">Documentation</p>
+      <h1 class="display display--page" style="margin-top:1rem">The whole record, <em>in the open</em>.</h1>
+      <p class="lede" style="margin-top:1.25rem">
+        Every document lives in the repository and is linked here by its real path. Start with status and limitations
+        if you are evaluating PenguDroid for the first time.
+      </p>
+    </div>
+  </section>
+
+  <section class="shell section--tight">
+    <div class="doc-filter">
+      <Icon name="search" size={15} />
+      <label for="doc-search" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)">Filter documents</label>
+      <input
+        id="doc-search"
+        type="search"
+        placeholder={`Filter ${documents.length} documents…`}
+        autocomplete="off"
+        data-doc-filter
+      />
+    </div>
+  </section>
+
+  <section class="section shell" style="padding-top:0" id="library">
+    <div data-doc-group>
+      {groups.map((group) => (
+        <div class="doc-group" data-doc-group>
+          <h2 class="doc-group__title">{group.category}</h2>
+          <div class="doc-grid">
+            {group.docs.map((doc) => (
+              <a class="glass glass--soft doc-card" href={doc.href} rel="noopener" data-doc-item={`${doc.title} ${doc.slug} ${doc.summary}`}>
+                <div class="doc-card__title">
+                  <h3>{doc.title}</h3>
+                  <Icon name="arrow-up-right" size={14} />
+                </div>
+                <p>{doc.summary}</p>
+                <span class="micro">docs/{doc.slug}.md</span>
+              </a>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+    <p class="doc-empty" data-doc-empty hidden>No document matches that filter.</p>
+    <p class="micro" style="margin-top:1.25rem">
+      All {documents.length} links open the file on GitHub in the PenguDroid repository.
+    </p>
+  </section>
+
+  <section class="section section-rule shell" id="faq">
+    <div class="section-head">
+      <div>
+        <p class="eyebrow">FAQ</p>
+        <h2 class="h2">Answers with <em>limits attached</em>.</h2>
+      </div>
+      <p class="lede">
+        If an answer here would need a guarantee, it is not written as one. Report reproducible problems through the
+        repository.
+      </p>
+    </div>
+    <FaqList faqs={faqs} />
+  </section>
+
+  <section class="section section-rule shell">
+    <div class="glass card" style="padding:clamp(1.5rem,3vw,2rem)">
+      <div class="split" style="align-items:center">
+        <div class="split__copy">
+          <p class="eyebrow">Repository</p>
+          <h2 class="h2" style="margin-top:0.7rem">Source, issues and releases.</h2>
+          <p class="small muted">
+            PenguDroid is Apache-2.0 licensed. Compatibility reports and reproducible failures are most useful as
+            issues with the failing stage and host details.
+          </p>
+        </div>
+        <div class="btn-row">
+          <a class="btn btn--primary" href={site.repo} rel="noopener">
+            <Icon name="github" size={15} />
+            Repository
+          </a>
+          <a class="btn btn--ghost" href={site.issues} rel="noopener">Issues</a>
+          <a class="btn btn--ghost" href={site.releases} rel="noopener">Releases</a>
+        </div>
+      </div>
+    </div>
+  </section>
+</BaseLayout>

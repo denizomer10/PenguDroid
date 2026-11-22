@@ -1,0 +1,35 @@
+---
+import { withBase } from '../lib/paths';
+
+interface Stat {
+  key: string;
+  label: string;
+  value: string;
+  note: string;
+}
+
+interface Props {
+  stats: Stat[];
+}
+
+const { stats } = Astro.props;
+---
+
+<div class="glass stats-bar">
+  <div class="stats-bar__grid">
+    {stats.map((stat) => (
+      <div class="stat">
+        <span class="stat__value">{stat.value}</span>
+        <span class="stat__label">{stat.label}</span>
+        <span class="stat__note">{stat.note}</span>
+      </div>
+    ))}
+  </div>
+  <p class="stats-bar__foot">
+    <span>
+      A scoped audit of JNI wiring plus a fixed 14-scenario foundation checklist — not a whole-Android completion
+      percentage.
+    </span>
+    <a class="text-link" href={withBase('/compatibility')}>How to read these numbers</a>
+  </p>
+</div>

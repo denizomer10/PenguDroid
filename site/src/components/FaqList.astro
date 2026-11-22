@@ -1,0 +1,21 @@
+---
+import Icon from './Icon.astro';
+
+interface Props {
+  faqs: { question: string; answer: string }[];
+}
+
+const { faqs } = Astro.props;
+---
+
+<div class="faq">
+  {faqs.map((faq, i) => (
+    <details class="reveal" style={`--reveal-delay:${Math.min(i, 5) * 45}ms`}>
+      <summary>
+        <span>{faq.question}</span>
+        <Icon name="plus" size={16} />
+      </summary>
+      <div class="faq__answer">{faq.answer}</div>
+    </details>
+  ))}
+</div>

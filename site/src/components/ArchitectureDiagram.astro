@@ -1,0 +1,76 @@
+---
+import Icon from './Icon.astro';
+
+const layers = [
+  {
+    n: '01',
+    title: 'APK',
+    sub: 'DEX bytecode, native libraries, resources',
+    tone: 'plain',
+  },
+  {
+    n: '02',
+    title: 'Execution path',
+    sub: 'Pengu interpreter and builtins, or hosted ART and framework components',
+    tone: 'accent',
+  },
+  {
+    n: '03',
+    title: 'ARM64 bridge',
+    sub: 'Guest ARM64 code translated to x86_64 host calls',
+    tone: 'plain',
+  },
+  {
+    n: '04',
+    title: 'Bionic and Android shims',
+    sub: 'libc, properties, storage, input and graphics surfaces',
+    tone: 'plain',
+  },
+  {
+    n: '05',
+    title: 'Per-user daemon',
+    sub: 'Session state, surfaces, input injection, audio routing, host EGL / GLES / Vulkan',
+    tone: 'accent',
+  },
+  {
+    n: '06',
+    title: 'Wayland and PipeWire',
+    sub: 'Desktop window, keyboard and pointer, gamepad evdev, audio output',
+    tone: 'plain',
+  },
+];
+---
+
+<div class="arch glass sheen">
+  <div class="arch__head">
+    <span class="eyebrow">Runtime path</span>
+    <span class="arch__meta mono">x86_64 host · API 37 guest</span>
+  </div>
+
+  <ol class="arch__stack">
+    {layers.map((layer) => (
+      <li class:list={['arch__layer', layer.tone === 'accent' && 'arch__layer--accent']}>
+        <span class="arch__n mono">{layer.n}</span>
+        <div class="arch__text">
+          <h3>{layer.title}</h3>
+          <p>{layer.sub}</p>
+        </div>
+        {layer.n === '02' && (
+          <span class="arch__split" aria-hidden="true">
+            <span>Pengu</span>
+            <span class="arch__or">or</span>
+            <span>ART</span>
+          </span>
+        )}
+      </li>
+    ))}
+  </ol>
+
+  <div class="arch__foot">
+    <span class="arch__socket mono">
+      <Icon name="terminal" size={13} />
+      protocol v5 · daemon.sock, mode 0600
+    </span>
+    <span class="micro">No Android kernel, VM or container in this path.</span>
+  </div>
+</div>

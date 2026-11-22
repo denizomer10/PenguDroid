@@ -1,0 +1,31 @@
+{
+  "name": "pengudroid-website",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "check": "astro check",
+    "verify": "node scripts/verify-build.mjs",
+    "data": "node scripts/generate-data.mjs",
+    "assets": "node scripts/generate-assets.mjs"
+  },
+  "dependencies": {
+    "@astrojs/db": "^0.21.3",
+    "@astrojs/sitemap": "^3.7.6",
+    "@fontsource-variable/inter-tight": "^5.3.0",
+    "@fontsource/instrument-serif": "^5.3.0",
+    "astro": "^7.4.13",
+    "sharp": "^0.35.5"
+  },
+  "devDependencies": {
+    "@astrojs/check": "^0.9.12",
+    "esbuild": "^0.27.0",
+    "typescript": "^5.9.0"
+  },
+  "allowScripts": {
+    "esbuild@0.27.7": true
+  }
+}
